@@ -6,3 +6,7 @@ generated/
 
 # macOS
 .DS_Store
+
+# Local Claude Code configuration
+.agents/
+.claude/
