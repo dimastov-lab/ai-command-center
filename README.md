@@ -37,13 +37,18 @@ The script resolves the repository root, activates `.venv` if present, verifies 
 available, and starts the app. It does not create the virtual environment or install packages —
 run steps 1 and 2 first.
 
-## Task storage
+## Runtime Data
 
-Kanban tasks are stored locally as JSON at `data/tasks.json` (created automatically on first
-run). Writes are atomic (write to a temp file, then replace). This file is local application
-state, separate from the AI task files generated under `generated/<PROJECT>/` by
-`scripts/start-task.sh`. Older task records without the Sprint 2 fields (see below) are
-backfilled with defaults automatically when loaded, so existing data keeps working.
+- `data/tasks.json` is local runtime state — the live Kanban task store. It is **gitignored** and
+  never committed; its contents are specific to your machine. Writes are atomic (temp file +
+  `os.replace`), and older task records missing newer fields are backfilled with defaults when
+  loaded, so existing data keeps working across app updates.
+- `data/tasks.example.json` is the **version-controlled** seed template (`[]`, an empty task
+  list). On startup, if `data/tasks.json` does not exist yet, the app copies
+  `tasks.example.json` to `tasks.json` before loading tasks — so a fresh checkout always starts
+  with a valid, empty store instead of failing or crashing.
+- `generated/` holds transient AI task files produced by `scripts/start-task.sh`. It is
+  **gitignored**; only the directory scaffolding (`.gitkeep`) is tracked.
 
 ## Sprint 2 (v1.1) features
 

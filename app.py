@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -17,6 +18,7 @@ REPORTS_DIR = ROOT / "reports"
 CONTEXT_DIR = ROOT / "context"
 DATA_DIR = ROOT / "data"
 TASKS_FILE = DATA_DIR / "tasks.json"
+TASKS_EXAMPLE_FILE = DATA_DIR / "tasks.example.json"
 START_TASK_SCRIPT = ROOT / "scripts" / "start-task.sh"
 
 PROJECTS: dict[str, str] = {
@@ -258,8 +260,10 @@ def normalize_task(task: dict) -> dict:
 def load_tasks() -> list[dict]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not TASKS_FILE.exists():
-        save_tasks([])
-        return []
+        if TASKS_EXAMPLE_FILE.exists():
+            shutil.copyfile(TASKS_EXAMPLE_FILE, TASKS_FILE)
+        else:
+            save_tasks([])
     try:
         data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
