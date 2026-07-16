@@ -1,0 +1,26 @@
+[
+  {
+    "id": "example0000000000000000000000000",
+    "project": "AIOS",
+    "title": "Пример разговора",
+    "task_id": null,
+    "created_at": "2026-01-01T09:00:00",
+    "updated_at": "2026-01-01T09:01:30",
+    "messages": [
+      {
+        "id": "examplemsg000000000000000000001",
+        "role": "user",
+        "content": "Какой сейчас статус проекта AIOS?",
+        "provider": null,
+        "created_at": "2026-01-01T09:00:00"
+      },
+      {
+        "id": "examplemsg000000000000000000002",
+        "role": "assistant",
+        "content": "Это пример ответа ассистента — в реальном разговоре он приходит от выбранного провайдера (local/claude_code/openai).",
+        "provider": "local",
+        "created_at": "2026-01-01T09:01:30"
+      }
+    ]
+  }
+]

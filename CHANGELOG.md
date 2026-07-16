@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow strict semantic versioning tags in Git; versions below refer to
 functional application milestones of `app.py`.
 
+## [1.2.0] - 2026-07-16
+
+### Added
+- **`command_center/` package**: `models`, `storage`, `project_config`, `agent_runner`,
+  `report_parser`, `chat_service`, `workflow`, `activity_log` — see ARCHITECTURE.md §11.
+- **Project Chat** (`chat` page): per-project conversations with a provider abstraction (local
+  manual mode, Claude Code CLI, optional OpenAI Responses API gated on `OPENAI_API_KEY` +
+  `OPENAI_MODEL`); save any message into `reports/`, or convert it into a task.
+- **Claude Code runner**: launch Claude Code from a Kanban task, the Agents page, Project Chat, or a
+  generated-task preview, with an explicit repository/branch/agent/prompt confirmation step, a
+  synchronous timeout-bounded execution, and full stdout/stderr capture.
+- **Full report storage**: every completed run's untruncated report is saved under
+  `reports/<PROJECT>/`.
+- **Structured result extraction** (`report_parser.py`): deterministic verdict/findings/files/
+  commit/branch/PR/validation/git-status/next-action parsing with evidence, a confidence level, and
+  a manual-correction UI that never discards the original extraction.
+- **Create Next Task**: verdict-driven task-type/workflow-stage/objective suggestion on a completed
+  run, always requiring review before creating anything and never auto-executing.
+- **Run journal** (`runs` page): filterable list of every run plus a full detail view; Executive
+  Dashboard gained run metrics (today's runs, success/failure, awaiting remediation/final review,
+  approved-for-commit, average duration by agent, open Blocker/High findings).
+- **Task workflow fields**: `parent_task_id`, `prior_run_id`, `current_run_id`, `workflow_stage`,
+  `latest_verdict`, `report_path`, `repository_path`, `branch`, `agent`, `last_run_at` — additive,
+  backfilled on load, parallel to (not a replacement for) the existing Kanban `status`.
+- **Project repository configuration**: Projects → "Настройки репозитория" tab; local overrides in
+  gitignored `data/project_config.json`; no path ever guessed (only ever a verified-existing git
+  repo, shown as a suggestion the user must save).
+- **Sensitive-project handling**: BANK/LEGAL show an explicit warning before any agent launch or
+  chat call and never auto-attach context files.
+- `AICOS` added to the project registry (repository path unconfigured — no known local path).
+- `requirements-dev.txt` (adds `pytest`), `.env.example`, and a `tests/` suite (pytest +
+  Streamlit `AppTest`) covering storage, migration, path validation, the report parser, next-task
+  mapping, report persistence, run filtering, sensitive-project warnings, and refusal to run
+  against unconfigured paths or via a shell.
+
+### Changed
+- `data/runs.jsonl` and `data/activity.jsonl` use JSON Lines instead of a single JSON array — see
+  ARCHITECTURE.md §11.2 for why. `reports/` is now gitignored (may contain BANK/LEGAL content).
+
+### Security
+- The Claude Code runner never calls git-write subcommands itself, and refuses to run against any
+  repository path not present in project configuration.
+- Read-only task types (`review`/`final_gate`/`architecture_review`) run with the model's tool set
+  restricted to `Read,Grep,Glob` via `--tools` — `Bash` and every file-edit tool are entirely absent
+  from that run, not merely pattern-denied. Implementation/remediation task types keep `Bash` but
+  have the specific git-write subcommands denied via `--disallowedTools` — see ARCHITECTURE.md §11.3
+  for exactly what each task-type class does and does not enforce.
+- Fixed during independent review (F-01/F-02): an earlier version of this control denied specific
+  `Bash(git ...)` patterns for read-only task types while leaving the general-purpose `Bash` tool
+  available, which left `git apply`/`checkout`/`stash` and plain shell writes unrestricted for task
+  types documented as unable to modify any file. Replaced with the `--tools` allowlist above.
+
 ## [1.1.0] - 2026-07-15
 
 ### Added
