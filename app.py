@@ -11,12 +11,23 @@ from pathlib import Path
 
 import streamlit as st
 
+from command_center import (
+    activity_log,
+    agent_runner,
+    chat_service,
+    models,
+    project_config,
+    report_parser,
+    storage,
+    workflow,
+)
+
 ROOT = Path(__file__).resolve().parent
 PROJECTS_DIR = ROOT / "projects"
 GENERATED_DIR = ROOT / "generated"
 REPORTS_DIR = ROOT / "reports"
 CONTEXT_DIR = ROOT / "context"
-DATA_DIR = ROOT / "data"
+DATA_DIR = storage.resolve_data_dir(ROOT)
 TASKS_FILE = DATA_DIR / "tasks.json"
 TASKS_EXAMPLE_FILE = DATA_DIR / "tasks.example.json"
 START_TASK_SCRIPT = ROOT / "scripts" / "start-task.sh"
@@ -140,8 +151,10 @@ NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
     "create": ("Создать задачу", ":material/add_task:"),
+    "chat": ("Чат по проекту", ":material/forum:"),
     "kanban": ("Kanban", ":material/view_kanban:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
+    "runs": ("Журнал запусков", ":material/history:"),
     "timeline": ("Таймлайн", ":material/timeline:"),
     "projects": ("Проекты", ":material/folder_open:"),
     "generated": ("Сгенерированные задачи", ":material/description:"),
@@ -254,6 +267,7 @@ def normalize_task(task: dict) -> dict:
     task.setdefault("estimate_hours", 0.0)
     task.setdefault("depends_on", [])
     task.setdefault("updated_at", task.get("created_at", ""))
+    models.normalize_task_workflow(task)
     return task
 
 
@@ -294,9 +308,12 @@ def new_task_record(
     owner: str = "",
     estimate_hours: float = 0.0,
     depends_on: list[str] | None = None,
+    parent_task_id: str | None = None,
+    prior_run_id: str | None = None,
+    workflow_stage: str = "Draft",
 ) -> dict:
     now = datetime.now().isoformat(timespec="seconds")
-    return {
+    record = {
         "id": uuid.uuid4().hex,
         "project": project,
         "title": title,
@@ -309,6 +326,11 @@ def new_task_record(
         "created_at": now,
         "updated_at": now,
     }
+    record.update(models.default_task_workflow_fields())
+    record["parent_task_id"] = parent_task_id
+    record["prior_run_id"] = prior_run_id
+    record["workflow_stage"] = workflow_stage
+    return record
 
 
 def update_task_status(tasks: list[dict], task_id: str, new_status: str) -> None:
@@ -504,17 +526,26 @@ def get_git_worktrees() -> list[dict[str, str]]:
 # --------------------------------------------------------------------------
 
 
-def build_timeline_events(tasks: list[dict], limit: int = 200) -> list[dict]:
+def _parse_iso_ts(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def build_timeline_events(
+    tasks: list[dict],
+    runs: list[dict] | None = None,
+    activity_events: list[dict] | None = None,
+    limit: int = 200,
+) -> list[dict]:
     events: list[dict] = []
 
     for task in tasks:
         created = task.get("created_at")
-        created_ts: float | None = None
-        if created:
-            try:
-                created_ts = datetime.fromisoformat(created).timestamp()
-            except ValueError:
-                created_ts = None
+        created_ts = _parse_iso_ts(created)
         if created_ts is not None:
             events.append(
                 {
@@ -527,10 +558,7 @@ def build_timeline_events(tasks: list[dict], limit: int = 200) -> list[dict]:
 
         updated = task.get("updated_at")
         if updated and updated != created:
-            try:
-                updated_ts = datetime.fromisoformat(updated).timestamp()
-            except ValueError:
-                updated_ts = None
+            updated_ts = _parse_iso_ts(updated)
             if updated_ts is not None:
                 events.append(
                     {
@@ -540,6 +568,32 @@ def build_timeline_events(tasks: list[dict], limit: int = 200) -> list[dict]:
                         "project": task.get("project"),
                     }
                 )
+
+    for run in runs or []:
+        run_ts = _parse_iso_ts(run.get("created_at"))
+        if run_ts is not None:
+            verdict = (run.get("parsed") or {}).get("verdict")
+            suffix = f" · {verdict}" if verdict else ""
+            events.append(
+                {
+                    "ts": run_ts,
+                    "icon": ":material/smart_toy:",
+                    "label": f"Запуск {run.get('task_type')} ({models.RUN_STATUS_LABELS.get(run.get('status'), run.get('status'))}){suffix}",
+                    "project": run.get("project"),
+                }
+            )
+
+    for event in activity_events or []:
+        event_ts = _parse_iso_ts(event.get("ts"))
+        if event_ts is not None:
+            events.append(
+                {
+                    "ts": event_ts,
+                    "icon": ":material/bolt:",
+                    "label": event.get("message") or event.get("type") or "",
+                    "project": event.get("project"),
+                }
+            )
 
     for path, mtime in gather_activity(limit=limit):
         project = None
@@ -566,6 +620,318 @@ def build_timeline_events(tasks: list[dict], limit: int = 200) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# Agent workflow (v1.2): launcher, next-task suggestion, project chat helpers
+# --------------------------------------------------------------------------
+
+
+def _build_project_context_text(project: str) -> str:
+    cfg = project_config.get_project_config(project)
+    parts: list[str] = []
+    for rel_path in cfg.get("context_file_paths", []):
+        path = ROOT / rel_path
+        if path.exists():
+            parts.append(f"### {rel_path}\n\n{read_text(path)}")
+    return "\n\n".join(parts)
+
+
+def _save_message_as_report(conversation: dict, message: dict) -> Path:
+    project = conversation["project"]
+    report_dir = REPORTS_DIR / project
+    report_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    filename = f"{timestamp}_chat_{conversation['id'][:8]}.md"
+    path = report_dir / filename
+    content = (
+        "# Сообщение чата, сохранённое как отчёт\n\n"
+        f"Project: {project}\n"
+        f"Conversation: {conversation['id']}\n"
+        f"Role: {message['role']}\n"
+        f"Provider: {message.get('provider') or '—'}\n"
+        f"Timestamp: {message.get('created_at')}\n\n"
+        "---\n\n"
+        f"{message['content']}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    activity_log.log_event(
+        "report_saved", project=project, conversation_id=conversation["id"], message=filename
+    )
+    return path
+
+
+def render_agent_launcher(
+    *,
+    key_prefix: str,
+    project: str,
+    default_prompt: str,
+    tasks: list[dict],
+    task_id: str | None = None,
+    default_task_type: str = "implementation",
+) -> None:
+    """Confirm-then-execute Claude Code launcher, reused from every required entry
+    point (task detail card, Project Chat, AI Agents, generated-task preview)."""
+    cfg = project_config.get_project_config(project)
+    repo_path = cfg.get("repository_path")
+    confirm_key = f"{key_prefix}_confirm_open"
+    st.session_state.setdefault(confirm_key, False)
+
+    if st.button("Запустить Claude Code", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
+        st.session_state[confirm_key] = True
+
+    if not st.session_state[confirm_key]:
+        return
+
+    with st.container(border=True):
+        st.markdown("#### Подтверждение запуска агента")
+
+        if not repo_path:
+            st.error(
+                f"Путь к репозиторию не настроен для проекта {project}. "
+                "Настройте его в разделе «Проекты» → вкладка «Настройки репозитория»."
+            )
+            if st.button("Закрыть", key=f"{key_prefix}_cancel_noconfig"):
+                st.session_state[confirm_key] = False
+                st.rerun()
+            return
+
+        if cfg.get("sensitive"):
+            st.warning(
+                f"Проект {project} — чувствительный (BANK/LEGAL). Файлы не прикрепляются "
+                "автоматически: добавьте разрешённый контекст вручную ниже, если он нужен."
+            )
+
+        default_type = default_task_type if default_task_type in TASK_TYPES else TASK_TYPES[0]
+        task_type = st.selectbox(
+            "Тип задачи",
+            TASK_TYPES,
+            index=TASK_TYPES.index(default_type),
+            format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
+            key=f"{key_prefix}_task_type",
+        )
+        prompt = st.text_area(
+            "Промпт для агента", value=default_prompt, height=220, key=f"{key_prefix}_prompt"
+        )
+        extra_context = ""
+        if cfg.get("sensitive"):
+            extra_context = st.text_area(
+                "Дополнительный контекст (вставьте вручную при необходимости)",
+                key=f"{key_prefix}_extra_context",
+                height=120,
+            )
+        timeout_seconds = st.number_input(
+            "Таймаут (секунды)",
+            min_value=agent_runner.MIN_TIMEOUT_SECONDS,
+            max_value=agent_runner.MAX_TIMEOUT_SECONDS,
+            value=agent_runner.DEFAULT_TIMEOUT_SECONDS,
+            step=30,
+            key=f"{key_prefix}_timeout",
+        )
+
+        pre_preview = agent_runner.git_snapshot(Path(repo_path))
+        st.markdown("**Проверьте перед запуском:**")
+        st.write(f"- Проект: `{project}`")
+        st.write(f"- Репозиторий: `{repo_path}`")
+        st.write(f"- Текущая ветка: `{pre_preview.get('branch') or '—'}`")
+        st.write("- Агент: `claude_code` (Claude Code CLI)")
+        st.write(f"- Тип задачи: `{task_type}`")
+        if pre_preview.get("is_git_repo") is False:
+            st.warning("Каталог не является git-репозиторием — снимок git будет недоступен.")
+
+        confirmed = st.checkbox(
+            "Я подтверждаю запуск внешнего агента с указанными параметрами.",
+            key=f"{key_prefix}_confirmed",
+        )
+        action_cols = st.columns(2)
+        with action_cols[0]:
+            launch_clicked = st.button(
+                "Подтвердить и запустить",
+                type="primary",
+                key=f"{key_prefix}_launch_btn",
+                disabled=not confirmed,
+                icon=":material/play_arrow:",
+            )
+        with action_cols[1]:
+            if st.button("Отмена", key=f"{key_prefix}_cancel_btn"):
+                st.session_state[confirm_key] = False
+                st.rerun()
+
+        if not launch_clicked:
+            return
+
+        try:
+            resolved_repo = agent_runner.validate_repository(project, repo_path)
+        except agent_runner.RunnerError as exc:
+            st.error(str(exc))
+            return
+
+        full_prompt = prompt
+        if extra_context.strip():
+            full_prompt = f"{prompt}\n\n## Дополнительный контекст (предоставлен пользователем)\n\n{extra_context.strip()}"
+
+        run = models.new_run_record(
+            project=project,
+            task_id=task_id,
+            agent="claude_code",
+            task_type=task_type,
+            repository_path=str(resolved_repo),
+            prompt=full_prompt,
+            timeout_seconds=int(timeout_seconds),
+        )
+        run["pre_run"] = agent_runner.git_snapshot(resolved_repo)
+        agent_runner.append_run(run)
+        activity_log.log_event(
+            "run_queued", project=project, task_id=task_id, run_id=run["id"],
+            message=f"Запуск {task_type} поставлен в очередь",
+        )
+
+        run["status"] = "running"
+        agent_runner.append_run(run)
+        activity_log.log_event(
+            "run_started", project=project, task_id=task_id, run_id=run["id"], message="Запуск начат",
+        )
+
+        with st.spinner("Выполняется Claude Code — это может занять несколько минут..."):
+            result = agent_runner.run_claude_code(
+                repository_path=resolved_repo,
+                prompt=full_prompt,
+                task_type=task_type,
+                timeout_seconds=int(timeout_seconds),
+                model=agent_runner.default_model(),
+            )
+
+        run["status"] = result.status
+        run["exit_code"] = result.exit_code
+        run["stdout"] = result.stdout
+        run["stderr"] = result.stderr
+        run["started_at"] = result.started_at
+        run["completed_at"] = result.completed_at
+        run["duration_seconds"] = result.duration_seconds
+        run["post_run"] = agent_runner.git_snapshot(resolved_repo)
+
+        report_text = agent_runner.extract_result_text(result.stdout) if result.stdout else ""
+        parsed = report_parser.parse_report(report_text)
+        run["parsed"] = parsed
+
+        report_path = agent_runner.save_report(run, parsed)
+        run["report_path"] = os.path.relpath(report_path, ROOT)
+        agent_runner.append_run(run)
+
+        activity_log.log_event(
+            "run_completed" if result.status == "completed" else "run_failed",
+            project=project, task_id=task_id, run_id=run["id"],
+            message=f"Статус: {result.status}, exit_code={result.exit_code}",
+        )
+        if parsed.get("verdict"):
+            activity_log.log_event(
+                "verdict_extracted", project=project, task_id=task_id, run_id=run["id"],
+                message=f"Вердикт: {parsed['verdict']}",
+            )
+        activity_log.log_event(
+            "report_saved", project=project, task_id=task_id, run_id=run["id"], message=report_path.name,
+        )
+
+        if task_id:
+            for existing_task in tasks:
+                if existing_task.get("id") == task_id:
+                    existing_task["current_run_id"] = run["id"]
+                    existing_task["latest_verdict"] = parsed.get("verdict")
+                    existing_task["report_path"] = run["report_path"]
+                    existing_task["repository_path"] = str(resolved_repo)
+                    existing_task["branch"] = run["post_run"].get("branch")
+                    existing_task["agent"] = "claude_code"
+                    existing_task["last_run_at"] = run["completed_at"]
+                    if result.status == "completed":
+                        suggestion = workflow.suggest_next_task(run)
+                        existing_task["workflow_stage"] = suggestion["workflow_stage"]
+                    else:
+                        existing_task["workflow_stage"] = "Ready"
+                    existing_task["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    break
+            save_tasks(tasks)
+
+        st.session_state[confirm_key] = False
+
+        if result.status == "completed":
+            st.success(f"Запуск завершён. Вердикт: {parsed.get('verdict') or 'не определён'}.")
+        elif result.status == "timed_out":
+            st.error("Превышено время ожидания выполнения агента.")
+        else:
+            st.error(f"Агент завершился с ошибкой (exit code {result.exit_code}).")
+        st.info(f"Полный отчёт сохранён: `{run['report_path']}`. Подробности — на странице «Журнал запусков».")
+
+
+def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str) -> None:
+    if run.get("status") != "completed":
+        st.caption("Кнопка «Создать следующую задачу» доступна только для завершённых запусков.")
+        return
+
+    suggestion = workflow.suggest_next_task(run)
+    with st.expander("Создать следующую задачу", icon=":material/add_task:"):
+        st.caption(
+            f"Источник: вердикт «{suggestion['source_verdict'] or 'не определён'}» "
+            f"из запуска `{run['id'][:8]}`."
+        )
+        if suggestion.get("contradictory"):
+            st.warning(
+                "Отчёт содержит противоречивые вердикты (найдено более одного). "
+                "Показан наиболее консервативный вариант — проверьте отчёт вручную, "
+                "при необходимости внесите ручную корректировку вердикта на странице "
+                "«Журнал запусков» перед созданием задачи."
+            )
+        project = run.get("project")
+        choices = suggestion["task_type_choices"] or TASK_TYPES
+        default_type = suggestion["task_type"] or choices[0]
+        next_task_type = st.selectbox(
+            "Тип следующей задачи",
+            choices,
+            index=choices.index(default_type) if default_type in choices else 0,
+            format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
+            key=f"{key_prefix}_next_type",
+        )
+        objective = st.text_area(
+            "Цель следующей задачи (черновик — проверьте перед созданием)",
+            value=suggestion["objective_draft"],
+            height=220,
+            key=f"{key_prefix}_next_objective",
+        )
+        next_stage = st.selectbox(
+            "Стадия workflow",
+            models.WORKFLOW_STAGES,
+            index=(
+                models.WORKFLOW_STAGES.index(suggestion["workflow_stage"])
+                if suggestion["workflow_stage"] in models.WORKFLOW_STAGES
+                else 0
+            ),
+            format_func=lambda value: models.WORKFLOW_STAGE_LABELS.get(value, value),
+            key=f"{key_prefix}_next_stage",
+        )
+
+        if st.button("Создать задачу", key=f"{key_prefix}_create_next_btn", type="primary", icon=":material/add_task:"):
+            objective_clean = objective.strip()
+            if not objective_clean:
+                st.error("Укажите цель задачи.")
+                return
+            new_task = new_task_record(
+                project,
+                objective_clean,
+                next_task_type,
+                "Backlog",
+                parent_task_id=run.get("task_id"),
+                prior_run_id=run["id"],
+                workflow_stage=next_stage,
+            )
+            tasks.append(new_task)
+            save_tasks(tasks)
+            run["next_task_id"] = new_task["id"]
+            agent_runner.append_run(run)
+            activity_log.log_event(
+                "next_task_created", project=project, task_id=new_task["id"], run_id=run["id"],
+                message=f"Создана задача из запуска {run['id'][:8]}",
+            )
+            st.success(f"Задача создана: {new_task['title'][:60]}")
+            st.rerun()
+
+
+# --------------------------------------------------------------------------
 # Page setup
 # --------------------------------------------------------------------------
 
@@ -579,6 +945,7 @@ _PENDING_KEY_MAP = {
     "pending_create_project": "create_task_project",
     "pending_create_type": "create_task_type",
     "pending_project_browser": "project_browser_select",
+    "pending_chat_conv": "chat_conv_select",
 }
 for _pending_key, _target_key in _PENDING_KEY_MAP.items():
     if _pending_key in st.session_state:
@@ -638,6 +1005,7 @@ with st.sidebar:
 
 tasks = load_tasks()
 tasks_by_id = {task["id"]: task for task in tasks}
+project_configs = project_config.load_project_configs()
 
 
 @st.dialog("Командная палитра", width="large")
@@ -811,6 +1179,53 @@ elif page_key == "executive":
                 st.markdown(f"**{(task.get('title') or '')[:80]}** · {task.get('project')}")
                 st.caption(f"Ожидает: {names}")
 
+    st.divider()
+    st.markdown("#### Метрики запусков агентов")
+
+    exec_runs = agent_runner.load_runs()
+    today = datetime.now().date()
+    runs_today = [
+        run
+        for run in exec_runs
+        if (run_ts := _parse_iso_ts(run.get("created_at"))) is not None
+        and datetime.fromtimestamp(run_ts).date() == today
+    ]
+    successful_runs = [run for run in exec_runs if run.get("status") == "completed"]
+    failed_runs = [run for run in exec_runs if run.get("status") in ("failed", "timed_out")]
+    awaiting_remediation = [task for task in tasks if task.get("workflow_stage") == "Remediation"]
+    awaiting_final_review = [task for task in tasks if task.get("workflow_stage") == "Final Review"]
+    approved_for_commit = [task for task in tasks if task.get("latest_verdict") == models.VERDICT_APPROVED_FOR_COMMIT]
+
+    with st.container(horizontal=True):
+        st.metric("Запусков сегодня", len(runs_today), border=True)
+        st.metric("Успешных", len(successful_runs), border=True)
+        st.metric("Неудачных", len(failed_runs), border=True)
+        st.metric("Ожидают исправления", len(awaiting_remediation), border=True)
+        st.metric("Ожидают финальной проверки", len(awaiting_final_review), border=True)
+        st.metric("Одобрено для commit", len(approved_for_commit), border=True)
+
+    exec_left, exec_right = st.columns(2)
+    with exec_left:
+        st.markdown("##### Средняя длительность по агентам")
+        durations_by_agent: dict[str, list[float]] = {}
+        for run in exec_runs:
+            duration = run.get("duration_seconds")
+            if isinstance(duration, (int, float)):
+                durations_by_agent.setdefault(run.get("agent", "—"), []).append(duration)
+        if durations_by_agent:
+            for agent_name, values in durations_by_agent.items():
+                st.caption(f"{agent_name}: {sum(values) / len(values):.1f} с (n={len(values)})")
+        else:
+            st.caption("Запусков пока нет.")
+
+    with exec_right:
+        st.markdown("##### Открытые находки (Blocker/High)")
+        open_blocker = sum(report_parser.severity_counts(run.get("parsed")).get("Blocker", 0) for run in exec_runs)
+        open_high = sum(report_parser.severity_counts(run.get("parsed")).get("High", 0) for run in exec_runs)
+        metric_cols = st.columns(2)
+        metric_cols[0].metric("Blocker", open_blocker)
+        metric_cols[1].metric("High", open_high)
+
 
 # --------------------------------------------------------------------------
 # Task creator
@@ -900,6 +1315,180 @@ elif page_key == "create":
 
 
 # --------------------------------------------------------------------------
+# Project Chat
+# --------------------------------------------------------------------------
+
+elif page_key == "chat":
+    st.subheader("Чат по проекту")
+
+    conversations = chat_service.load_conversations()
+    chat_project = st.selectbox("Проект", list(PROJECTS.keys()), key="chat_project_select")
+    project_conversations = [c for c in conversations if c.get("project") == chat_project]
+    chat_cfg = project_configs[chat_project]
+
+    if chat_cfg["sensitive"]:
+        st.warning(
+            f"{chat_project} — чувствительный проект (BANK/LEGAL). Файлы не прикрепляются "
+            "автоматически — добавляйте разрешённый контекст вручную."
+        )
+
+    conv_options = ["+ Новый разговор"] + [c["id"] for c in project_conversations]
+    conv_labels = {c["id"]: f"{c.get('title', '—')} · {c.get('updated_at', '—')}" for c in project_conversations}
+    chosen_conv_id = st.selectbox(
+        "Разговор",
+        conv_options,
+        format_func=lambda value: "Новый разговор" if value == "+ Новый разговор" else conv_labels.get(value, value),
+        key="chat_conv_select",
+    )
+
+    if chosen_conv_id == "+ Новый разговор":
+        new_conv_title = st.text_input(
+            "Название нового разговора", key="chat_new_title", placeholder="Например: обсуждение архитектуры P1"
+        )
+        project_task_options = ["Без привязки"] + [
+            task["id"] for task in tasks if task.get("project") == chat_project
+        ]
+        link_task_id = st.selectbox(
+            "Привязать к задаче (необязательно)",
+            project_task_options,
+            format_func=lambda value: "Без привязки" if value == "Без привязки" else task_label(tasks_by_id[value]),
+            key="chat_link_task",
+        )
+        if st.button("Создать разговор", key="chat_create_conv_btn", icon=":material/add_comment:"):
+            new_conv = models.new_conversation(
+                chat_project,
+                new_conv_title.strip() or "Новый разговор",
+                task_id=None if link_task_id == "Без привязки" else link_task_id,
+            )
+            conversations.append(new_conv)
+            chat_service.save_conversations(conversations)
+            activity_log.log_event(
+                "conversation_created", project=chat_project, task_id=new_conv.get("task_id"),
+                conversation_id=new_conv["id"], message=new_conv["title"],
+            )
+            st.session_state.pending_chat_conv = new_conv["id"]
+            st.rerun()
+    else:
+        active_conversation = chat_service.get_conversation(conversations, chosen_conv_id)
+        if active_conversation is None:
+            st.error("Разговор не найден.")
+        else:
+            linked_task = tasks_by_id.get(active_conversation.get("task_id") or "")
+            caption = f"Проект: {active_conversation['project']} · создан {active_conversation['created_at']}"
+            if linked_task:
+                caption += f" · задача: {task_label(linked_task)}"
+            st.caption(caption)
+
+            include_context = st.checkbox(
+                "Включить контекст проекта в запрос провайдеру", value=True, key=f"chat_include_ctx_{active_conversation['id']}"
+            )
+
+            for message in active_conversation.get("messages", []):
+                with st.chat_message("user" if message["role"] == "user" else "assistant"):
+                    role_label = "Вы" if message["role"] == "user" else "Ассистент"
+                    provider_suffix = f" · {message['provider']}" if message.get("provider") else ""
+                    st.caption(f"{role_label} · {message.get('created_at', '—')}{provider_suffix}")
+                    st.write(message["content"])
+                    msg_action_cols = st.columns(2)
+                    with msg_action_cols[0]:
+                        if st.button("Сохранить в отчёты", key=f"chat_save_report_{message['id']}", icon=":material/save:"):
+                            saved_path = _save_message_as_report(active_conversation, message)
+                            st.success(f"Сохранено: `{saved_path.relative_to(ROOT)}`")
+                    with msg_action_cols[1]:
+                        if st.button("Сделать задачей", key=f"chat_to_task_{message['id']}", icon=":material/add_task:"):
+                            st.session_state[f"chat_convert_open_{message['id']}"] = True
+
+                    if st.session_state.get(f"chat_convert_open_{message['id']}"):
+                        with st.form(f"chat_convert_form_{message['id']}"):
+                            conv_task_type = st.selectbox(
+                                "Тип задачи", TASK_TYPES, format_func=lambda v: TASK_TYPE_LABELS.get(v, v),
+                                key=f"chat_convert_type_{message['id']}",
+                            )
+                            conv_objective = st.text_area(
+                                "Цель задачи", value=message["content"], key=f"chat_convert_obj_{message['id']}"
+                            )
+                            if st.form_submit_button("Создать задачу"):
+                                objective_clean = conv_objective.strip()
+                                if not objective_clean:
+                                    st.error("Укажите цель задачи.")
+                                else:
+                                    new_task_from_msg = new_task_record(
+                                        active_conversation["project"], objective_clean, conv_task_type, "Backlog",
+                                    )
+                                    tasks.append(new_task_from_msg)
+                                    save_tasks(tasks)
+                                    activity_log.log_event(
+                                        "task_created_from_message", project=active_conversation["project"],
+                                        task_id=new_task_from_msg["id"], conversation_id=active_conversation["id"],
+                                        message="Задача создана из сообщения чата",
+                                    )
+                                    st.session_state[f"chat_convert_open_{message['id']}"] = False
+                                    st.success("Задача создана.")
+                                    st.rerun()
+
+            st.divider()
+            chat_providers = chat_service.available_providers()
+            provider_status = {provider.name: provider.is_available() for provider in chat_providers}
+            chosen_provider_name = st.selectbox(
+                "Провайдер",
+                [provider.name for provider in chat_providers],
+                format_func=lambda name: chat_service.get_provider(name).label,
+                key=f"chat_provider_{active_conversation['id']}",
+            )
+            provider_available, provider_reason = provider_status[chosen_provider_name]
+            if provider_reason:
+                st.info(provider_reason)
+            if chosen_provider_name == "openai":
+                st.caption("Использование OpenAI API оплачивается отдельно от подписки ChatGPT.")
+
+            user_input = st.chat_input("Введите сообщение...", key=f"chat_input_{active_conversation['id']}")
+            if user_input:
+                conversations = chat_service.load_conversations()
+                user_message = models.new_message("user", user_input, provider=None)
+                chat_service.append_message(conversations, active_conversation["id"], user_message)
+                activity_log.log_event(
+                    "message_added", project=active_conversation["project"], conversation_id=active_conversation["id"],
+                    message="Сообщение пользователя добавлено",
+                )
+
+                if chosen_provider_name != "local" and provider_available:
+                    context_text = _build_project_context_text(chat_project) if include_context else ""
+                    updated_conversation = chat_service.get_conversation(conversations, active_conversation["id"])
+                    try:
+                        with st.spinner("Ожидание ответа провайдера..."):
+                            response_text = chat_service.get_provider(chosen_provider_name).send(
+                                messages=updated_conversation["messages"],
+                                project_context=context_text,
+                                project_id=chat_project,
+                                repository_path=chat_cfg.get("repository_path"),
+                                timeout_seconds=180,
+                            )
+                        conversations = chat_service.load_conversations()
+                        assistant_message = models.new_message("assistant", response_text, provider=chosen_provider_name)
+                        chat_service.append_message(conversations, active_conversation["id"], assistant_message)
+                        activity_log.log_event(
+                            "message_added", project=active_conversation["project"], conversation_id=active_conversation["id"],
+                            message=f"Ответ провайдера {chosen_provider_name} добавлен",
+                        )
+                    except Exception as exc:  # noqa: BLE001 — surfaced to the user, never crashes the page
+                        st.error(f"Ошибка провайдера: {exc}")
+                st.rerun()
+
+            st.divider()
+            st.markdown("##### Запустить Claude Code из этого разговора")
+            last_user_message = next(
+                (m["content"] for m in reversed(active_conversation.get("messages", [])) if m["role"] == "user"), ""
+            )
+            render_agent_launcher(
+                key_prefix=f"chat_launch_{active_conversation['id']}",
+                project=chat_project,
+                default_prompt=last_user_message,
+                tasks=tasks,
+                task_id=active_conversation.get("task_id"),
+            )
+
+
+# --------------------------------------------------------------------------
 # Kanban board
 # --------------------------------------------------------------------------
 
@@ -960,6 +1549,28 @@ elif page_key == "kanban":
                                 dep = tasks_by_id.get(dep_id)
                                 label = f"{dep.get('title', '')[:50]} ({dep.get('status')})" if dep else f"(удалена) {dep_id}"
                                 st.caption(f"- {label}")
+
+                        st.write(
+                            f"Стадия workflow: "
+                            f"{models.WORKFLOW_STAGE_LABELS.get(task.get('workflow_stage'), task.get('workflow_stage') or '—')}"
+                        )
+                        if task.get("latest_verdict"):
+                            st.write(
+                                f"Последний вердикт: "
+                                f"{models.VERDICT_LABELS.get(task['latest_verdict'], task['latest_verdict'])}"
+                            )
+                        if task.get("report_path"):
+                            st.write(f"Отчёт: `{task['report_path']}`")
+
+                        st.divider()
+                        render_agent_launcher(
+                            key_prefix=f"kanban_launch_{task_id}",
+                            project=task.get("project"),
+                            default_prompt=title,
+                            tasks=tasks,
+                            task_id=task_id,
+                            default_task_type=task.get("task_type", "implementation"),
+                        )
 
                     new_status = st.selectbox(
                         "Статус",
@@ -1022,6 +1633,179 @@ elif page_key == "agents":
                 st.session_state.pending_create_type = task_type
                 st.rerun()
 
+            with st.expander(f"Запустить «{meta['title']}» напрямую", icon=":material/smart_toy:"):
+                agent_launch_project = st.selectbox(
+                    "Проект", list(PROJECTS.keys()), key=f"agent_launch_project_{task_type}"
+                )
+                agent_launch_objective = st.text_area(
+                    "Цель задачи",
+                    key=f"agent_launch_objective_{task_type}",
+                    height=120,
+                    placeholder="Опишите, что должен сделать агент",
+                )
+                render_agent_launcher(
+                    key_prefix=f"agents_page_launch_{task_type}",
+                    project=agent_launch_project,
+                    default_prompt=agent_launch_objective,
+                    tasks=tasks,
+                    default_task_type=task_type,
+                )
+
+
+# --------------------------------------------------------------------------
+# Run journal
+# --------------------------------------------------------------------------
+
+elif page_key == "runs":
+    st.subheader("Журнал запусков")
+
+    all_runs = agent_runner.load_runs()
+
+    filter_cols = st.columns(4)
+    with filter_cols[0]:
+        runs_project_filter = st.selectbox("Проект", ["Все"] + list(PROJECTS.keys()), key="runs_project_filter")
+    with filter_cols[1]:
+        runs_agent_filter = st.selectbox(
+            "Агент", ["Все"] + sorted({run.get("agent", "—") for run in all_runs}), key="runs_agent_filter"
+        )
+    with filter_cols[2]:
+        runs_status_filter = st.multiselect(
+            "Статус", models.RUN_STATUSES, default=models.RUN_STATUSES,
+            format_func=lambda v: models.RUN_STATUS_LABELS.get(v, v), key="runs_status_filter",
+        )
+    with filter_cols[3]:
+        verdict_choices = list(models.VERDICT_LABELS.keys())
+        runs_verdict_filter = st.multiselect(
+            "Вердикт", verdict_choices, default=verdict_choices,
+            format_func=lambda v: models.VERDICT_LABELS.get(v, v), key="runs_verdict_filter",
+        )
+
+    date_cols = st.columns(2)
+    with date_cols[0]:
+        runs_date_from = st.date_input("С даты", value=None, key="runs_date_from")
+    with date_cols[1]:
+        runs_date_to = st.date_input("По дату", value=None, key="runs_date_to")
+
+    task_choices = ["Все"] + sorted({run.get("task_id") for run in all_runs if run.get("task_id")})
+    runs_task_filter = st.selectbox(
+        "Задача", task_choices,
+        format_func=lambda v: "Все" if v == "Все" else task_label(tasks_by_id.get(v, {"project": "—", "title": v, "status": "—"})),
+        key="runs_task_filter",
+    )
+
+    def _run_matches_filters(run: dict) -> bool:
+        if runs_project_filter != "Все" and run.get("project") != runs_project_filter:
+            return False
+        if runs_agent_filter != "Все" and run.get("agent") != runs_agent_filter:
+            return False
+        if run.get("status") not in runs_status_filter:
+            return False
+        run_verdict = (run.get("parsed") or {}).get("verdict")
+        if run_verdict and run_verdict not in runs_verdict_filter:
+            return False
+        if runs_task_filter != "Все" and run.get("task_id") != runs_task_filter:
+            return False
+        created_ts = _parse_iso_ts(run.get("created_at"))
+        if created_ts is not None:
+            created_date = datetime.fromtimestamp(created_ts).date()
+            if runs_date_from and created_date < runs_date_from:
+                return False
+            if runs_date_to and created_date > runs_date_to:
+                return False
+        return True
+
+    filtered_runs = [run for run in all_runs if _run_matches_filters(run)]
+    st.caption(f"Найдено запусков: {len(filtered_runs)} из {len(all_runs)}")
+
+    if not filtered_runs:
+        st.info("Запусков, соответствующих фильтрам, не найдено.")
+
+    for run in filtered_runs:
+        parsed = run.get("parsed") or report_parser.empty_parsed_result()
+        effective_parsed = report_parser.apply_manual_corrections(parsed)
+        counts = report_parser.severity_counts(parsed)
+
+        with st.container(border=True):
+            header_cols = st.columns([3, 1, 1, 1])
+            header_cols[0].markdown(f"**{run.get('project')} · {run.get('task_type')} · {run.get('agent')}**")
+            header_cols[0].caption(f"{run.get('created_at', '—')} · repo: `{run.get('repository_path', '—')}`")
+            header_cols[1].badge(
+                models.RUN_STATUS_LABELS.get(run.get("status"), run.get("status")),
+                color=models.RUN_STATUS_COLORS.get(run.get("status"), "gray"),
+            )
+            if effective_parsed.get("verdict"):
+                header_cols[2].badge(
+                    models.VERDICT_LABELS.get(effective_parsed["verdict"], effective_parsed["verdict"]), color="blue"
+                )
+            duration = run.get("duration_seconds")
+            header_cols[3].caption(f"{duration:.1f}с" if isinstance(duration, (int, float)) else "—")
+
+            if any(counts.values()):
+                st.caption("Находки: " + " · ".join(f"{sev}: {counts[sev]}" for sev in models.SEVERITIES if counts[sev]))
+
+            with st.expander("Детали запуска", icon=":material/info:"):
+                st.write(f"Run ID: `{run['id']}`")
+                st.write(f"Task ID: `{run.get('task_id') or '—'}`")
+                pre_run = run.get("pre_run") or {}
+                post_run = run.get("post_run") or {}
+                st.write(f"Ветка до запуска: {pre_run.get('branch') or '—'} · после: {post_run.get('branch') or '—'}")
+                st.write(f"HEAD до запуска: {pre_run.get('head') or '—'} · после: {post_run.get('head') or '—'}")
+                st.write(f"Commit hash: {effective_parsed.get('commit_hash') or 'не указан'}")
+                st.write(f"Recommended next action: {effective_parsed.get('recommended_next_action') or 'не указано'}")
+
+                st.markdown("**Промпт:**")
+                st.code(run.get("prompt", ""), language=None)
+
+                stdout_text = run.get("stdout", "")
+                st.markdown("**Stdout (предпросмотр в интерфейсе):**")
+                st.code(stdout_text[:5000] or "—", language=None)
+                if len(stdout_text) > 5000:
+                    st.caption(
+                        "Показаны первые 5000 символов вывода в интерфейсе — полный текст "
+                        "сохранён в файле отчёта без сокращений."
+                    )
+                if run.get("stderr"):
+                    st.markdown("**Stderr:**")
+                    st.code(run["stderr"], language=None)
+
+                if run.get("report_path"):
+                    st.write(f"Отчёт: `{run['report_path']}`")
+                    report_full_path = agent_runner.resolve_report_path(run)
+                    if report_full_path is None:
+                        st.warning("Путь к отчёту не проходит проверку безопасности — файл не открыт.")
+                    elif report_full_path.exists():
+                        with st.expander("Полный текст отчёта"):
+                            st.markdown(read_text(report_full_path))
+
+                if run.get("next_task_id"):
+                    st.success(f"Следующая задача уже создана: `{run['next_task_id']}`")
+
+                st.markdown("**Ручная корректировка полей**")
+                correction_cols = st.columns([1, 2, 1])
+                with correction_cols[0]:
+                    correction_field = st.selectbox(
+                        "Поле", report_parser.CORRECTABLE_FIELDS, key=f"run_correct_field_{run['id']}"
+                    )
+                with correction_cols[1]:
+                    correction_value = st.text_input("Значение", key=f"run_correct_value_{run['id']}")
+                with correction_cols[2]:
+                    st.write("")
+                    if st.button("Сохранить", key=f"run_correct_btn_{run['id']}"):
+                        if correction_value.strip():
+                            corrected_parsed = report_parser.set_manual_correction(
+                                parsed, correction_field, correction_value.strip()
+                            )
+                            run["parsed"] = corrected_parsed
+                            agent_runner.append_run(run)
+                            activity_log.log_event(
+                                "manual_field_correction", project=run.get("project"), task_id=run.get("task_id"),
+                                run_id=run["id"], message=f"{correction_field} -> {correction_value.strip()[:80]}",
+                            )
+                            st.success("Сохранено.")
+                            st.rerun()
+
+            render_create_next_task_widget(run, tasks, key_prefix=f"runs_page_{run['id']}")
+
 
 # --------------------------------------------------------------------------
 # Timeline
@@ -1032,7 +1816,9 @@ elif page_key == "timeline":
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + list(PROJECTS.keys()), key="timeline_project_filter")
 
-    events = build_timeline_events(tasks, limit=200)
+    events = build_timeline_events(
+        tasks, runs=agent_runner.load_runs(), activity_events=activity_log.load_activity(limit=200), limit=200
+    )
     if project_filter != "Все":
         events = [event for event in events if event.get("project") == project_filter]
 
@@ -1060,8 +1846,8 @@ elif page_key == "projects":
     selected_project = st.selectbox("Проект", list(PROJECTS.keys()), key="project_browser_select")
     project_file = PROJECTS_DIR / PROJECTS[selected_project]
 
-    tab_status, tab_generated, tab_reports, tab_context = st.tabs(
-        ["Статус проекта", "Сгенерированные задачи", "Отчёты", "Контекст"]
+    tab_status, tab_generated, tab_reports, tab_context, tab_settings = st.tabs(
+        ["Статус проекта", "Сгенерированные задачи", "Отчёты", "Контекст", "Настройки репозитория"]
     )
 
     with tab_status:
@@ -1076,7 +1862,16 @@ elif page_key == "projects":
             chosen_name = st.selectbox("Файл задания", [path.name for path in files], key="proj_gen_select")
             chosen_path = next(path for path in files if path.name == chosen_name)
             st.caption(f"Изменён: {format_mtime(chosen_path)}")
-            st.markdown(read_text(chosen_path))
+            chosen_content = read_text(chosen_path)
+            st.markdown(chosen_content)
+            st.divider()
+            render_agent_launcher(
+                key_prefix=f"proj_gen_launch_{selected_project}_{chosen_name}",
+                project=selected_project,
+                default_prompt=chosen_content,
+                tasks=tasks,
+                default_task_type=infer_task_type_from_filename(chosen_path) or "implementation",
+            )
 
     with tab_reports:
         files = list_markdown_files(REPORTS_DIR / selected_project)
@@ -1099,6 +1894,55 @@ elif page_key == "projects":
             else:
                 st.caption(f"Изменён: {format_mtime(context_path)}")
                 st.markdown(read_text(context_path))
+
+    with tab_settings:
+        cfg = project_configs[selected_project]
+        st.write(f"Проект: **{cfg['display_name']}** (`{selected_project}`)")
+        if cfg["sensitive"]:
+            st.warning(
+                "Проект помечен как чувствительный (BANK/LEGAL): файлы для агента не "
+                "прикладываются автоматически, контекст добавляется вручную при запуске."
+            )
+
+        current_path = cfg.get("repository_path")
+        if current_path:
+            st.success(f"Текущий путь репозитория: `{current_path}`")
+        else:
+            st.info("Путь к репозиторию не настроен.")
+
+        suggested_path = project_config.discover_candidate_repository_path(selected_project)
+        if suggested_path and not current_path:
+            st.info(
+                f"Обнаружен вероятный путь репозитория (существующий git-репозиторий на "
+                f"этой машине): `{suggested_path}`. Проверьте и сохраните, если это верно."
+            )
+
+        new_path_input = st.text_input(
+            "Путь к репозиторию",
+            value=current_path or suggested_path or "",
+            key=f"repo_path_input_{selected_project}",
+        )
+        settings_cols = st.columns(2)
+        with settings_cols[0]:
+            if st.button("Сохранить путь", key=f"repo_path_save_{selected_project}", icon=":material/save:"):
+                ok, message = project_config.validate_repository_path(new_path_input)
+                if ok:
+                    project_config.save_repository_path(selected_project, new_path_input.strip())
+                    st.success("Путь сохранён.")
+                    st.rerun()
+                else:
+                    st.error(message)
+        with settings_cols[1]:
+            if current_path and st.button(
+                "Очистить путь", key=f"repo_path_clear_{selected_project}", icon=":material/delete:"
+            ):
+                project_config.save_repository_path(selected_project, None)
+                st.success("Путь очищен.")
+                st.rerun()
+
+        st.caption(f"Разрешённые агенты: {', '.join(cfg['allowed_agents'])}")
+        st.caption(f"Каталог отчётов: `{cfg['reports_dir']}` · Каталог заданий: `{cfg['generated_dir']}`")
+        st.caption("Файлы контекста: " + (", ".join(f"`{p}`" for p in cfg["context_file_paths"]) or "—"))
 
 
 # --------------------------------------------------------------------------
@@ -1123,8 +1967,19 @@ elif page_key == "generated":
         st.caption(f"Найдено файлов: {len(filtered_files)} (новые сверху)")
         for path in filtered_files:
             rel = path.relative_to(GENERATED_DIR)
+            file_project = project_from_path(path, GENERATED_DIR)
             with st.expander(f"{rel} · {format_mtime(path)}"):
-                st.markdown(read_text(path))
+                content = read_text(path)
+                st.markdown(content)
+                if file_project != "—":
+                    st.divider()
+                    render_agent_launcher(
+                        key_prefix=f"gen_page_launch_{rel}".replace("/", "_"),
+                        project=file_project,
+                        default_prompt=content,
+                        tasks=tasks,
+                        default_task_type=infer_task_type_from_filename(path) or "implementation",
+                    )
 
 
 # --------------------------------------------------------------------------
@@ -1147,10 +2002,24 @@ elif page_key == "reports":
         st.info("Файлы отчётов не найдены.")
     else:
         st.caption(f"Найдено файлов: {len(filtered_files)} (новые сверху)")
+        runs_by_report_path = {
+            run["report_path"]: run for run in agent_runner.load_runs() if run.get("report_path")
+        }
         for path in filtered_files:
             rel = path.relative_to(REPORTS_DIR)
+            matching_run = runs_by_report_path.get(f"reports/{rel}")
             with st.expander(f"{rel} · {format_mtime(path)}"):
                 st.markdown(read_text(path))
+                if matching_run:
+                    st.divider()
+                    parsed = report_parser.apply_manual_corrections(matching_run.get("parsed") or {})
+                    st.markdown("**Извлечённые данные**")
+                    st.write(f"Вердикт: {models.VERDICT_LABELS.get(parsed.get('verdict'), parsed.get('verdict') or 'не определён')}")
+                    st.write(f"Уверенность парсера: {parsed.get('confidence', 'none')}")
+                    counts = report_parser.severity_counts(matching_run.get("parsed"))
+                    if any(counts.values()):
+                        st.caption("Находки: " + " · ".join(f"{sev}: {counts[sev]}" for sev in models.SEVERITIES if counts[sev]))
+                    render_create_next_task_widget(matching_run, tasks, key_prefix=f"reports_page_{matching_run['id']}")
 
 
 # --------------------------------------------------------------------------

@@ -1,0 +1,2 @@
+{"id": "exampleact0000000000000000001", "ts": "2026-01-01T09:04:58", "type": "run_queued", "project": "AIOS", "task_id": "example0taskid0000000000000001", "run_id": "example0runid00000000000000001", "conversation_id": null, "message": "Запуск review поставлен в очередь"}
+{"id": "exampleact0000000000000000002", "ts": "2026-01-01T09:07:12", "type": "verdict_extracted", "project": "AIOS", "task_id": "example0taskid0000000000000001", "run_id": "example0runid00000000000000001", "conversation_id": null, "message": "Вердикт: NOT APPROVED FOR COMMIT"}
