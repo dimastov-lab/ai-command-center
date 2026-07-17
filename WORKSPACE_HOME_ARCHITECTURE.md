@@ -26,14 +26,34 @@ moving as tests are added — always trust a fresh run over this document). No a
 changed as part of either correction. Status is updated to **APPROVED FOR IMPLEMENTATION** (§1,
 §20, and the closing Verdict section).
 
+**Remediation note (post-Founder-Review, dependency-direction finding):** a subsequent Founder
+Review returned **BLOCKED** on one finding, not raised by either prior review: this document
+required `command_center/workspace_home.py` to use `list_markdown_files()` for Artifacts and
+Reports (§9), but that function exists only inside `app.py`, which imports Streamlit at module
+scope. Importing it from `workspace_home.py` would (1) execute Streamlit module initialization as
+a side effect of importing a module this document itself requires to be plain Python, (2) invert
+the dependency direction this document requires (`app.py` depends on `command_center/*`, never
+the reverse), (3) break the requirement that `workspace_home.py`'s unit tests run under plain
+`pytest` with no Streamlit dependency (§14), and (4) leave the document internally inconsistent
+with its own restated rule in §2. This revision resolves that finding: artifact discovery must
+first be extracted into a new, dedicated, Streamlit-free module, `command_center/artifacts.py`
+(§9, §9.1, §9.2), as a new prerequisite implementation step — **Condition 4** (§1) — sequenced *before*
+`workspace_home.py` is built, not alongside or after it. Every section that referenced
+`list_markdown_files()` (and, on inspection, its two neighboring helpers `project_from_path()` and
+`infer_task_type_from_filename()`, both required by the same read model — see §9 for the
+extraction decision on each) has been updated accordingly: §2, §4, §5, §5.1, §6, §9, §9.1, §9.2, §14,
+§15, §17, §18, §20. No other architecture decision changed as part of this correction — the
+underlying design direction is unchanged; only the module that owns artifact-discovery helpers,
+and the order in which it is built, changed.
+
 ---
 
 ## 1. Executive verdict
 
 Workspace Home is buildable almost entirely by **composing existing read APIs** — no new runtime,
 no new database logic beyond one additive query extension, no new git-write logic, no schema
-migration. Three small, additive, backward-compatible/well-isolated pieces of work are needed
-first, sequenced as the first three implementation steps (§17):
+migration. Four small, additive, backward-compatible/well-isolated pieces of work are needed
+first, sequenced as the first four implementation steps (§17):
 
 1. **Git worktree/status discovery is currently hardcoded to the app's own repo root**
    (`app.py`'s `get_git_worktrees()` always runs `git worktree list --porcelain` with
@@ -57,17 +77,31 @@ first, sequenced as the first three implementation steps (§17):
    what may passively render on screen. This requires a dedicated redaction stage inside the
    read model itself (`command_center/workspace_home.py`), not a rendering-layer convention in
    `app.py`. See §5/§13 for the exact design. *(Condition 3.)*
+4. **Artifact discovery (`list_markdown_files`, `project_from_path`, `infer_task_type_from_filename`)
+   currently exists only inside `app.py`, which imports Streamlit at module scope.** Workspace
+   Home's read model (§5/§5.1) and its Artifacts/Reports sections (§9) require all three helpers,
+   but `workspace_home.py` must be plain Python — no `st.*` import, unit-testable under plain
+   `pytest` with no Streamlit dependency (§2's own restated rule; §14). Importing these helpers
+   from `app.py` would execute Streamlit module initialization as a side effect of importing a
+   supposedly Streamlit-free module, and would invert the dependency direction this document
+   requires (`app.py` depends on `command_center/*`, never the reverse — see §9.2). This requires
+   extracting all three helpers, verbatim/zero-behavior-change, into a new, dedicated,
+   Streamlit-free module, `command_center/artifacts.py`, **before** `workspace_home.py` can import
+   any of them. See §9/§9.1/§9.2 for the extraction scope and dependency-direction rules. *(Condition 4
+   — resolves the Founder Review's dependency-direction finding.)*
 
-All three are scoped, additive pieces of work, each independently testable and each verified safe
+All four are scoped, additive pieces of work, each independently testable and each verified safe
 against every current call site (§16, redone in full — see F4 below). Everything else — Projects,
 Active Runs, Recent Runs, Recent Activity, Artifacts, Reports, Quick Actions — is direct reuse of
 `command_center/*` public APIs.
 
-**Verdict: APPROVED FOR IMPLEMENTATION** (see §17 for the three prerequisite steps above,
-sequenced as implementation steps 1–3; this status was confirmed by a second, independent
-architecture review after F1–F5 were verified fully resolved — see the finalization note above.
-The three items are prerequisite *implementation sequencing*, not open architectural gaps: nothing
-here blocks starting §17 step 1 today).
+**Verdict: APPROVED FOR IMPLEMENTATION** (see §17 for the four prerequisite steps above,
+sequenced as implementation steps 1–4, with Condition 4 required to complete, in full, before
+Condition 3/`workspace_home.py` begins; this status was confirmed by a second, independent
+architecture review after F1–F5 were verified fully resolved — see the finalization note above,
+and the dependency-direction finding was resolved in the remediation note above that. The four
+items are prerequisite *implementation sequencing*, not open architectural gaps: nothing here
+blocks starting §17 step 1 today).
 
 ---
 
@@ -80,15 +114,23 @@ here blocks starting §17 step 1 today).
 | Active Runs | `ExecutionCenterAPI.list_runs()` (v2, SQLite, async) | `command_center/runtime/api.py` |
 | Recent Runs | same, plus `agent_runner.load_runs()` (v1.2, JSONL, sync) | `command_center/agent_runner.py` |
 | Recent Activity | `activity_log.load_activity()` (typed event log) | `command_center/activity_log.py` |
-| Artifacts | `list_markdown_files(GENERATED_DIR)` | `app.py:201-208` |
-| Reports | `list_markdown_files(REPORTS_DIR)` + `report_parser` | `command_center/report_parser.py` |
+| Artifacts | `list_markdown_files(GENERATED_DIR)` — **today** at `app.py:201-208`; **must move** to `command_center/artifacts.py` before Workspace Home can use it (§9/§9.1/§9.2, Condition 4) | `app.py:201-208` → `command_center/artifacts.py` |
+| Reports | `list_markdown_files(REPORTS_DIR)` + `report_parser` — same relocation as above | `command_center/artifacts.py` (moved) + `command_center/report_parser.py` |
 | Quick Actions | `pending_nav` staged-navigation pattern, `render_agent_launcher`, `render_execution_center_launch_form` | `app.py` §5, §11.3 machinery |
 
 The codebase already enforces one hard rule worth restating because Workspace Home must follow it:
 *if a function calls `st.*`, it stays in `app.py`; if it doesn't, it lives in `command_center/`*
-(ARCHITECTURE.md §3). Every new read-model function in this design obeys that rule — **including
-the sensitivity redaction stage (§5, §13), which is plain Python, lives in
-`command_center/workspace_home.py`, and must run before any data reaches `app.py`.**
+(ARCHITECTURE.md §3). `list_markdown_files`, `project_from_path`, and `infer_task_type_from_filename`
+are a live violation of this rule today — none of the three calls `st.*` (verified by reading
+`app.py:201-223`), yet all three currently live in `app.py` rather than `command_center/`, only
+because nothing outside `app.py` needed them until now. Workspace Home is the first caller that
+does, and it is plain Python by requirement (§14), which is precisely what surfaces this
+pre-existing misplacement as a blocker: see §9/§9.1/§9.2 for the extraction this document now requires
+(Condition 4) before that hard rule can be honored. Every new read-model function in this design
+obeys that rule — **including the sensitivity redaction stage (§5, §13), which is plain Python,
+lives in `command_center/workspace_home.py`, and must run before any data reaches `app.py`, and
+including artifact discovery itself (§9), which is plain Python and must live in
+`command_center/artifacts.py`, never `app.py`, before `workspace_home.py` can call it.**
 
 ---
 
@@ -144,8 +186,8 @@ future increment.
 | Active Runs | `ExecutionCenterAPI.list_runs(states=ACTIVE, limit=N)` **(extended, §8)** | SQLite | cheap with limit | redacted via `workspace_home.py`'s sanitize stage before entering the snapshot (§5/§13) |
 | Recent Runs | `ExecutionCenterAPI.list_runs(states=TERMINAL, limit=N)` **(extended, §8)** + `agent_runner.load_runs()` tail | SQLite + JSONL | cheap with limit | same |
 | Recent Activity | `activity_log.load_activity(limit=N)` + derived v2 lifecycle rows from Recent Runs | JSONL (+ in-memory derivation) | cheap | same — derived rows are built from the *already-redacted* Recent Runs list, never from raw run rows |
-| Artifacts | `list_markdown_files(GENERATED_DIR)[:N]` | filesystem `rglob` | moderate, already paid by `generated` page today | filename replaced with a generic label (`"<task_type> artifact — <date>"`) for sensitive projects; real path never sent to the renderer for those rows (§13) |
-| Reports | `list_markdown_files(REPORTS_DIR)[:N]` + `report_parser` + run/report join | filesystem + JSONL/SQLite | moderate, already paid by `reports` page today | verdict/severity **badge only** (already a small enum, not free text) for sensitive projects; report body, findings text, and file path excluded |
+| Artifacts | `command_center.artifacts.list_markdown_files(GENERATED_DIR)[:N]` (moved from `app.py`, §9/§9.1/§9.2) | filesystem `rglob` | moderate, already paid by `generated` page today | filename replaced with a generic label (`"<task_type> artifact — <date>"`) for sensitive projects; real path never sent to the renderer for those rows (§13) |
+| Reports | `command_center.artifacts.list_markdown_files(REPORTS_DIR)[:N]` (moved from `app.py`, §9/§9.1/§9.2) + `report_parser` + run/report join | filesystem + JSONL/SQLite | moderate, already paid by `reports` page today | verdict/severity **badge only** (already a small enum, not free text) for sensitive projects; report body, findings text, and file path excluded |
 | Quick Actions | none (pure dispatch) | — | free | unaffected — Quick Actions never carry document content, only ids/navigation targets |
 
 ---
@@ -153,7 +195,11 @@ future increment.
 ## 5. Read model
 
 **NEW module: `command_center/workspace_home.py`.** Plain Python, no `st.*` import, independently
-unit-testable — same "dict + factory function" convention as `models.new_run_record` etc.
+unit-testable — same "dict + factory function" convention as `models.new_run_record` etc. For
+Artifacts/Reports discovery, this module imports **only** `command_center.artifacts`
+(`list_markdown_files`, `project_from_path`, `infer_task_type_from_filename` — §9/§9.1/§9.2) — it never
+imports `app.py`, directly or transitively, for any reason. `command_center/artifacts.py` must
+exist and be repointed-to before this module is written (§17 Condition 4 precedes Condition 3).
 
 ```python
 def build_workspace_home_snapshot(
@@ -224,7 +270,7 @@ field not listed is dropped, never merely hidden by the renderer:
 |---|---|
 | Run (active/recent) | `run_id` (or v1.2 `id`), `source` (`"v1.2"`/`"v2"`), `project`, `task_type`, `state`/`status` (enum value, not free text), `created_at`, `started_at`, `completed_at`, `exit_code` (int), `duration_seconds` |
 | Report | `run_id`, `source`, `project`, `verdict` (enum, from `models.VERDICT_*`), `severity_counts` (int counts per `models.SEVERITIES`, from `report_parser.severity_counts`), `created_at` |
-| Artifact | `project`, `task_type` (inferred from filename via existing `infer_task_type_from_filename`, itself just an enum lookup, not the filename), `created_at` (mtime), a generic navigation target (project + section, not the file path) |
+| Artifact | `project` (via `command_center.artifacts.project_from_path`, §9/§9.1/§9.2), `task_type` (inferred from filename via `command_center.artifacts.infer_task_type_from_filename`, §9/§9.1/§9.2 — itself just an enum lookup, not the filename), `created_at` (mtime), a generic navigation target (project + section, not the file path) |
 | Activity | `project`, `event_type` (enum, from `models.ACTIVITY_EVENT_TYPES`), `ts`, `run_id`/`task_id` (ids only, no `message` field) |
 
 **Explicitly excluded for sensitive projects, in all cases:** `prompt`, `instruction`,
@@ -252,15 +298,26 @@ transform for `AIOS`/`AICOS`/`BUSINESS`/`PERSONAL`, verified by a dedicated test
 - Call `project_config.load_project_configs()` / `is_sensitive()`.
 - Call `activity_log.load_activity()`.
 - Call the new per-repo git helper (§7) — read-only git subcommands only.
-- Call `list_markdown_files()` / `read_text()`.
+- Call `command_center.artifacts.list_markdown_files()` / `.project_from_path()` /
+  `.infer_task_type_from_filename()` (§9/§9.1/§9.2) / `read_text()`. These are the **only** artifact-
+  discovery entry points this module may use — never the pre-extraction `app.py` originals.
 
 **Workspace Home's read model MUST:**
 - Apply `sanitize_workspace_project_entry` (§5.1) to every sensitive project's runs, reports,
   artifacts, and activity **before** they are folded into the returned snapshot dict. This is not
   optional and not deferrable to the renderer — it is the one new invariant this increment adds to
   the service boundary, on top of every rule below (which are all carried over unchanged).
+- Import artifact/report discovery helpers exclusively from `command_center.artifacts` (§9/§9.1/§9.2) —
+  `command_center/artifacts.py` must exist before this module is written (§17, Condition 4 before
+  Condition 3).
 
 **Workspace Home's read model MUST NOT:**
+- Import `app.py`, or any symbol from it, for any reason, directly or transitively — including
+  `list_markdown_files`/`project_from_path`/`infer_task_type_from_filename`, which is precisely why
+  those three now live in `command_center/artifacts.py` instead (§9/§9.1/§9.2). This is the dependency-
+  direction rule the Founder Review's blocking finding required: `app.py` may import
+  `command_center.workspace_home` and `command_center.artifacts`; neither of the latter may ever
+  import `app.py` (§9.2).
 - Construct a second `Supervisor`.
 - Touch `runtime/db.py`'s SQLite connection directly with ad-hoc SQL — always through `db.py`'s
   own functions (which already enforce the `_UPDATABLE_RUN_FIELDS` allowlist, CAS versioning,
@@ -478,8 +535,9 @@ This is the exact, final approved call shape for both Active Runs and Recent Run
 Explicit definition, since the brief lists Artifacts and Reports as two distinct sections:
 
 - **Artifacts** = generated task files, `generated/<PROJECT>/*.md`, via
-  `list_markdown_files(GENERATED_DIR)` — identical source to today's "Сгенерированные задачи"
-  page, just a bounded recent-N slice with a "View all" deep link (`pending_nav="generated"`).
+  `command_center.artifacts.list_markdown_files(GENERATED_DIR)` — identical source to today's
+  "Сгенерированные задачи" page, just a bounded recent-N slice with a "View all" deep link
+  (`pending_nav="generated"`).
 - **Reports** = run-linked structured reports, `reports/<PROJECT>/*.md`, joined against
   `agent_runner.load_runs()`'s `report_path` (v1.2) and `ExecutionCenterAPI.get_report(run_id)`
   (v2, `report.path` column) for verdict/severity badges via `report_parser` — identical source
@@ -498,6 +556,87 @@ not expand its blast radius (Home applies the same `rglob` call the `generated`/
 already pay for on every render today, just capped to a smaller display slice before rendering).
 Hardening this function (depth cap, size cap, explicit symlink policy) is out of scope for
 Workspace Home and is tracked as backlog (§17) rather than presented as resolved.
+
+### 9.1 Extraction requirement and module ownership (resolves the Founder Review's dependency-direction finding)
+
+**Gap:** `list_markdown_files`, `project_from_path`, and `infer_task_type_from_filename` all exist
+today only inside `app.py` (`app.py:201-223`), which imports Streamlit at module scope. Workspace
+Home's read model (§5) must be plain Python — no `st.*` import, unit-testable under plain `pytest`
+with no Streamlit dependency (§2, §14) — so it cannot import any of these three functions from
+`app.py`: doing so would execute Streamlit module initialization as a side effect of importing
+`workspace_home.py`, and would invert the dependency direction this document requires (§9.2 below).
+This is not a new capability gap the way §7/§8's conditions are — the logic itself is already
+correct and already tested indirectly (via the `generated`/`reports`/dashboard pages) — it is a
+**module-ownership** gap: the code is plain Python already (none of the three functions calls
+`st.*`, verified by reading `app.py:201-223`), it is simply filed in the wrong module for a
+Streamlit-free caller to reach it.
+
+**NEW module: `command_center/artifacts.py`** — extract all three functions verbatim (zero
+behavior change) from `app.py:201-223`:
+
+```python
+def list_markdown_files(directory: Path) -> list[Path]: ...
+def project_from_path(path: Path, base: Path) -> str: ...
+def infer_task_type_from_filename(path: Path) -> str | None: ...
+```
+
+**Decision: all three are extracted, not just `list_markdown_files`.** The brief only named
+`list_markdown_files`, so this is called out explicitly rather than left implicit:
+
+- **`project_from_path` is extracted.** Workspace Home's Artifacts/Reports sections are
+  cross-project rollups (§3, §4) — every artifact/report entry in the returned snapshot carries a
+  `project` field (§5.1's allowlist requires it for *both* sensitive and non-sensitive entries;
+  §9's own bullet list above requires it to join reports against per-project run data). The only
+  existing code that derives a project id from a `generated/<PROJECT>/*.md` or
+  `reports/<PROJECT>/*.md` path is `project_from_path` (`app.py:211-216`, today used exactly for
+  this purpose at `app.py:607,2330,2339,2367`). Without extracting it alongside
+  `list_markdown_files`, `workspace_home.py` would have no Streamlit-free way to attribute a
+  discovered file to a project, and would face the identical import problem this section exists to
+  resolve. Not extracting it would just relocate the same blocking finding one function over.
+- **`infer_task_type_from_filename` is extracted.** The Artifact allowlist (§5.1) requires
+  `task_type` as an allowed field, and §9's bullet list above already specifies artifacts carry a
+  `task_type`; the only existing code that derives it from a filename is
+  `infer_task_type_from_filename` (`app.py:219-223`). Same reasoning as `project_from_path`: leaving
+  it in `app.py` would reintroduce the exact dependency-direction problem for a second helper the
+  read model provably needs.
+
+  Both functions are already plain Python today — neither calls `st.*`, imports Streamlit, or reads
+  any Streamlit session/widget state (verified by reading `app.py:211-223`) — so extracting them is
+  a zero-risk, zero-behavior-change move, identical in kind to `list_markdown_files`'s own
+  extraction, not a new design decision about *what* they do.
+
+`app.py`'s existing call sites (the `generated`/`reports`/dashboard pages, and every other current
+caller of these three functions) are repointed to import from `command_center.artifacts` instead of
+using their own module-local definitions — a pure refactor, zero behavior change, verified by the
+existing `test_app_streamlit.py` page-render tests passing unmodified (mirrors exactly how §7
+extracts `git_info.py`).
+
+### 9.2 Dependency direction (required, explicit, and enforced)
+
+```
+app.py
+    ├── imports command_center.workspace_home
+    └── imports command_center.artifacts
+command_center.workspace_home
+    └── imports command_center.artifacts
+command_center.artifacts
+    ├── no Streamlit
+    └── never imports app.py
+```
+
+**Explicitly prohibited, in all cases:**
+- `workspace_home.py` → `app.py` (would defeat the entire "plain Python, Streamlit-free,
+  pytest-only" requirement this document places on Workspace Home — §2, §14).
+- `artifacts.py` → `app.py` (would make a module this document requires to be a leaf dependency
+  import the one module everything else depends on — a cycle by construction, since `app.py`
+  already imports `command_center.artifacts`).
+- `artifacts.py` → `streamlit` (would reintroduce the exact Streamlit-initialization side effect
+  this extraction exists to eliminate).
+
+`command_center/artifacts.py` has no dependency on `command_center/workspace_home.py`,
+`command_center/runtime/*`, or `app.py` — it is a leaf module (stdlib `pathlib`/`os` only, same
+imports `list_markdown_files`/`project_from_path`/`infer_task_type_from_filename` already use
+today), importable and unit-testable in complete isolation (§14).
 
 ---
 
@@ -654,7 +793,22 @@ redaction stage (§5.1) has no bearing on this section: there is nothing here fo
 Follows existing conventions exactly (plain pytest for `command_center/*`, `streamlit.testing.v1.AppTest`
 for pages, `tests/conftest.py`'s fixtures, no real `claude` CLI ever invoked):
 
-- **`tests/test_workspace_home.py`** (new, plain pytest) — build a scenario with `isolated_data_dir`:
+- **`tests/test_artifacts.py`** (new, plain pytest, no Streamlit import anywhere in the test module
+  or the module under test — §9/§9.1/§9.2, Condition 4, lands *before* `test_workspace_home.py`
+  in implementation order per §17) — unit tests for the three extracted
+  `command_center/artifacts.py` functions: `list_markdown_files` (empty/missing directory,
+  mtime-descending sort order preserved verbatim from today's behavior, nested project
+  subdirectories via `tmp_path`), `project_from_path` (file directly under `base`, file one level
+  down under `base/<project>/...`, path not under `base` at all → `"—"`), and
+  `infer_task_type_from_filename` (valid `<id>_<task_type>.md` stem, unrecognized task type,
+  no-underscore stem → `None`). These are extracted verbatim from `app.py`, so these tests pin
+  today's already-shipped behavior exactly — no new behavior is introduced, only new direct
+  coverage of logic previously exercised only indirectly through `test_app_streamlit.py`'s
+  page-render tests.
+- **`tests/test_workspace_home.py`** (new, plain pytest, requires `command_center/artifacts.py` to
+  already exist — §17 orders this after Condition 4 — and imports artifact/report discovery
+  exclusively via `command_center.artifacts`, never `app.py`) — build a scenario with
+  `isolated_data_dir`:
   a couple of Kanban tasks, a v1.2 legacy run (`agent_runner.append_run`), a v2 run via
   `ExecutionCenterAPI.start_run` + the `fake_claude` fixture, some `activity_log` events, some
   generated/report files under `tmp_path`. Assert: snapshot shape, limits respected, states
@@ -718,8 +872,8 @@ for pages, `tests/conftest.py`'s fixtures, no real `claude` CLI ever invoked):
 | Active Runs | `ExecutionCenterAPI.list_runs` | Full, needs filter extension | additive `states`/`limit` on **both** `db.list_runs` and `ExecutionCenterAPI.list_runs` |
 | Recent Runs | `ExecutionCenterAPI.list_runs` + `agent_runner.load_runs` | Full | small merge/sort/tag function, `(source, run_id)`-keyed |
 | Recent Activity | `activity_log.load_activity` | Full, needs v2 folding | small derive-from-recent-runs helper (no new storage) |
-| Artifacts | `list_markdown_files(GENERATED_DIR)` | Full | none (redaction applied at fold-in, §5.1) |
-| Reports | `list_markdown_files(REPORTS_DIR)` + `report_parser` | Full | none (redaction applied at fold-in, §5.1) |
+| Artifacts | `list_markdown_files(GENERATED_DIR)` — **today** in `app.py`, must relocate first | Full (logic), needs relocation | `command_center/artifacts.py` (extracted, Streamlit-free — §9/§9.1/§9.2), thin repointed call sites in `app.py`; redaction applied at fold-in (§5.1) |
+| Reports | `list_markdown_files(REPORTS_DIR)` + `report_parser` — same relocation | Full (logic), needs relocation | same `command_center/artifacts.py` extraction as Artifacts; redaction applied at fold-in (§5.1) |
 | Sensitivity redaction | none — genuinely new | New | `sanitize_workspace_project_entry` (§5.1), the one net-new piece of business logic in this increment |
 | Quick Actions | `pending_nav` pattern, existing forms | Full | one new pending key |
 
@@ -785,6 +939,13 @@ must build versus what is intentionally deferred, per the independent review's r
 
 ### Required implementation changes
 
+**Ordering constraint (Condition 4, resolves the Founder Review's dependency-direction finding):
+artifact-helper extraction (steps 3–5 below) must complete, in full — including its own unit
+tests and the `app.py` repoint — before step 6 (`workspace_home.py`) begins. Workspace Home must
+never, even temporarily, import `list_markdown_files`/`project_from_path`/
+`infer_task_type_from_filename` from `app.py`; there is no intermediate state in which
+`workspace_home.py` exists and still depends on `app.py` for these helpers.**
+
 1. **Extract `command_center/git_info.py`** from `app.py`'s existing git helpers (lines 410–526),
    parameterized by `cwd: Path`. Repoint Git Center + Workspace Launcher at it with **zero
    behavior change** — pure refactor, own PR, verified by existing `test_app_streamlit.py`
@@ -793,22 +954,42 @@ must build versus what is intentionally deferred, per the independent review's r
    exact signatures given there); move `EXECUTION_CENTER_ACTIVE_STATES` from `app.py` into `db.py`
    beside `TERMINAL_STATES`; update the `app.py:1990` call site; add the mutual-exclusion
    (`state` + `states` together → `ValueError`) check in `db.list_runs`. *(Condition 2, §1.)*
-3. **Build `command_center/workspace_home.py`** — the read model (§5) and the sensitivity
+3. **Extract `command_center/artifacts.py`** from `app.py`'s `list_markdown_files`,
+   `project_from_path`, and `infer_task_type_from_filename` (`app.py:201-223`), verbatim, **zero
+   behavior change** (§9/§9.1). This module has no dependency on `workspace_home.py`,
+   `runtime/*`, or `app.py` (§9.2) — it can be built and merged independently of steps 1–2.
+   *(Condition 4a.)*
+4. **Add `tests/test_artifacts.py`** — standalone unit tests for the three extracted functions
+   (§14), pinning today's already-shipped behavior with no Streamlit dependency anywhere in the
+   test. *(Condition 4b.)*
+5. **Repoint `app.py`'s existing call sites** (`generated`/`reports`/dashboard pages, and every
+   other current caller of the three functions) at `command_center.artifacts` — pure refactor,
+   **zero behavior change**, verified by existing `test_app_streamlit.py` page-render tests passing
+   unmodified (mirrors step 1's git_info repoint exactly). *(Condition 4c.)*
+6. **Build `command_center/workspace_home.py`** — the read model (§5) and the sensitivity
    redaction stage `sanitize_workspace_project_entry` (§5.1) together, not as separable pieces:
    the redaction stage has no independent purpose outside the snapshot builder that calls it, and
-   the snapshot builder is not complete/safe to use without it. Unit-test standalone (no
-   Streamlit), including every case in §14's `test_workspace_home.py` list. *(Condition 3, §1.)*
-4. **Add the `workspace_home` NAV entry** and a thin `app.py` renderer over the snapshot dict; add
-   the `AppTest` UI test (including the dual-layer BANK/LEGAL regression case, §14).
-5. **Wire Quick Actions** to existing `pending_nav` targets; add the one new pending key.
-6. **Manual smoke pass**: all-six-unconfigured empty state, populated state, BANK/LEGAL-only
-   state (visually confirm no banned field renders, in addition to the automated tests),
-   partially-configured state, invalid-path state, non-git-directory state.
+   the snapshot builder is not complete/safe to use without it. This module imports artifact/report
+   discovery **exclusively** from `command_center.artifacts` (steps 3–5 must already be merged) —
+   it never imports `app.py` (§9.2). Unit-test standalone (no Streamlit). *(Condition 3, §1 —
+   requires Condition 4 complete first.)*
+7. **Add `tests/test_workspace_home.py`** — the snapshot-level test suite (§14), including every
+   case in §14's list (sanitize identity-transform, banned-field stripping, snapshot-level banned-
+   field assertion, merged-run-identity). Runs under plain `pytest`, no Streamlit.
+8. **Add the `workspace_home` NAV entry** and a thin `app.py` renderer over the snapshot dict; add
+   `tests/test_workspace_home_ui.py`'s `AppTest` rendering-level tests (including the dual-layer
+   BANK/LEGAL regression case, §14).
+9. **Wire Quick Actions** to existing `pending_nav` targets; add the one new pending key.
+10. **Manual smoke pass**: all-six-unconfigured empty state, populated state, BANK/LEGAL-only
+    state (visually confirm no banned field renders, in addition to the automated tests),
+    partially-configured state, invalid-path state, non-git-directory state.
 
-Steps 1–3 change nothing user-visible on their own (steps 1–2 are pure refactor/additive-API; step
-3 is a new, unused-until-step-4 module) and can each ship ahead of the Home page itself —
-lowest-risk sequencing, and all three are prerequisites for §7–§9/§13 regardless of when Home
-itself lands.
+Steps 1–7 change nothing user-visible on their own (steps 1–2 and 3/5 are pure refactor/additive-
+API; steps 4/7 are test-only additions; step 6 is a new, unused-until-step-8 module) and can each
+ship ahead of the Home page itself — lowest-risk sequencing, and all four numbered conditions
+(§1) are prerequisites for §7–§9/§13 regardless of when Home itself lands. Steps 3–5 (Condition 4)
+must land before step 6 begins, per the ordering constraint above; steps 1–2 have no ordering
+dependency on steps 3–5 or on each other and may proceed in parallel with them.
 
 ### Deferred backlog (explicitly out of scope for this increment)
 
@@ -856,6 +1037,13 @@ itself lands.
   333 tests, ~16-17s — the currently verified baseline; re-verify against the actual run at
   implementation time, since the count will have grown by then).
 - No new subprocess call site outside the existing read-only git-subcommand allowlist.
+- **`command_center/artifacts.py` exists, contains `list_markdown_files`, `project_from_path`, and
+  `infer_task_type_from_filename`, imports no Streamlit symbol, and is never imported by `app.py`
+  in the reverse direction** (§9/§9.1/§9.2). `command_center/workspace_home.py` imports these three
+  functions exclusively from `command_center.artifacts` and contains no import of `app.py`,
+  directly or transitively — verified by `tests/test_workspace_home.py` and `tests/test_artifacts.py`
+  both collecting and passing with Streamlit uninstalled/unmocked in the import graph of the module
+  under test (§14).
 
 ---
 
@@ -890,10 +1078,17 @@ verified by the existing `test_app_streamlit.py` page-render tests continuing to
 This is the smallest, most isolated, zero-user-visible-change piece of this plan.
 
 Step 2 (§8.1: additive `states`/`limit` on both `db.list_runs` and `ExecutionCenterAPI.list_runs`)
-and step 3 (§5/§5.1: `workspace_home.py` with the sensitivity redaction stage built in from the
-start, not retrofitted) should follow before any Streamlit UI work begins — §7–§9/§13 of this
-design all depend on per-repository-path git discovery, the extended runtime query surface, and
-the redaction stage existing before Workspace Home itself can be built or reviewed for security.
+can proceed in parallel with, or either side of, step 1 — no ordering dependency between them.
+
+Steps 3–5 (§9/§9.1/§9.2: extract `command_center/artifacts.py`, add its standalone unit tests,
+repoint `app.py`'s existing call sites at it) must complete, in full, before step 6 (§5/§5.1:
+`workspace_home.py` with the sensitivity redaction stage built in from the start, not retrofitted)
+begins — this is the dependency-direction fix the Founder Review's blocking finding required.
+Workspace Home's read model has no Streamlit-free way to reach artifact/report data until
+`command_center/artifacts.py` exists; it must never import `app.py` to get there, not even
+temporarily. Once steps 3–6 are done, §7–§9/§13 of this design all depend on per-repository-path
+git discovery, the extended runtime query surface, and the redaction stage existing before
+Workspace Home itself can be built or reviewed for security.
 
 ---
 
@@ -929,10 +1124,16 @@ actual result, the same way this number was produced.
 ## Verdict
 
 **APPROVED FOR IMPLEMENTATION** — confirmed by a second, independent architecture review after
-F1–F5 (from the first review) were verified fully **RESOLVED**. The three items in §1 (git helper
-extraction, additive `db.list_runs`/`ExecutionCenterAPI.list_runs` extension, sensitivity-aware
-read model with `sanitize_workspace_project_entry`) remain the required first three implementation
-steps in §17 — they are prerequisite sequencing, not unresolved architecture conditions blocking
-this approval. The two LOW-severity, non-blocking observations from the second review (stale
-`app.py` line citations; a stale test count) are corrected in this revision. No architecture
-decision changed as a result of either correction. §17 step 1 may begin immediately.
+F1–F5 (from the first review) were verified fully **RESOLVED**, and after a subsequent Founder
+Review's dependency-direction finding was resolved by this revision. The four items in §1 (git
+helper extraction, additive `db.list_runs`/`ExecutionCenterAPI.list_runs` extension,
+sensitivity-aware read model with `sanitize_workspace_project_entry`, and extraction of artifact
+discovery helpers into `command_center/artifacts.py`) remain the required first four implementation
+conditions in §17 — they are prerequisite sequencing, not unresolved architecture conditions
+blocking this approval, with the one explicit ordering constraint that Condition 4 (artifact-helper
+extraction, §17 steps 3–5) must complete before Condition 3 (`workspace_home.py`, §17 step 6)
+begins. The two LOW-severity, non-blocking observations from the second review (stale `app.py`
+line citations; a stale test count) remain corrected from that prior revision. No other
+architecture decision changed as a result of this correction — only the module that owns
+artifact-discovery helpers, and the order in which it is built relative to `workspace_home.py`,
+changed. §17 step 1 may begin immediately; step 6 may not begin until steps 3–5 are complete.
