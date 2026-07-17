@@ -109,6 +109,18 @@ def test_execution_center_page_renders_and_nav_entry_exists():
 # --------------------------------------------------------------------------
 
 
+def _assert_execution_center_page_rendered(at: AppTest) -> None:
+    """Asserts the page actually rendered its expected elements, not just
+    that no exception was raised (an empty/blank page also raises none).
+    `st.expander(..., icon=...)` (as used for the launch form) is modeled by
+    `AppTest` as a `Status` node rather than an `Expander` node -- see
+    `streamlit/testing/v1/element_tree.py`'s `bty == "expandable"` handling,
+    which switches on whether an icon was passed."""
+    assert not at.exception
+    assert at.subheader[0].value == "Live Execution Center"
+    assert any("Запустить новый прогон" in status.label for status in at.status)
+
+
 def test_api_singleton_not_recreated_across_reruns(monkeypatch):
     construct_calls = []
     original_init = runtime_api.ExecutionCenterAPI.__init__
@@ -120,10 +132,17 @@ def test_api_singleton_not_recreated_across_reruns(monkeypatch):
     monkeypatch.setattr(runtime_api.ExecutionCenterAPI, "__init__", counting_init)
 
     at = _at_on_page("execution_center")
-    at = at.run()
-    at = at.run()
-
+    _assert_execution_center_page_rendered(at)
     assert len(construct_calls) == 1
+
+    # Verify the singleton survives *every* rerun, not just the first one —
+    # each iteration re-checks the full triad: no exception, the page (and
+    # its expected elements) actually rendered, and the cached
+    # `ExecutionCenterAPI` was reused rather than reconstructed.
+    for _ in range(3):
+        at = at.run()
+        _assert_execution_center_page_rendered(at)
+        assert len(construct_calls) == 1, "ExecutionCenterAPI must not be reconstructed across reruns"
 
 
 # --------------------------------------------------------------------------
@@ -315,6 +334,57 @@ def test_cancel_requires_confirmation_before_calling_api(monkeypatch, git_repo, 
 
 
 # --------------------------------------------------------------------------
+# 9b. Cancel action is only offered while the run is actually RUNNING —
+# PREPARED/QUEUED runs cannot be cancelled by the runtime (see Supervisor),
+# so the UI must not show an enabled Cancel control for them either.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "QUEUED"])
+def test_cancel_action_hidden_for_non_running_states(state):
+    api = runtime_api.ExecutionCenterAPI()
+    task = runtime_db.create_task(api.db_path, project="AIOS", title="t", task_type="review")
+    session = runtime_db.create_session(
+        api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    run = runtime_db.create_run(
+        api.db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        task_type="review",
+        repository_path="/tmp/x",
+        prompt="p",
+        is_resume=False,
+    )
+    if state == "QUEUED":
+        run = runtime_db.update_run_state(
+            api.db_path, run["id"], expected_version=run["version"], new_state="QUEUED"
+        )
+
+    at = _at_on_page("execution_center", exec_center_run_selector=run["id"])
+    assert not at.exception
+    assert not any(cb.key == f"exec_center_cancel_confirm_{run['id']}" for cb in at.checkbox)
+    assert not any(b.key == f"exec_center_cancel_btn_{run['id']}" for b in at.button)
+
+
+def test_cancel_action_visible_while_running(git_repo, configure_project_repo, fake_claude):
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    configure_project_repo("AIOS", git_repo)
+
+    at = _at_on_page("execution_center")
+    at = _launch_via_ui(at)
+    run_id = _current_run_id(at)
+
+    assert any(cb.key == f"exec_center_cancel_confirm_{run_id}" for cb in at.checkbox)
+    assert any(b.key == f"exec_center_cancel_btn_{run_id}" for b in at.button)
+
+    at.checkbox(key=f"exec_center_cancel_confirm_{run_id}").check().run()
+    at.button(key=f"exec_center_cancel_btn_{run_id}").click().run()
+    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+
+
+# --------------------------------------------------------------------------
 # 11. UI eventually displays CANCELLED after runtime persistence changes
 # --------------------------------------------------------------------------
 
@@ -329,7 +399,10 @@ def test_cancelled_state_eventually_displayed(git_repo, configure_project_repo, 
 
     at.checkbox(key=f"exec_center_cancel_confirm_{run_id}").check().run()
     at = at.button(key=f"exec_center_cancel_btn_{run_id}").click().run()
-    assert any("отправлен" in s.value for s in at.success)
+    metrics = {m.label: m.value for m in at.metric}
+    assert any("отправлен" in s.value for s in at.success) or metrics.get("Статус") == "Отменено", (
+        "expected either the immediate cancel-request confirmation or an already-cancelled state"
+    )
 
     state = None
     deadline = time.monotonic() + 10

@@ -958,8 +958,14 @@ EXECUTION_CENTER_STATE_LABELS: dict[str, str] = {
 }
 
 # Non-terminal states (see `runtime_db.TERMINAL_STATES` for the terminal set) —
-# a run in one of these can still be cancelled and is still worth polling.
+# a run in one of these is still worth polling. Note the runtime only accepts
+# cancellation while a run is actually RUNNING (see EXECUTION_CENTER_CANCELLABLE_STATES).
 EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED", "RUNNING"})
+
+# The Cancel action is only ever accepted by the runtime for a run that is
+# actually RUNNING (PREPARED/QUEUED runs have no subprocess yet for the
+# Supervisor to signal) — the UI must not offer a control implying otherwise.
+EXECUTION_CENTER_CANCELLABLE_STATES: frozenset[str] = frozenset({"RUNNING"})
 
 
 @st.cache_resource
@@ -1095,18 +1101,12 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
     st.rerun()
 
 
-@st.fragment(run_every=2.0)
-def render_execution_center_watch(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
-    """Live status/log/cancel panel for one run. Auto-refreshes itself every
-    2s (via `st.fragment(run_every=...)`, without blocking or re-running the
-    rest of the page) while this fragment is on screen; every refresh reads
-    persisted truth fresh from `ExecutionCenterAPI`, so the panel is always
-    correct even if this browser tab reconnects to a different rerun."""
-    run = api.get_run(run_id)
-    if run is None:
-        st.warning(f"Прогон `{run_id}` не найден.")
-        return
-
+def _render_execution_center_watch_body(
+    api: runtime_api.ExecutionCenterAPI, run_id: str, run: dict
+) -> None:
+    """Live status/log/cancel panel body for one already-fetched `run` row.
+    Shared by both the auto-polling and the one-shot render paths below, so
+    the panel looks identical however it got drawn."""
     state = run.get("state", "UNKNOWN")
     st.markdown(f"#### Прогон `{run['id']}`")
 
@@ -1141,7 +1141,7 @@ def render_execution_center_watch(api: runtime_api.ExecutionCenterAPI, run_id: s
         st.markdown("**Итоговый результат:**")
         st.code(result_events[-1]["payload"].get("result") or "—", language=None)
 
-    if state in EXECUTION_CENTER_ACTIVE_STATES:
+    if state in EXECUTION_CENTER_CANCELLABLE_STATES:
         cancel_ack = st.checkbox(
             "Я подтверждаю отмену этого прогона.", key=f"exec_center_cancel_confirm_{run_id}"
         )
@@ -1163,6 +1163,47 @@ def render_execution_center_watch(api: runtime_api.ExecutionCenterAPI, run_id: s
                 st.rerun()
     elif state in runtime_db.TERMINAL_STATES:
         st.caption("Прогон завершён — состояние сохранено в базе данных runtime.db.")
+
+
+@st.fragment(run_every=2.0)
+def _render_execution_center_watch_polling(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
+    """Auto-refreshes itself every 2s (via `st.fragment(run_every=...)`,
+    without blocking or re-running the rest of the page) while this fragment
+    is on screen. Only ever dispatched to from `render_execution_center_watch`
+    while the run is still active — see that function's docstring for why
+    that stops the polling once the run reaches a terminal state."""
+    run = api.get_run(run_id)
+    if run is None:
+        st.warning(f"Прогон `{run_id}` не найден.")
+        return
+    _render_execution_center_watch_body(api, run_id, run)
+
+
+def render_execution_center_watch(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
+    """Dispatches to the auto-polling fragment above while the run is still
+    active, and to a single, non-polling render once it reaches a terminal
+    state (`runtime_db.TERMINAL_STATES`).
+
+    `st.fragment(run_every=...)` reruns on a client-side timer that, once
+    started, keeps firing for as long as that fragment instance stays
+    registered — it does not stop itself just because the body decides
+    there's nothing left to do. So the only way to actually stop the
+    polling is to stop *calling* the `run_every` fragment on a subsequent
+    full-page rerun, which is what this dispatch does. Every full-page
+    rerun (switching the run selector, clicking Cancel, revisiting the page)
+    re-evaluates this check and re-reads persisted truth fresh from
+    `ExecutionCenterAPI`, so the final state always renders correctly even
+    after automatic polling has stopped, and any manual refresh (a rerun
+    triggered any other way) still works."""
+    run = api.get_run(run_id)
+    if run is None:
+        st.warning(f"Прогон `{run_id}` не найден.")
+        return
+
+    if run.get("state", "UNKNOWN") in EXECUTION_CENTER_ACTIVE_STATES:
+        _render_execution_center_watch_polling(api, run_id)
+    else:
+        _render_execution_center_watch_body(api, run_id, run)
 
 
 # --------------------------------------------------------------------------
