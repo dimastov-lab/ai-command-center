@@ -21,6 +21,10 @@ from command_center import (
     storage,
     workflow,
 )
+from command_center.runtime import api as runtime_api
+from command_center.runtime import context_service as runtime_context_service
+from command_center.runtime import db as runtime_db
+from command_center.runtime import supervisor as runtime_supervisor
 
 ROOT = Path(__file__).resolve().parent
 PROJECTS_DIR = ROOT / "projects"
@@ -154,6 +158,7 @@ NAV: dict[str, tuple[str, str]] = {
     "chat": ("Чат по проекту", ":material/forum:"),
     "kanban": ("Kanban", ":material/view_kanban:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
+    "execution_center": ("Live Execution Center", ":material/bolt:"),
     "runs": ("Журнал запусков", ":material/history:"),
     "timeline": ("Таймлайн", ":material/timeline:"),
     "projects": ("Проекты", ":material/folder_open:"),
@@ -932,6 +937,235 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
 
 
 # --------------------------------------------------------------------------
+# Live Execution Center (v2 Session Supervisor UI — Sprint 2 Increment 1)
+#
+# Thin consumer of the frozen Sprint 1 runtime (`command_center.runtime`):
+# every launch/status/event/cancel operation below goes through
+# `runtime_api.ExecutionCenterAPI`, never touching `Supervisor` internals,
+# raw SQL, or OS signals directly. See `command_center/runtime/api.py` and
+# `command_center/runtime/supervisor.py` for what those calls actually do.
+# --------------------------------------------------------------------------
+
+EXECUTION_CENTER_STATE_LABELS: dict[str, str] = {
+    "PREPARED": "Подготовлен",
+    "QUEUED": "В очереди",
+    "RUNNING": "Выполняется",
+    "COMPLETED": "Завершено",
+    "FAILED": "Ошибка",
+    "CANCELLED": "Отменено",
+    "INTERRUPTED": "Прервано",
+    "UNKNOWN": "Неизвестно",
+}
+
+# Non-terminal states (see `runtime_db.TERMINAL_STATES` for the terminal set) —
+# a run in one of these can still be cancelled and is still worth polling.
+EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED", "RUNNING"})
+
+
+@st.cache_resource
+def get_execution_center_api() -> runtime_api.ExecutionCenterAPI:
+    """One `ExecutionCenterAPI` (and the `Supervisor` it owns) per Streamlit
+    server process, reused across every script rerun.
+
+    A fresh `Supervisor` on every rerun would lose `Supervisor._active` — the
+    in-memory registry of subprocess handles a *running* Supervisor instance
+    needs to stream stdout/stderr and to signal a cancellation (see
+    `supervisor.py`'s module docstring). Persisted run truth (status,
+    timestamps, events) always still comes from `ExecutionCenterAPI`'s own
+    reads of the runtime database, never from Streamlit session state — the
+    singleton only needs to survive so cancellation keeps working, not to
+    cache any data itself.
+    """
+    return runtime_api.ExecutionCenterAPI()
+
+
+def _execution_center_event_line(event: dict) -> str:
+    preview = json.dumps(event["payload"], ensure_ascii=False)[:500]
+    return f"[{event['seq']:>5}] {event.get('created_at', '—')} {event['event_type']}: {preview}"
+
+
+def _execution_center_poll_new_events(api: runtime_api.ExecutionCenterAPI, run_id: str) -> list[dict]:
+    """Fetch only events after this run's last-seen cursor (both cursor and
+    the accumulated list live in `st.session_state`, keyed per run id so
+    switching runs never mixes logs), append them once, and return the full
+    accumulated list. Never re-fetches or re-appends an event already
+    stored — safe to call on every rerun without producing duplicate lines."""
+    events_key = f"exec_center_events_{run_id}"
+    cursor_key = f"exec_center_cursor_{run_id}"
+    st.session_state.setdefault(events_key, [])
+    st.session_state.setdefault(cursor_key, 0)
+    new_events = api.get_events(run_id, after_seq=st.session_state[cursor_key])
+    if new_events:
+        st.session_state[events_key].extend(new_events)
+        st.session_state[cursor_key] = new_events[-1]["seq"]
+    return st.session_state[events_key]
+
+
+def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> None:
+    """Confirm-then-execute launcher for the v2 runtime, mirroring
+    `render_agent_launcher`'s existing confirm/warn/disable pattern for
+    BANK/LEGAL, but calling `ExecutionCenterAPI.start_run` (non-blocking:
+    the Supervisor launches the subprocess and returns immediately with the
+    run in state RUNNING) instead of `agent_runner.run_claude_code`
+    (synchronous, blocks the whole script inside `st.spinner`)."""
+    launch_project = st.selectbox("Проект", list(PROJECTS.keys()), key="exec_center_launch_project")
+    cfg = project_config.get_project_config(launch_project)
+    repo_path = cfg.get("repository_path")
+
+    task_type = st.selectbox(
+        "Тип задачи",
+        TASK_TYPES,
+        format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
+        key="exec_center_launch_task_type",
+    )
+    instruction = st.text_area(
+        "Инструкция для агента", key="exec_center_launch_instruction", height=160
+    )
+    timeout_seconds = st.number_input(
+        "Таймаут (секунды)",
+        min_value=agent_runner.MIN_TIMEOUT_SECONDS,
+        max_value=agent_runner.MAX_TIMEOUT_SECONDS,
+        value=runtime_api.DEFAULT_TIMEOUT_SECONDS,
+        step=30,
+        key="exec_center_launch_timeout",
+    )
+
+    if not repo_path:
+        st.error(
+            f"Путь к репозиторию не настроен для проекта {launch_project}. "
+            "Настройте его в разделе «Проекты» → «Настройки репозитория»."
+        )
+        return
+
+    st.caption(f"Репозиторий: `{repo_path}`")
+
+    confirmed = st.checkbox(
+        "Я подтверждаю запуск Claude Code с указанными параметрами.",
+        key="exec_center_launch_confirm",
+    )
+    sensitivity_ack = True
+    if cfg.get("sensitive"):
+        st.warning(
+            f"Проект {launch_project} — чувствительный (BANK/LEGAL). Дополнительный "
+            "контент не прикладывается автоматически — инструкция отправляется как есть."
+        )
+        sensitivity_ack = st.checkbox(
+            "Я подтверждаю, что не прикладываю дополнительный чувствительный контент "
+            "без явного разрешения.",
+            key="exec_center_launch_sensitivity_ack",
+        )
+
+    ready = confirmed and sensitivity_ack and bool(instruction.strip())
+    launch_clicked = st.button(
+        "Запустить",
+        type="primary",
+        icon=":material/play_arrow:",
+        disabled=not ready,
+        key="exec_center_launch_btn",
+    )
+    if not launch_clicked:
+        return
+
+    # Re-checked server-side, not just via the button's (client-side-only)
+    # `disabled` state — this is the actual gate, matching the rest of the
+    # codebase's defense-in-depth convention (e.g. `_assert_no_forbidden_flags`).
+    if not ready:
+        st.error("Запуск заблокирован: подтвердите все необходимые пункты перед запуском.")
+        return
+
+    try:
+        run = api.start_run(
+            project=launch_project,
+            repository_path=repo_path,
+            task_type=task_type,
+            instruction=instruction,
+            confirmed=confirmed,
+            timeout_seconds=int(timeout_seconds),
+        )
+    except (
+        runtime_context_service.ConfirmationRequiredError,
+        agent_runner.RunnerError,
+        runtime_supervisor.SupervisorError,
+    ) as exc:
+        st.error(str(exc))
+        return
+
+    st.success(f"Запуск создан: `{run['id']}` (статус: {EXECUTION_CENTER_STATE_LABELS.get(run['state'], run['state'])})")
+    st.session_state.pending_exec_center_run = run["id"]
+    st.rerun()
+
+
+@st.fragment(run_every=2.0)
+def render_execution_center_watch(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
+    """Live status/log/cancel panel for one run. Auto-refreshes itself every
+    2s (via `st.fragment(run_every=...)`, without blocking or re-running the
+    rest of the page) while this fragment is on screen; every refresh reads
+    persisted truth fresh from `ExecutionCenterAPI`, so the panel is always
+    correct even if this browser tab reconnects to a different rerun."""
+    run = api.get_run(run_id)
+    if run is None:
+        st.warning(f"Прогон `{run_id}` не найден.")
+        return
+
+    state = run.get("state", "UNKNOWN")
+    st.markdown(f"#### Прогон `{run['id']}`")
+
+    info_cols = st.columns(4)
+    info_cols[0].metric("Статус", EXECUTION_CENTER_STATE_LABELS.get(state, state))
+    info_cols[1].write(f"Проект: **{run.get('project', '—')}**")
+    info_cols[2].write(f"Тип задачи: **{run.get('task_type', '—')}**")
+    info_cols[3].write(f"Сессия: `{(run.get('session_id') or '—')[:8]}`")
+
+    ts_cols = st.columns(3)
+    ts_cols[0].caption(f"Создан: {run.get('created_at') or '—'}")
+    ts_cols[1].caption(f"Начат: {run.get('started_at') or '—'}")
+    ts_cols[2].caption(f"Завершён: {run.get('completed_at') or '—'}")
+
+    if run.get("exit_code") is not None:
+        st.caption(f"Код выхода: {run['exit_code']}")
+    if run.get("failure_reason"):
+        st.error(f"Причина ошибки: {run['failure_reason']}")
+    if run.get("cancel_requested") and state in EXECUTION_CENTER_ACTIVE_STATES:
+        st.info("Запрошена отмена — ожидание завершения процесса...")
+
+    events = _execution_center_poll_new_events(api, run_id)
+    st.markdown("**Журнал событий (инкрементально):**")
+    with st.container(height=320, border=True):
+        if events:
+            st.code("\n".join(_execution_center_event_line(event) for event in events), language=None)
+        else:
+            st.caption("Событий пока нет.")
+
+    result_events = [event for event in events if event["event_type"] == "result"]
+    if result_events:
+        st.markdown("**Итоговый результат:**")
+        st.code(result_events[-1]["payload"].get("result") or "—", language=None)
+
+    if state in EXECUTION_CENTER_ACTIVE_STATES:
+        cancel_ack = st.checkbox(
+            "Я подтверждаю отмену этого прогона.", key=f"exec_center_cancel_confirm_{run_id}"
+        )
+        cancel_clicked = st.button(
+            "Отменить прогон",
+            icon=":material/stop_circle:",
+            key=f"exec_center_cancel_btn_{run_id}",
+            disabled=not cancel_ack,
+        )
+        if cancel_clicked:
+            if not cancel_ack:
+                st.error("Отмена заблокирована: подтвердите отмену перед выполнением.")
+            else:
+                try:
+                    api.request_cancel(run_id, confirmed=True)
+                    st.success("Запрос на отмену отправлен.")
+                except (runtime_supervisor.SupervisorError, KeyError) as exc:
+                    st.error(str(exc))
+                st.rerun()
+    elif state in runtime_db.TERMINAL_STATES:
+        st.caption("Прогон завершён — состояние сохранено в базе данных runtime.db.")
+
+
+# --------------------------------------------------------------------------
 # Page setup
 # --------------------------------------------------------------------------
 
@@ -946,6 +1180,7 @@ _PENDING_KEY_MAP = {
     "pending_create_type": "create_task_type",
     "pending_project_browser": "project_browser_select",
     "pending_chat_conv": "chat_conv_select",
+    "pending_exec_center_run": "exec_center_run_selector",
 }
 for _pending_key, _target_key in _PENDING_KEY_MAP.items():
     if _pending_key in st.session_state:
@@ -1650,6 +1885,52 @@ elif page_key == "agents":
                     tasks=tasks,
                     default_task_type=task_type,
                 )
+
+
+# --------------------------------------------------------------------------
+# Live Execution Center (v2 Session Supervisor)
+# --------------------------------------------------------------------------
+
+elif page_key == "execution_center":
+    st.subheader("Live Execution Center")
+    st.caption(
+        "Запуск и наблюдение за прогонами Claude Code через v2 Session Supervisor "
+        "(command_center.runtime) — отдельно от синхронного запуска на странице «AI-агенты»."
+    )
+
+    execution_center_api = get_execution_center_api()
+    recent_runs = execution_center_api.list_runs()[:20]
+
+    with st.expander(
+        "Запустить новый прогон", icon=":material/smart_toy:", expanded=not recent_runs
+    ):
+        render_execution_center_launch_form(execution_center_api)
+
+    st.divider()
+
+    if not recent_runs:
+        st.info("Прогонов пока нет — запустите первый выше.")
+    else:
+        run_options = [run["id"] for run in recent_runs]
+        runs_by_id = {run["id"]: run for run in recent_runs}
+
+        def _format_execution_center_run_option(run_id: str) -> str:
+            match = runs_by_id.get(run_id)
+            if match is None:
+                return run_id
+            state_label = EXECUTION_CENTER_STATE_LABELS.get(match["state"], match["state"])
+            return (
+                f"{match['id'][:8]} · {match['project']} · {match['task_type']} · "
+                f"{state_label} · {match.get('created_at', '—')}"
+            )
+
+        selected_run_id = st.selectbox(
+            "Прогон",
+            run_options,
+            format_func=_format_execution_center_run_option,
+            key="exec_center_run_selector",
+        )
+        render_execution_center_watch(execution_center_api, selected_run_id)
 
 
 # --------------------------------------------------------------------------
