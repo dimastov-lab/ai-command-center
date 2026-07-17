@@ -1,3 +1,4 @@
+import itertools
 import multiprocessing
 import sqlite3
 import threading
@@ -654,3 +655,82 @@ def test_list_run_events_after_seq_returns_only_newer_events(tmp_path):
         db.append_run_event(path, run["id"], "lifecycle", {"i": i})
     events = db.list_run_events(path, run["id"], after_seq=2)
     assert [e["payload"]["i"] for e in events] == [2, 3, 4]
+
+
+# --------------------------------------------------------------------------
+# list_runs — states (plural) / limit extension
+# --------------------------------------------------------------------------
+
+
+def test_list_runs_states_filters_to_matching_set(tmp_path):
+    path = _fresh_db(tmp_path)
+    prepared = _make_run(path)
+    running = _make_run(path)
+    running = db.update_run_state(path, running["id"], expected_version=running["version"], new_state="QUEUED")
+    running = db.update_run_state(path, running["id"], expected_version=running["version"], new_state="RUNNING")
+    completed = _make_run(path)
+    completed = db.update_run_state(path, completed["id"], expected_version=completed["version"], new_state="QUEUED")
+    completed = db.update_run_state(path, completed["id"], expected_version=completed["version"], new_state="RUNNING")
+    completed = db.update_run_state(path, completed["id"], expected_version=completed["version"], new_state="COMPLETED")
+
+    active = db.list_runs(path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert {r["id"] for r in active} == {prepared["id"], running["id"]}
+
+    terminal = db.list_runs(path, states=db.TERMINAL_STATES)
+    assert {r["id"] for r in terminal} == {completed["id"]}
+
+
+def test_list_runs_states_empty_iterable_matches_nothing(tmp_path):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    assert db.list_runs(path, states=[]) == []
+
+
+def test_list_runs_limit_bounds_result_set_and_preserves_order(tmp_path, monkeypatch):
+    path = _fresh_db(tmp_path)
+
+    # `iso_now()` is second-precision (see `models.iso_now`'s docstring), so creating
+    # several runs in quick succession can produce identical `created_at` values.
+    # Monkeypatch it to strictly-increasing timestamps so ordering is deterministic
+    # without a real multi-second sleep per row. `_make_run` calls `iso_now()` three
+    # times per run (task/session/run), so the ticker must not run dry.
+    counter = itertools.count()
+
+    def fake_iso_now() -> str:
+        minute, second = divmod(next(counter), 60)
+        return f"2026-01-01T00:{minute:02d}:{second:02d}"
+
+    monkeypatch.setattr(db, "iso_now", fake_iso_now)
+
+    runs = [_make_run(path) for _ in range(5)]
+
+    limited = db.list_runs(path, limit=2)
+    assert len(limited) == 2
+    assert [r["id"] for r in limited] == [runs[4]["id"], runs[3]["id"]]
+
+    unbounded = db.list_runs(path)
+    assert [r["id"] for r in unbounded] == [r["id"] for r in reversed(runs)]
+
+
+def test_list_runs_state_and_states_together_raises_value_error(tmp_path):
+    path = _fresh_db(tmp_path)
+    with pytest.raises(ValueError):
+        db.list_runs(path, state="RUNNING", states=["RUNNING", "QUEUED"])
+
+
+def test_list_runs_states_combined_with_session_id_filter(tmp_path):
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session_a = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    session_b = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    run_a = db.create_run(
+        path, session_id=session_a["id"], task_id=task["id"], project="AIOS",
+        task_type="implementation", repository_path="/tmp/x", prompt="p", is_resume=False,
+    )
+    db.create_run(
+        path, session_id=session_b["id"], task_id=task["id"], project="AIOS",
+        task_type="implementation", repository_path="/tmp/x", prompt="p", is_resume=False,
+    )
+
+    scoped = db.list_runs(path, session_id=session_a["id"], states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert {r["id"] for r in scoped} == {run_a["id"]}

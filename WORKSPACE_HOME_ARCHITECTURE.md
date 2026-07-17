@@ -3,6 +3,16 @@
 Sprint 3 — Universal Workspace · Increment: Workspace Home
 Branch: `feature/v3-workspace-home-architecture` · Status: **architecture only, no code changed**
 
+**Implementation note:** all 10 steps of §17's implementation plan have since been built on `main`
+(`command_center/git_info.py`, `command_center/artifacts.py`, the additive `db.list_runs`/
+`ExecutionCenterAPI.list_runs` extension, `command_center/workspace_home.py`, the `workspace_home`
+NAV page, and Quick Actions), with one recorded deviation (see `CHANGELOG.md`'s "Sprint 3
+Increment 1" entry: the Projects section's task count uses `ExecutionCenterAPI.list_tasks`
+instead of the v1.2 `load_tasks()` this document's §4 named, because the latter would have
+required importing `app.py`, which §6/§9.2 prohibit outright). The status line above is left
+as-is as a historical record of this document's state at review time — see `CHANGELOG.md` for
+what actually shipped.
+
 This document is grounded in the actual code as of this branch's HEAD (`git log` tip: merge of
 Sprint 2 "Live Execution Center"). Where it says a function/module exists, it was read directly;
 where it proposes something new, that is explicitly flagged as **NEW**.

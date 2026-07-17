@@ -34,7 +34,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from command_center import storage
 from command_center.models import iso_now, new_id
@@ -78,6 +78,8 @@ RUN_STATES: list[str] = [
 ]
 
 TERMINAL_STATES: frozenset[str] = frozenset({"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "UNKNOWN"})
+
+EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED", "RUNNING"})
 
 # Explicit allow-list of state transitions. Anything not listed here is refused
 # by `update_run_state` before it ever reaches SQL — in particular, no terminal
@@ -631,7 +633,17 @@ def list_runs(
     session_id: str | None = None,
     task_id: str | None = None,
     state: str | None = None,
+    states: Iterable[str] | None = None,
+    limit: int | None = None,
 ) -> list[dict]:
+    """`state` (singular, exact match) and `states` (plural, `IN (...)`) are mutually
+    exclusive — passing both raises `ValueError` before any SQL is built, so a caller
+    can never end up with an ambiguous, silently-ORed filter. `limit`, if given, is
+    applied as a SQL `LIMIT` after the existing `ORDER BY created_at DESC`, bounding
+    the result set inside SQLite rather than truncating a full-table fetch in Python.
+    """
+    if state is not None and states is not None:
+        raise ValueError("Pass either `state` or `states`, not both.")
     clauses = []
     params: list[Any] = []
     if session_id:
@@ -643,10 +655,21 @@ def list_runs(
     if state:
         clauses.append("state = ?")
         params.append(state)
+    if states is not None:
+        states_list = list(states)
+        if states_list:
+            placeholders = ", ".join("?" for _ in states_list)
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(states_list)
+        else:
+            clauses.append("0")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    limit_clause = " LIMIT ?" if limit is not None else ""
+    if limit is not None:
+        params.append(limit)
     with connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM run {where} ORDER BY created_at DESC", params
+            f"SELECT * FROM run {where} ORDER BY created_at DESC{limit_clause}", params
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow strict semantic versioning tags in Git; versions below refer to
 functional application milestones of `app.py`.
 
+## [Unreleased] — Sprint 3 Increment 1: Workspace Home
+
+Implements `WORKSPACE_HOME_ARCHITECTURE.md` in full (all 10 steps of §17's implementation
+plan). That document's own status header ("architecture only, no code changed") is now stale —
+the design is implemented, not just approved.
+
+### Added
+- **`command_center/git_info.py`**: per-project git/worktree discovery (`get_status`,
+  `get_worktrees`, `get_log`, `get_diff_stat`, `get_branches`, `get_remotes`), extracted from
+  `app.py`'s original ROOT-only helpers and parameterized by `cwd: Path`. `app.py`'s Git Center
+  and Workspace Launcher pages are now thin wrappers over it (zero behavior change).
+- **`command_center/artifacts.py`**: `list_markdown_files`, `project_from_path`,
+  `infer_task_type_from_filename`, `read_text` — extracted verbatim from `app.py`, Streamlit-free,
+  a leaf module. Every existing `app.py` call site repointed at it.
+- **`db.list_runs`/`ExecutionCenterAPI.list_runs`** gained `states` (plural, `IN (...)`) and
+  `limit` (SQL `LIMIT`) parameters, additive and backward compatible; `state`+`states` together
+  raise `ValueError`. `EXECUTION_CENTER_ACTIVE_STATES` moved to `runtime/db.py` beside
+  `TERMINAL_STATES`.
+- **`command_center/workspace_home.py`**: the Workspace Home read model
+  (`build_workspace_home_snapshot`) and its sensitivity redaction stage
+  (`sanitize_workspace_project_entry`) — cross-project rollup of projects, git worktrees, active/
+  recent runs (v1.2 + v2, merged and source-tagged), reports, artifacts, and activity, with every
+  BANK/LEGAL entry passed through a field allowlist *before* it reaches the renderer.
+- **Workspace Home page** (`workspace_home` nav entry): a new, additional page — Dashboard and
+  Workspace Launcher are unchanged. Read-only; every Quick Action (Open Project, New Task, Launch
+  Run, view Run/Report/Artifact) delegates to the existing gated forms, never mutates directly.
+- Tests: `test_git_info.py`, `test_artifacts.py`, `test_workspace_home.py`,
+  `test_workspace_home_ui.py`, plus extensions to `test_runtime_db.py`/`test_runtime_api.py` —
+  389 tests total (up from 333), including a dual-layer (snapshot + rendered-page) regression
+  test that no BANK/LEGAL prompt/log/report-body/raw-path content ever reaches the page.
+
+### Deviation from the architecture document
+- §4's data-source map lists `load_tasks()` (the v1.2 Kanban store, which lives only in `app.py`)
+  as a Projects-section input. `workspace_home.py` cannot import `app.py` under any circumstance
+  (§6/§9.2, a hard constraint stated three times in the document) and `load_tasks` was not in
+  Condition 4's extraction scope, so the per-project task count instead uses
+  `ExecutionCenterAPI.list_tasks(project=...)` (v2 SQLite tasks, an explicitly allowed read
+  method). This counts v2 orchestration tasks, not v1.2 Kanban cards — recorded in
+  `workspace_home.py`'s module docstring.
+
 ## [1.2.0] - 2026-07-16
 
 ### Added

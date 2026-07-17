@@ -69,6 +69,30 @@ def test_full_lifecycle_through_the_api(git_repo, configure_project_repo, fake_c
     assert report is not None
 
 
+def test_list_runs_states_and_limit_forward_to_db(git_repo, configure_project_repo, fake_claude):
+    configure_project_repo("AIOS", git_repo)
+    api = ExecutionCenterAPI()
+    run = api.start_run(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", instruction="p", confirmed=True
+    )
+    api.supervisor.wait_for_run(run["id"], timeout=10)
+
+    active = api.list_runs(states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert run["id"] not in {r["id"] for r in active}
+
+    terminal = api.list_runs(states=db.TERMINAL_STATES)
+    assert run["id"] in {r["id"] for r in terminal}
+
+    limited = api.list_runs(limit=1)
+    assert len(limited) == 1
+
+
+def test_list_runs_state_and_states_together_raises_value_error(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    with pytest.raises(ValueError):
+        api.list_runs(state="RUNNING", states=["RUNNING"])
+
+
 def test_request_cancel_requires_confirmation(git_repo, configure_project_repo, fake_claude):
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     configure_project_repo("AIOS", git_repo)
