@@ -1165,36 +1165,83 @@ def _render_execution_center_watch_body(
         st.caption("Прогон завершён — состояние сохранено в базе данных runtime.db.")
 
 
+# Decisions for `_execution_center_watch_action` below. Kept as plain strings
+# (not an Enum) — this is a private, in-module signal with exactly one
+# consumer, not a value that crosses a boundary.
+_EXECUTION_CENTER_WATCH_POLL_AND_RENDER = "poll_and_render"
+_EXECUTION_CENTER_WATCH_FULL_RERUN = "full_rerun"
+_EXECUTION_CENTER_WATCH_RENDER_MISSING = "render_missing"
+
+
+def _execution_center_watch_action(run: dict | None) -> str:
+    """Pure decision step for the polling fragment: given a freshly fetched
+    `run` row (or `None` if the run no longer exists), decide what happens
+    next. Deliberately has no Streamlit calls in it, so it — and the thin
+    wrapper below that acts on it — can be unit-tested directly, without
+    booting a Streamlit script context.
+
+    - Still active: keep polling and render the live panel in place.
+    - Reached a terminal state, or vanished entirely: a `run_every` fragment
+      auto-rerun is a client-side JS `setInterval` that Streamlit only tears
+      down on a *full* app rerun (see `streamlit/runtime/fragment.py` and
+      the frontend's `handleAutoRerun`/`cleanupAutoReruns`) — a fragment-only
+      rerun never reaches `render_execution_center_watch` to re-check this,
+      so it would otherwise keep firing every 2s forever. Reporting anything
+      other than "poll and render" tells the caller to request one full-app
+      rerun instead of rendering through this path, which lands back in
+      `render_execution_center_watch` and stops the polling for good.
+    """
+    if run is None:
+        return _EXECUTION_CENTER_WATCH_RENDER_MISSING
+    if run.get("state", "UNKNOWN") not in EXECUTION_CENTER_ACTIVE_STATES:
+        return _EXECUTION_CENTER_WATCH_FULL_RERUN
+    return _EXECUTION_CENTER_WATCH_POLL_AND_RENDER
+
+
+def _execution_center_watch_poll_once(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
+    """One polling tick's worth of work, extracted out of the `@st.fragment`
+    wrapper below so it can be called (and unit-tested) directly — a
+    fragment-decorated function is a no-op outside of a live Streamlit script
+    context, per `streamlit/runtime/fragment.py`.
+
+    Never renders the terminal/missing-run panel itself: as soon as the
+    freshly fetched state is no longer active (or the run vanished), it
+    requests exactly one full-app rerun and returns, deferring to
+    `render_execution_center_watch`'s non-polling branch for that render —
+    that's what actually removes this fragment's `run_every` registration
+    and stops the browser's polling timer.
+    """
+    run = api.get_run(run_id)
+    if _execution_center_watch_action(run) != _EXECUTION_CENTER_WATCH_POLL_AND_RENDER:
+        st.rerun()
+        return
+    _render_execution_center_watch_body(api, run_id, run)
+
+
 @st.fragment(run_every=2.0)
 def _render_execution_center_watch_polling(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
     """Auto-refreshes itself every 2s (via `st.fragment(run_every=...)`,
     without blocking or re-running the rest of the page) while this fragment
     is on screen. Only ever dispatched to from `render_execution_center_watch`
-    while the run is still active — see that function's docstring for why
-    that stops the polling once the run reaches a terminal state."""
-    run = api.get_run(run_id)
-    if run is None:
-        st.warning(f"Прогон `{run_id}` не найден.")
-        return
-    _render_execution_center_watch_body(api, run_id, run)
+    while the run is still active. See `_execution_center_watch_poll_once`
+    for how it stops itself once the run stops being active."""
+    _execution_center_watch_poll_once(api, run_id)
 
 
 def render_execution_center_watch(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
     """Dispatches to the auto-polling fragment above while the run is still
     active, and to a single, non-polling render once it reaches a terminal
-    state (`runtime_db.TERMINAL_STATES`).
+    state (`runtime_db.TERMINAL_STATES`) or has been deleted.
 
-    `st.fragment(run_every=...)` reruns on a client-side timer that, once
-    started, keeps firing for as long as that fragment instance stays
-    registered — it does not stop itself just because the body decides
-    there's nothing left to do. So the only way to actually stop the
-    polling is to stop *calling* the `run_every` fragment on a subsequent
-    full-page rerun, which is what this dispatch does. Every full-page
-    rerun (switching the run selector, clicking Cancel, revisiting the page)
-    re-evaluates this check and re-reads persisted truth fresh from
-    `ExecutionCenterAPI`, so the final state always renders correctly even
-    after automatic polling has stopped, and any manual refresh (a rerun
-    triggered any other way) still works."""
+    Every full-page rerun (switching the run selector, clicking Cancel,
+    revisiting the page, or the one `st.rerun()` that
+    `_execution_center_watch_poll_once` requests the moment it observes a
+    terminal/missing run) re-evaluates this check and re-reads persisted
+    truth fresh from `ExecutionCenterAPI`. Taking the non-polling branch
+    here is what actually stops the `run_every` fragment's browser-side
+    timer — it simply isn't called again this run, so Streamlit tears down
+    its auto-rerun registration (see `_execution_center_watch_poll_once`'s
+    docstring for why that's the only thing that works)."""
     run = api.get_run(run_id)
     if run is None:
         st.warning(f"Прогон `{run_id}` не найден.")

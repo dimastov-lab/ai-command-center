@@ -31,6 +31,8 @@ from pathlib import Path
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
 
+import app
+
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
 
@@ -484,3 +486,115 @@ def test_existing_pages_still_render_without_exception():
     for page_key in ("dashboard", "agents", "runs", "executive"):
         at = _at_on_page(page_key)
         assert not at.exception, f"page {page_key!r} raised: {at.exception}"
+
+
+# --------------------------------------------------------------------------
+# 15. F1 remediation — the polling fragment must stop itself on a terminal
+# transition instead of relying on some *other* full rerun to happen to come
+# along.
+#
+# Honesty about coverage: `AppTest.run()` (see `_at_on_page` above) always
+# performs a full script rerun. It has no way to reproduce the one thing that
+# actually caused the original bug: the browser's timer-driven, *fragment-only*
+# rerun that `st.fragment(run_every=...)` schedules client-side (a JS
+# `setInterval` that Streamlit only clears on a full rerun — see
+# `streamlit/runtime/fragment.py` and the compiled frontend's
+# `handleAutoRerun`/`cleanupAutoReruns`). None of the tests below claim to
+# simulate that browser timer. Instead they call `app._execution_center_watch_action`
+# and `app._execution_center_watch_poll_once` — the extracted, undecorated
+# server-side logic the polling fragment now runs on every tick — directly,
+# against a stub API and a monkeypatched `st.rerun`/render body. That is the
+# strongest testable proof available that, the moment a tick observes a
+# terminal or missing run, it asks for exactly one full-app rerun and renders
+# nothing itself, which is what stops the browser's timer for good (a real
+# browser/integration check of the timer itself is out of reach for
+# `AppTest` and is not attempted here).
+# --------------------------------------------------------------------------
+
+
+class _StubExecutionCenterApi:
+    """Duck-typed stand-in for `ExecutionCenterAPI` exposing only `get_run`,
+    which is all `_execution_center_watch_poll_once` touches."""
+
+    def __init__(self, run: dict | None):
+        self._run = run
+
+    def get_run(self, run_id: str) -> dict | None:
+        return self._run
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "QUEUED", "RUNNING"])
+def test_watch_action_polls_while_active(state):
+    assert (
+        app._execution_center_watch_action({"id": "r1", "state": state})
+        == app._EXECUTION_CENTER_WATCH_POLL_AND_RENDER
+    )
+
+
+@pytest.mark.parametrize("state", sorted(runtime_db.TERMINAL_STATES))
+def test_watch_action_requests_full_rerun_on_terminal_state(state):
+    assert (
+        app._execution_center_watch_action({"id": "r1", "state": state})
+        == app._EXECUTION_CENTER_WATCH_FULL_RERUN
+    )
+
+
+def test_watch_action_reports_missing_when_run_deleted():
+    assert app._execution_center_watch_action(None) == app._EXECUTION_CENTER_WATCH_RENDER_MISSING
+
+
+def test_poll_once_reruns_full_app_without_rendering_on_terminal_transition(monkeypatch):
+    """The exact bug this whole increment exists to fix: a polling tick that
+    freshly observes a terminal state must not render the terminal panel
+    itself (that would just keep the `run_every` fragment — and the
+    browser's setInterval driving it — registered) and must request exactly
+    one full-app rerun instead."""
+    rerun_calls = []
+    render_calls = []
+    monkeypatch.setattr(app.st, "rerun", lambda *a, **k: rerun_calls.append((a, k)))
+    monkeypatch.setattr(
+        app, "_render_execution_center_watch_body", lambda *a, **k: render_calls.append((a, k))
+    )
+
+    api = _StubExecutionCenterApi({"id": "r1", "state": "COMPLETED"})
+    app._execution_center_watch_poll_once(api, "r1")
+
+    assert len(rerun_calls) == 1, "a terminal tick must request exactly one full-app rerun"
+    assert render_calls == [], "a terminal tick must not render through the polling path"
+
+
+def test_poll_once_reruns_full_app_without_rendering_when_run_missing(monkeypatch):
+    """A run deleted mid-poll must be treated the same way as a terminal
+    transition — otherwise a vanished run would poll forever too."""
+    rerun_calls = []
+    render_calls = []
+    monkeypatch.setattr(app.st, "rerun", lambda *a, **k: rerun_calls.append((a, k)))
+    monkeypatch.setattr(
+        app, "_render_execution_center_watch_body", lambda *a, **k: render_calls.append((a, k))
+    )
+
+    api = _StubExecutionCenterApi(None)
+    app._execution_center_watch_poll_once(api, "r1")
+
+    assert len(rerun_calls) == 1
+    assert render_calls == []
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "QUEUED", "RUNNING"])
+def test_poll_once_keeps_rendering_without_rerun_while_active(monkeypatch, state):
+    """The other half of the fix: an active run must keep being rendered
+    in place, with no rerun requested — only a terminal/missing transition
+    should ever trigger one, or polling would never settle."""
+    rerun_calls = []
+    render_calls = []
+    monkeypatch.setattr(app.st, "rerun", lambda *a, **k: rerun_calls.append((a, k)))
+    monkeypatch.setattr(
+        app, "_render_execution_center_watch_body", lambda *a, **k: render_calls.append((a, k))
+    )
+
+    run = {"id": "r1", "state": state}
+    api = _StubExecutionCenterApi(run)
+    app._execution_center_watch_poll_once(api, "r1")
+
+    assert rerun_calls == [], "an active run must not request a rerun"
+    assert render_calls == [((api, "r1", run), {})]
