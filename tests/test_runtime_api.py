@@ -95,6 +95,68 @@ def test_request_cancel_end_to_end(git_repo, configure_project_repo, fake_claude
     assert result["state"] == "CANCELLED"
 
 
+def _make_run_via_db(api, state=None):
+    task = db.create_task(api.db_path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    run = db.create_run(
+        api.db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p", is_resume=False,
+    )
+    if state is not None:
+        run = db.update_run_state(api.db_path, run["id"], expected_version=run["version"], new_state=state)
+    return run
+
+
+def test_list_runs_states_through_the_facade(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    prepared = _make_run_via_db(api)
+    queued = _make_run_via_db(api, state="QUEUED")
+    failed = _make_run_via_db(api, state="FAILED")
+
+    active = api.list_runs(states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert {r["id"] for r in active} == {prepared["id"], queued["id"]}
+    assert failed["id"] not in {r["id"] for r in active}
+
+
+def test_list_runs_limit_through_the_facade(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    for _ in range(5):
+        _make_run_via_db(api)
+    limited = api.list_runs(limit=2)
+    assert len(limited) == 2
+
+
+def test_list_runs_state_and_states_mutually_exclusive_through_the_facade(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    with pytest.raises(ValueError):
+        api.list_runs(state="RUNNING", states=["QUEUED"])
+
+
+def test_list_runs_negative_limit_raises_through_the_facade(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    _make_run_via_db(api)
+    with pytest.raises(ValueError):
+        api.list_runs(limit=-1)
+
+
+def test_list_runs_limit_zero_returns_empty_through_the_facade(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    _make_run_via_db(api)
+    assert api.list_runs(limit=0) == []
+
+
+def test_list_runs_empty_states_returns_empty_through_the_facade(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    _make_run_via_db(api)
+    assert api.list_runs(states=[]) == []
+
+
+def test_list_runs_states_none_applies_no_filter_through_the_facade(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    run = _make_run_via_db(api)
+    assert {r["id"] for r in api.list_runs(states=None)} == {run["id"]}
+
+
 def test_reconcile_stale_runs_through_the_api(tmp_path):
     api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
     task = db.create_task(api.db_path, project="AIOS", title="t", task_type="implementation")

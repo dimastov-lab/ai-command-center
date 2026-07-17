@@ -654,3 +654,146 @@ def test_list_run_events_after_seq_returns_only_newer_events(tmp_path):
         db.append_run_event(path, run["id"], "lifecycle", {"i": i})
     events = db.list_run_events(path, run["id"], after_seq=2)
     assert [e["payload"]["i"] for e in events] == [2, 3, 4]
+
+
+# --------------------------------------------------------------------------
+# `list_runs` — `states`/`limit` extension
+# --------------------------------------------------------------------------
+
+
+def _set_created_at(path, run_id, created_at):
+    """Directly rewrites `created_at` so ordering tests don't depend on
+    `iso_now()`'s second-precision timestamps happening to differ within a
+    fast-running test. `sqlite3.connect(...)` used as a context manager only
+    commits/rolls back the transaction — it does not close the connection —
+    so this closes it explicitly to avoid leaking a connection per call."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("UPDATE run SET created_at = ? WHERE id = ?", (created_at, run_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_list_runs_states_filters_by_multiple_states(tmp_path):
+    path = _fresh_db(tmp_path)
+    prepared = _make_run(path)
+    queued = _make_run(path)
+    db.update_run_state(path, queued["id"], expected_version=0, new_state="QUEUED")
+    failed = _make_run(path)
+    db.update_run_state(path, failed["id"], expected_version=0, new_state="FAILED")
+
+    active = db.list_runs(path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert {r["id"] for r in active} == {prepared["id"], queued["id"]}
+    assert failed["id"] not in {r["id"] for r in active}
+
+
+def test_list_runs_state_and_states_mutually_exclusive(tmp_path):
+    path = _fresh_db(tmp_path)
+    with pytest.raises(ValueError):
+        db.list_runs(path, state="RUNNING", states=["QUEUED"])
+
+
+def test_list_runs_limit_applied_at_sql_level(tmp_path):
+    path = _fresh_db(tmp_path)
+    runs = [_make_run(path) for _ in range(5)]
+    for i, run in enumerate(runs):
+        _set_created_at(path, run["id"], f"2026-01-01T00:00:{i:02d}")
+
+    limited = db.list_runs(path, limit=2)
+    assert len(limited) == 2
+    assert [r["id"] for r in limited] == [runs[4]["id"], runs[3]["id"]]
+
+
+def test_list_runs_ordering_is_stable_created_at_desc(tmp_path):
+    path = _fresh_db(tmp_path)
+    runs = [_make_run(path) for _ in range(3)]
+    for i, run in enumerate(runs):
+        _set_created_at(path, run["id"], f"2026-01-01T00:00:{i:02d}")
+
+    ordered = db.list_runs(path)
+    assert [r["id"] for r in ordered] == [runs[2]["id"], runs[1]["id"], runs[0]["id"]]
+
+
+def test_list_runs_backward_compatible_with_no_args(tmp_path):
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    runs = db.list_runs(path)
+    assert {r["id"] for r in runs} == {run["id"]}
+
+
+def test_list_runs_backward_compatible_with_single_state(tmp_path):
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    runs = db.list_runs(path, state="PREPARED")
+    assert {r["id"] for r in runs} == {run["id"]}
+    assert db.list_runs(path, state="COMPLETED") == []
+
+
+def test_list_runs_states_and_limit_combined(tmp_path):
+    path = _fresh_db(tmp_path)
+    runs = [_make_run(path) for _ in range(3)]
+    for i, run in enumerate(runs):
+        _set_created_at(path, run["id"], f"2026-01-01T00:00:{i:02d}")
+
+    limited = db.list_runs(path, states=db.EXECUTION_CENTER_ACTIVE_STATES, limit=2)
+    assert [r["id"] for r in limited] == [runs[2]["id"], runs[1]["id"]]
+
+
+# --------------------------------------------------------------------------
+# NB-1 remediation — `limit`/`states` edge semantics
+# --------------------------------------------------------------------------
+
+
+def test_list_runs_negative_limit_raises_value_error(tmp_path):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    with pytest.raises(ValueError):
+        db.list_runs(path, limit=-1)
+
+
+@pytest.mark.parametrize("negative_limit", [-1, -5, -1000])
+def test_list_runs_any_negative_limit_raises(tmp_path, negative_limit):
+    path = _fresh_db(tmp_path)
+    with pytest.raises(ValueError):
+        db.list_runs(path, limit=negative_limit)
+
+
+def test_list_runs_limit_zero_returns_empty_list(tmp_path):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    assert db.list_runs(path, limit=0) == []
+
+
+def test_list_runs_empty_states_returns_empty_list(tmp_path):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    assert db.list_runs(path, states=[]) == []
+    assert db.list_runs(path, states=()) == []
+
+
+def test_list_runs_states_none_applies_no_state_filter(tmp_path):
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    assert {r["id"] for r in db.list_runs(path, states=None)} == {run["id"]}
+
+
+def test_list_runs_state_and_empty_states_still_mutually_exclusive(tmp_path):
+    path = _fresh_db(tmp_path)
+    with pytest.raises(ValueError):
+        db.list_runs(path, state="RUNNING", states=[])
+
+
+def test_list_runs_generator_states_still_works_after_nb1_fix(tmp_path):
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    result = db.list_runs(path, states=(s for s in ["PREPARED"]))
+    assert {r["id"] for r in result} == {run["id"]}
+
+
+def test_list_runs_normal_calls_unaffected_by_nb1_fix(tmp_path):
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    assert {r["id"] for r in db.list_runs(path)} == {run["id"]}
+    assert {r["id"] for r in db.list_runs(path, limit=10)} == {run["id"]}
+    assert {r["id"] for r in db.list_runs(path, states=["PREPARED", "QUEUED"])} == {run["id"]}

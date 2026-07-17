@@ -34,7 +34,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from command_center import storage
 from command_center.models import iso_now, new_id
@@ -78,6 +78,8 @@ RUN_STATES: list[str] = [
 ]
 
 TERMINAL_STATES: frozenset[str] = frozenset({"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "UNKNOWN"})
+
+EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED", "RUNNING"})
 
 # Explicit allow-list of state transitions. Anything not listed here is refused
 # by `update_run_state` before it ever reaches SQL — in particular, no terminal
@@ -631,7 +633,32 @@ def list_runs(
     session_id: str | None = None,
     task_id: str | None = None,
     state: str | None = None,
+    states: Iterable[str] | None = None,
+    limit: int | None = None,
 ) -> list[dict]:
+    """`state` (singular) and `states` (plural) are mutually exclusive — passing
+    both raises `ValueError` before any SQL is built. `states=()`/`[]` — an
+    explicitly empty collection, as opposed to `states=None` — means "match no
+    states" and short-circuits to `[]` without touching the database; this is
+    distinct from omitting the filter entirely (`states=None`, which applies no
+    state filter at all). `limit`, if given, is applied as a SQL `LIMIT ?`,
+    bounding the result set inside SQLite rather than truncating a Python list
+    after a full-table fetch; a negative `limit` raises `ValueError` before any
+    SQL runs (SQLite's own `LIMIT -1` means "unlimited," which would silently
+    defeat the bound this parameter exists to provide) — `limit=0` remains a
+    valid request that returns `[]`. Ordering is unchanged: `ORDER BY
+    created_at DESC`, applied before `LIMIT`.
+    """
+    if state is not None and states is not None:
+        raise ValueError("Pass either `state` or `states`, not both")
+    if limit is not None and limit < 0:
+        raise ValueError(f"limit must be >= 0, got {limit!r}")
+
+    if states is not None:
+        states = list(states)
+        if not states:
+            return []
+
     clauses = []
     params: list[Any] = []
     if session_id:
@@ -643,11 +670,16 @@ def list_runs(
     if state:
         clauses.append("state = ?")
         params.append(state)
+    if states is not None:
+        clauses.append(f"state IN ({', '.join('?' for _ in states)})")
+        params.extend(states)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = f"SELECT * FROM run {where} ORDER BY created_at DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
     with connect(db_path) as conn:
-        rows = conn.execute(
-            f"SELECT * FROM run {where} ORDER BY created_at DESC", params
-        ).fetchall()
+        rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
 

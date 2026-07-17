@@ -14,12 +14,15 @@ import streamlit as st
 from command_center import (
     activity_log,
     agent_runner,
+    artifacts,
     chat_service,
+    git_info,
     models,
     project_config,
     report_parser,
     storage,
     workflow,
+    workspace_home,
 )
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
@@ -50,13 +53,7 @@ CONTEXT_FILES: dict[str, str] = {
     "LEGAL": "LEGAL_CONTEXT.md",
 }
 
-TASK_TYPES: list[str] = [
-    "implementation",
-    "review",
-    "remediation",
-    "final_gate",
-    "architecture_review",
-]
+TASK_TYPES: list[str] = artifacts.TASK_TYPES
 
 TASK_TYPE_LABELS: dict[str, str] = {
     "implementation": "Реализация",
@@ -153,6 +150,7 @@ IGNORED_FILE_NAMES = {".DS_Store", ".gitkeep"}
 
 NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
+    "workspace_home": ("Workspace Home", ":material/home:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
@@ -196,31 +194,6 @@ def format_mtime(path: Path) -> str:
 
 def format_estimate(hours: float) -> str:
     return f"{int(hours)}ч" if hours == int(hours) else f"{hours:g}ч"
-
-
-def list_markdown_files(directory: Path) -> list[Path]:
-    if not directory.exists():
-        return []
-    return sorted(
-        (path for path in directory.rglob("*.md") if path.is_file()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-
-
-def project_from_path(path: Path, base: Path) -> str:
-    try:
-        parts = path.relative_to(base).parts
-    except ValueError:
-        return "—"
-    return parts[0] if len(parts) > 1 else "—"
-
-
-def infer_task_type_from_filename(path: Path) -> str | None:
-    parts = path.stem.split("_", 1)
-    if len(parts) == 2 and parts[1] in TASK_TYPES:
-        return parts[1]
-    return None
 
 
 def gather_activity(limit: int = 20) -> list[tuple[Path, float]]:
@@ -408,122 +381,31 @@ def run_start_task_script(
 
 
 def run_git_command(args: list[str], timeout: int = 5) -> subprocess.CompletedProcess | None:
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
+    return git_info.run_git_command(ROOT, args, timeout=timeout)
 
 
 def get_git_status() -> dict[str, object]:
-    toplevel = run_git_command(["rev-parse", "--show-toplevel"])
-    if toplevel is None or toplevel.returncode != 0:
-        return {"is_repo": False}
-
-    branch = run_git_command(["branch", "--show-current"])
-    status = run_git_command(["status", "--porcelain"])
-    head_hash = run_git_command(["rev-parse", "--short", "HEAD"])
-    head_subject = run_git_command(["log", "-1", "--pretty=%s"])
-
-    status_lines = [
-        line
-        for line in (status.stdout.splitlines() if status and status.returncode == 0 else [])
-        if line
-    ]
-    untracked_count = sum(1 for line in status_lines if line.startswith("??"))
-    modified_count = len(status_lines) - untracked_count
-
-    return {
-        "is_repo": True,
-        "root": toplevel.stdout.strip(),
-        "branch": branch.stdout.strip() if branch and branch.stdout.strip() else "(detached HEAD)",
-        "dirty": bool(status_lines),
-        "modified_count": modified_count,
-        "untracked_count": untracked_count,
-        "last_commit_hash": head_hash.stdout.strip() if head_hash and head_hash.returncode == 0 else "—",
-        "last_commit_subject": head_subject.stdout.strip() if head_subject and head_subject.returncode == 0 else "—",
-        "status_lines": status_lines,
-    }
+    return git_info.get_status(ROOT)
 
 
 def get_git_log(limit: int = 20) -> list[dict[str, str]]:
-    result = run_git_command(
-        ["log", f"-{limit}", "--pretty=format:%h%x1f%an%x1f%ad%x1f%s", "--date=short"],
-        timeout=10,
-    )
-    if result is None or result.returncode != 0 or not result.stdout.strip():
-        return []
-
-    commits: list[dict[str, str]] = []
-    for line in result.stdout.splitlines():
-        parts = line.split("\x1f")
-        if len(parts) == 4:
-            commits.append({"hash": parts[0], "author": parts[1], "date": parts[2], "subject": parts[3]})
-    return commits
+    return git_info.get_log(ROOT, limit=limit)
 
 
 def get_git_diff_stat(staged: bool = False) -> str:
-    args = ["diff", "--cached", "--stat"] if staged else ["diff", "--stat"]
-    result = run_git_command(args, timeout=10)
-    if result is None or result.returncode != 0:
-        return ""
-    return result.stdout.strip()
+    return git_info.get_diff_stat(ROOT, staged=staged)
 
 
 def get_git_branches() -> list[str]:
-    result = run_git_command(["branch", "--list", "--format=%(refname:short)"])
-    if result is None or result.returncode != 0:
-        return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return git_info.get_branches(ROOT)
 
 
 def get_git_remotes() -> list[tuple[str, str]]:
-    result = run_git_command(["remote", "-v"])
-    if result is None or result.returncode != 0:
-        return []
-    seen: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            seen.setdefault(parts[0], parts[1])
-    return list(seen.items())
+    return git_info.get_remotes(ROOT)
 
 
 def get_git_worktrees() -> list[dict[str, str]]:
-    result = run_git_command(["worktree", "list", "--porcelain"], timeout=10)
-    if result is None or result.returncode != 0:
-        return []
-
-    worktrees: list[dict[str, str]] = []
-    current: dict[str, str] = {}
-
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            if current:
-                worktrees.append(current)
-                current = {}
-            continue
-        if line.startswith("worktree "):
-            current["path"] = line[len("worktree "):].strip()
-        elif line.startswith("HEAD "):
-            current["head"] = line[len("HEAD "):].strip()[:10]
-        elif line.startswith("branch "):
-            current["branch"] = line[len("branch "):].strip().removeprefix("refs/heads/")
-        elif line == "bare":
-            current["branch"] = "(bare)"
-        elif line == "detached":
-            current["branch"] = "(detached)"
-
-    if current:
-        worktrees.append(current)
-
-    return worktrees
+    return git_info.get_worktrees(ROOT)
 
 
 # --------------------------------------------------------------------------
@@ -604,7 +486,7 @@ def build_timeline_events(
         project = None
         for base in (GENERATED_DIR, REPORTS_DIR):
             if base in path.parents:
-                candidate = project_from_path(path, base)
+                candidate = artifacts.project_from_path(path, base)
                 project = candidate if candidate != "—" else None
                 break
         try:
@@ -960,7 +842,7 @@ EXECUTION_CENTER_STATE_LABELS: dict[str, str] = {
 # Non-terminal states (see `runtime_db.TERMINAL_STATES` for the terminal set) —
 # a run in one of these is still worth polling. Note the runtime only accepts
 # cancellation while a run is actually RUNNING (see EXECUTION_CENTER_CANCELLABLE_STATES).
-EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED", "RUNNING"})
+EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = runtime_db.EXECUTION_CENTER_ACTIVE_STATES
 
 # The Cancel action is only ever accepted by the runtime for a run that is
 # actually RUNNING (PREPARED/QUEUED runs have no subprocess yet for the
@@ -1269,6 +1151,7 @@ _PENDING_KEY_MAP = {
     "pending_project_browser": "project_browser_select",
     "pending_chat_conv": "chat_conv_select",
     "pending_exec_center_run": "exec_center_run_selector",
+    "pending_exec_center_project": "exec_center_launch_project",
 }
 for _pending_key, _target_key in _PENDING_KEY_MAP.items():
     if _pending_key in st.session_state:
@@ -1380,8 +1263,8 @@ if page_key == "dashboard":
 
     active_tasks = [task for task in tasks if task.get("status") != "Done"]
     completed_tasks = [task for task in tasks if task.get("status") == "Done"]
-    generated_count = len(list_markdown_files(GENERATED_DIR))
-    reports_count = len(list_markdown_files(REPORTS_DIR))
+    generated_count = len(artifacts.list_markdown_files(GENERATED_DIR))
+    reports_count = len(artifacts.list_markdown_files(REPORTS_DIR))
 
     with st.container(horizontal=True):
         st.metric("Проекты", len(PROJECTS), border=True)
@@ -1418,6 +1301,163 @@ if page_key == "dashboard":
                     rel = path.relative_to(ROOT)
                     stamp = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M")
                     st.caption(f"{stamp} — {rel}")
+
+
+# --------------------------------------------------------------------------
+# Workspace Home — cross-project rollup
+#
+# This page is a thin renderer over `workspace_home.build_workspace_home_snapshot`:
+# every field shown below is already bounded and, for BANK/LEGAL, already
+# redacted by the read model before it ever reaches this code (see
+# `command_center/workspace_home.py`'s module docstring). This renderer never
+# reconstructs sensitive data, never issues its own SQL/subprocess/filesystem
+# calls, and never starts or cancels a run directly — mutating actions only
+# ever stage a `pending_nav` target onto the form/page that already gates them.
+# --------------------------------------------------------------------------
+
+elif page_key == "workspace_home":
+    st.subheader("Workspace Home")
+    st.caption("Единый обзор всех проектов, прогонов, отчётов и активности.")
+
+    execution_center_api = get_execution_center_api()
+    home_snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=execution_center_api)
+
+    with st.container(horizontal=True):
+        st.metric("Проекты", len(home_snapshot["projects"]), border=True)
+        st.metric("Активные прогоны", len(home_snapshot["active_runs"]), border=True)
+        st.metric("Артефакты", len(home_snapshot["artifacts"]), border=True)
+        st.metric("Отчёты", len(home_snapshot["reports"]), border=True)
+
+    st.divider()
+
+    st.markdown("#### Проекты")
+    for home_project in home_snapshot["projects"]:
+        with st.container(border=True):
+            badge = " · чувствительный" if home_project["sensitive"] else ""
+            st.markdown(f"**{home_project['display_name']}**{badge}")
+            repo_state = "настроен" if home_project["repository_path_configured"] else "не настроен"
+            st.caption(f"Репозиторий: {repo_state} · Активные прогоны: {home_project['active_run_count']}")
+            action_cols = st.columns(3)
+            with action_cols[0]:
+                if st.button(
+                    "Новая задача", key=f"home_new_task_{home_project['id']}", icon=":material/add_task:"
+                ):
+                    st.session_state.pending_nav = "create"
+                    st.session_state.pending_create_project = home_project["id"]
+                    st.rerun()
+            with action_cols[1]:
+                if st.button(
+                    "Запустить прогон", key=f"home_launch_{home_project['id']}", icon=":material/bolt:"
+                ):
+                    st.session_state.pending_nav = "execution_center"
+                    st.session_state.pending_exec_center_project = home_project["id"]
+                    st.rerun()
+            with action_cols[2]:
+                if st.button(
+                    "Открыть проект", key=f"home_open_{home_project['id']}", icon=":material/folder_open:"
+                ):
+                    st.session_state.pending_nav = "projects"
+                    st.session_state.pending_project_browser = home_project["id"]
+                    st.rerun()
+
+    st.divider()
+
+    st.markdown("#### Активные Git worktree")
+    any_worktrees = False
+    for wt_project_id, wt_entry in home_snapshot["worktrees_by_project"].items():
+        if wt_entry["status"] != "ok" or not wt_entry["worktrees"]:
+            continue
+        any_worktrees = True
+        with st.container(border=True):
+            st.markdown(f"**{wt_project_id}**")
+            for worktree in wt_entry["worktrees"]:
+                st.caption(
+                    f"{worktree.get('branch', '—')} · {worktree.get('head', '—')} · `{worktree.get('path', '—')}`"
+                )
+    if not any_worktrees:
+        st.info("Нет активных worktree — настройте путь к репозиторию в разделе «Проекты».")
+
+    st.divider()
+
+    st.markdown("#### Активные прогоны")
+    if not home_snapshot["active_runs"]:
+        st.info("Активных прогонов нет.")
+    else:
+        for active_run in home_snapshot["active_runs"]:
+            with st.container(border=True):
+                state_label = active_run.get("state") or active_run.get("status") or "—"
+                st.caption(
+                    f"{active_run.get('project')} · {active_run.get('source')} · {state_label} · "
+                    f"{active_run.get('created_at', '—')}"
+                )
+                if st.button(
+                    "Открыть",
+                    key=f"home_active_open_{active_run['source']}_{active_run['run_id']}",
+                    icon=":material/open_in_new:",
+                ):
+                    if active_run["source"] == "v2":
+                        st.session_state.pending_nav = "execution_center"
+                        st.session_state.pending_exec_center_run = active_run["run_id"]
+                    else:
+                        st.session_state.pending_nav = "runs"
+                    st.rerun()
+
+    st.divider()
+
+    st.markdown("#### Последние прогоны")
+    if not home_snapshot["recent_runs"]:
+        st.info("Прогонов пока нет.")
+    else:
+        for recent_run in home_snapshot["recent_runs"]:
+            with st.container(border=True):
+                state_label = recent_run.get("state") or recent_run.get("status") or "—"
+                st.caption(
+                    f"{recent_run.get('project')} · {recent_run.get('source')} · {state_label} · "
+                    f"{recent_run.get('created_at', '—')}"
+                )
+
+    st.divider()
+
+    st.markdown("#### Последняя активность")
+    if not home_snapshot["recent_activity"]:
+        st.info("Активности пока нет.")
+    else:
+        with st.container(border=True):
+            for activity_event in home_snapshot["recent_activity"]:
+                event_label = activity_event.get("type") or activity_event.get("event_type") or "—"
+                st.caption(
+                    f"{activity_event.get('ts', '—')} — {activity_event.get('project') or '—'} — {event_label}"
+                )
+
+    st.divider()
+
+    home_artifacts_col, home_reports_col = st.columns(2)
+    with home_artifacts_col:
+        st.markdown("#### Артефакты")
+        if not home_snapshot["artifacts"]:
+            st.info("Файлы заданий не найдены.")
+        else:
+            for home_artifact in home_snapshot["artifacts"]:
+                label = home_artifact.get("filename") or (
+                    f"{home_artifact.get('task_type') or 'артефакт'} — {home_artifact.get('created_at', '—')}"
+                )
+                st.caption(f"{home_artifact.get('project')} · {label}")
+        if st.button("Все файлы заданий", key="home_view_all_generated"):
+            st.session_state.pending_nav = "generated"
+            st.rerun()
+    with home_reports_col:
+        st.markdown("#### Отчёты")
+        if not home_snapshot["reports"]:
+            st.info("Файлы отчётов не найдены.")
+        else:
+            for home_report in home_snapshot["reports"]:
+                verdict_label = models.VERDICT_LABELS.get(
+                    home_report.get("verdict"), home_report.get("verdict") or "не определён"
+                )
+                st.caption(f"{home_report.get('project')} · {home_report.get('source')} · {verdict_label}")
+        if st.button("Все отчёты", key="home_view_all_reports"):
+            st.session_state.pending_nav = "reports"
+            st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -1925,14 +1965,14 @@ elif page_key == "agents":
     st.subheader("AI-агенты")
     st.caption("Каталог типов задач, поддерживаемых scripts/start-task.sh")
 
-    generated_files = list_markdown_files(GENERATED_DIR)
+    generated_files = artifacts.list_markdown_files(GENERATED_DIR)
 
     for task_type in TASK_TYPES:
         meta = AGENT_ROLES[task_type]
         type_tasks = [task for task in tasks if task.get("task_type") == task_type]
         active_count = sum(1 for task in type_tasks if task.get("status") != "Done")
         done_count = len(type_tasks) - active_count
-        generated_count = sum(1 for path in generated_files if infer_task_type_from_filename(path) == task_type)
+        generated_count = sum(1 for path in generated_files if artifacts.infer_task_type_from_filename(path) == task_type)
 
         with st.container(border=True):
             st.markdown(f"### {meta['title']}")
@@ -1987,7 +2027,7 @@ elif page_key == "execution_center":
     )
 
     execution_center_api = get_execution_center_api()
-    recent_runs = execution_center_api.list_runs()[:20]
+    recent_runs = execution_center_api.list_runs(limit=20)
 
     with st.expander(
         "Запустить новый прогон", icon=":material/smart_toy:", expanded=not recent_runs
@@ -2224,7 +2264,7 @@ elif page_key == "projects":
         st.markdown(read_text(project_file))
 
     with tab_generated:
-        files = list_markdown_files(GENERATED_DIR / selected_project)
+        files = artifacts.list_markdown_files(GENERATED_DIR / selected_project)
         if not files:
             st.info("Для проекта пока нет сгенерированных задач.")
         else:
@@ -2239,11 +2279,11 @@ elif page_key == "projects":
                 project=selected_project,
                 default_prompt=chosen_content,
                 tasks=tasks,
-                default_task_type=infer_task_type_from_filename(chosen_path) or "implementation",
+                default_task_type=artifacts.infer_task_type_from_filename(chosen_path) or "implementation",
             )
 
     with tab_reports:
-        files = list_markdown_files(REPORTS_DIR / selected_project)
+        files = artifacts.list_markdown_files(REPORTS_DIR / selected_project)
         if not files:
             st.info("Для проекта пока нет отчётов.")
         else:
@@ -2323,11 +2363,11 @@ elif page_key == "generated":
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + list(PROJECTS.keys()), key="gen_filter")
 
-    all_files = list_markdown_files(GENERATED_DIR)
+    all_files = artifacts.list_markdown_files(GENERATED_DIR)
     filtered_files = (
         all_files
         if project_filter == "Все"
-        else [path for path in all_files if project_from_path(path, GENERATED_DIR) == project_filter]
+        else [path for path in all_files if artifacts.project_from_path(path, GENERATED_DIR) == project_filter]
     )
 
     if not filtered_files:
@@ -2336,7 +2376,7 @@ elif page_key == "generated":
         st.caption(f"Найдено файлов: {len(filtered_files)} (новые сверху)")
         for path in filtered_files:
             rel = path.relative_to(GENERATED_DIR)
-            file_project = project_from_path(path, GENERATED_DIR)
+            file_project = artifacts.project_from_path(path, GENERATED_DIR)
             with st.expander(f"{rel} · {format_mtime(path)}"):
                 content = read_text(path)
                 st.markdown(content)
@@ -2347,7 +2387,7 @@ elif page_key == "generated":
                         project=file_project,
                         default_prompt=content,
                         tasks=tasks,
-                        default_task_type=infer_task_type_from_filename(path) or "implementation",
+                        default_task_type=artifacts.infer_task_type_from_filename(path) or "implementation",
                     )
 
 
@@ -2360,11 +2400,11 @@ elif page_key == "reports":
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + list(PROJECTS.keys()), key="report_filter")
 
-    all_files = list_markdown_files(REPORTS_DIR)
+    all_files = artifacts.list_markdown_files(REPORTS_DIR)
     filtered_files = (
         all_files
         if project_filter == "Все"
-        else [path for path in all_files if project_from_path(path, REPORTS_DIR) == project_filter]
+        else [path for path in all_files if artifacts.project_from_path(path, REPORTS_DIR) == project_filter]
     )
 
     if not filtered_files:
@@ -2501,7 +2541,7 @@ elif page_key == "workspace":
         project_file = PROJECTS_DIR / PROJECTS[project]
         context_name = CONTEXT_FILES.get(project)
         project_active = sum(1 for task in tasks if task.get("project") == project and task.get("status") != "Done")
-        project_generated = list_markdown_files(GENERATED_DIR / project)
+        project_generated = artifacts.list_markdown_files(GENERATED_DIR / project)
         last_activity = format_mtime(project_generated[0]) if project_generated else "—"
 
         with st.container(border=True):

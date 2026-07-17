@@ -24,6 +24,7 @@ need to exercise process-lifecycle mechanics directly.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable
 
 from command_center.runtime import context_service, db, supervisor
 
@@ -108,9 +109,22 @@ class ExecutionCenterAPI:
         return db.list_sessions(self.db_path, task_id=task_id)
 
     def list_runs(
-        self, *, session_id: str | None = None, task_id: str | None = None, state: str | None = None
+        self,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+        state: str | None = None,
+        states: Iterable[str] | None = None,
+        limit: int | None = None,
     ) -> list[dict]:
-        return db.list_runs(self.db_path, session_id=session_id, task_id=task_id, state=state)
+        return db.list_runs(
+            self.db_path,
+            session_id=session_id,
+            task_id=task_id,
+            state=state,
+            states=states,
+            limit=limit,
+        )
 
     def get_run(self, run_id: str) -> dict | None:
         return db.get_run(self.db_path, run_id)
