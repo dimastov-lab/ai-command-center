@@ -31,6 +31,8 @@ from pathlib import Path
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
 
+import app
+
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
 
@@ -109,6 +111,18 @@ def test_execution_center_page_renders_and_nav_entry_exists():
 # --------------------------------------------------------------------------
 
 
+def _assert_execution_center_page_rendered(at: AppTest) -> None:
+    """Asserts the page actually rendered its expected elements, not just
+    that no exception was raised (an empty/blank page also raises none).
+    `st.expander(..., icon=...)` (as used for the launch form) is modeled by
+    `AppTest` as a `Status` node rather than an `Expander` node -- see
+    `streamlit/testing/v1/element_tree.py`'s `bty == "expandable"` handling,
+    which switches on whether an icon was passed."""
+    assert not at.exception
+    assert at.subheader[0].value == "Live Execution Center"
+    assert any("Запустить новый прогон" in status.label for status in at.status)
+
+
 def test_api_singleton_not_recreated_across_reruns(monkeypatch):
     construct_calls = []
     original_init = runtime_api.ExecutionCenterAPI.__init__
@@ -120,10 +134,17 @@ def test_api_singleton_not_recreated_across_reruns(monkeypatch):
     monkeypatch.setattr(runtime_api.ExecutionCenterAPI, "__init__", counting_init)
 
     at = _at_on_page("execution_center")
-    at = at.run()
-    at = at.run()
-
+    _assert_execution_center_page_rendered(at)
     assert len(construct_calls) == 1
+
+    # Verify the singleton survives *every* rerun, not just the first one —
+    # each iteration re-checks the full triad: no exception, the page (and
+    # its expected elements) actually rendered, and the cached
+    # `ExecutionCenterAPI` was reused rather than reconstructed.
+    for _ in range(3):
+        at = at.run()
+        _assert_execution_center_page_rendered(at)
+        assert len(construct_calls) == 1, "ExecutionCenterAPI must not be reconstructed across reruns"
 
 
 # --------------------------------------------------------------------------
@@ -315,6 +336,57 @@ def test_cancel_requires_confirmation_before_calling_api(monkeypatch, git_repo, 
 
 
 # --------------------------------------------------------------------------
+# 9b. Cancel action is only offered while the run is actually RUNNING —
+# PREPARED/QUEUED runs cannot be cancelled by the runtime (see Supervisor),
+# so the UI must not show an enabled Cancel control for them either.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "QUEUED"])
+def test_cancel_action_hidden_for_non_running_states(state):
+    api = runtime_api.ExecutionCenterAPI()
+    task = runtime_db.create_task(api.db_path, project="AIOS", title="t", task_type="review")
+    session = runtime_db.create_session(
+        api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    run = runtime_db.create_run(
+        api.db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        task_type="review",
+        repository_path="/tmp/x",
+        prompt="p",
+        is_resume=False,
+    )
+    if state == "QUEUED":
+        run = runtime_db.update_run_state(
+            api.db_path, run["id"], expected_version=run["version"], new_state="QUEUED"
+        )
+
+    at = _at_on_page("execution_center", exec_center_run_selector=run["id"])
+    assert not at.exception
+    assert not any(cb.key == f"exec_center_cancel_confirm_{run['id']}" for cb in at.checkbox)
+    assert not any(b.key == f"exec_center_cancel_btn_{run['id']}" for b in at.button)
+
+
+def test_cancel_action_visible_while_running(git_repo, configure_project_repo, fake_claude):
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    configure_project_repo("AIOS", git_repo)
+
+    at = _at_on_page("execution_center")
+    at = _launch_via_ui(at)
+    run_id = _current_run_id(at)
+
+    assert any(cb.key == f"exec_center_cancel_confirm_{run_id}" for cb in at.checkbox)
+    assert any(b.key == f"exec_center_cancel_btn_{run_id}" for b in at.button)
+
+    at.checkbox(key=f"exec_center_cancel_confirm_{run_id}").check().run()
+    at.button(key=f"exec_center_cancel_btn_{run_id}").click().run()
+    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+
+
+# --------------------------------------------------------------------------
 # 11. UI eventually displays CANCELLED after runtime persistence changes
 # --------------------------------------------------------------------------
 
@@ -329,7 +401,10 @@ def test_cancelled_state_eventually_displayed(git_repo, configure_project_repo, 
 
     at.checkbox(key=f"exec_center_cancel_confirm_{run_id}").check().run()
     at = at.button(key=f"exec_center_cancel_btn_{run_id}").click().run()
-    assert any("отправлен" in s.value for s in at.success)
+    metrics = {m.label: m.value for m in at.metric}
+    assert any("отправлен" in s.value for s in at.success) or metrics.get("Статус") == "Отменено", (
+        "expected either the immediate cancel-request confirmation or an already-cancelled state"
+    )
 
     state = None
     deadline = time.monotonic() + 10
@@ -411,3 +486,115 @@ def test_existing_pages_still_render_without_exception():
     for page_key in ("dashboard", "agents", "runs", "executive"):
         at = _at_on_page(page_key)
         assert not at.exception, f"page {page_key!r} raised: {at.exception}"
+
+
+# --------------------------------------------------------------------------
+# 15. F1 remediation — the polling fragment must stop itself on a terminal
+# transition instead of relying on some *other* full rerun to happen to come
+# along.
+#
+# Honesty about coverage: `AppTest.run()` (see `_at_on_page` above) always
+# performs a full script rerun. It has no way to reproduce the one thing that
+# actually caused the original bug: the browser's timer-driven, *fragment-only*
+# rerun that `st.fragment(run_every=...)` schedules client-side (a JS
+# `setInterval` that Streamlit only clears on a full rerun — see
+# `streamlit/runtime/fragment.py` and the compiled frontend's
+# `handleAutoRerun`/`cleanupAutoReruns`). None of the tests below claim to
+# simulate that browser timer. Instead they call `app._execution_center_watch_action`
+# and `app._execution_center_watch_poll_once` — the extracted, undecorated
+# server-side logic the polling fragment now runs on every tick — directly,
+# against a stub API and a monkeypatched `st.rerun`/render body. That is the
+# strongest testable proof available that, the moment a tick observes a
+# terminal or missing run, it asks for exactly one full-app rerun and renders
+# nothing itself, which is what stops the browser's timer for good (a real
+# browser/integration check of the timer itself is out of reach for
+# `AppTest` and is not attempted here).
+# --------------------------------------------------------------------------
+
+
+class _StubExecutionCenterApi:
+    """Duck-typed stand-in for `ExecutionCenterAPI` exposing only `get_run`,
+    which is all `_execution_center_watch_poll_once` touches."""
+
+    def __init__(self, run: dict | None):
+        self._run = run
+
+    def get_run(self, run_id: str) -> dict | None:
+        return self._run
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "QUEUED", "RUNNING"])
+def test_watch_action_polls_while_active(state):
+    assert (
+        app._execution_center_watch_action({"id": "r1", "state": state})
+        == app._EXECUTION_CENTER_WATCH_POLL_AND_RENDER
+    )
+
+
+@pytest.mark.parametrize("state", sorted(runtime_db.TERMINAL_STATES))
+def test_watch_action_requests_full_rerun_on_terminal_state(state):
+    assert (
+        app._execution_center_watch_action({"id": "r1", "state": state})
+        == app._EXECUTION_CENTER_WATCH_FULL_RERUN
+    )
+
+
+def test_watch_action_reports_missing_when_run_deleted():
+    assert app._execution_center_watch_action(None) == app._EXECUTION_CENTER_WATCH_RENDER_MISSING
+
+
+def test_poll_once_reruns_full_app_without_rendering_on_terminal_transition(monkeypatch):
+    """The exact bug this whole increment exists to fix: a polling tick that
+    freshly observes a terminal state must not render the terminal panel
+    itself (that would just keep the `run_every` fragment — and the
+    browser's setInterval driving it — registered) and must request exactly
+    one full-app rerun instead."""
+    rerun_calls = []
+    render_calls = []
+    monkeypatch.setattr(app.st, "rerun", lambda *a, **k: rerun_calls.append((a, k)))
+    monkeypatch.setattr(
+        app, "_render_execution_center_watch_body", lambda *a, **k: render_calls.append((a, k))
+    )
+
+    api = _StubExecutionCenterApi({"id": "r1", "state": "COMPLETED"})
+    app._execution_center_watch_poll_once(api, "r1")
+
+    assert len(rerun_calls) == 1, "a terminal tick must request exactly one full-app rerun"
+    assert render_calls == [], "a terminal tick must not render through the polling path"
+
+
+def test_poll_once_reruns_full_app_without_rendering_when_run_missing(monkeypatch):
+    """A run deleted mid-poll must be treated the same way as a terminal
+    transition — otherwise a vanished run would poll forever too."""
+    rerun_calls = []
+    render_calls = []
+    monkeypatch.setattr(app.st, "rerun", lambda *a, **k: rerun_calls.append((a, k)))
+    monkeypatch.setattr(
+        app, "_render_execution_center_watch_body", lambda *a, **k: render_calls.append((a, k))
+    )
+
+    api = _StubExecutionCenterApi(None)
+    app._execution_center_watch_poll_once(api, "r1")
+
+    assert len(rerun_calls) == 1
+    assert render_calls == []
+
+
+@pytest.mark.parametrize("state", ["PREPARED", "QUEUED", "RUNNING"])
+def test_poll_once_keeps_rendering_without_rerun_while_active(monkeypatch, state):
+    """The other half of the fix: an active run must keep being rendered
+    in place, with no rerun requested — only a terminal/missing transition
+    should ever trigger one, or polling would never settle."""
+    rerun_calls = []
+    render_calls = []
+    monkeypatch.setattr(app.st, "rerun", lambda *a, **k: rerun_calls.append((a, k)))
+    monkeypatch.setattr(
+        app, "_render_execution_center_watch_body", lambda *a, **k: render_calls.append((a, k))
+    )
+
+    run = {"id": "r1", "state": state}
+    api = _StubExecutionCenterApi(run)
+    app._execution_center_watch_poll_once(api, "r1")
+
+    assert rerun_calls == [], "an active run must not request a rerun"
+    assert render_calls == [((api, "r1", run), {})]
