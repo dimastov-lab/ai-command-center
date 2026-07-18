@@ -26,12 +26,62 @@ from pathlib import Path
 
 from command_center import git_info, models, os_actions
 
+# `resolve_workspace_path`'s precedence tiers, in order. Surfaced in the Launch
+# confirmation UI (`app.py`'s `render_agent_launcher`) and persisted on each
+# `launch_history` entry so it's clear, after the fact, which tier actually
+# produced the path a run executed against.
+WORKSPACE_SOURCE_TASK = "task"
+WORKSPACE_SOURCE_PROJECT_DEFAULT = "project_default"
+WORKSPACE_SOURCE_REPOSITORY_FALLBACK = "repository_fallback"
+
+WORKSPACE_SOURCE_LABELS: dict[str, str] = {
+    WORKSPACE_SOURCE_TASK: "Задача (workspace_path)",
+    WORKSPACE_SOURCE_PROJECT_DEFAULT: "Проект (default_workspace_path)",
+    WORKSPACE_SOURCE_REPOSITORY_FALLBACK: "Проект (repository_path, fallback)",
+}
+
+
+@dataclass(frozen=True)
+class WorkspaceSelection:
+    path: str | None
+    source: str  # one of WORKSPACE_SOURCE_*
+
+
+def resolve_workspace_path(*, task: dict | None, project_config: dict | None) -> WorkspaceSelection:
+    """Selects the single workspace path used consistently for every later
+    launch step (validation, git reads, Terminal/Folder actions, the Claude
+    launch itself, and persisted launch history) — never recomputed
+    differently at different steps.
+
+    Precedence, matching the Launch flow's documented resolution order:
+    1. `task["workspace_path"]`, if explicitly set — even if it turns out to
+       be invalid. A present-but-broken task workspace must block with a
+       clear error (see `validate_launch`), never silently fall through to
+       a lower tier: an engineer who pointed a task at the wrong path needs
+       to see that, not have it masked by a fallback that happens to work.
+    2. `project_config["default_workspace_path"]`, if configured.
+    3. `project_config["repository_path"]` — the fallback every pre-existing
+       task without a `workspace_path` already relied on, so legacy tasks
+       keep launching unchanged with no data migration required.
+    """
+    task_workspace = (task or {}).get("workspace_path")
+    if task_workspace:
+        return WorkspaceSelection(path=task_workspace, source=WORKSPACE_SOURCE_TASK)
+
+    project_default = (project_config or {}).get("default_workspace_path")
+    if project_default:
+        return WorkspaceSelection(path=project_default, source=WORKSPACE_SOURCE_PROJECT_DEFAULT)
+
+    repository_path = (project_config or {}).get("repository_path")
+    return WorkspaceSelection(path=repository_path, source=WORKSPACE_SOURCE_REPOSITORY_FALLBACK)
+
 
 @dataclass
 class LaunchValidation:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     git_status: dict[str, object] | None = None
+    workspace_path: str | None = None
 
     @property
     def can_launch(self) -> bool:
@@ -44,7 +94,7 @@ class LaunchValidation:
 
 def validate_launch(*, workspace_path: str | None, expected_branch: str | None = None) -> LaunchValidation:
     """Read-only pre-flight check. Never mutates the repository or filesystem."""
-    result = LaunchValidation()
+    result = LaunchValidation(workspace_path=workspace_path)
 
     if not workspace_path:
         result.errors.append("Workspace-путь не настроен для этой задачи.")
@@ -96,11 +146,18 @@ def begin_launch(task: dict, *, executor_id: str, validation: LaunchValidation) 
     A validation warning (dirty tree, detached HEAD, branch mismatch) — the
     caller must have already obtained explicit user confirmation before
     calling this — still lands as "Requires Attention" so it is visible in
-    `launch_history` even once acknowledged."""
+    `launch_history` even once acknowledged. The recorded `workspace_path`
+    is exactly the path `validation` was computed against — the same
+    resolved path the caller is about to launch, never re-derived here."""
     branch = (validation.git_status or {}).get("branch") if validation.git_status else None
     status = "Requires Attention" if validation.warnings else "Launching"
     models.append_launch_attempt(
-        task, executor=executor_id, branch=branch, status=status, warnings=list(validation.warnings)
+        task,
+        executor=executor_id,
+        branch=branch,
+        status=status,
+        warnings=list(validation.warnings),
+        workspace_path=validation.workspace_path,
     )
     if not task.get("started_at"):
         task["started_at"] = models.iso_now()
@@ -109,10 +166,14 @@ def begin_launch(task: dict, *, executor_id: str, validation: LaunchValidation) 
     return status
 
 
-def complete_launch(task: dict, *, executor_id: str, succeeded: bool) -> str:
+def complete_launch(
+    task: dict, *, executor_id: str, succeeded: bool, workspace_path: str | None = None
+) -> str:
     branch = task.get("branch")
     status = "Completed" if succeeded else "Failed"
-    models.append_launch_attempt(task, executor=executor_id, branch=branch, status=status)
+    models.append_launch_attempt(
+        task, executor=executor_id, branch=branch, status=status, workspace_path=workspace_path
+    )
     task["finished_at"] = models.iso_now()
     event_type = "completed" if succeeded else "launch_requires_attention"
     models.append_timeline_event(task, event_type, f"Запуск завершён со статусом {status}.")

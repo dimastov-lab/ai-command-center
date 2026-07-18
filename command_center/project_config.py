@@ -65,6 +65,11 @@ def default_project_config(project_id: str) -> dict:
         "id": project_id,
         "display_name": DISPLAY_NAMES.get(project_id, project_id),
         "repository_path": None,
+        # Optional per-project override consulted by `command_center.launch.
+        # resolve_workspace_path` between a task's own `workspace_path` and the
+        # `repository_path` fallback below. `None` unless explicitly set in
+        # `project_config.json` — no existing project config needs to define it.
+        "default_workspace_path": None,
         "allowed_agents": list(DEFAULT_ALLOWED_AGENTS),
         "sensitive": project_id in models.SENSITIVE_PROJECT_IDS,
         "context_file_paths": context_paths,
@@ -102,8 +107,11 @@ def load_project_configs() -> dict[str, dict]:
     for project_id in models.PROJECT_IDS:
         cfg = default_project_config(project_id)
         override = overrides.get(project_id)
-        if isinstance(override, dict) and override.get("repository_path"):
-            cfg["repository_path"] = override["repository_path"]
+        if isinstance(override, dict):
+            if override.get("repository_path"):
+                cfg["repository_path"] = override["repository_path"]
+            if override.get("default_workspace_path"):
+                cfg["default_workspace_path"] = override["default_workspace_path"]
         configs[project_id] = cfg
     return configs
 

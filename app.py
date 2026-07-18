@@ -543,7 +543,14 @@ def render_agent_launcher(
     default_task_type: str = "implementation",
 ) -> None:
     """Confirm-then-execute Claude Code launcher, reused from every required entry
-    point (task detail card, Project Chat, AI Agents, generated-task preview)."""
+    point (task detail card, Project Chat, AI Agents, generated-task preview).
+
+    The workspace to validate and launch against is resolved exactly once, via
+    `launch.resolve_workspace_path` (task workspace_path → project
+    default_workspace_path → project repository_path), and that same path is
+    then reused for every later step — validation, git reads, the Terminal/
+    Folder actions, the actual Claude launch, and persisted launch history —
+    instead of being recomputed (and risking drifting) at each step."""
     cfg = project_config.get_project_config(project)
     repo_path = cfg.get("repository_path")
     confirm_key = f"{key_prefix}_confirm_open"
@@ -558,10 +565,15 @@ def render_agent_launcher(
     with st.container(border=True):
         st.markdown("#### Подтверждение запуска агента")
 
-        if not repo_path:
+        task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
+        selection = launch.resolve_workspace_path(task=task_for_launch, project_config=cfg)
+
+        if not selection.path:
             st.error(
-                f"Путь к репозиторию не настроен для проекта {project}. "
-                "Настройте его в разделе «Проекты» → вкладка «Настройки репозитория»."
+                f"Не удалось определить workspace для запуска: не заданы ни workspace задачи, "
+                f"ни workspace проекта по умолчанию, ни путь к репозиторию для проекта {project} — "
+                "ничего не настроено. Настройте путь к репозиторию в разделе «Проекты» → "
+                "«Настройки репозитория» или укажите workspace_path у задачи."
             )
             if st.button("Закрыть", key=f"{key_prefix}_cancel_noconfig"):
                 st.session_state[confirm_key] = False
@@ -605,20 +617,19 @@ def render_agent_launcher(
         if extra_context.strip():
             full_prompt = f"{prompt}\n\n## Дополнительный контекст (предоставлен пользователем)\n\n{extra_context.strip()}"
 
-        task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
-        workspace_path = (task_for_launch or {}).get("workspace_path") or repo_path
         expected_branch = (task_for_launch or {}).get("branch")
-        validation = launch.validate_launch(workspace_path=workspace_path, expected_branch=expected_branch)
+        validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
+        actual_branch = (validation.git_status or {}).get("branch") if validation.git_status else None
 
-        pre_preview = agent_runner.git_snapshot(Path(repo_path))
         st.markdown("**Проверьте перед запуском:**")
         st.write(f"- Проект: `{project}`")
-        st.write(f"- Репозиторий: `{repo_path}`")
-        st.write(f"- Текущая ветка: `{pre_preview.get('branch') or '—'}`")
+        st.write(f"- Репозиторий проекта: `{repo_path or '—'}`")
+        st.write(f"- Выбранный workspace: `{selection.path}`")
+        st.write(f"- Источник workspace: {launch.WORKSPACE_SOURCE_LABELS.get(selection.source, selection.source)}")
+        st.write(f"- Ожидаемая ветка: `{expected_branch or '—'}`")
+        st.write(f"- Текущая ветка: `{actual_branch or '—'}`")
         st.write("- Агент: `claude_code` (Claude Code CLI)")
         st.write(f"- Тип задачи: `{task_type}`")
-        if pre_preview.get("is_git_repo") is False:
-            st.warning("Каталог не является git-репозиторием — снимок git будет недоступен.")
 
         for error in validation.errors:
             st.error(error)
@@ -629,11 +640,11 @@ def render_agent_launcher(
         workspace_action_cols = st.columns(3)
         with workspace_action_cols[0]:
             if st.button("Открыть Workspace", key=f"{key_prefix}_open_folder"):
-                action_ok, action_message = launch.open_folder_at(workspace_path)
+                action_ok, action_message = launch.open_folder_at(selection.path)
                 (st.success if action_ok else st.error)(action_message)
         with workspace_action_cols[1]:
             if st.button("Открыть терминал", key=f"{key_prefix}_open_terminal"):
-                action_ok, action_message = launch.open_terminal_at(workspace_path)
+                action_ok, action_message = launch.open_terminal_at(selection.path)
                 (st.success if action_ok else st.error)(action_message)
         with workspace_action_cols[2]:
             if st.button("Копировать промпт", key=f"{key_prefix}_copy_prompt"):
@@ -677,11 +688,12 @@ def render_agent_launcher(
             st.error("Подтвердите предупреждения выше перед запуском.")
             return
 
-        try:
-            resolved_repo = agent_runner.validate_repository(project, repo_path)
-        except agent_runner.RunnerError as exc:
-            st.error(str(exc))
-            return
+        # `selection.path` was already validated above (existence, is_dir,
+        # is a git repo) — resolved the same way `agent_runner.
+        # validate_repository` used to (`expanduser().resolve()`), so
+        # symlink/`..` tricks can't escape it, but against the *selected*
+        # workspace rather than always forcing the project's repository_path.
+        resolved_workspace = Path(selection.path).expanduser().resolve()
 
         with st.spinner("Выполняется Claude Code — это может занять несколько минут..."):
             outcome = launch_service.execute_agent_launch(
@@ -689,7 +701,7 @@ def render_agent_launcher(
                 task_type=task_type,
                 prompt=full_prompt,
                 timeout_seconds=int(timeout_seconds),
-                repository_path=resolved_repo,
+                repository_path=resolved_workspace,
                 task=task_for_launch,
                 executor_id="claude_code",
                 validation=validation,

@@ -9,8 +9,16 @@ Security model:
   by a shell, so prompt content cannot inject shell commands.
 - `validate_repository` refuses to run unless `repository_path` is *exactly* the path
   configured for that project in `command_center.project_config` (resolved, so
-  symlink/`..` tricks can't escape it). A task can never be launched against a
-  repository path that isn't in the project configuration.
+  symlink/`..` tricks can't escape it). Used directly by `chat_service` and
+  `runtime.supervisor`, which have no per-task workspace concept — a run
+  launched through either can never target a path outside project config.
+  The task-launcher flow (`app.py`'s `render_agent_launcher`) instead resolves
+  its path via `command_center.launch.resolve_workspace_path` — task
+  `workspace_path` / project `default_workspace_path` / project
+  `repository_path`, in that order — and validates *that* resolved path
+  (same `expanduser().resolve()` symlink/`..` guard) rather than calling
+  `validate_repository`; a task can still never be launched against a path
+  that didn't come from that trusted precedence chain.
 - This module itself never calls `git commit`/`push`/`merge`/`reset`/`rebase`/`clean` —
   the only git subprocess calls here are the read-only pre/post-run snapshot
   (`rev-parse`, `branch --show-current`, `status --porcelain`).

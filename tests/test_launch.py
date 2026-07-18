@@ -65,6 +65,109 @@ def test_validate_launch_clean_repo_no_warnings(tmp_path):
     assert not result.needs_confirmation
 
 
+# --------------------------------------------------------------------------
+# resolve_workspace_path — task.workspace_path / project.default_workspace_path
+# / project.repository_path precedence
+# --------------------------------------------------------------------------
+
+
+def test_resolve_workspace_path_prefers_task_workspace_over_project_repository():
+    task = {"workspace_path": "/task/workspace"}
+    project_config = {"repository_path": "/project/repo", "default_workspace_path": "/project/default"}
+    selection = launch.resolve_workspace_path(task=task, project_config=project_config)
+    assert selection.path == "/task/workspace"
+    assert selection.source == launch.WORKSPACE_SOURCE_TASK
+
+
+def test_resolve_workspace_path_missing_task_workspace_falls_back_to_project_default():
+    task = {"workspace_path": None}
+    project_config = {"repository_path": "/project/repo", "default_workspace_path": "/project/default"}
+    selection = launch.resolve_workspace_path(task=task, project_config=project_config)
+    assert selection.path == "/project/default"
+    assert selection.source == launch.WORKSPACE_SOURCE_PROJECT_DEFAULT
+
+
+def test_resolve_workspace_path_missing_task_and_project_default_falls_back_to_repository_path():
+    """Backward compatibility: a legacy task with no `workspace_path` and a
+    project with no `default_workspace_path` override must resolve to
+    exactly the project's `repository_path` — the same value every
+    pre-existing task already launched against — with no data migration."""
+    task = {}
+    selection = launch.resolve_workspace_path(task=task, project_config={"repository_path": "/legacy/repo"})
+    assert selection.path == "/legacy/repo"
+    assert selection.source == launch.WORKSPACE_SOURCE_REPOSITORY_FALLBACK
+
+    # No task at all (e.g. a project-only launch with no associated task)
+    # resolves the same way.
+    selection = launch.resolve_workspace_path(task=None, project_config={"repository_path": "/legacy/repo"})
+    assert selection.path == "/legacy/repo"
+    assert selection.source == launch.WORKSPACE_SOURCE_REPOSITORY_FALLBACK
+
+
+def test_resolve_workspace_path_keeps_invalid_task_workspace_and_does_not_fall_back(tmp_path):
+    """An explicit-but-broken task.workspace_path must win the precedence
+    order (and therefore block via `validate_launch`) rather than being
+    silently swapped out for a lower-precedence path that happens to work."""
+    invalid = tmp_path / "does-not-exist"
+    task = {"workspace_path": str(invalid)}
+    project_config = {"repository_path": str(tmp_path)}  # a valid, existing directory
+    selection = launch.resolve_workspace_path(task=task, project_config=project_config)
+    assert selection.path == str(invalid)
+    assert selection.source == launch.WORKSPACE_SOURCE_TASK
+
+    validation = launch.validate_launch(workspace_path=selection.path)
+    assert not validation.can_launch
+    assert any("не найден" in error for error in validation.errors)
+
+
+def test_resolve_workspace_path_valid_worktree_on_expected_branch_passes_validation(tmp_path):
+    repo = tmp_path / "aios-p1-deployment"
+    repo.mkdir()
+    _init_repo(repo)
+    subprocess.run(["git", "checkout", "-q", "-b", "feature/p1-7-deployment"], cwd=repo, check=True)
+
+    task = {"workspace_path": str(repo), "branch": "feature/p1-7-deployment"}
+    # The project's own repository_path deliberately points elsewhere — the
+    # task's own worktree must still be what gets selected and validated.
+    selection = launch.resolve_workspace_path(
+        task=task, project_config={"repository_path": str(tmp_path / "aios")}
+    )
+    assert selection.path == str(repo)
+    assert selection.source == launch.WORKSPACE_SOURCE_TASK
+
+    validation = launch.validate_launch(workspace_path=selection.path, expected_branch=task["branch"])
+    assert validation.can_launch
+    assert not validation.needs_confirmation
+    assert validation.git_status["branch"] == "feature/p1-7-deployment"
+
+
+# --------------------------------------------------------------------------
+# Persisted launch metadata records the actual resolved workspace path
+# --------------------------------------------------------------------------
+
+
+def test_begin_launch_records_the_resolved_workspace_path_and_branch():
+    task = {}
+    models.normalize_task_execution(task)
+    validation = launch.LaunchValidation(
+        git_status={"branch": "feature/p1-7-deployment"}, workspace_path="/resolved/workspace"
+    )
+    launch.begin_launch(task, executor_id="claude_code", validation=validation)
+    assert task["launch_history"][-1]["workspace_path"] == "/resolved/workspace"
+    assert task["launch_history"][-1]["branch"] == "feature/p1-7-deployment"
+
+
+def test_complete_launch_records_the_actual_workspace_path():
+    task = {}
+    models.normalize_task_execution(task)
+    task["branch"] = "feature/p1-7-deployment"
+    launch.complete_launch(
+        task, executor_id="claude_code", succeeded=True, workspace_path="/resolved/workspace"
+    )
+    assert task["launch_history"][-1]["workspace_path"] == "/resolved/workspace"
+    assert task["launch_history"][-1]["branch"] == "feature/p1-7-deployment"
+
+
 def test_open_terminal_at_missing_path_fails_cleanly(tmp_path):
     ok, message = launch.open_terminal_at(tmp_path / "nope")
     assert ok is False

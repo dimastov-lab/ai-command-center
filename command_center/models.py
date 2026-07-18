@@ -301,24 +301,43 @@ def append_timeline_event(task: dict, event_type: str, message: str = "") -> dic
 
 
 def new_launch_attempt(
-    *, executor: str | None, branch: str | None, status: str, warnings: list[str] | None = None
+    *,
+    executor: str | None,
+    branch: str | None,
+    status: str,
+    warnings: list[str] | None = None,
+    workspace_path: str | None = None,
 ) -> dict:
     return {
         "id": new_id(),
         "ts": iso_now(),
         "executor": executor,
         "branch": branch,
+        # The actual resolved launch path (task workspace_path / project
+        # default_workspace_path / repository_path fallback) this attempt
+        # ran against — see `command_center.launch.resolve_workspace_path`.
+        # `None` for entries recorded before this field existed; no
+        # backfill needed, callers just treat a missing key as unknown.
+        "workspace_path": workspace_path,
         "status": status,
         "warnings": warnings or [],
     }
 
 
 def append_launch_attempt(
-    task: dict, *, executor: str | None, branch: str | None, status: str, warnings: list[str] | None = None
+    task: dict,
+    *,
+    executor: str | None,
+    branch: str | None,
+    status: str,
+    warnings: list[str] | None = None,
+    workspace_path: str | None = None,
 ) -> dict:
     task.setdefault("launch_history", [])
     task["launch_history"].append(
-        new_launch_attempt(executor=executor, branch=branch, status=status, warnings=warnings)
+        new_launch_attempt(
+            executor=executor, branch=branch, status=status, warnings=warnings, workspace_path=workspace_path
+        )
     )
     task["launch_status"] = status
     return task

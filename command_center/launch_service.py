@@ -175,5 +175,10 @@ def _apply_run_outcome_to_task(
     else:
         task["workflow_stage"] = "Ready"
 
-    launch.complete_launch(task, executor_id=executor_id, succeeded=result_status == "completed")
+    launch.complete_launch(
+        task,
+        executor_id=executor_id,
+        succeeded=result_status == "completed",
+        workspace_path=run["repository_path"],
+    )
     task["updated_at"] = models.iso_now()

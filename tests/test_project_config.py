@@ -84,3 +84,19 @@ def test_saved_path_does_not_leak_into_other_projects(tmp_path):
     configs = project_config.load_project_configs()
     assert configs["BANK"]["repository_path"] is None
     assert configs["LEGAL"]["repository_path"] is None
+
+
+def test_default_config_has_no_default_workspace_path_for_any_project():
+    for project_id in models.PROJECT_IDS:
+        cfg = project_config.default_project_config(project_id)
+        assert cfg["default_workspace_path"] is None
+
+
+def test_default_workspace_path_override_is_loaded_from_config_file(tmp_path):
+    project_config.storage.atomic_write_json(
+        project_config.CONFIG_FILE,
+        {"AIOS": {"repository_path": str(tmp_path / "repo"), "default_workspace_path": str(tmp_path / "default")}},
+    )
+    cfg = project_config.get_project_config("AIOS")
+    assert cfg["default_workspace_path"] == str(tmp_path / "default")
+    assert cfg["repository_path"] == str(tmp_path / "repo")

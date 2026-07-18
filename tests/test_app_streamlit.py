@@ -241,6 +241,140 @@ def test_full_launch_flow_records_run_and_parses_verdict(monkeypatch, tmp_path):
     assert runs[0]["repository_path"] == str(repo.resolve())
 
 
+def _init_repo(path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=path, check=True)
+    (path / "f.txt").write_text("hello")
+    subprocess.run(["git", "add", "f.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+
+def test_launcher_launches_claude_against_task_workspace_not_project_repository(monkeypatch, tmp_path):
+    """Regression test for the Launch path-resolution bug: a task's own
+    `workspace_path` (a separate worktree on its own feature branch) must be
+    what Claude Code actually runs against, and what gets persisted in the
+    run record and the task's `launch_history` — never silently replaced by
+    the project's configured `repository_path`, even though both are valid,
+    clean git repositories."""
+    project_repo = tmp_path / "aios"
+    project_repo.mkdir()
+    _init_repo(project_repo)
+
+    task_workspace = tmp_path / "aios-p1-deployment"
+    task_workspace.mkdir()
+    _init_repo(task_workspace)
+    subprocess.run(["git", "checkout", "-q", "-b", "feature/p1-7-deployment"], cwd=task_workspace, check=True)
+
+    project_config.save_repository_path("AIOS", str(project_repo))
+    real_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command and command[0] == "claude":
+            payload = json.dumps([{"type": "result", "result": "Verdict: APPROVED FOR COMMIT"}])
+            return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+
+    _seed_task(workspace_path=str(task_workspace), branch="feature/p1-7-deployment")
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+    # The confirmation panel must show the selected workspace and its
+    # source, not just the project repository.
+    body_text = " ".join(w.value for w in at.markdown)
+    assert str(task_workspace) in body_text
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_launch_launch_btn").click().run()
+    assert not at.exception
+
+    runs = agent_runner.load_runs()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["repository_path"] == str(task_workspace.resolve())
+    assert runs[0]["repository_path"] != str(project_repo.resolve())
+
+    tasks_on_disk = json.loads((Path(os.environ["AICC_DATA_DIR"]) / "tasks.json").read_text())
+    saved_task = next(t for t in tasks_on_disk if t["id"] == "seeded-task-1")
+    assert saved_task["launch_history"][-1]["workspace_path"] == str(task_workspace.resolve())
+    assert saved_task["launch_history"][-1]["branch"] == "feature/p1-7-deployment"
+
+
+def test_launcher_workspace_action_buttons_use_task_workspace_not_project_repository(monkeypatch, tmp_path):
+    """Terminal/Folder actions in the confirmation panel must act on the
+    same selected workspace as the launch itself, not the project repo."""
+    project_repo = tmp_path / "aios"
+    project_repo.mkdir()
+    _init_repo(project_repo)
+
+    task_workspace = tmp_path / "aios-p1-deployment"
+    task_workspace.mkdir()
+    _init_repo(task_workspace)
+
+    project_config.save_repository_path("AIOS", str(project_repo))
+
+    from command_center import launch as launch_module
+
+    captured: dict[str, str] = {}
+
+    def fake_open_folder_at(path):
+        captured["folder_path"] = str(path)
+        return True, "ok"
+
+    def fake_open_terminal_at(path):
+        captured["terminal_path"] = str(path)
+        return True, "ok"
+
+    monkeypatch.setattr(launch_module, "open_folder_at", fake_open_folder_at)
+    monkeypatch.setattr(launch_module, "open_terminal_at", fake_open_terminal_at)
+
+    _seed_task(workspace_path=str(task_workspace))
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_folder").click().run()
+    assert not at.exception
+    assert captured["folder_path"] == str(task_workspace)
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_terminal").click().run()
+    assert not at.exception
+    assert captured["terminal_path"] == str(task_workspace)
+
+
+def test_launcher_missing_task_workspace_falls_back_to_project_default_workspace(monkeypatch, tmp_path):
+    """When a task has no `workspace_path` but the project defines a
+    `default_workspace_path`, the launcher must select that default —
+    never silently jump straight to `repository_path`."""
+    project_repo = tmp_path / "aios"
+    project_repo.mkdir()
+    _init_repo(project_repo)
+
+    project_default_workspace = tmp_path / "aios-default-workspace"
+    project_default_workspace.mkdir()
+    _init_repo(project_default_workspace)
+
+    project_config.save_repository_path("AIOS", str(project_repo))
+    project_config.storage.atomic_write_json(
+        project_config.CONFIG_FILE,
+        {"AIOS": {"repository_path": str(project_repo), "default_workspace_path": str(project_default_workspace)}},
+    )
+
+    _seed_task()  # no workspace_path override — task relies on project fallback
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    body_text = " ".join(w.value for w in at.markdown)
+    assert str(project_default_workspace) in body_text
+
+
 # --------------------------------------------------------------------------
 # Completed run → parsed result / Create Next Task (Runs page)
 # --------------------------------------------------------------------------
