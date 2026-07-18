@@ -92,6 +92,20 @@ VERDICT_LABELS: dict[str, str] = {
     VERDICT_FAILED: "Ошибка",
 }
 
+PASSING_VERDICTS: tuple[str, ...] = (
+    VERDICT_APPROVED_FOR_COMMIT,
+    VERDICT_READY_FOR_COMMIT,
+    VERDICT_READY_FOR_FINAL_REVIEW,
+)
+
+
+def is_passing_verdict(verdict: str | None) -> bool:
+    """Single source of truth for "is this verdict good enough" — reused by
+    the Task Card's verdict badge color and by `launch_service`'s
+    stage-advancement logic, so the two never drift out of sync."""
+    return verdict in PASSING_VERDICTS
+
+
 SEVERITIES: list[str] = ["Blocker", "High", "Medium", "Low"]
 
 
@@ -135,6 +149,219 @@ def normalize_task_workflow(task: dict) -> dict:
     for key, default in default_task_workflow_fields().items():
         task.setdefault(key, default)
     return task
+
+
+# --------------------------------------------------------------------------
+# Task execution model v2 (backward compatible with v1.1/v1.2 tasks.json)
+#
+# Adds Progress/Current Stage/Launch/Timeline/Prompt-history to a task
+# without renaming or removing any pre-existing field. The one semantic
+# shift is `title`: pre-v2 records used `title` to hold the objective text
+# that is now split into its own `goal` field — `normalize_task_execution`
+# migrates old records by copying that text into `goal` and deriving a
+# short `title` from it, so `title` is always present and always short.
+# --------------------------------------------------------------------------
+
+EXECUTION_STAGES: list[str] = [
+    "Created",
+    "Workspace Verified",
+    "Architecture Review",
+    "Implementation",
+    "Coding Complete",
+    "Validation",
+    "Tests Passed",
+    "PR Ready",
+    "Merged",
+]
+
+STAGE_PROGRESS: dict[str, int] = {
+    "Created": 0,
+    "Workspace Verified": 5,
+    "Architecture Review": 20,
+    "Implementation": 40,
+    "Coding Complete": 60,
+    "Validation": 75,
+    "Tests Passed": 90,
+    "PR Ready": 95,
+    "Merged": 100,
+}
+
+LAUNCH_STATUSES: list[str] = [
+    "Ready",
+    "Launching",
+    "Running",
+    "Completed",
+    "Failed",
+    "Requires Attention",
+]
+
+TIMELINE_EVENT_TYPES: list[str] = [
+    "task_created",
+    "workspace_opened",
+    "executor_started",
+    "architecture_review_finished",
+    "implementation_finished",
+    "validation_started",
+    "tests_passed",
+    "pr_created",
+    "review_started",
+    "merged",
+    "completed",
+    "launch_requires_attention",
+]
+
+
+def derive_short_title(text: str, limit: int = 80) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    truncated = collapsed[:limit].rsplit(" ", 1)[0].strip() or collapsed[:limit]
+    return f"{truncated}…"
+
+
+def default_task_execution_fields() -> dict:
+    return {
+        "goal": None,
+        "prompt": "",
+        "prompt_history": [],
+        "prompt_version": 0,
+        "notes": "",
+        "executor": None,
+        "workspace_path": None,
+        "pull_request_url": None,
+        "pull_request_status": None,
+        "progress": 0,
+        "progress_mode": "auto",
+        "progress_updated_at": None,
+        "current_stage": EXECUTION_STAGES[0],
+        "started_at": None,
+        "finished_at": None,
+        "timeline": [],
+        "launch_status": "Ready",
+        "launch_history": [],
+    }
+
+
+def normalize_task_execution(task: dict) -> dict:
+    if not (task.get("goal") or "").strip():
+        legacy_title = (task.get("title") or "").strip()
+        task["goal"] = legacy_title
+        if legacy_title:
+            task["title"] = derive_short_title(legacy_title)
+
+    for key, default in default_task_execution_fields().items():
+        task.setdefault(key, default)
+
+    if not task.get("workspace_path"):
+        task["workspace_path"] = task.get("repository_path")
+    if not task.get("executor"):
+        task["executor"] = task.get("agent")
+    if not task.get("title"):
+        task["title"] = derive_short_title(task.get("goal") or "") or "Untitled task"
+
+    return task
+
+
+def set_current_stage(task: dict, stage: str, *, mode: str = "auto") -> dict:
+    """Advance `current_stage`/`progress`. A manual override (`mode="manual"`)
+    wins over subsequent automatic-advancement calls until the user resets
+    it back to auto via `reset_progress_to_auto`."""
+    if stage not in STAGE_PROGRESS:
+        raise ValueError(f"Unknown execution stage: {stage!r}")
+    if mode == "auto" and task.get("progress_mode") == "manual":
+        return task
+    task["current_stage"] = stage
+    task["progress"] = STAGE_PROGRESS[stage]
+    task["progress_mode"] = mode
+    task["progress_updated_at"] = iso_now()
+    return task
+
+
+def reset_progress_to_auto(task: dict) -> dict:
+    task["progress_mode"] = "auto"
+    stage = task.get("current_stage") or EXECUTION_STAGES[0]
+    task["progress"] = STAGE_PROGRESS.get(stage, 0)
+    task["progress_updated_at"] = iso_now()
+    return task
+
+
+def new_timeline_event(event_type: str, message: str = "") -> dict:
+    return {
+        "id": new_id(),
+        "ts": iso_now(),
+        "type": event_type,
+        "message": (message or "")[:500],
+    }
+
+
+def append_timeline_event(task: dict, event_type: str, message: str = "") -> dict:
+    task.setdefault("timeline", [])
+    task["timeline"].append(new_timeline_event(event_type, message))
+    return task
+
+
+def new_launch_attempt(
+    *, executor: str | None, branch: str | None, status: str, warnings: list[str] | None = None
+) -> dict:
+    return {
+        "id": new_id(),
+        "ts": iso_now(),
+        "executor": executor,
+        "branch": branch,
+        "status": status,
+        "warnings": warnings or [],
+    }
+
+
+def append_launch_attempt(
+    task: dict, *, executor: str | None, branch: str | None, status: str, warnings: list[str] | None = None
+) -> dict:
+    task.setdefault("launch_history", [])
+    task["launch_history"].append(
+        new_launch_attempt(executor=executor, branch=branch, status=status, warnings=warnings)
+    )
+    task["launch_status"] = status
+    return task
+
+
+def push_prompt_history(task: dict, new_prompt: str) -> dict:
+    """Records the outgoing prompt value (if any) before overwriting it. A
+    no-op edit — relaunching with the exact same prompt text, which is the
+    common case (the launcher pre-fills the previous prompt by default) —
+    does not create a duplicate history entry or bump the version; only a
+    genuine change is versioned."""
+    task.setdefault("prompt_history", [])
+    previous = task.get("prompt") or ""
+    if previous.strip() and previous != new_prompt:
+        task["prompt_version"] = int(task.get("prompt_version") or 0) + 1
+        task["prompt_history"].append(
+            {"version": task["prompt_version"], "text": previous, "saved_at": iso_now()}
+        )
+    task["prompt"] = new_prompt
+    return task
+
+
+def unmet_dependencies(task: dict, tasks_by_id: dict[str, dict]) -> list[str]:
+    return [
+        dep_id
+        for dep_id in task.get("depends_on", [])
+        if tasks_by_id.get(dep_id, {}).get("status") != "Done"
+    ]
+
+
+def is_blocked(task: dict, tasks_by_id: dict[str, dict]) -> bool:
+    return bool(unmet_dependencies(task, tasks_by_id))
+
+
+def derive_dependency_edges(task: dict, all_tasks: list[dict]) -> dict:
+    """Read-time-only reverse edges: `blocks` (tasks that depend on this one)
+    and `children` (tasks whose parent_task_id is this one). Never persisted
+    on the task dict, to avoid dual-write drift with `depends_on`/
+    `parent_task_id`, which remain the sole source of truth."""
+    task_id = task.get("id")
+    blocks = [t["id"] for t in all_tasks if task_id in (t.get("depends_on") or []) and t.get("id") != task_id]
+    children = [t["id"] for t in all_tasks if t.get("parent_task_id") == task_id and t.get("id") != task_id]
+    return {"blocks": blocks, "children": children}
 
 
 # --------------------------------------------------------------------------

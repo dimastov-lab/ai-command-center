@@ -150,6 +150,51 @@ def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
     assert any("не настроен" in message for message in errors)
 
 
+def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
+    """`disabled=` on the launch button is the primary gate, but
+    `streamlit.testing.v1.AppTest.click()` does not itself respect
+    `disabled` (it drives the widget's simulated state directly) — so this
+    test forces the click a real disabled button in a browser could never
+    receive, to prove the server-side `validation.can_launch` re-check
+    (not just the widget attribute) is what actually stops the launch."""
+
+    real_run = subprocess.run
+
+    def fail_if_claude_launched(command, **kwargs):
+        # `subprocess` is a single shared module object, so this also
+        # intercepts `git_info`'s legitimate (and expected) read-only status
+        # calls for the Task Card's git badge — only the `claude` launch
+        # itself must be refused.
+        if command and command[0] == "claude":
+            raise AssertionError("claude must not be launched when launch validation blocks the launch")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fail_if_claude_launched)
+
+    repo = tmp_path / "aios-real-repo"
+    repo.mkdir()
+    project_config.save_repository_path("AIOS", str(repo))
+
+    _seed_task(workspace_path=str(tmp_path / "does-not-exist"))
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+    assert any("не найден" in e.value for e in at.error)
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert not at.exception
+
+    launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
+    assert launch_button.disabled is True  # confirms the UI-level gate is also engaged
+
+    at = launch_button.click().run()
+    assert not at.exception
+    assert agent_runner.load_runs() == []  # the forced click must not have launched anything
+    assert any("заблокирован" in e.value for e in at.error)
+
+
 # --------------------------------------------------------------------------
 # Full confirm → run → parse flow, with subprocess mocked (never a real Claude job)
 # --------------------------------------------------------------------------
@@ -180,13 +225,13 @@ def test_full_launch_flow_records_run_and_parses_verdict(monkeypatch, tmp_path):
     at = _at_on_page("kanban")
     assert not at.exception
 
-    at = at.button(key="kanban_launch_seeded-task-1_open_btn").click().run()
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
     assert not at.exception
 
-    at = at.checkbox(key="kanban_launch_seeded-task-1_confirmed").check().run()
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
     assert not at.exception
 
-    at = at.button(key="kanban_launch_seeded-task-1_launch_btn").click().run()
+    at = at.button(key="kanban_seeded-task-1_launch_launch_btn").click().run()
     assert not at.exception
 
     runs = agent_runner.load_runs()

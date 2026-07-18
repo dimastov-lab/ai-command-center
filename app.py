@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
-import tempfile
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -16,11 +13,17 @@ from command_center import (
     agent_runner,
     artifacts,
     chat_service,
+    executors,
     git_info,
+    launch,
+    launch_service,
     models,
     project_config,
+    recommend,
     report_parser,
     storage,
+    task_view,
+    tasks_repository,
     workflow,
     workspace_home,
 )
@@ -146,6 +149,15 @@ PRIORITY_COLORS: dict[str, str] = {
     "Critical": "red",
 }
 
+LAUNCH_STATUS_COLORS: dict[str, str] = {
+    "Ready": "gray",
+    "Launching": "blue",
+    "Running": "blue",
+    "Completed": "green",
+    "Failed": "red",
+    "Requires Attention": "orange",
+}
+
 GLOBAL_FILES: list[str] = ["CURRENT_STATE.md", "DECISIONS.md", "INBOX.md"]
 
 IGNORED_FILE_NAMES = {".DS_Store", ".gitkeep"}
@@ -247,42 +259,22 @@ def parse_project_statuses() -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 
+# Task persistence itself lives in `command_center.tasks_repository` (pure
+# Python, no Streamlit) — see `docs/adr/0001-engineering-control-center-v2-
+# increment-1.md`. These are thin wrappers binding in this app's ROOT/
+# TASKS_EXAMPLE_FILE constants so every existing call site below is unchanged.
+
+
 def normalize_task(task: dict) -> dict:
-    task.setdefault("priority", "Medium")
-    task.setdefault("owner", "")
-    task.setdefault("estimate_hours", 0.0)
-    task.setdefault("depends_on", [])
-    task.setdefault("updated_at", task.get("created_at", ""))
-    models.normalize_task_workflow(task)
-    return task
+    return tasks_repository.normalize_task(task)
 
 
 def load_tasks() -> list[dict]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not TASKS_FILE.exists():
-        if TASKS_EXAMPLE_FILE.exists():
-            shutil.copyfile(TASKS_EXAMPLE_FILE, TASKS_FILE)
-        else:
-            save_tasks([])
-    try:
-        data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
-    if not isinstance(data, list):
-        return []
-    return [normalize_task(task) for task in data]
+    return tasks_repository.load_tasks(ROOT, example_file=TASKS_EXAMPLE_FILE)
 
 
 def save_tasks(tasks: list[dict]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=DATA_DIR, prefix=".tasks_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(tasks, handle, ensure_ascii=False, indent=2)
-        os.replace(tmp_name, TASKS_FILE)
-    except Exception:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+    tasks_repository.save_tasks(ROOT, tasks)
 
 
 def new_task_record(
@@ -290,6 +282,9 @@ def new_task_record(
     title: str,
     task_type: str,
     status: str,
+    *,
+    goal: str | None = None,
+    notes: str = "",
     priority: str = "Medium",
     owner: str = "",
     estimate_hours: float = 0.0,
@@ -298,56 +293,41 @@ def new_task_record(
     prior_run_id: str | None = None,
     workflow_stage: str = "Draft",
 ) -> dict:
-    now = datetime.now().isoformat(timespec="seconds")
-    record = {
-        "id": uuid.uuid4().hex,
-        "project": project,
-        "title": title,
-        "task_type": task_type,
-        "status": status,
-        "priority": priority,
-        "owner": owner,
-        "estimate_hours": estimate_hours,
-        "depends_on": depends_on or [],
-        "created_at": now,
-        "updated_at": now,
-    }
-    record.update(models.default_task_workflow_fields())
-    record["parent_task_id"] = parent_task_id
-    record["prior_run_id"] = prior_run_id
-    record["workflow_stage"] = workflow_stage
-    return record
+    return tasks_repository.new_task_record(
+        project,
+        title,
+        task_type,
+        status,
+        goal=goal,
+        notes=notes,
+        priority=priority,
+        owner=owner,
+        estimate_hours=estimate_hours,
+        depends_on=depends_on,
+        parent_task_id=parent_task_id,
+        prior_run_id=prior_run_id,
+        workflow_stage=workflow_stage,
+    )
 
 
 def update_task_status(tasks: list[dict], task_id: str, new_status: str) -> None:
-    for task in tasks:
-        if task.get("id") == task_id:
-            task["status"] = new_status
-            task["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            break
-    save_tasks(tasks)
+    tasks_repository.update_task_status(ROOT, tasks, task_id, new_status)
 
 
 def delete_task(tasks: list[dict], task_id: str) -> None:
-    remaining = [task for task in tasks if task.get("id") != task_id]
-    save_tasks(remaining)
+    tasks_repository.delete_task(ROOT, tasks, task_id)
 
 
 def task_label(task: dict) -> str:
-    title = (task.get("title") or "—")[:50]
-    return f"[{task.get('project')}] {title} · {task.get('status')}"
+    return tasks_repository.task_label(task)
 
 
 def unmet_dependencies(task: dict, tasks_by_id: dict[str, dict]) -> list[str]:
-    return [
-        dep_id
-        for dep_id in task.get("depends_on", [])
-        if tasks_by_id.get(dep_id, {}).get("status") != "Done"
-    ]
+    return models.unmet_dependencies(task, tasks_by_id)
 
 
 def is_blocked(task: dict, tasks_by_id: dict[str, dict]) -> bool:
-    return bool(unmet_dependencies(task, tasks_by_id))
+    return models.is_blocked(task, tasks_by_id)
 
 
 # --------------------------------------------------------------------------
@@ -621,6 +601,15 @@ def render_agent_launcher(
             key=f"{key_prefix}_timeout",
         )
 
+        full_prompt = prompt
+        if extra_context.strip():
+            full_prompt = f"{prompt}\n\n## Дополнительный контекст (предоставлен пользователем)\n\n{extra_context.strip()}"
+
+        task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
+        workspace_path = (task_for_launch or {}).get("workspace_path") or repo_path
+        expected_branch = (task_for_launch or {}).get("branch")
+        validation = launch.validate_launch(workspace_path=workspace_path, expected_branch=expected_branch)
+
         pre_preview = agent_runner.git_snapshot(Path(repo_path))
         st.markdown("**Проверьте перед запуском:**")
         st.write(f"- Проект: `{project}`")
@@ -631,17 +620,43 @@ def render_agent_launcher(
         if pre_preview.get("is_git_repo") is False:
             st.warning("Каталог не является git-репозиторием — снимок git будет недоступен.")
 
+        for error in validation.errors:
+            st.error(error)
+        for warning in validation.warnings:
+            st.warning(warning)
+
+        st.markdown("**Workspace-действия (не запускают агента):**")
+        workspace_action_cols = st.columns(3)
+        with workspace_action_cols[0]:
+            if st.button("Открыть Workspace", key=f"{key_prefix}_open_folder"):
+                action_ok, action_message = launch.open_folder_at(workspace_path)
+                (st.success if action_ok else st.error)(action_message)
+        with workspace_action_cols[1]:
+            if st.button("Открыть терминал", key=f"{key_prefix}_open_terminal"):
+                action_ok, action_message = launch.open_terminal_at(workspace_path)
+                (st.success if action_ok else st.error)(action_message)
+        with workspace_action_cols[2]:
+            if st.button("Копировать промпт", key=f"{key_prefix}_copy_prompt"):
+                action_ok, action_message = launch.copy_to_clipboard(full_prompt)
+                (st.success if action_ok else st.error)(action_message)
+
         confirmed = st.checkbox(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
         )
+        warnings_ack = True
+        if validation.warnings:
+            warnings_ack = st.checkbox(
+                "Я подтверждаю запуск несмотря на предупреждения выше.",
+                key=f"{key_prefix}_warnings_ack",
+            )
         action_cols = st.columns(2)
         with action_cols[0]:
             launch_clicked = st.button(
                 "Подтвердить и запустить",
                 type="primary",
                 key=f"{key_prefix}_launch_btn",
-                disabled=not confirmed,
+                disabled=not confirmed or not validation.can_launch or not warnings_ack,
                 icon=":material/play_arrow:",
             )
         with action_cols[1]:
@@ -652,106 +667,47 @@ def render_agent_launcher(
         if not launch_clicked:
             return
 
+        # Defense in depth: `disabled=` on the button above is the primary
+        # gate, but a launch this consequential should not depend solely on
+        # a widget attribute — re-check server-side before doing anything.
+        if not validation.can_launch:
+            st.error("Запуск заблокирован ошибками валидации выше — сначала устраните их.")
+            return
+        if validation.warnings and not warnings_ack:
+            st.error("Подтвердите предупреждения выше перед запуском.")
+            return
+
         try:
             resolved_repo = agent_runner.validate_repository(project, repo_path)
         except agent_runner.RunnerError as exc:
             st.error(str(exc))
             return
 
-        full_prompt = prompt
-        if extra_context.strip():
-            full_prompt = f"{prompt}\n\n## Дополнительный контекст (предоставлен пользователем)\n\n{extra_context.strip()}"
-
-        run = models.new_run_record(
-            project=project,
-            task_id=task_id,
-            agent="claude_code",
-            task_type=task_type,
-            repository_path=str(resolved_repo),
-            prompt=full_prompt,
-            timeout_seconds=int(timeout_seconds),
-        )
-        run["pre_run"] = agent_runner.git_snapshot(resolved_repo)
-        agent_runner.append_run(run)
-        activity_log.log_event(
-            "run_queued", project=project, task_id=task_id, run_id=run["id"],
-            message=f"Запуск {task_type} поставлен в очередь",
-        )
-
-        run["status"] = "running"
-        agent_runner.append_run(run)
-        activity_log.log_event(
-            "run_started", project=project, task_id=task_id, run_id=run["id"], message="Запуск начат",
-        )
-
         with st.spinner("Выполняется Claude Code — это может занять несколько минут..."):
-            result = agent_runner.run_claude_code(
-                repository_path=resolved_repo,
-                prompt=full_prompt,
+            outcome = launch_service.execute_agent_launch(
+                project=project,
                 task_type=task_type,
+                prompt=full_prompt,
                 timeout_seconds=int(timeout_seconds),
-                model=agent_runner.default_model(),
+                repository_path=resolved_repo,
+                task=task_for_launch,
+                executor_id="claude_code",
+                validation=validation,
+                on_task_state_changed=(lambda: save_tasks(tasks)) if task_for_launch is not None else None,
             )
 
-        run["status"] = result.status
-        run["exit_code"] = result.exit_code
-        run["stdout"] = result.stdout
-        run["stderr"] = result.stderr
-        run["started_at"] = result.started_at
-        run["completed_at"] = result.completed_at
-        run["duration_seconds"] = result.duration_seconds
-        run["post_run"] = agent_runner.git_snapshot(resolved_repo)
-
-        report_text = agent_runner.extract_result_text(result.stdout) if result.stdout else ""
-        parsed = report_parser.parse_report(report_text)
-        run["parsed"] = parsed
-
-        report_path = agent_runner.save_report(run, parsed)
-        run["report_path"] = os.path.relpath(report_path, ROOT)
-        agent_runner.append_run(run)
-
-        activity_log.log_event(
-            "run_completed" if result.status == "completed" else "run_failed",
-            project=project, task_id=task_id, run_id=run["id"],
-            message=f"Статус: {result.status}, exit_code={result.exit_code}",
-        )
-        if parsed.get("verdict"):
-            activity_log.log_event(
-                "verdict_extracted", project=project, task_id=task_id, run_id=run["id"],
-                message=f"Вердикт: {parsed['verdict']}",
-            )
-        activity_log.log_event(
-            "report_saved", project=project, task_id=task_id, run_id=run["id"], message=report_path.name,
-        )
-
-        if task_id:
-            for existing_task in tasks:
-                if existing_task.get("id") == task_id:
-                    existing_task["current_run_id"] = run["id"]
-                    existing_task["latest_verdict"] = parsed.get("verdict")
-                    existing_task["report_path"] = run["report_path"]
-                    existing_task["repository_path"] = str(resolved_repo)
-                    existing_task["branch"] = run["post_run"].get("branch")
-                    existing_task["agent"] = "claude_code"
-                    existing_task["last_run_at"] = run["completed_at"]
-                    if result.status == "completed":
-                        suggestion = workflow.suggest_next_task(run)
-                        existing_task["workflow_stage"] = suggestion["workflow_stage"]
-                    else:
-                        existing_task["workflow_stage"] = "Ready"
-                    existing_task["updated_at"] = datetime.now().isoformat(timespec="seconds")
-                    break
+        if task_for_launch is not None:
             save_tasks(tasks)
 
         st.session_state[confirm_key] = False
 
-        if result.status == "completed":
-            st.success(f"Запуск завершён. Вердикт: {parsed.get('verdict') or 'не определён'}.")
-        elif result.status == "timed_out":
+        if outcome.result_status == "completed":
+            st.success(f"Запуск завершён. Вердикт: {outcome.parsed.get('verdict') or 'не определён'}.")
+        elif outcome.result_status == "timed_out":
             st.error("Превышено время ожидания выполнения агента.")
         else:
-            st.error(f"Агент завершился с ошибкой (exit code {result.exit_code}).")
-        st.info(f"Полный отчёт сохранён: `{run['report_path']}`. Подробности — на странице «Журнал запусков».")
+            st.error(f"Агент завершился с ошибкой (exit code {outcome.run.get('exit_code')}).")
+        st.info(f"Полный отчёт сохранён: `{outcome.report_relpath}`. Подробности — на странице «Журнал запусков».")
 
 
 def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str) -> None:
@@ -807,9 +763,10 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
                 return
             new_task = new_task_record(
                 project,
-                objective_clean,
+                models.derive_short_title(objective_clean),
                 next_task_type,
                 "Backlog",
+                goal=objective_clean,
                 parent_task_id=run.get("task_id"),
                 prior_run_id=run["id"],
                 workflow_stage=next_stage,
@@ -824,6 +781,213 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
             )
             st.success(f"Задача создана: {new_task['title'][:60]}")
             st.rerun()
+
+
+# --------------------------------------------------------------------------
+# Task Card — shared component (Title/Progress/Stage/Project/Executor/
+# Repository/Workspace/Branch/Git/PR/Tests + action row), used by kanban
+# and focus mode so every task-summary view stays visually/behaviorally
+# consistent instead of each page duplicating its own inline markup.
+# --------------------------------------------------------------------------
+
+
+# Pure task-card read-model logic lives in `command_center.task_view` — see
+# `docs/adr/0001-engineering-control-center-v2-increment-1.md`. These
+# render_* functions only turn its plain-data output into widgets.
+
+
+def _set_launch_status(tasks: list[dict], task_id: str, status: str, note: str) -> None:
+    tasks_repository.set_manual_launch_status(ROOT, tasks, task_id, status, note)
+
+
+def render_task_timeline(task: dict) -> None:
+    events = task_view.sorted_timeline(task)
+    if not events:
+        st.caption("История ещё пуста.")
+        return
+    for event in events:
+        st.caption(f"`{event.get('ts', '—')}` · **{event.get('type', '—')}** — {event.get('message', '')}")
+
+
+def render_dependency_graph(task: dict, tasks_by_id: dict[str, dict]) -> None:
+    dot = task_view.dependency_graph_dot(task, tasks_by_id)
+    if dot is None:
+        st.caption("Нет связанных задач.")
+        return
+    st.graphviz_chart(dot)
+
+
+def render_task_card(
+    task: dict,
+    *,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    key_prefix: str,
+    git_status_cache: dict[str, dict],
+    show_kanban_controls: bool = False,
+) -> None:
+    task_id = task.get("id")
+    title = task.get("title") or "Без названия"
+    workspace_path = task.get("workspace_path") or task.get("repository_path")
+
+    with st.container(border=True):
+        st.markdown(f"### {title}")
+        st.caption(f"{task.get('project')} · {TASK_TYPE_LABELS.get(task.get('task_type'), task.get('task_type'))}")
+
+        progress = int(task.get("progress") or 0)
+        stage = task.get("current_stage") or models.EXECUTION_STAGES[0]
+        st.progress(progress / 100, text=f"{stage} — {progress}%")
+
+        with st.container(horizontal=True):
+            priority = task.get("priority", "Medium")
+            st.badge(priority, color=PRIORITY_COLORS.get(priority, "blue"))
+            launch_status = task.get("launch_status", "Ready")
+            st.badge(launch_status, color=LAUNCH_STATUS_COLORS.get(launch_status, "gray"))
+            executor_id = task.get("executor")
+            if executor_id:
+                st.badge(executors.get_executor(executor_id).label, color="blue", icon=":material/smart_toy:")
+            if task.get("branch"):
+                st.badge(task["branch"], color="gray", icon=":material/fork_right:")
+            if task.get("owner"):
+                st.badge(task["owner"], color="gray", icon=":material/person:")
+            if task.get("estimate_hours"):
+                st.badge(format_estimate(task["estimate_hours"]), color="gray", icon=":material/schedule:")
+            if models.is_blocked(task, tasks_by_id):
+                st.badge("Заблокировано", color="red", icon=":material/block:")
+
+        git_status = task_view.cached_git_status(workspace_path, git_status_cache)
+        with st.container(horizontal=True):
+            if git_status.get("is_repo"):
+                dirty = git_status.get("dirty")
+                st.badge("Изменения" if dirty else "Чисто", color="orange" if dirty else "green", icon=":material/commit:")
+            if task.get("pull_request_url"):
+                st.link_button("PR", task["pull_request_url"], icon=":material/merge:")
+            if task.get("latest_verdict"):
+                passing = models.is_passing_verdict(task["latest_verdict"])
+                st.badge(
+                    models.VERDICT_LABELS.get(task["latest_verdict"], task["latest_verdict"]),
+                    color="green" if passing else "red",
+                )
+
+        with st.expander("Действия", icon=":material/tune:"):
+            st.caption(f"ID: `{task_id}` · Создано: {task.get('created_at', '—')} · Обновлено: {task.get('updated_at', '—')}")
+            st.caption(
+                f"Стадия workflow: "
+                f"{models.WORKFLOW_STAGE_LABELS.get(task.get('workflow_stage'), task.get('workflow_stage') or '—')}"
+            )
+            if task.get("goal"):
+                st.caption(f"Цель: {task['goal']}")
+            if task.get("notes"):
+                st.caption(f"Заметки: {task['notes']}")
+            st.caption(f"Репозиторий: `{task.get('repository_path') or '—'}` · Workspace: `{workspace_path or '—'}`")
+
+            action_cols = st.columns(4)
+            with action_cols[0]:
+                if st.button("Workspace", key=f"{key_prefix}_action_workspace", icon=":material/folder_open:"):
+                    if workspace_path:
+                        ok_action, message_action = launch.open_folder_at(workspace_path)
+                        (st.success if ok_action else st.error)(message_action)
+                    else:
+                        st.error("Workspace не настроен.")
+            with action_cols[1]:
+                git_open = st.button("Git", key=f"{key_prefix}_action_git", icon=":material/commit:")
+            with action_cols[2]:
+                if st.button("Промпт", key=f"{key_prefix}_action_prompt", icon=":material/content_copy:"):
+                    prompt_text = task.get("prompt") or task.get("goal") or ""
+                    ok_action, message_action = launch.copy_to_clipboard(prompt_text)
+                    (st.success if ok_action else st.error)(message_action)
+            with action_cols[3]:
+                report_open = st.button("Отчёт", key=f"{key_prefix}_action_report", icon=":material/description:")
+
+            if git_open:
+                if workspace_path and git_status.get("is_repo"):
+                    st.write(f"Ветка: `{git_status.get('branch')}`")
+                    st.write(f"Последний коммит: `{git_status.get('last_commit_hash')}` — {git_status.get('last_commit_subject')}")
+                    st.write(f"Изменено файлов: {git_status.get('modified_count', 0)}, неотслеживаемых: {git_status.get('untracked_count', 0)}")
+                else:
+                    st.warning("Workspace не является git-репозиторием или не настроен.")
+
+            if report_open:
+                if task.get("report_path"):
+                    report_full_path = ROOT / task["report_path"]
+                    st.code(read_text(report_full_path), language="markdown")
+                else:
+                    st.caption("Отчёт ещё не создан.")
+
+            status_cols = st.columns(3)
+            with status_cols[0]:
+                if st.button("Pause", key=f"{key_prefix}_action_pause", icon=":material/pause:"):
+                    _set_launch_status(tasks, task_id, "Requires Attention", "Отмечено как приостановлено (вручную).")
+                    st.rerun()
+            with status_cols[1]:
+                if st.button("Resume", key=f"{key_prefix}_action_resume", icon=":material/play_arrow:"):
+                    _set_launch_status(tasks, task_id, "Ready", "Отмечено как возобновлено (вручную).")
+                    st.rerun()
+            with status_cols[2]:
+                if st.button("Restart", key=f"{key_prefix}_action_restart", icon=":material/restart_alt:"):
+                    _set_launch_status(tasks, task_id, "Ready", "Отмечено для перезапуска (вручную).")
+                    st.rerun()
+            st.caption(
+                "Pause/Resume/Restart — это статус-метки для планирования, а не управление процессом: "
+                "синхронный запуск Claude Code нельзя приостановить на лету."
+            )
+
+            st.divider()
+            st.markdown("**Запуск**")
+            render_agent_launcher(
+                key_prefix=f"{key_prefix}_launch",
+                project=task.get("project"),
+                default_prompt=task.get("prompt") or task.get("goal") or title,
+                tasks=tasks,
+                task_id=task_id,
+                default_task_type=task.get("task_type", "implementation"),
+            )
+
+            st.divider()
+            st.markdown("**История**")
+            render_task_timeline(task)
+
+            st.markdown("**Зависимости**")
+            deps = task.get("depends_on") or []
+            if deps:
+                for dep_id in deps:
+                    dep = tasks_by_id.get(dep_id)
+                    label = f"{(dep.get('title') or '')[:50]} ({dep.get('status')})" if dep else f"(удалена) {dep_id}"
+                    st.caption(f"- {label}")
+            render_dependency_graph(task, tasks_by_id)
+
+        if show_kanban_controls:
+            current_status = task.get("status", KANBAN_COLUMNS[0])
+            new_status = st.selectbox(
+                "Статус",
+                KANBAN_COLUMNS,
+                index=KANBAN_COLUMNS.index(current_status) if current_status in KANBAN_COLUMNS else 0,
+                key=f"{key_prefix}_status_select",
+                label_visibility="collapsed",
+            )
+            if new_status != current_status:
+                update_task_status(tasks, task_id, new_status)
+                st.rerun()
+
+            if st.button("Удалить", key=f"{key_prefix}_delete", icon=":material/delete:", width="stretch"):
+                delete_task(tasks, task_id)
+                st.rerun()
+
+
+def render_next_task_callout(tasks: list[dict], project: str | None = None) -> None:
+    """Non-invasive '➡ Next Task' recommendation, always with an explanation
+    of *why* — see `command_center.recommend.recommend_next_task`. Never
+    creates, launches, or modifies anything; purely advisory."""
+    recommendation = recommend.recommend_next_task(tasks, project=project)
+    if recommendation is None:
+        st.info("➡ Следующая задача: нет открытых незаблокированных задач.")
+        return
+
+    task = recommendation.task
+    with st.container(border=True):
+        st.markdown(f"##### ➡ Следующая задача: {task.get('title') or 'Без названия'}")
+        st.caption(f"{task.get('project')} · {task.get('status')} · приоритет {task.get('priority', 'Medium')}")
+        st.caption("Почему: " + "; ".join(recommendation.reasons))
 
 
 # --------------------------------------------------------------------------
@@ -1431,6 +1595,8 @@ if st.session_state.show_command_palette:
 if page_key == "dashboard":
     st.subheader("Обзор")
 
+    render_next_task_callout(tasks)
+
     active_tasks = [task for task in tasks if task.get("status") != "Done"]
     completed_tasks = [task for task in tasks if task.get("status") == "Done"]
     generated_count = len(artifacts.list_markdown_files(GENERATED_DIR))
@@ -1492,6 +1658,8 @@ elif page_key == "workspace_home":
 
 elif page_key == "executive":
     st.subheader("Исполнительная панель")
+
+    render_next_task_callout(tasks)
 
     active_tasks = [task for task in tasks if task.get("status") != "Done"]
     completed_tasks = [task for task in tasks if task.get("status") == "Done"]
@@ -1626,6 +1794,11 @@ elif page_key == "create":
     open_tasks = [task for task in tasks if task.get("status") != "Done"]
 
     with st.form("create_task_form"):
+        title_input = st.text_input(
+            "Название задачи",
+            placeholder="Короткий заголовок, например: Исправить сортировку в Kanban",
+            key="create_task_title",
+        )
         project = st.selectbox("Проект", list(PROJECTS.keys()), key="create_task_project")
         task_type = st.selectbox(
             "Тип задачи",
@@ -1638,6 +1811,12 @@ elif page_key == "create":
             height=160,
             placeholder="Например: проверить текущий статус AIOS и определить следующую задачу",
             key="create_task_objective",
+        )
+        notes = st.text_area(
+            "Заметки (необязательно)",
+            height=80,
+            placeholder="Свободные заметки, независимые от цели и промпта",
+            key="create_task_notes",
         )
 
         col_a, col_b, col_c = st.columns(3)
@@ -1665,9 +1844,12 @@ elif page_key == "create":
         )
 
     if submitted:
+        title_clean = title_input.strip()
         objective_clean = objective.strip()
 
-        if not objective_clean:
+        if not title_clean:
+            st.error("Укажите название задачи.")
+        elif not objective_clean:
             st.error("Укажите цель задачи.")
         elif project not in PROJECTS:
             st.error("Неизвестный проект.")
@@ -1681,9 +1863,11 @@ elif page_key == "create":
                 tasks.append(
                     new_task_record(
                         project,
-                        objective_clean,
+                        title_clean,
                         task_type,
                         initial_status,
+                        goal=objective_clean,
+                        notes=notes.strip(),
                         priority=priority,
                         owner=owner.strip(),
                         estimate_hours=float(estimate),
@@ -1802,7 +1986,11 @@ elif page_key == "chat":
                                     st.error("Укажите цель задачи.")
                                 else:
                                     new_task_from_msg = new_task_record(
-                                        active_conversation["project"], objective_clean, conv_task_type, "Backlog",
+                                        active_conversation["project"],
+                                        models.derive_short_title(objective_clean),
+                                        conv_task_type,
+                                        "Backlog",
+                                        goal=objective_clean,
                                     )
                                     tasks.append(new_task_from_msg)
                                     save_tasks(tasks)
@@ -1898,6 +2086,7 @@ elif page_key == "kanban":
     ]
 
     columns = st.columns(len(KANBAN_COLUMNS))
+    kanban_git_status_cache: dict[str, dict] = {}
 
     for column, status in zip(columns, KANBAN_COLUMNS, strict=True):
         with column:
@@ -1909,78 +2098,14 @@ elif page_key == "kanban":
                 st.caption("Пусто")
 
             for task in status_tasks:
-                task_id = task.get("id")
-                with st.container(border=True):
-                    title = task.get("title") or "Без названия"
-                    st.markdown(f"**{title[:60]}**")
-                    st.caption(f"{task.get('project')} · {task.get('task_type')}")
-
-                    with st.container(horizontal=True):
-                        priority = task.get("priority", "Medium")
-                        st.badge(priority, color=PRIORITY_COLORS.get(priority, "blue"))
-                        if task.get("owner"):
-                            st.badge(task["owner"], color="gray", icon=":material/person:")
-                        if task.get("estimate_hours"):
-                            st.badge(format_estimate(task["estimate_hours"]), color="gray", icon=":material/schedule:")
-                        if is_blocked(task, tasks_by_id):
-                            st.badge("Заблокировано", color="red", icon=":material/block:")
-
-                    with st.expander("Детали", icon=":material/info:"):
-                        st.write(f"ID: `{task_id}`")
-                        st.write(f"Создано: {task.get('created_at', '—')}")
-                        st.write(f"Обновлено: {task.get('updated_at', '—')}")
-                        st.write("Полный текст:")
-                        st.write(title)
-                        deps = task.get("depends_on", [])
-                        if deps:
-                            st.write("Зависимости:")
-                            for dep_id in deps:
-                                dep = tasks_by_id.get(dep_id)
-                                label = f"{dep.get('title', '')[:50]} ({dep.get('status')})" if dep else f"(удалена) {dep_id}"
-                                st.caption(f"- {label}")
-
-                        st.write(
-                            f"Стадия workflow: "
-                            f"{models.WORKFLOW_STAGE_LABELS.get(task.get('workflow_stage'), task.get('workflow_stage') or '—')}"
-                        )
-                        if task.get("latest_verdict"):
-                            st.write(
-                                f"Последний вердикт: "
-                                f"{models.VERDICT_LABELS.get(task['latest_verdict'], task['latest_verdict'])}"
-                            )
-                        if task.get("report_path"):
-                            st.write(f"Отчёт: `{task['report_path']}`")
-
-                        st.divider()
-                        render_agent_launcher(
-                            key_prefix=f"kanban_launch_{task_id}",
-                            project=task.get("project"),
-                            default_prompt=title,
-                            tasks=tasks,
-                            task_id=task_id,
-                            default_task_type=task.get("task_type", "implementation"),
-                        )
-
-                    new_status = st.selectbox(
-                        "Статус",
-                        KANBAN_COLUMNS,
-                        index=KANBAN_COLUMNS.index(status),
-                        key=f"status_select_{task_id}",
-                        label_visibility="collapsed",
-                    )
-
-                    if new_status != status:
-                        update_task_status(tasks, task_id, new_status)
-                        st.rerun()
-
-                    if st.button(
-                        "Удалить",
-                        key=f"delete_{task_id}",
-                        icon=":material/delete:",
-                        width="stretch",
-                    ):
-                        delete_task(tasks, task_id)
-                        st.rerun()
+                render_task_card(
+                    task,
+                    tasks=tasks,
+                    tasks_by_id=tasks_by_id,
+                    key_prefix=f"kanban_{task.get('id')}",
+                    git_status_cache=kanban_git_status_cache,
+                    show_kanban_controls=True,
+                )
 
 
 # --------------------------------------------------------------------------
@@ -2477,26 +2602,26 @@ elif page_key == "context":
 elif page_key == "git_center":
     st.subheader("Git Center")
 
-    git_info = get_git_status()
+    repo_status = get_git_status()
 
-    if not git_info.get("is_repo"):
+    if not repo_status.get("is_repo"):
         st.info("Текущая директория не является git-репозиторием.")
     else:
         with st.container(horizontal=True):
-            st.metric("Ветка", git_info["branch"], border=True)
-            st.metric("Статус", "Изменения есть" if git_info["dirty"] else "Чисто", border=True)
-            st.metric("Изменено файлов", git_info["modified_count"], border=True)
-            st.metric("Неотслеживаемых файлов", git_info["untracked_count"], border=True)
+            st.metric("Ветка", repo_status["branch"], border=True)
+            st.metric("Статус", "Изменения есть" if repo_status["dirty"] else "Чисто", border=True)
+            st.metric("Изменено файлов", repo_status["modified_count"], border=True)
+            st.metric("Неотслеживаемых файлов", repo_status["untracked_count"], border=True)
 
-        st.caption(f"Корень репозитория: `{git_info['root']}`")
-        st.caption(f"Последний коммит: `{git_info['last_commit_hash']}` — {git_info['last_commit_subject']}")
+        st.caption(f"Корень репозитория: `{repo_status['root']}`")
+        st.caption(f"Последний коммит: `{repo_status['last_commit_hash']}` — {repo_status['last_commit_subject']}")
 
         tab_files, tab_log, tab_diff, tab_branches, tab_remotes = st.tabs(
             ["Изменённые файлы", "История коммитов", "Diff", "Ветки", "Remotes"]
         )
 
         with tab_files:
-            status_lines = git_info.get("status_lines", [])
+            status_lines = repo_status.get("status_lines", [])
             if not status_lines:
                 st.success("Нет изменений — рабочее дерево чистое.")
             else:
@@ -2525,7 +2650,7 @@ elif page_key == "git_center":
                 st.info("Ветки не найдены.")
             else:
                 for branch in branches:
-                    marker = "→ " if branch == git_info["branch"] else "  "
+                    marker = "→ " if branch == repo_status["branch"] else "  "
                     st.caption(f"{marker}{branch}")
 
         with tab_remotes:
@@ -2546,8 +2671,8 @@ elif page_key == "workspace":
     st.caption("Быстрый переход к рабочим пространствам проектов и обзор git worktree.")
 
     st.markdown("#### Git worktrees")
-    git_info = get_git_status()
-    if not git_info.get("is_repo"):
+    repo_status = get_git_status()
+    if not repo_status.get("is_repo"):
         st.info("Текущая директория не является git-репозиторием.")
     else:
         worktrees = get_git_worktrees()
@@ -2647,6 +2772,10 @@ elif page_key == "focus":
             with st.container(border=True):
                 st.markdown(f"## {task.get('title', 'Без названия')}")
                 st.caption(f"{task.get('project')} · {TASK_TYPE_LABELS.get(task.get('task_type', ''), task.get('task_type'))}")
+
+                task_progress = int(task.get("progress") or 0)
+                task_stage = task.get("current_stage") or models.EXECUTION_STAGES[0]
+                st.progress(task_progress / 100, text=f"{task_stage} — {task_progress}%")
 
                 with st.container(horizontal=True):
                     priority = task.get("priority", "Medium")
