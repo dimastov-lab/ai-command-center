@@ -104,6 +104,28 @@ def test_resolve_workspace_path_missing_task_and_project_default_falls_back_to_r
     assert selection.source == launch.WORKSPACE_SOURCE_REPOSITORY_FALLBACK
 
 
+def test_resolve_expected_branch_prefers_task_branch():
+    task = {"branch": "feature/p1-7-deployment"}
+    project_config = {"default_branch": "main"}
+    assert launch.resolve_expected_branch(task=task, project_config=project_config) == "feature/p1-7-deployment"
+
+
+def test_resolve_expected_branch_falls_back_to_project_default_branch():
+    """The display gap this fixes: `task.branch` unset must fall back to the
+    project's configured default branch, not show '—' even though a default
+    is configured."""
+    task = {"branch": None}
+    project_config = {"default_branch": "main"}
+    assert launch.resolve_expected_branch(task=task, project_config=project_config) == "main"
+
+    assert launch.resolve_expected_branch(task=None, project_config=project_config) == "main"
+
+
+def test_resolve_expected_branch_none_when_neither_configured():
+    assert launch.resolve_expected_branch(task={}, project_config={}) is None
+    assert launch.resolve_expected_branch(task=None, project_config=None) is None
+
+
 def test_resolve_workspace_path_keeps_invalid_task_workspace_and_does_not_fall_back(tmp_path):
     """An explicit-but-broken task.workspace_path must win the precedence
     order (and therefore block via `validate_launch`) rather than being

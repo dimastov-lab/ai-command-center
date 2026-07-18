@@ -57,6 +57,10 @@ class ExecutionCenterAPI:
         is_resume: bool = False,
         model: str | None = None,
         timeout_seconds: int | None = DEFAULT_TIMEOUT_SECONDS,
+        expected_branch: str | None = None,
+        launch_source: str | None = None,
+        prompt_version: int | None = None,
+        repository_already_validated: bool = False,
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -92,6 +96,10 @@ class ExecutionCenterAPI:
             is_resume=is_resume,
             model=model,
             timeout_seconds=timeout_seconds,
+            expected_branch=expected_branch,
+            launch_source=launch_source,
+            prompt_version=prompt_version,
+            repository_already_validated=repository_already_validated,
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)

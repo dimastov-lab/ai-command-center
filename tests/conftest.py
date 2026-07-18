@@ -29,9 +29,26 @@ def isolated_data_dir():
     if _TEST_DATA_DIR.exists():
         shutil.rmtree(_TEST_DATA_DIR)
     _TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_execution_center_singleton_cache()
     yield _TEST_DATA_DIR
     if _TEST_DATA_DIR.exists():
         shutil.rmtree(_TEST_DATA_DIR)
+
+
+def _clear_execution_center_singleton_cache() -> None:
+    """`app.py`'s `get_execution_center_api()` is `@st.cache_resource` —
+    cached process-wide, not per-`AppTest`-instance. Since the Live
+    Execution Center v2 bridge means *any* Kanban task launch (not just a
+    visit to the Live Execution Center page) now constructs that singleton,
+    every test that resets `AICC_DATA_DIR` must also clear this cache —
+    otherwise a `Supervisor` cached from a previous test would keep pointing
+    at a `runtime.db` path this fixture just deleted and recreated fresh
+    (unmigrated), surfacing as `sqlite3.OperationalError: no such table:
+    run`. Streamlit is imported lazily here so modules that never touch
+    Streamlit at all aren't forced to import it just for this cleanup."""
+    import streamlit as st
+
+    st.cache_resource.clear()
 
 
 @pytest.fixture(autouse=True)

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from command_center import activity_log, agent_runner, executors, launch, models, report_parser, workflow
+from command_center.runtime import db as runtime_db
 
 
 @dataclass
@@ -143,6 +144,131 @@ def execute_agent_launch(
     return LaunchOutcome(
         run=run, parsed=parsed, result_status=result.status, report_relpath=run["report_path"]
     )
+
+
+class DuplicateActiveLaunchError(Exception):
+    """Raised when launching would create a second, concurrently-active v2
+    run against the same task or the same resolved workspace — two agents
+    mutating the same working tree at once, which nothing else in this
+    codebase guards against (the old synchronous flow only avoided this by
+    accident, by blocking the whole script for the run's duration)."""
+
+
+def find_active_run_conflict(
+    execution_center_api, *, task_id: str | None, resolved_workspace: str
+) -> dict | None:
+    """Returns the conflicting active run, if any — either one already
+    bound to `task_id`, or a *different* task's run currently active
+    against the exact same resolved workspace path. `None` means it is safe
+    to launch."""
+    for run in execution_center_api.list_runs(states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES):
+        if task_id is not None and run.get("task_id") == task_id:
+            return run
+        run_repo = run.get("repository_path")
+        if not run_repo:
+            continue
+        try:
+            if str(Path(run_repo).expanduser().resolve()) == resolved_workspace:
+                return run
+        except OSError:
+            continue
+    return None
+
+
+def execute_agent_launch_v2(
+    *,
+    project: str,
+    task_type: str,
+    prompt: str,
+    timeout_seconds: int,
+    repository_path: Path,
+    execution_center_api,
+    confirmed: bool,
+    task: dict | None = None,
+    executor_id: str = "claude_code",
+    validation: launch.LaunchValidation | None = None,
+    expected_branch: str | None = None,
+    on_task_state_changed: Callable[[], None] | None = None,
+) -> dict:
+    """Async counterpart to `execute_agent_launch` above — same pre-launch
+    bookkeeping (`push_prompt_history`, `launch.begin_launch`), but instead
+    of blocking on a synchronous executor call, starts a real, PID-tracked,
+    cancellable v2 run via `ExecutionCenterAPI.start_run` and returns
+    immediately in state `RUNNING`/`QUEUED`. The caller (`app.py`) redirects
+    the user to Live Execution Center to watch it, instead of blocking
+    behind `st.spinner`.
+
+    Raises `DuplicateActiveLaunchError` — before any task mutation, and
+    before any subprocess is spawned — if the task already has an active
+    run, or if any other active run is already using this exact resolved
+    workspace.
+
+    `execute_agent_launch` (old, synchronous) is left completely untouched —
+    this is a pure addition, not a replacement, so anything not yet bridged
+    onto v2 keeps working exactly as before.
+    """
+    task_id = (task or {}).get("id")
+    resolved_workspace = str(Path(repository_path).expanduser().resolve())
+    conflict = find_active_run_conflict(
+        execution_center_api, task_id=task_id, resolved_workspace=resolved_workspace
+    )
+    if conflict is not None:
+        raise DuplicateActiveLaunchError(
+            f"An active run (`{conflict['id']}`, state={conflict['state']!r}) already exists for "
+            f"this task or workspace (`{resolved_workspace}`). Wait for it to finish or cancel it "
+            "before launching again."
+        )
+
+    if task is not None:
+        models.push_prompt_history(task, prompt)
+        if validation is not None:
+            launch.begin_launch(task, executor_id=executor_id, validation=validation)
+        if on_task_state_changed is not None:
+            on_task_state_changed()
+
+    title = (task or {}).get("title") or prompt[:120]
+
+    run = execution_center_api.start_run(
+        project=project,
+        repository_path=str(repository_path),
+        task_type=task_type,
+        instruction=prompt,
+        confirmed=confirmed,
+        task_id=task_id,
+        title=title,
+        timeout_seconds=timeout_seconds,
+        expected_branch=expected_branch,
+        launch_source="kanban_task" if task is not None else "execution_center_adhoc",
+        prompt_version=(task or {}).get("prompt_version"),
+        # `repository_path` here is exactly the path `validation` was
+        # computed against (the caller's contract — see `render_agent_
+        # launcher`), already checked for existence/is-a-directory/is-a-
+        # git-repo by `launch.validate_launch` — equivalent-or-stronger than
+        # `agent_runner.validate_repository`'s project-repository-equality
+        # check, which would otherwise reject a task's own worktree on a
+        # different path. Gated on `validation.can_launch`, not just
+        # `validation is not None` — a `validation` object that itself
+        # failed (missing workspace, not a git repo) must never bypass the
+        # stricter check just because *a* validation object was passed in;
+        # defense-in-depth against a future caller that forwards a failed
+        # validation without re-checking it first (today's only caller,
+        # `render_agent_launcher`, already refuses to reach this call at all
+        # when `not validation.can_launch`, but this must hold regardless of
+        # caller discipline).
+        repository_already_validated=bool(validation is not None and validation.can_launch),
+    )
+
+    if task is not None:
+        task["current_run_id"] = run["id"]
+        if on_task_state_changed is not None:
+            on_task_state_changed()
+
+    activity_log.log_event(
+        "run_queued", project=project, task_id=task_id, run_id=run["id"],
+        message=f"Асинхронный запуск {task_type} через Live Execution Center v2 (run {run['id'][:8]})",
+    )
+
+    return run
 
 
 def _apply_run_outcome_to_task(

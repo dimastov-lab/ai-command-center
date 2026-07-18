@@ -76,6 +76,17 @@ def resolve_workspace_path(*, task: dict | None, project_config: dict | None) ->
     return WorkspaceSelection(path=repository_path, source=WORKSPACE_SOURCE_REPOSITORY_FALLBACK)
 
 
+def resolve_expected_branch(*, task: dict | None, project_config: dict | None) -> str | None:
+    """Precedence: `task["branch"]` → `project_config["default_branch"]` →
+    `None`. Fixes the display gap where Expected Branch showed "—" even
+    though the project's default branch was configured — the caller used to
+    read only `task.get("branch")`, with no fallback at all."""
+    task_branch = (task or {}).get("branch")
+    if task_branch:
+        return task_branch
+    return (project_config or {}).get("default_branch") or None
+
+
 @dataclass
 class LaunchValidation:
     errors: list[str] = field(default_factory=list)

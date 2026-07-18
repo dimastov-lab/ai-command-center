@@ -166,8 +166,35 @@ class Supervisor:
         is_resume: bool = False,
         model: str | None = None,
         timeout_seconds: int | None = None,
+        expected_branch: str | None = None,
+        launch_source: str | None = None,
+        prompt_version: int | None = None,
+        repository_already_validated: bool = False,
     ) -> dict:
         """Prepare and launch a run from an already-final `prompt` string.
+
+        `expected_branch`/`launch_source`/`prompt_version` are opaque,
+        write-once Live Execution Center v2 metadata (see
+        `command_center.runtime.session_view`/`task_sync`) — this method
+        never inspects or validates them, just forwards them to
+        `db.create_run` for later display/sync.
+
+        `repository_already_validated`, default `False`, preserves the
+        original v2 behavior for every existing caller: `repository_path`
+        must equal `project`'s *configured* `repository_path`
+        (`agent_runner.validate_repository`'s security boundary against an
+        arbitrary/untrusted path). Set it only when the caller has already
+        independently validated `repository_path` through an equivalent or
+        stronger check — today, only `launch_service.execute_agent_launch_v2`
+        does, via `launch.validate_launch` (existence, is-a-directory,
+        is-a-git-repo) on the exact path `launch.resolve_workspace_path`
+        already resolved (task workspace, else project default workspace,
+        else project repository — see `docs/adr`). This is what makes a
+        task's own worktree on its own feature branch launchable at all: the
+        v1.2 synchronous flow (`agent_runner.run_claude_code`) never enforced
+        project-repository equality either, only `launch.validate_launch`'s
+        checks, so this keeps the v2 bridge exactly as permissive as the
+        flow it replaces — never more.
 
         **Internal/low-level.** This method executes `prompt` verbatim — it
         does not call `context_service.assemble_context` and does not know
@@ -194,7 +221,12 @@ class Supervisor:
         """
         context_service.require_launch_confirmation(confirmed, what="Launching a Claude Code run")
 
-        repo_path = agent_runner.validate_repository(project, repository_path)
+        if repository_already_validated:
+            repo_path = Path(repository_path).expanduser().resolve()
+            if not repo_path.is_dir():
+                raise SupervisorError(f"Workspace not found: {repo_path}")
+        else:
+            repo_path = agent_runner.validate_repository(project, repository_path)
 
         if task_id is None:
             task = db.create_task(
@@ -242,6 +274,9 @@ class Supervisor:
             is_resume=is_resume,
             timeout_seconds=timeout_seconds,
             command=command,
+            expected_branch=expected_branch,
+            launch_source=launch_source,
+            prompt_version=prompt_version,
         )
         run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
 
@@ -579,6 +614,20 @@ class Supervisor:
         background-agent registry (which p-mode runs never touch anyway,
         since `--background`/`--bg` is prohibited everywhere in this module).
 
+        Skips any run currently in `self._active` — a run *this* instance is
+        actively supervising is never a candidate for reconciliation, it is
+        the opposite of orphaned: its own `_supervise` background thread
+        already holds the real waitable-child handle and will write the
+        authoritative terminal state itself the moment the process exits.
+        Without this guard, calling `reconcile()` repeatedly during normal
+        operation (the Live Execution Center v2 dashboard's refresh tick
+        calls it on every tick, not just at startup — see `task_sync.
+        reconcile_and_sync`) would race a fast-exiting process: if the OS
+        process happens to exit before this instance's own `_supervise`
+        thread gets to `process.wait()` and persist the result, `identity.
+        capture_identity(pid)` here would see "pid gone" and misclassify a
+        run that is completing completely normally as `INTERRUPTED`.
+
         Classification:
 
         - No pid was ever recorded -> `INTERRUPTED` (we never captured what
@@ -599,8 +648,12 @@ class Supervisor:
           persistence and must not attempt to signal/cancel it.
         """
         outcomes = []
+        with self._active_lock:
+            actively_supervised_ids = set(self._active.keys())
         for run in db.list_runs(self.db_path, state="RUNNING"):
             run_id = run["id"]
+            if run_id in actively_supervised_ids:
+                continue
             pid = run.get("pid")
             recorded_identity = run.get("process_start_identity")
 

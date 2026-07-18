@@ -140,6 +140,14 @@ _UPDATABLE_RUN_FIELDS: frozenset[str] = frozenset(
         "started_at",
         "completed_at",
         "failure_reason",
+        # v2 Live Execution Center fields (migration 3) — commit_hash/
+        # pull_request_url are the only ones ever set post-create (once, at
+        # terminal-state task sync, via `set_run_result_fields`);
+        # expected_branch/launch_source/prompt_version are write-once at
+        # `create_run` time and never updated afterward, but are still listed
+        # here as a defense-in-depth allowlist entry like every other column.
+        "commit_hash",
+        "pull_request_url",
     }
 )
 
@@ -155,7 +163,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -258,12 +266,38 @@ def _migration_2_add_failure_reason(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE run ADD COLUMN failure_reason TEXT")
 
 
+def _migration_3_add_live_execution_center_v2_fields(conn: sqlite3.Connection) -> None:
+    """Adds the Live Execution Center v2 columns (see `docs/adr` for the
+    Increment 2 brief): `expected_branch` (resolved once at launch time —
+    task branch, else project default branch, else NULL — and never
+    recomputed afterward, so it can't drift if project config changes mid-
+    run), `launch_source` (`"kanban_task"` or `"execution_center_adhoc"`),
+    `prompt_version` (the launching task's `prompt_version` at launch time,
+    or NULL for an ad-hoc run), and `commit_hash`/`pull_request_url`
+    (populated once, at terminal-state task sync, by parsing the run's final
+    result text with the existing `report_parser` — see `task_sync.py`).
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migration 2
+    (`_migration_2_add_failure_reason`) — safe to re-run against a db where
+    this migration was already (fully or partially) applied, and safe under
+    genuine concurrent execution via the same `BEGIN IMMEDIATE` transaction.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        for column in ("expected_branch", "launch_source", "commit_hash", "pull_request_url"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE run ADD COLUMN {column} TEXT")
+        if "prompt_version" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN prompt_version INTEGER")
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
 MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (1, _SCHEMA_V1),
     (2, _migration_2_add_failure_reason),
+    (3, _migration_3_add_live_execution_center_v2_fields),
 ]
 
 
@@ -566,7 +600,14 @@ def create_run(
     timeout_seconds: int | None = None,
     command: list[str] | None = None,
     run_id: str | None = None,
+    expected_branch: str | None = None,
+    launch_source: str | None = None,
+    prompt_version: int | None = None,
 ) -> dict:
+    """`expected_branch`/`launch_source`/`prompt_version` are write-once, like
+    `project`/`task_type`/`repository_path` above — resolved by the caller
+    once at launch time and never recomputed or overwritten afterward (they
+    are deliberately absent from `_UPDATABLE_RUN_FIELDS`)."""
     with connect(db_path) as conn:
         with transaction(conn):
             row = conn.execute(
@@ -598,6 +639,11 @@ def create_run(
                 "cancel_requested_at": None,
                 "started_at": None,
                 "completed_at": None,
+                "expected_branch": expected_branch,
+                "launch_source": launch_source,
+                "prompt_version": prompt_version,
+                "commit_hash": None,
+                "pull_request_url": None,
                 "version": 0,
                 "created_at": now,
                 "updated_at": now,
@@ -608,13 +654,15 @@ def create_run(
                     repository_path, prompt, command_json, timeout_seconds, pid,
                     process_start_identity, pre_run_git_status, post_run_git_status,
                     working_tree_changed, exit_code, cancel_requested, cancel_requested_at,
-                    started_at, completed_at, version, created_at, updated_at
+                    started_at, completed_at, expected_branch, launch_source, prompt_version,
+                    commit_hash, pull_request_url, version, created_at, updated_at
                 ) VALUES (
                     :id, :session_id, :task_id, :sequence, :is_resume, :state, :project, :task_type,
                     :repository_path, :prompt, :command_json, :timeout_seconds, :pid,
                     :process_start_identity, :pre_run_git_status, :post_run_git_status,
                     :working_tree_changed, :exit_code, :cancel_requested, :cancel_requested_at,
-                    :started_at, :completed_at, :version, :created_at, :updated_at
+                    :started_at, :completed_at, :expected_branch, :launch_source, :prompt_version,
+                    :commit_hash, :pull_request_url, :version, :created_at, :updated_at
                 )""",
                 record,
             )
@@ -736,6 +784,25 @@ def update_run_state(
             return dict(updated)
 
 
+def set_run_result_fields(
+    db_path: Path,
+    run_id: str,
+    *,
+    expected_version: int,
+    commit_hash: str | None = None,
+    pull_request_url: str | None = None,
+) -> dict:
+    """Thin `update_run_fields` wrapper for the one terminal-sync write site
+    (`task_sync.sync_task_from_run`) — populates the two fields deterministic
+    report parsing can extract, once, at terminal state."""
+    return update_run_fields(
+        db_path,
+        run_id,
+        expected_version=expected_version,
+        fields={"commit_hash": commit_hash, "pull_request_url": pull_request_url},
+    )
+
+
 def update_run_fields(db_path: Path, run_id: str, *, expected_version: int, fields: dict) -> dict:
     """Compare-and-set update of non-state fields (e.g. recording a PID right
     after Popen succeeds, before any state transition). Does not touch `state`."""
@@ -798,18 +865,52 @@ def append_run_event(db_path: Path, run_id: str, event_type: str, payload: dict)
             return seq
 
 
-def list_run_events(db_path: Path, run_id: str, *, after_seq: int = 0, limit: int = 1000) -> list[dict]:
+def list_run_events(
+    db_path: Path, run_id: str, *, after_seq: int = 0, limit: int = 1000, event_type: str | None = None
+) -> list[dict]:
+    """`event_type`, if given, filters in SQL (e.g. `"lifecycle"` for
+    `log_tail.session_timeline`) — bounded by `limit` the same way an
+    unfiltered call is, never a full-table read followed by an in-Python
+    filter."""
+    with connect(db_path) as conn:
+        if event_type is not None:
+            rows = conn.execute(
+                """SELECT run_id, seq, event_type, payload_json, created_at FROM run_event
+                   WHERE run_id = ? AND seq > ? AND event_type = ? ORDER BY seq ASC LIMIT ?""",
+                (run_id, after_seq, event_type, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT run_id, seq, event_type, payload_json, created_at FROM run_event
+                   WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?""",
+                (run_id, after_seq, limit),
+            ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            event["payload"] = json.loads(event.pop("payload_json"))
+            events.append(event)
+        return events
+
+
+def tail_run_events(db_path: Path, run_id: str, *, limit: int = 200) -> list[dict]:
+    """Bounded log tail: the *last* `limit` events for a run, oldest-first —
+    never the whole table. Orders `DESC` (so SQLite can stop after `limit`
+    rows without scanning every event this run has ever produced) and
+    reverses in Python before returning, so callers see them in the same
+    chronological order `list_run_events` already returns."""
     with connect(db_path) as conn:
         rows = conn.execute(
             """SELECT run_id, seq, event_type, payload_json, created_at FROM run_event
-               WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?""",
-            (run_id, after_seq, limit),
+               WHERE run_id = ? ORDER BY seq DESC LIMIT ?""",
+            (run_id, limit),
         ).fetchall()
         events = []
         for row in rows:
             event = dict(row)
             event["payload"] = json.loads(event.pop("payload_json"))
             events.append(event)
+        events.reverse()
         return events
 
 

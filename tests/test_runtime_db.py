@@ -754,3 +754,101 @@ def test_list_runs_states_combined_with_session_id_filter(tmp_path):
 
     scoped = db.list_runs(path, session_id=session_a["id"], states=db.EXECUTION_CENTER_ACTIVE_STATES)
     assert {r["id"] for r in scoped} == {run_a["id"]}
+
+
+# --------------------------------------------------------------------------
+# Migration 3 — Live Execution Center v2 fields (expected_branch,
+# launch_source, prompt_version, commit_hash, pull_request_url)
+# --------------------------------------------------------------------------
+
+
+def test_migration_3_columns_exist_and_are_idempotent(tmp_path):
+    path = tmp_path / "runtime.db"
+    db.migrate(path)
+    db.migrate(path)  # re-running must not raise (idempotent ALTER TABLE ADD COLUMN)
+    with db.connect(path) as conn:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(run)").fetchall()}
+    for column in ("expected_branch", "launch_source", "prompt_version", "commit_hash", "pull_request_url"):
+        assert column in columns
+
+
+def test_create_run_persists_migration_3_fields(tmp_path):
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    run = db.create_run(
+        path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        task_type="implementation",
+        repository_path="/tmp/x",
+        prompt="p",
+        is_resume=False,
+        expected_branch="feature/p1-7-deployment",
+        launch_source="kanban_task",
+        prompt_version=3,
+    )
+    assert run["expected_branch"] == "feature/p1-7-deployment"
+    assert run["launch_source"] == "kanban_task"
+    assert run["prompt_version"] == 3
+    assert run["commit_hash"] is None
+    assert run["pull_request_url"] is None
+
+    reloaded = db.get_run(path, run["id"])
+    assert reloaded["expected_branch"] == "feature/p1-7-deployment"
+    assert reloaded["launch_source"] == "kanban_task"
+    assert reloaded["prompt_version"] == 3
+
+
+def test_create_run_defaults_migration_3_fields_to_none(tmp_path):
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    assert run["expected_branch"] is None
+    assert run["launch_source"] is None
+    assert run["prompt_version"] is None
+    assert run["commit_hash"] is None
+    assert run["pull_request_url"] is None
+
+
+def test_set_run_result_fields_updates_commit_hash_and_pr_url(tmp_path):
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    updated = db.set_run_result_fields(
+        path, run["id"], expected_version=run["version"],
+        commit_hash="abc1234", pull_request_url="https://example.invalid/pr/1",
+    )
+    assert updated["commit_hash"] == "abc1234"
+    assert updated["pull_request_url"] == "https://example.invalid/pr/1"
+    assert updated["version"] == run["version"] + 1
+
+
+def test_legacy_pre_migration_3_row_loads_with_none_defaults(tmp_path):
+    """A `run` row inserted before migration 3 ran (simulated by inserting
+    directly with only the migration-1/2 columns) must still load cleanly —
+    additive schema evolution, never a destructive migration."""
+    path = tmp_path / "runtime.db"
+    db.migrate(path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    now = "2026-01-01T00:00:00"
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                """INSERT INTO run (
+                    id, session_id, task_id, sequence, is_resume, state, project, task_type,
+                    repository_path, prompt, timeout_seconds, cancel_requested, version,
+                    created_at, updated_at
+                ) VALUES (
+                    'legacy-run-1', :session_id, :task_id, 1, 0, 'COMPLETED', 'AIOS', 'implementation',
+                    '/tmp/x', 'p', NULL, 0, 0, :now, :now
+                )""",
+                {"session_id": session["id"], "task_id": task["id"], "now": now},
+            )
+    run = db.get_run(path, "legacy-run-1")
+    assert run is not None
+    assert run["expected_branch"] is None
+    assert run["launch_source"] is None
+    assert run["prompt_version"] is None
+    assert run["commit_hash"] is None
+    assert run["pull_request_url"] is None

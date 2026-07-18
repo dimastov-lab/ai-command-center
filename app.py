@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from datetime import datetime
@@ -30,6 +29,8 @@ from command_center import (
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
 from command_center.runtime import db as runtime_db
+from command_center.runtime import log_tail, project_overview, session_view, task_sync
+from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 
 ROOT = Path(__file__).resolve().parent
@@ -625,7 +626,7 @@ def render_agent_launcher(
         if extra_context.strip():
             full_prompt = f"{prompt}\n\n## Дополнительный контекст (предоставлен пользователем)\n\n{extra_context.strip()}"
 
-        expected_branch = (task_for_launch or {}).get("branch")
+        expected_branch = launch.resolve_expected_branch(task=task_for_launch, project_config=cfg)
         validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
         actual_branch = (validation.git_status or {}).get("branch") if validation.git_status else None
 
@@ -703,31 +704,45 @@ def render_agent_launcher(
         # workspace rather than always forcing the project's repository_path.
         resolved_workspace = Path(selection.path).expanduser().resolve()
 
-        with st.spinner("Выполняется Claude Code — это может занять несколько минут..."):
-            outcome = launch_service.execute_agent_launch(
+        # Real, PID-tracked, cancellable v2 run — not a blocking call. The
+        # button click above already re-validated `confirmed`/`warnings_ack`
+        # server-side, so `confirmed=True` here reflects a genuine, already-
+        # checked confirmation, not a bypass of it.
+        try:
+            run = launch_service.execute_agent_launch_v2(
                 project=project,
                 task_type=task_type,
                 prompt=full_prompt,
                 timeout_seconds=int(timeout_seconds),
                 repository_path=resolved_workspace,
+                execution_center_api=get_execution_center_api(),
+                confirmed=True,
                 task=task_for_launch,
                 executor_id="claude_code",
                 validation=validation,
+                expected_branch=expected_branch,
                 on_task_state_changed=(lambda: save_tasks(tasks)) if task_for_launch is not None else None,
             )
+        except (
+            runtime_context_service.ConfirmationRequiredError,
+            agent_runner.RunnerError,
+            runtime_supervisor.SupervisorError,
+            launch_service.DuplicateActiveLaunchError,
+        ) as exc:
+            st.error(str(exc))
+            return
 
         if task_for_launch is not None:
             save_tasks(tasks)
 
         st.session_state[confirm_key] = False
-
-        if outcome.result_status == "completed":
-            st.success(f"Запуск завершён. Вердикт: {outcome.parsed.get('verdict') or 'не определён'}.")
-        elif outcome.result_status == "timed_out":
-            st.error("Превышено время ожидания выполнения агента.")
-        else:
-            st.error(f"Агент завершился с ошибкой (exit code {outcome.run.get('exit_code')}).")
-        st.info(f"Полный отчёт сохранён: `{outcome.report_relpath}`. Подробности — на странице «Журнал запусков».")
+        st.success(
+            f"Запуск начат: `{run['id']}`. Отслеживайте прогресс, workspace, ветку и логи "
+            "в разделе «Live Execution Center»."
+        )
+        st.session_state.pending_nav = "execution_center"
+        st.session_state.pending_exec_center_run = run["id"]
+        st.rerun()
 
 
 def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str) -> None:
@@ -1031,17 +1046,11 @@ EXECUTION_CENTER_STATE_LABELS: dict[str, str] = {
     "UNKNOWN": "Неизвестно",
 }
 
-# Non-terminal states — a run in one of these is still worth polling. Note the
-# runtime only accepts cancellation while a run is actually RUNNING (see
-# EXECUTION_CENTER_CANCELLABLE_STATES). The set itself lives in `runtime_db`
-# (beside `TERMINAL_STATES`) so both `app.py` and Streamlit-free `command_center`
-# modules (e.g. `workspace_home.py`) share the same source of truth.
+# Non-terminal states — a run in one of these is still worth polling. The set
+# itself lives in `runtime_db` (beside `TERMINAL_STATES`) so both `app.py` and
+# Streamlit-free `command_center` modules (e.g. `workspace_home.py`) share the
+# same source of truth.
 EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = runtime_db.EXECUTION_CENTER_ACTIVE_STATES
-
-# The Cancel action is only ever accepted by the runtime for a run that is
-# actually RUNNING (PREPARED/QUEUED runs have no subprocess yet for the
-# Supervisor to signal) — the UI must not offer a control implying otherwise.
-EXECUTION_CENTER_CANCELLABLE_STATES: frozenset[str] = frozenset({"RUNNING"})
 
 
 @st.cache_resource
@@ -1057,30 +1066,17 @@ def get_execution_center_api() -> runtime_api.ExecutionCenterAPI:
     reads of the runtime database, never from Streamlit session state — the
     singleton only needs to survive so cancellation keeps working, not to
     cache any data itself.
+
+    Calls `.reconcile()` exactly once here, right after construction —
+    `st.cache_resource` guarantees this runs once per server process, which
+    is exactly "on app restart" for a restarted Streamlit process. This is
+    the only place startup reconciliation is triggered; it reuses
+    `Supervisor.reconcile()` unchanged (see `runtime/supervisor.py`) rather
+    than adding any new engine or duplicating its logic.
     """
-    return runtime_api.ExecutionCenterAPI()
-
-
-def _execution_center_event_line(event: dict) -> str:
-    preview = json.dumps(event["payload"], ensure_ascii=False)[:500]
-    return f"[{event['seq']:>5}] {event.get('created_at', '—')} {event['event_type']}: {preview}"
-
-
-def _execution_center_poll_new_events(api: runtime_api.ExecutionCenterAPI, run_id: str) -> list[dict]:
-    """Fetch only events after this run's last-seen cursor (both cursor and
-    the accumulated list live in `st.session_state`, keyed per run id so
-    switching runs never mixes logs), append them once, and return the full
-    accumulated list. Never re-fetches or re-appends an event already
-    stored — safe to call on every rerun without producing duplicate lines."""
-    events_key = f"exec_center_events_{run_id}"
-    cursor_key = f"exec_center_cursor_{run_id}"
-    st.session_state.setdefault(events_key, [])
-    st.session_state.setdefault(cursor_key, 0)
-    new_events = api.get_events(run_id, after_seq=st.session_state[cursor_key])
-    if new_events:
-        st.session_state[events_key].extend(new_events)
-        st.session_state[cursor_key] = new_events[-1]["seq"]
-    return st.session_state[events_key]
+    api = runtime_api.ExecutionCenterAPI()
+    api.reconcile()
+    return api
 
 
 def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> None:
@@ -1155,6 +1151,16 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
         st.error("Запуск заблокирован: подтвердите все необходимые пункты перед запуском.")
         return
 
+    conflict = launch_service.find_active_run_conflict(
+        api, task_id=None, resolved_workspace=str(Path(repo_path).expanduser().resolve())
+    )
+    if conflict is not None:
+        st.error(
+            f"У workspace `{repo_path}` уже есть активный прогон (`{conflict['id']}`, "
+            f"статус {conflict['state']}) — дождитесь его завершения или отмените перед новым запуском."
+        )
+        return
+
     try:
         run = api.start_run(
             project=launch_project,
@@ -1177,156 +1183,376 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
     st.rerun()
 
 
-def _render_execution_center_watch_body(
-    api: runtime_api.ExecutionCenterAPI, run_id: str, run: dict
+def _execution_center_status_badge_color(status: str) -> str:
+    return {
+        session_view.STATUS_LAUNCHING: "blue",
+        session_view.STATUS_RUNNING: "blue",
+        session_view.STATUS_WAITING: "orange",
+        session_view.STATUS_REQUIRES_ATTENTION: "orange",
+        session_view.STATUS_COMPLETED: "green",
+        session_view.STATUS_FAILED: "red",
+        session_view.STATUS_CANCELLED: "gray",
+    }.get(status, "gray")
+
+
+def _execution_center_record_heartbeat(run_id: str, pid: int | None, now: datetime) -> None:
+    """Cheap, read-only liveness probe — never a signal to the process,
+    never a write to `runtime.db`. This *is* the mission's "Heartbeat", and
+    it is exactly what it sounds like: the last time the UI itself confirmed
+    (via `identity.capture_identity`, the same primitive `Supervisor.
+    reconcile()` already uses) that this PID still exists — not a signal the
+    agent emits. Kept only in `st.session_state`, never persisted, so it
+    never adds a row to `runtime.db` on every refresh tick."""
+    if not pid:
+        return
+    if runtime_identity.capture_identity(pid) is not None:
+        st.session_state.setdefault("exec_center_heartbeats", {})[run_id] = now
+
+
+def _execution_center_heartbeat_probe_at(run_id: str) -> datetime | None:
+    return st.session_state.get("exec_center_heartbeats", {}).get(run_id)
+
+
+def _build_execution_center_sessions(
+    api: runtime_api.ExecutionCenterAPI, tasks: list[dict], *, now: datetime
+) -> tuple[list[dict], dict[str, dict]]:
+    """Fetches every v2 run, joins it with its Kanban task (if any) and
+    project config, and projects it through `session_view.build_session_view`
+    — all business logic lives in `command_center.runtime.session_view`,
+    this is just the join. Also performs the read-only heartbeat probe for
+    every currently-Running run as a side effect."""
+    tasks_by_id = {t["id"]: t for t in tasks if t.get("id")}
+    runs = api.list_runs(limit=200)
+    sessions: list[dict] = []
+    for run in runs:
+        kanban_task = tasks_by_id.get(run.get("task_id"))
+        project_cfg = project_config.get_project_config(run.get("project")) if run.get("project") else None
+        latest = log_tail.latest_event(api.db_path, run["id"])
+        report_path = (kanban_task or {}).get("report_path")
+        if not report_path:
+            report_row = api.get_report(run["id"])
+            report_path = report_row["path"] if report_row else None
+        session = session_view.build_session_view(
+            run,
+            kanban_task=kanban_task,
+            project_cfg=project_cfg,
+            latest_event=latest,
+            report_path=report_path,
+            now=now,
+        )
+        if session["status"] == session_view.STATUS_RUNNING:
+            _execution_center_record_heartbeat(run["id"], session["process_id"], now)
+        sessions.append(session)
+    return sessions, tasks_by_id
+
+
+def _render_execution_center_card(
+    api: runtime_api.ExecutionCenterAPI, session: dict, tasks_by_id: dict[str, dict], *, now: datetime
 ) -> None:
-    """Live status/log/cancel panel body for one already-fetched `run` row.
-    Shared by both the auto-polling and the one-shot render paths below, so
-    the panel looks identical however it got drawn."""
-    state = run.get("state", "UNKNOWN")
-    st.markdown(f"#### Прогон `{run['id']}`")
-
-    info_cols = st.columns(4)
-    info_cols[0].metric("Статус", EXECUTION_CENTER_STATE_LABELS.get(state, state))
-    info_cols[1].write(f"Проект: **{run.get('project', '—')}**")
-    info_cols[2].write(f"Тип задачи: **{run.get('task_type', '—')}**")
-    info_cols[3].write(f"Сессия: `{(run.get('session_id') or '—')[:8]}`")
-
-    ts_cols = st.columns(3)
-    ts_cols[0].caption(f"Создан: {run.get('created_at') or '—'}")
-    ts_cols[1].caption(f"Начат: {run.get('started_at') or '—'}")
-    ts_cols[2].caption(f"Завершён: {run.get('completed_at') or '—'}")
-
-    if run.get("exit_code") is not None:
-        st.caption(f"Код выхода: {run['exit_code']}")
-    if run.get("failure_reason"):
-        st.error(f"Причина ошибки: {run['failure_reason']}")
-    if run.get("cancel_requested") and state in EXECUTION_CENTER_ACTIVE_STATES:
-        st.info("Запрошена отмена — ожидание завершения процесса...")
-
-    events = _execution_center_poll_new_events(api, run_id)
-    st.markdown("**Журнал событий (инкрементально):**")
-    with st.container(height=320, border=True):
-        if events:
-            st.code("\n".join(_execution_center_event_line(event) for event in events), language=None)
-        else:
-            st.caption("Событий пока нет.")
-
-    result_events = [event for event in events if event["event_type"] == "result"]
-    if result_events:
-        st.markdown("**Итоговый результат:**")
-        st.code(result_events[-1]["payload"].get("result") or "—", language=None)
-
-    if state in EXECUTION_CENTER_CANCELLABLE_STATES:
-        cancel_ack = st.checkbox(
-            "Я подтверждаю отмену этого прогона.", key=f"exec_center_cancel_confirm_{run_id}"
+    run_id = session["run_id"]
+    with st.container(border=True):
+        header_cols = st.columns([3, 1])
+        header_cols[0].markdown(f"##### {session['task_title']}")
+        header_cols[1].badge(session["status"], color=_execution_center_status_badge_color(session["status"]))
+        # `session["status"]` is repeated here as plain caption text (not just
+        # the `st.badge` pill above) so the run's display status stays
+        # queryable in tests and screen readers alike.
+        st.caption(
+            f"Статус: **{session['status']}** · Проект: **{session['project_id']}** · "
+            f"Executor: `{session['executor']}` · Источник: {session['launch_source']}"
         )
-        cancel_clicked = st.button(
-            "Отменить прогон",
-            icon=":material/stop_circle:",
-            key=f"exec_center_cancel_btn_{run_id}",
-            disabled=not cancel_ack,
-        )
-        if cancel_clicked:
-            if not cancel_ack:
-                st.error("Отмена заблокирована: подтвердите отмену перед выполнением.")
-            else:
-                try:
-                    api.request_cancel(run_id, confirmed=True)
-                    st.success("Запрос на отмену отправлен.")
-                except (runtime_supervisor.SupervisorError, KeyError) as exc:
-                    st.error(str(exc))
+
+        if session["progress"] is not None:
+            st.progress(
+                min(max(session["progress"], 0), 100) / 100,
+                text=f"{session['progress']}% · {session.get('current_stage') or '—'}",
+            )
+
+        info_cols = st.columns(2)
+        with info_cols[0]:
+            st.write(f"Workspace: `{session['workspace_path'] or '—'}`")
+            st.write(f"Репозиторий: `{session['repository_path'] or '—'}`")
+            st.write(f"Ожидаемая ветка: `{session['expected_branch'] or '—'}`")
+            st.write(f"Текущая ветка: `{session['actual_branch'] or '—'}`")
+            git_status = session.get("git_status")
+            if git_status:
+                dirty_label = "есть изменения" if git_status.get("dirty") else "чисто"
+                st.caption(
+                    f"Git-статус: {dirty_label} "
+                    f"({git_status.get('modified_count', 0)} изменено, {git_status.get('untracked_count', 0)} новых)"
+                )
+        with info_cols[1]:
+            st.write(f"Начат: {session['started_at'] or '—'}")
+            st.write(f"Прошло: {session_view.format_elapsed(session['elapsed_seconds'])}")
+            st.write(f"PID: `{session['process_id'] or '—'}`")
+            if session["status"] == session_view.STATUS_RUNNING:
+                probe_at = _execution_center_heartbeat_probe_at(run_id)
+                age = session_view.heartbeat_age_seconds(probe_at, now)
+                stale = session_view.is_heartbeat_stale(probe_at, now)
+                age_text = f"{int(age)} с назад" if age is not None else "ещё не подтверждено"
+                st.write("Heartbeat (проверка живости UI, не сигнал агента): " + age_text + (" ⚠️" if stale else ""))
+
+        if session["latest_event"]:
+            st.caption(
+                f"Последнее событие ({session['latest_event'].get('at') or '—'}): "
+                f"{session['latest_event'].get('summary') or '—'}"
+            )
+        if session["last_error"]:
+            st.error(f"Последняя ошибка: {session['last_error']}")
+
+        button_cols = st.columns(6)
+        with button_cols[0]:
+            if st.button(
+                "Workspace", key=f"exec_card_ws_{run_id}", icon=":material/folder_open:",
+                disabled=not session["workspace_path"],
+            ):
+                ok, msg = launch.open_folder_at(session["workspace_path"])
+                (st.success if ok else st.error)(msg)
+        with button_cols[1]:
+            if st.button(
+                "Terminal", key=f"exec_card_term_{run_id}", icon=":material/terminal:",
+                disabled=not session["workspace_path"],
+            ):
+                ok, msg = launch.open_terminal_at(session["workspace_path"])
+                (st.success if ok else st.error)(msg)
+        with button_cols[2]:
+            logs_key = f"exec_card_logs_open_{run_id}"
+            if st.button("Logs", key=f"exec_card_logs_btn_{run_id}", icon=":material/description:"):
+                st.session_state[logs_key] = not st.session_state.get(logs_key, False)
+        with button_cols[3]:
+            real_task = tasks_by_id.get(session["task_id"]) if session["task_id"] else None
+            if st.button(
+                "Task", key=f"exec_card_task_{run_id}", icon=":material/task_alt:", disabled=real_task is None,
+            ):
+                st.session_state.pending_nav = "kanban"
                 st.rerun()
-    elif state in runtime_db.TERMINAL_STATES:
-        st.caption("Прогон завершён — состояние сохранено в базе данных runtime.db.")
+        with button_cols[4]:
+            report_key = f"exec_card_report_open_{run_id}"
+            if st.button(
+                "Report", key=f"exec_card_report_btn_{run_id}", icon=":material/summarize:",
+                disabled=not session["report_path"],
+            ):
+                st.session_state[report_key] = not st.session_state.get(report_key, False)
+        with button_cols[5]:
+            if session["status"] == session_view.STATUS_RUNNING:
+                cancel_ack = st.checkbox("Подтвердить", key=f"exec_card_cancel_ack_{run_id}")
+                if st.button(
+                    "Cancel", key=f"exec_card_cancel_btn_{run_id}", icon=":material/stop_circle:",
+                    disabled=not cancel_ack,
+                ):
+                    # `disabled=` above is the primary, client-side gate, but
+                    # `AppTest.click()` (and, in principle, a malformed
+                    # client request) does not itself respect it — re-check
+                    # `cancel_ack` server-side, the same defense-in-depth
+                    # convention every other confirm-then-act control in this
+                    # codebase uses, before ever calling `request_cancel`.
+                    if not cancel_ack:
+                        st.error("Отмена заблокирована: подтвердите отмену перед выполнением.")
+                    else:
+                        # The only path to `Supervisor.cancel` — signals
+                        # exactly the PID+identity recorded at launch, never
+                        # an arbitrary PID, never a git command.
+                        try:
+                            api.request_cancel(run_id, confirmed=True)
+                            st.success("Запрос на отмену отправлен.")
+                        except (runtime_supervisor.SupervisorError, KeyError) as exc:
+                            st.error(str(exc))
+                        st.rerun()
+
+        if st.session_state.get(f"exec_card_logs_open_{run_id}"):
+            with st.expander("Логи и таймлайн сессии", expanded=True, icon=":material/description:"):
+                events = log_tail.tail_events(api.db_path, run_id)
+                if events:
+                    st.code("\n".join(log_tail.render_log_lines(events)), language=None)
+                else:
+                    st.caption("Логи пока недоступны.")
+                timeline = log_tail.session_timeline(api.db_path, run_id)
+                if timeline:
+                    st.markdown("**Таймлайн (launch/cancel/completion/failure/reconciliation):**")
+                    for event in timeline:
+                        payload = event.get("payload") or {}
+                        st.caption(f"{event.get('created_at', '—')} — {payload.get('lifecycle', event['event_type'])}")
+                if session.get("prompt") and st.button("Копировать промпт", key=f"exec_card_copy_prompt_{run_id}"):
+                    ok, msg = launch.copy_to_clipboard(session["prompt"])
+                    (st.success if ok else st.error)(msg)
+
+        if st.session_state.get(f"exec_card_report_open_{run_id}"):
+            with st.expander("Отчёт", expanded=True, icon=":material/summarize:"):
+                report_full_path = agent_runner.resolve_report_path({"report_path": session["report_path"]})
+                if report_full_path is None:
+                    st.warning("Путь к отчёту не проходит проверку безопасности — файл не открыт.")
+                elif report_full_path.exists():
+                    st.markdown(read_text(report_full_path))
+                else:
+                    st.caption("Файл отчёта не найден на диске.")
+                if session.get("commit_hash"):
+                    st.write(f"Commit: `{session['commit_hash']}`")
+                if session.get("pull_request_url"):
+                    st.write(f"Pull Request: {session['pull_request_url']}")
 
 
-# Decisions for `_execution_center_watch_action` below. Kept as plain strings
-# (not an Enum) — this is a private, in-module signal with exactly one
-# consumer, not a value that crosses a boundary.
-_EXECUTION_CENTER_WATCH_POLL_AND_RENDER = "poll_and_render"
-_EXECUTION_CENTER_WATCH_FULL_RERUN = "full_rerun"
-_EXECUTION_CENTER_WATCH_RENDER_MISSING = "render_missing"
-
-
-def _execution_center_watch_action(run: dict | None) -> str:
-    """Pure decision step for the polling fragment: given a freshly fetched
-    `run` row (or `None` if the run no longer exists), decide what happens
-    next. Deliberately has no Streamlit calls in it, so it — and the thin
-    wrapper below that acts on it — can be unit-tested directly, without
-    booting a Streamlit script context.
-
-    - Still active: keep polling and render the live panel in place.
-    - Reached a terminal state, or vanished entirely: a `run_every` fragment
-      auto-rerun is a client-side JS `setInterval` that Streamlit only tears
-      down on a *full* app rerun (see `streamlit/runtime/fragment.py` and
-      the frontend's `handleAutoRerun`/`cleanupAutoReruns`) — a fragment-only
-      rerun never reaches `render_execution_center_watch` to re-check this,
-      so it would otherwise keep firing every 2s forever. Reporting anything
-      other than "poll and render" tells the caller to request one full-app
-      rerun instead of rendering through this path, which lands back in
-      `render_execution_center_watch` and stops the polling for good.
-    """
-    if run is None:
-        return _EXECUTION_CENTER_WATCH_RENDER_MISSING
-    if run.get("state", "UNKNOWN") not in EXECUTION_CENTER_ACTIVE_STATES:
-        return _EXECUTION_CENTER_WATCH_FULL_RERUN
-    return _EXECUTION_CENTER_WATCH_POLL_AND_RENDER
-
-
-def _execution_center_watch_poll_once(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
-    """One polling tick's worth of work, extracted out of the `@st.fragment`
-    wrapper below so it can be called (and unit-tested) directly — a
-    fragment-decorated function is a no-op outside of a live Streamlit script
-    context, per `streamlit/runtime/fragment.py`.
-
-    Never renders the terminal/missing-run panel itself: as soon as the
-    freshly fetched state is no longer active (or the run vanished), it
-    requests exactly one full-app rerun and returns, deferring to
-    `render_execution_center_watch`'s non-polling branch for that render —
-    that's what actually removes this fragment's `run_every` registration
-    and stops the browser's polling timer.
-    """
-    run = api.get_run(run_id)
-    if _execution_center_watch_action(run) != _EXECUTION_CENTER_WATCH_POLL_AND_RENDER:
-        st.rerun()
+def _render_execution_center_project_overview(sessions: list[dict], now: datetime) -> None:
+    by_project: dict[str, list[dict]] = {}
+    for session in sessions:
+        by_project.setdefault(session["project_id"], []).append(session)
+    if not by_project:
         return
-    _render_execution_center_watch_body(api, run_id, run)
+
+    stale_run_ids = frozenset(
+        s["run_id"]
+        for s in sessions
+        if s["status"] == session_view.STATUS_RUNNING
+        and session_view.is_heartbeat_stale(_execution_center_heartbeat_probe_at(s["run_id"]), now)
+    )
+
+    st.markdown("#### Обзор проектов")
+    project_ids = sorted(by_project)
+    cols = st.columns(min(len(project_ids), 4) or 1)
+    for idx, project_id in enumerate(project_ids):
+        cfg = project_config.get_project_config(project_id)
+        overview = project_overview.build_project_overview(
+            project_id, sessions=by_project[project_id], project_cfg=cfg, now=now, stale_run_ids=stale_run_ids
+        )
+        health_color = {"OK": "green", "Attention": "orange", "Degraded": "red"}.get(overview["health"], "gray")
+        with cols[idx % len(cols)]:
+            with st.container(border=True):
+                st.markdown(f"**{project_id}**")
+                st.badge(overview["health"], color=health_color)
+                st.caption(
+                    f"Running: {overview['running_count']} · Waiting: {overview['waiting_count']} · "
+                    f"Завершено сегодня: {overview['completed_today_count']}"
+                )
+                st.caption(f"Executor: {overview['current_executor'] or '—'}")
+                st.caption(f"Workspace: `{overview['current_workspace'] or '—'}`")
+                st.caption(f"Branch: `{overview['current_branch'] or '—'}`")
+    st.divider()
 
 
+# (title, statuses-bucketed-into-this-section) — 5 sections per the mission.
+# Cancelled sessions render inside Failed, labeled distinctly by their own
+# status badge — `models.LAUNCH_STATUSES` has no dedicated Cancelled value
+# either (see `task_sync.py`).
+_EXECUTION_CENTER_SECTIONS: list[tuple[str, frozenset[str]]] = [
+    ("Running", frozenset({session_view.STATUS_RUNNING})),
+    # A `PREPARED`/`QUEUED` run (`Launching`) has no subprocess yet — it is
+    # "waiting to start" in exactly the same practical sense as a run whose
+    # cancellation is in flight, so it is folded into the same section
+    # rather than getting its own (the mission enumerates exactly 5
+    # sections, with no dedicated "Launching" bucket).
+    ("Waiting", frozenset({session_view.STATUS_WAITING, session_view.STATUS_LAUNCHING})),
+    ("Requires Attention", frozenset({session_view.STATUS_REQUIRES_ATTENTION})),
+    ("Completed", frozenset({session_view.STATUS_COMPLETED, session_view.STATUS_CANCELLED})),
+    ("Failed", frozenset({session_view.STATUS_FAILED})),
+]
+
+
+def _render_execution_center_sections(
+    api: runtime_api.ExecutionCenterAPI, sessions: list[dict], tasks_by_id: dict[str, dict], *, now: datetime
+) -> None:
+    sessions_by_status: dict[str, list[dict]] = {}
+    for session in sessions:
+        sessions_by_status.setdefault(session["status"], []).append(session)
+
+    for title, statuses in _EXECUTION_CENTER_SECTIONS:
+        section_sessions: list[dict] = []
+        for status in statuses:
+            section_sessions.extend(sessions_by_status.get(status, []))
+        section_sessions.sort(key=lambda s: s.get("started_at") or "", reverse=True)
+        if title in ("Completed", "Failed"):
+            section_sessions = section_sessions[:20]  # "recently completed" / bounded history, not the whole table
+
+        st.markdown(f"#### {title} ({len(section_sessions)})")
+        if not section_sessions:
+            st.caption("Пусто.")
+            continue
+        for session in section_sessions:
+            _render_execution_center_card(api, session, tasks_by_id, now=now)
+
+
+def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+    """One refresh tick's worth of work: reconcile+sync, then re-render the
+    whole dashboard from freshly-read state. Called directly (no
+    auto-refresh) or from one of the fixed-interval poller fragments below."""
+    now = datetime.now()
+    mutated_tasks = task_sync.reconcile_and_sync(api, tasks)
+    if mutated_tasks:
+        save_tasks(tasks)
+
+    sessions, tasks_by_id = _build_execution_center_sessions(api, tasks, now=now)
+    _render_execution_center_project_overview(sessions, now)
+    _render_execution_center_sections(api, sessions, tasks_by_id, now=now)
+    st.session_state["exec_center_last_refreshed_at"] = now.strftime("%H:%M:%S")
+
+
+# Four fixed-interval pollers (2/3/4/5s) — `st.fragment(run_every=...)`
+# requires a static interval per decorated function, so a user-configurable
+# interval is implemented as a small fixed set of pollers, dispatched to by
+# `render_live_execution_center` below, rather than any unmanaged background
+# thread or a dynamically-parameterized refresh mechanism.
 @st.fragment(run_every=2.0)
-def _render_execution_center_watch_polling(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
-    """Auto-refreshes itself every 2s (via `st.fragment(run_every=...)`,
-    without blocking or re-running the rest of the page) while this fragment
-    is on screen. Only ever dispatched to from `render_execution_center_watch`
-    while the run is still active. See `_execution_center_watch_poll_once`
-    for how it stops itself once the run stops being active."""
-    _execution_center_watch_poll_once(api, run_id)
+def _render_live_execution_center_poll_2s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+    _render_live_execution_center_body(api, tasks)
 
 
-def render_execution_center_watch(api: runtime_api.ExecutionCenterAPI, run_id: str) -> None:
-    """Dispatches to the auto-polling fragment above while the run is still
-    active, and to a single, non-polling render once it reaches a terminal
-    state (`runtime_db.TERMINAL_STATES`) or has been deleted.
+@st.fragment(run_every=3.0)
+def _render_live_execution_center_poll_3s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+    _render_live_execution_center_body(api, tasks)
 
-    Every full-page rerun (switching the run selector, clicking Cancel,
-    revisiting the page, or the one `st.rerun()` that
-    `_execution_center_watch_poll_once` requests the moment it observes a
-    terminal/missing run) re-evaluates this check and re-reads persisted
-    truth fresh from `ExecutionCenterAPI`. Taking the non-polling branch
-    here is what actually stops the `run_every` fragment's browser-side
-    timer — it simply isn't called again this run, so Streamlit tears down
-    its auto-rerun registration (see `_execution_center_watch_poll_once`'s
-    docstring for why that's the only thing that works)."""
-    run = api.get_run(run_id)
-    if run is None:
-        st.warning(f"Прогон `{run_id}` не найден.")
-        return
 
-    if run.get("state", "UNKNOWN") in EXECUTION_CENTER_ACTIVE_STATES:
-        _render_execution_center_watch_polling(api, run_id)
+@st.fragment(run_every=4.0)
+def _render_live_execution_center_poll_4s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+    _render_live_execution_center_body(api, tasks)
+
+
+@st.fragment(run_every=5.0)
+def _render_live_execution_center_poll_5s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+    _render_live_execution_center_body(api, tasks)
+
+
+_EXECUTION_CENTER_POLLERS = {
+    2: _render_live_execution_center_poll_2s,
+    3: _render_live_execution_center_poll_3s,
+    4: _render_live_execution_center_poll_4s,
+    5: _render_live_execution_center_poll_5s,
+}
+
+
+def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+    """Top-level Live Execution Center v2 dashboard: refresh controls,
+    Project Overview row, and the 5-section session dashboard. Reconciles
+    every persisted `RUNNING` row against real OS processes and syncs any
+    linked Kanban task's `launch_status` on every render — see
+    `task_sync.reconcile_and_sync` (always the existing `Supervisor`, never
+    a second execution engine)."""
+    header_cols = st.columns([1, 1, 1, 2])
+    with header_cols[0]:
+        auto_refresh = st.toggle(
+            "Автообновление", value=st.session_state.get("exec_center_auto_refresh", True), key="exec_center_auto_refresh"
+        )
+    with header_cols[1]:
+        interval = st.selectbox(
+            "Интервал (с)",
+            [2, 3, 4, 5],
+            index=[2, 3, 4, 5].index(st.session_state.get("exec_center_refresh_interval", 3)),
+            key="exec_center_refresh_interval",
+        )
+    with header_cols[2]:
+        st.write("")
+        refresh_clicked = st.button("Обновить сейчас", icon=":material/refresh:", key="exec_center_refresh_now")
+    with header_cols[3]:
+        st.write("")
+        st.caption(f"Обновлено: {st.session_state.get('exec_center_last_refreshed_at') or '—'}")
+
+    if refresh_clicked:
+        st.rerun()
+
+    if auto_refresh:
+        _EXECUTION_CENTER_POLLERS[interval](api, tasks)
     else:
-        _render_execution_center_watch_body(api, run_id, run)
+        _render_live_execution_center_body(api, tasks)
+
+    with st.expander("Запустить новый прогон (ad-hoc, без привязки к задаче)", icon=":material/smart_toy:"):
+        render_execution_center_launch_form(api)
 
 
 # --------------------------------------------------------------------------
@@ -1504,7 +1730,7 @@ _PENDING_KEY_MAP = {
     "pending_create_type": "create_task_type",
     "pending_project_browser": "project_browser_select",
     "pending_chat_conv": "chat_conv_select",
-    "pending_exec_center_run": "exec_center_run_selector",
+    "pending_exec_center_run": "exec_center_highlight_run",
     "pending_exec_center_project": "exec_center_launch_project",
 }
 for _pending_key, _target_key in _PENDING_KEY_MAP.items():
@@ -2240,43 +2466,12 @@ elif page_key == "agents":
 elif page_key == "execution_center":
     st.subheader("Live Execution Center")
     st.caption(
-        "Запуск и наблюдение за прогонами Claude Code через v2 Session Supervisor "
-        "(command_center.runtime) — отдельно от синхронного запуска на странице «AI-агенты»."
+        "Канонический монитор выполнения: реальные PID-отслеживаемые прогоны через "
+        "v2 Session Supervisor (command_center.runtime) — источник истины для статуса "
+        "выполнения, сверяемый с реальными OS-процессами при каждом обновлении."
     )
 
-    execution_center_api = get_execution_center_api()
-    recent_runs = execution_center_api.list_runs(limit=20)
-
-    with st.expander(
-        "Запустить новый прогон", icon=":material/smart_toy:", expanded=not recent_runs
-    ):
-        render_execution_center_launch_form(execution_center_api)
-
-    st.divider()
-
-    if not recent_runs:
-        st.info("Прогонов пока нет — запустите первый выше.")
-    else:
-        run_options = [run["id"] for run in recent_runs]
-        runs_by_id = {run["id"]: run for run in recent_runs}
-
-        def _format_execution_center_run_option(run_id: str) -> str:
-            match = runs_by_id.get(run_id)
-            if match is None:
-                return run_id
-            state_label = EXECUTION_CENTER_STATE_LABELS.get(match["state"], match["state"])
-            return (
-                f"{match['id'][:8]} · {match['project']} · {match['task_type']} · "
-                f"{state_label} · {match.get('created_at', '—')}"
-            )
-
-        selected_run_id = st.selectbox(
-            "Прогон",
-            run_options,
-            format_func=_format_execution_center_run_option,
-            key="exec_center_run_selector",
-        )
-        render_execution_center_watch(execution_center_api, selected_run_id)
+    render_live_execution_center(get_execution_center_api(), tasks)
 
 
 # --------------------------------------------------------------------------

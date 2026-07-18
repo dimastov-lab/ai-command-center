@@ -59,7 +59,11 @@ def _tool_activity_lines(events: list[dict]) -> list[str]:
     return lines
 
 
-def _result_text(events: list[dict]) -> str:
+def result_text(events: list[dict]) -> str:
+    """The run's final `result` event text, or a placeholder if none exists
+    yet. Public — also used by `task_sync.py` to feed `report_parser.
+    parse_report` the same text v1.2 parses (the agent's final message, not
+    the whole rendered report markdown)."""
     for event in reversed(events):
         if event["event_type"] == "result":
             text = event["payload"].get("result")
@@ -91,7 +95,7 @@ def render_report_markdown(run: dict, events: list[dict]) -> str:
     assistant_text = "\n\n".join(_assistant_text_blocks(events)) or "_Нет текстового вывода ассистента._"
     tool_lines = _tool_activity_lines(events)
     tool_text = "\n".join(tool_lines) if tool_lines else "_Инструменты не вызывались._"
-    result_text = _result_text(events)
+    result_text_value = result_text(events)
     stderr_text = _stderr_text(events)
     malformed = _malformed_count(events)
 
@@ -128,7 +132,7 @@ def render_report_markdown(run: dict, events: list[dict]) -> str:
 ## Итоговый результат (result)
 
 ```
-{result_text}
+{result_text_value}
 ```
 
 ## Stderr (полный, без сокращений)
