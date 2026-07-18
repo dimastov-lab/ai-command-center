@@ -52,6 +52,12 @@ _RUN_ALLOWED_FIELDS: frozenset[str] = frozenset(
         "completed_at",
         "exit_code",
         "duration_seconds",
+        # `failure_reason` is allowed because the Supervisor constrains it, at the
+        # single call site that ever sets it (`runtime/supervisor.py:_supervise`),
+        # to exactly `None` or the literal string `"timeout"` — never raw exception
+        # text or any other free-form detail. If that constraint ever changes, this
+        # field must be re-reviewed before staying in the allowlist.
+        "failure_reason",
     }
 )
 

@@ -7,6 +7,7 @@ under test.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 from command_center import artifacts
 
@@ -116,3 +117,26 @@ def test_infer_task_type_from_filename_every_recognized_type(tmp_path):
     for task_type in ["implementation", "review", "remediation", "final_gate", "architecture_review"]:
         path = tmp_path / f"id_{task_type}.md"
         assert artifacts.infer_task_type_from_filename(path) == task_type
+
+
+def test_task_types_is_the_canonical_ordered_values():
+    """Pins the exact values and order `app.py` relies on (selectbox default index,
+    display order) now that `command_center.artifacts.TASK_TYPES` is the single
+    source of truth app.py imports instead of defining its own duplicate list."""
+    assert artifacts.TASK_TYPES == (
+        "implementation",
+        "review",
+        "remediation",
+        "final_gate",
+        "architecture_review",
+    )
+
+
+def test_app_py_consumes_canonical_task_types_not_a_duplicate_list():
+    """Regression test: `app.py` must reference `artifacts.TASK_TYPES` rather than
+    define its own literal task-type list, so the two collections can never drift
+    apart again. Static source check, kept here (not in `test_app_streamlit.py`) so
+    this module's assertions about `TASK_TYPES` stay in one Streamlit-free place."""
+    app_source = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
+    assert "TASK_TYPES: tuple[str, ...] = artifacts.TASK_TYPES" in app_source
+    assert "TASK_TYPES: list[str] = [" not in app_source

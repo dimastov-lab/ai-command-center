@@ -712,6 +712,26 @@ def test_list_runs_limit_bounds_result_set_and_preserves_order(tmp_path, monkeyp
     assert [r["id"] for r in unbounded] == [r["id"] for r in reversed(runs)]
 
 
+@pytest.mark.parametrize("negative_limit", [-1, -2, -100])
+def test_list_runs_negative_limit_raises_value_error_before_sql(tmp_path, negative_limit):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    with pytest.raises(ValueError):
+        db.list_runs(path, limit=negative_limit)
+
+
+def test_list_runs_limit_none_is_unbounded(tmp_path):
+    path = _fresh_db(tmp_path)
+    runs = [_make_run(path) for _ in range(3)]
+    assert len(db.list_runs(path, limit=None)) == len(runs)
+
+
+def test_list_runs_limit_zero_returns_empty_list(tmp_path):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    assert db.list_runs(path, limit=0) == []
+
+
 def test_list_runs_state_and_states_together_raises_value_error(tmp_path):
     path = _fresh_db(tmp_path)
     with pytest.raises(ValueError):

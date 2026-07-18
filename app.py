@@ -53,13 +53,9 @@ CONTEXT_FILES: dict[str, str] = {
     "LEGAL": "LEGAL_CONTEXT.md",
 }
 
-TASK_TYPES: list[str] = [
-    "implementation",
-    "review",
-    "remediation",
-    "final_gate",
-    "architecture_review",
-]
+# Canonical source: command_center.artifacts.TASK_TYPES — see that module's
+# docstring for why app.py must not define its own duplicate list.
+TASK_TYPES: tuple[str, ...] = artifacts.TASK_TYPES
 
 TASK_TYPE_LABELS: dict[str, str] = {
     "implementation": "Реализация",
