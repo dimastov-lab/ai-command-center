@@ -100,3 +100,51 @@ def test_set_manual_launch_status_unknown_id_is_a_no_op_but_still_saves(tmp_path
     tasks = [task]
     tr.set_manual_launch_status(tmp_path, tasks, "nonexistent", "Ready", "note")
     assert tasks[0]["launch_status"] == "Ready"  # unchanged, default
+
+
+# --------------------------------------------------------------------------
+# Task inheritance: workspace_path / branch / executor / prompt, resolved by
+# the caller (the Create Task UI, via `project_config.task_defaults_from_project`)
+# and handed to `new_task_record` as the final, already-resolved values.
+# --------------------------------------------------------------------------
+
+
+def test_new_task_record_applies_given_workspace_branch_executor_prompt():
+    task = tr.new_task_record(
+        "AIOS", "T", "implementation", "Backlog",
+        workspace_path="/ws/aios", branch="develop", executor="claude_code", prompt="Do the thing.",
+    )
+    assert task["workspace_path"] == "/ws/aios"
+    assert task["branch"] == "develop"
+    assert task["executor"] == "claude_code"
+    assert task["prompt"] == "Do the thing."
+
+
+def test_new_task_record_executor_also_sets_legacy_agent_field():
+    """`agent` is the pre-v2 field name for the same concept; keeping both in
+    sync at creation time avoids the same drift `launch_service._apply_run_outcome_to_task`
+    already guards against after a run completes."""
+    task = tr.new_task_record("AIOS", "T", "implementation", "Backlog", executor="claude_code")
+    assert task["agent"] == "claude_code"
+    assert task["executor"] == "claude_code"
+
+
+def test_new_task_record_without_inheritance_kwargs_leaves_pre_existing_defaults():
+    """Backward compatibility: every pre-existing call site that doesn't pass
+    the new kwargs at all must keep getting exactly the same record shape as
+    before — `workspace_path`/`branch`/`executor` unset, `prompt` empty."""
+    task = tr.new_task_record("AIOS", "T", "implementation", "Backlog")
+    assert task["workspace_path"] is None
+    assert task["branch"] is None
+    assert task["executor"] is None
+    assert task["prompt"] == ""
+
+
+def test_new_task_record_inherited_workspace_survives_save_and_reload(tmp_path):
+    task = tr.new_task_record(
+        "AIOS", "T", "implementation", "Backlog", workspace_path="/ws/aios", branch="develop",
+    )
+    tr.save_tasks(tmp_path, [task])
+    reloaded = tr.load_tasks(tmp_path)
+    assert reloaded[0]["workspace_path"] == "/ws/aios"
+    assert reloaded[0]["branch"] == "develop"

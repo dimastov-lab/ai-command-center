@@ -18,12 +18,43 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from command_center import models, storage
+from command_center import git_info, models, storage
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = storage.resolve_data_dir(ROOT)
 CONFIG_FILE = DATA_DIR / "project_config.json"
 CONFIG_EXAMPLE_FILE = DATA_DIR / "project_config.example.json"
+
+# Engineering-environment defaults a new task inherits from its project (see
+# `task_defaults_from_project`), plus the descriptive/planning fields the
+# Projects settings UI exposes. All are optional overrides layered onto
+# `default_project_config` by `load_project_configs` — a project missing any
+# of these in `project_config.json` just keeps the built-in default below,
+# which is how pre-existing project configs (only `repository_path`/
+# `default_workspace_path`) keep loading unchanged.
+OVERRIDABLE_FIELDS: list[str] = [
+    "repository_path",
+    "default_workspace_path",
+    "default_branch",
+    "default_executor",
+    "default_prompt",
+    "description",
+    "status",
+    "priority",
+    "progress",
+    "current_sprint",
+    "current_milestone",
+    "owner",
+]
+
+PROJECT_STATUSES: list[str] = ["Planning", "Active", "Paused", "Blocked", "Done"]
+
+# Same value set as `app.py`'s task-level `PRIORITIES` — kept as an independent
+# constant here (rather than imported from `app.py`, which must never be
+# imported by a `command_center` module) since a project's priority and a
+# task's priority are conceptually separate fields that merely happen to
+# share a vocabulary today.
+PROJECT_PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
 
 DISPLAY_NAMES: dict[str, str] = {
     "AIOS": "AIOS",
@@ -70,6 +101,22 @@ def default_project_config(project_id: str) -> dict:
         # `repository_path` fallback below. `None` unless explicitly set in
         # `project_config.json` — no existing project config needs to define it.
         "default_workspace_path": None,
+        # Engineering-environment defaults a new task inherits at creation time
+        # (see `task_defaults_from_project`) — same "unset unless explicitly
+        # configured" contract as `default_workspace_path` above.
+        "default_branch": None,
+        "default_executor": None,
+        "default_prompt": "",
+        # Descriptive/planning fields surfaced in the Projects settings UI.
+        # Purely informational — nothing in Launch or task inheritance reads
+        # these — so their defaults are just sensible blanks.
+        "description": "",
+        "status": PROJECT_STATUSES[1],  # "Active"
+        "priority": PROJECT_PRIORITIES[1],  # "Medium"
+        "progress": 0,
+        "current_sprint": None,
+        "current_milestone": None,
+        "owner": "",
         "allowed_agents": list(DEFAULT_ALLOWED_AGENTS),
         "sensitive": project_id in models.SENSITIVE_PROJECT_IDS,
         "context_file_paths": context_paths,
@@ -108,10 +155,9 @@ def load_project_configs() -> dict[str, dict]:
         cfg = default_project_config(project_id)
         override = overrides.get(project_id)
         if isinstance(override, dict):
-            if override.get("repository_path"):
-                cfg["repository_path"] = override["repository_path"]
-            if override.get("default_workspace_path"):
-                cfg["default_workspace_path"] = override["default_workspace_path"]
+            for field in OVERRIDABLE_FIELDS:
+                if override.get(field) not in (None, ""):
+                    cfg[field] = override[field]
         configs[project_id] = cfg
     return configs
 
@@ -150,3 +196,105 @@ def save_repository_path(project_id: str, repository_path: str | None) -> None:
 
 def is_sensitive(project_id: str) -> bool:
     return project_id in models.SENSITIVE_PROJECT_IDS
+
+
+def save_project_settings(project_id: str, **fields: object) -> None:
+    """Generic setter for any subset of `OVERRIDABLE_FIELDS` — the Projects
+    settings UI's single save action for Default Workspace/Branch/Executor/
+    Prompt/Description/Status/Priority/Progress/Sprint/Milestone/Owner.
+
+    `save_repository_path` above is kept as its own dedicated function (its
+    existing call sites and tests are untouched); this is the superset used
+    by every other field. A field value of `None` or `""` clears the override
+    (falls back to `default_project_config`'s default), matching
+    `save_repository_path`'s existing clear-on-falsy contract.
+    """
+    if project_id not in models.PROJECT_IDS:
+        raise ValueError(f"Unknown project: {project_id}")
+    unknown = set(fields) - set(OVERRIDABLE_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown project config field(s): {sorted(unknown)}")
+
+    overrides = _read_overrides()
+    entry = overrides.get(project_id)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+    for key, value in fields.items():
+        if value in (None, ""):
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+    overrides[project_id] = entry
+    storage.atomic_write_json(CONFIG_FILE, overrides)
+
+
+def task_defaults_from_project(cfg: dict) -> dict:
+    """Fields a new task inherits from its project's configuration at creation
+    time (see `tasks_repository.new_task_record`'s `workspace_path`/`branch`/
+    `executor`/`prompt` kwargs). The user is never required to enter these
+    manually — the Create Task UI pre-fills them from here and only overrides
+    what the user explicitly changes.
+
+    `workspace_path` mirrors `command_center.launch.resolve_workspace_path`'s
+    precedence (project default workspace, else repository path) so the value
+    baked onto the task at creation is exactly what Launch would already have
+    resolved for it — this function does not change Launch's own fallback
+    chain, it just materializes the same result earlier, for display and for
+    legacy tasks created without ever visiting Launch.
+    """
+    return {
+        "workspace_path": cfg.get("default_workspace_path") or cfg.get("repository_path") or None,
+        "branch": cfg.get("default_branch") or None,
+        "executor": cfg.get("default_executor") or None,
+        "prompt": cfg.get("default_prompt") or "",
+    }
+
+
+def validate_project_settings(cfg: dict) -> list[str]:
+    """Non-fatal warnings for the Projects settings UI to show before saving.
+
+    Read-only — never mutates the filesystem or git state — and never blocks
+    a save; the caller always persists the values via `save_project_settings`
+    regardless of what is returned here, the same tolerance the pre-existing
+    repository-path field already has (an unconfigured/invalid path is only
+    ever caught later, by Launch's own `validate_launch`).
+    """
+    warnings: list[str] = []
+
+    repository_path = cfg.get("repository_path")
+    if repository_path:
+        ok, message = validate_repository_path(repository_path)
+        if not ok:
+            warnings.append(f"Путь к репозиторию: {message}")
+
+    workspace_path = cfg.get("default_workspace_path")
+    if workspace_path:
+        ok, message = validate_repository_path(workspace_path)
+        if not ok:
+            warnings.append(f"Workspace по умолчанию: {message}")
+        else:
+            status = git_info.get_status(Path(workspace_path).expanduser())
+            if not status.get("is_repo"):
+                warnings.append(f"Workspace по умолчанию не является git-репозиторием: {workspace_path}")
+            else:
+                branch = cfg.get("default_branch")
+                if branch:
+                    branches = git_info.get_branches(Path(workspace_path).expanduser())
+                    if branches and branch not in branches:
+                        warnings.append(f"Ветка «{branch}» не найдена в workspace по умолчанию.")
+
+    executor_id = cfg.get("default_executor")
+    if executor_id:
+        # Imported locally: `executors` imports `agent_runner`, which imports
+        # this module — a module-level import here would be circular.
+        from command_center import executors
+
+        if executor_id not in executors.EXECUTOR_IDS:
+            warnings.append(f"Неизвестный executor: {executor_id}")
+        elif not executors.get_executor(executor_id).available:
+            warnings.append(f"Executor «{executor_id}» зарегистрирован, но пока недоступен для запуска.")
+
+    prompt = cfg.get("default_prompt") or ""
+    if len(prompt) > 20000:
+        warnings.append("Prompt по умолчанию длиннее 20000 символов — проверьте содержимое.")
+
+    return warnings

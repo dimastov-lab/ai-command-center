@@ -84,12 +84,27 @@ def new_task_record(
     parent_task_id: str | None = None,
     prior_run_id: str | None = None,
     workflow_stage: str = "Draft",
+    workspace_path: str | None = None,
+    branch: str | None = None,
+    executor: str | None = None,
+    prompt: str | None = None,
 ) -> dict:
     """`title` is the short, dedicated heading (Название задачи); `goal`
     (Цель задачи) is the independent objective description. If `goal` is
     omitted it defaults to `title` for call sites that don't yet collect a
     separate objective — this keeps every caller trivially valid without
-    silently losing the objective text."""
+    silently losing the objective text.
+
+    `workspace_path`/`branch`/`executor`/`prompt` are the engineering
+    environment fields a task inherits from its project at creation time
+    (see `command_center.project_config.task_defaults_from_project`) — the
+    caller (the Create Task UI) resolves inherited-vs-overridden before
+    calling this, so this function just persists whatever final values it is
+    given. Omitting them (the pre-existing call signature) leaves the
+    pre-existing defaults from `models.default_task_execution_fields`/
+    `default_task_workflow_fields` untouched — `workspace_path=None` still
+    means "unset, resolve via Launch's own fallback chain," exactly as
+    before."""
     now = models.iso_now()
     record = {
         "id": uuid.uuid4().hex,
@@ -111,6 +126,15 @@ def new_task_record(
     record.update(models.default_task_execution_fields())
     record["goal"] = goal if goal is not None else title
     record["notes"] = notes
+    if workspace_path:
+        record["workspace_path"] = workspace_path
+    if branch:
+        record["branch"] = branch
+    if executor:
+        record["executor"] = executor
+        record["agent"] = executor
+    if prompt:
+        record["prompt"] = prompt
     models.append_timeline_event(record, "task_created", f"Задача создана: {title}")
     return record
 

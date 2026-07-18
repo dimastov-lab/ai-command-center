@@ -426,6 +426,102 @@ def test_create_next_task_button_creates_backlog_task():
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# Create Task page: project-driven inheritance of workspace/branch/executor/prompt
+# --------------------------------------------------------------------------
+
+
+def test_create_task_page_shows_inherited_workspace_from_project_default():
+    project_config.save_project_settings(
+        "AIOS", default_workspace_path="/ws/aios-default", default_branch="develop", default_executor="claude_code",
+    )
+    at = _at_on_page("create", create_task_project="AIOS")
+    assert not at.exception
+    caption_text = " ".join(c.value for c in at.caption)
+    assert "/ws/aios-default" in caption_text
+    assert "develop" in caption_text
+
+
+def test_create_task_without_project_config_shows_no_inherited_workspace():
+    at = _at_on_page("create", create_task_project="PERSONAL")
+    assert not at.exception
+    caption_text = " ".join(c.value for c in at.caption)
+    assert "workspace `—`" in caption_text
+
+
+def test_created_task_inherits_project_workspace_and_branch_without_manual_entry():
+    project_config.save_project_settings("AIOS", default_workspace_path="/ws/aios-default", default_branch="develop")
+
+    at = _at_on_page("create", create_task_project="AIOS")
+    assert not at.exception
+
+    at = at.text_input(key="create_task_title").set_value("Inherit test").run()
+    at = at.text_area(key="create_task_objective").set_value("Do the inherited thing").run()
+    at = at.button(key="create_task_form_submit").click().run()
+    assert not at.exception
+
+    tasks_on_disk = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    assert len(tasks_on_disk) == 1
+    assert tasks_on_disk[0]["workspace_path"] == "/ws/aios-default"
+    assert tasks_on_disk[0]["branch"] == "develop"
+
+
+def test_created_task_override_wins_over_project_inheritance(tmp_path):
+    project_config.save_project_settings("AIOS", default_workspace_path="/ws/aios-default", default_branch="develop")
+
+    at = _at_on_page("create", create_task_project="AIOS")
+    assert not at.exception
+
+    override_path = str(tmp_path / "manual-override-workspace")
+    at = at.text_input(key="create_task_workspace_override").set_value(override_path).run()
+    at = at.text_input(key="create_task_title").set_value("Override test").run()
+    at = at.text_area(key="create_task_objective").set_value("Do the overridden thing").run()
+    at = at.button(key="create_task_form_submit").click().run()
+    assert not at.exception
+
+    tasks_on_disk = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    assert len(tasks_on_disk) == 1
+    assert tasks_on_disk[0]["workspace_path"] == override_path
+    assert tasks_on_disk[0]["branch"] == "develop"  # not overridden — still inherited
+
+
+# --------------------------------------------------------------------------
+# Projects settings tab: extended project configuration fields
+# --------------------------------------------------------------------------
+
+
+def test_projects_settings_tab_saves_extended_configuration(tmp_path):
+    at = _at_on_page("projects", project_browser_select="AIOS")
+    assert not at.exception
+
+    at = at.text_input(key="default_workspace_input_AIOS").set_value(str(tmp_path)).run()
+    at = at.text_input(key="default_branch_input_AIOS").set_value("develop").run()
+    at = at.text_area(key="default_prompt_input_AIOS").set_value("Default prompt text").run()
+    at = at.text_input(key="owner_input_AIOS").set_value("Dmitry").run()
+    at = at.button(key="save_project_settings_AIOS").click().run()
+    assert not at.exception
+
+    cfg = project_config.get_project_config("AIOS")
+    assert cfg["default_workspace_path"] == str(tmp_path)
+    assert cfg["default_branch"] == "develop"
+    assert cfg["default_prompt"] == "Default prompt text"
+    assert cfg["owner"] == "Dmitry"
+
+
+def test_projects_settings_tab_shows_warning_for_invalid_default_workspace():
+    at = _at_on_page("projects", project_browser_select="AIOS")
+    assert not at.exception
+
+    at = at.text_input(key="default_workspace_input_AIOS").set_value("/definitely/does/not/exist").run()
+    at = at.button(key="save_project_settings_AIOS").click().run()
+    assert not at.exception
+
+    warnings = [w.value for w in at.warning]
+    assert any("Workspace" in w for w in warnings)
+    # Still saves despite the warning — warnings are advisory, not blocking.
+    assert project_config.get_project_config("AIOS")["default_workspace_path"] == "/definitely/does/not/exist"
+
+
 def test_runs_page_project_filter_narrows_results():
     _seed_run(project="AIOS")
     run_bank = models.new_run_record(

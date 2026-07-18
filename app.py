@@ -292,6 +292,10 @@ def new_task_record(
     parent_task_id: str | None = None,
     prior_run_id: str | None = None,
     workflow_stage: str = "Draft",
+    workspace_path: str | None = None,
+    branch: str | None = None,
+    executor: str | None = None,
+    prompt: str | None = None,
 ) -> dict:
     return tasks_repository.new_task_record(
         project,
@@ -307,6 +311,10 @@ def new_task_record(
         parent_task_id=parent_task_id,
         prior_run_id=prior_run_id,
         workflow_stage=workflow_stage,
+        workspace_path=workspace_path,
+        branch=branch,
+        executor=executor,
+        prompt=prompt,
     )
 
 
@@ -1805,13 +1813,52 @@ elif page_key == "create":
 
     open_tasks = [task for task in tasks if task.get("status") != "Done"]
 
+    # `project` lives outside `create_task_form` on purpose: its value must be
+    # available immediately (a form's inner widgets don't rerun the script
+    # until submitted) so the inherited-defaults preview below reacts to the
+    # project the user just picked, before they submit anything.
+    project = st.selectbox("Проект", list(PROJECTS.keys()), key="create_task_project")
+    create_task_cfg = project_configs[project]
+    inherited = project_config.task_defaults_from_project(create_task_cfg)
+
+    st.caption(
+        f"Унаследовано из настроек проекта «{create_task_cfg['display_name']}»: "
+        f"workspace `{inherited['workspace_path'] or '—'}` · "
+        f"branch `{inherited['branch'] or '—'}` · "
+        f"executor `{inherited['executor'] or '—'}` · "
+        f"prompt {'задан' if inherited['prompt'] else '—'}. "
+        "Изменить можно в разделе «Проекты» → «Настройки проекта», либо переопределить ниже только для этой задачи."
+    )
+
+    with st.expander("Переопределить workspace / branch / executor / prompt для этой задачи"):
+        override_workspace = st.text_input(
+            "Workspace (переопределение)",
+            placeholder=inherited["workspace_path"] or "унаследовано из проекта",
+            key="create_task_workspace_override",
+        )
+        override_branch = st.text_input(
+            "Branch (переопределение)",
+            placeholder=inherited["branch"] or "унаследовано из проекта",
+            key="create_task_branch_override",
+        )
+        executor_override_options = ["(унаследовано из проекта)"] + executors.EXECUTOR_IDS
+        override_executor = st.selectbox(
+            "Executor (переопределение)",
+            executor_override_options,
+            key="create_task_executor_override",
+        )
+        override_prompt = st.text_area(
+            "Prompt (переопределение)",
+            placeholder=inherited["prompt"] or "унаследовано из проекта",
+            key="create_task_prompt_override",
+        )
+
     with st.form("create_task_form"):
         title_input = st.text_input(
             "Название задачи",
             placeholder="Короткий заголовок, например: Исправить сортировку в Kanban",
             key="create_task_title",
         )
-        project = st.selectbox("Проект", list(PROJECTS.keys()), key="create_task_project")
         task_type = st.selectbox(
             "Тип задачи",
             TASK_TYPES,
@@ -1853,6 +1900,7 @@ elif page_key == "create":
             "Создать задачу",
             icon=":material/add_task:",
             type="primary",
+            key="create_task_form_submit",
         )
 
     if submitted:
@@ -1872,6 +1920,9 @@ elif page_key == "create":
                 ok, stdout, stderr = run_start_task_script(project, task_type, objective_clean)
 
             if ok:
+                final_executor = (
+                    None if override_executor == "(унаследовано из проекта)" else override_executor
+                )
                 tasks.append(
                     new_task_record(
                         project,
@@ -1884,6 +1935,10 @@ elif page_key == "create":
                         owner=owner.strip(),
                         estimate_hours=float(estimate),
                         depends_on=dependencies,
+                        workspace_path=override_workspace.strip() or inherited["workspace_path"],
+                        branch=override_branch.strip() or inherited["branch"],
+                        executor=final_executor or inherited["executor"],
+                        prompt=override_prompt.strip() or inherited["prompt"],
                     )
                 )
                 save_tasks(tasks)
@@ -2515,6 +2570,123 @@ elif page_key == "projects":
         st.caption(f"Разрешённые агенты: {', '.join(cfg['allowed_agents'])}")
         st.caption(f"Каталог отчётов: `{cfg['reports_dir']}` · Каталог заданий: `{cfg['generated_dir']}`")
         st.caption("Файлы контекста: " + (", ".join(f"`{p}`" for p in cfg["context_file_paths"]) or "—"))
+
+        st.divider()
+        st.markdown("#### Настройки проекта (по умолчанию для новых задач)")
+        st.caption(
+            "Эти значения автоматически наследуются новыми задачами проекта "
+            "(workspace, branch, executor, prompt) на странице «Создать задачу»."
+        )
+
+        workspace_input = st.text_input(
+            "Workspace по умолчанию",
+            value=cfg.get("default_workspace_path") or "",
+            key=f"default_workspace_input_{selected_project}",
+        )
+        branch_input = st.text_input(
+            "Branch по умолчанию",
+            value=cfg.get("default_branch") or "",
+            key=f"default_branch_input_{selected_project}",
+        )
+        executor_options = ["(не задан)"] + executors.EXECUTOR_IDS
+        current_executor = cfg.get("default_executor")
+        executor_index = executor_options.index(current_executor) if current_executor in executor_options else 0
+        executor_input = st.selectbox(
+            "Executor по умолчанию",
+            executor_options,
+            index=executor_index,
+            key=f"default_executor_input_{selected_project}",
+        )
+        prompt_input = st.text_area(
+            "Prompt по умолчанию",
+            value=cfg.get("default_prompt") or "",
+            height=120,
+            key=f"default_prompt_input_{selected_project}",
+        )
+        description_input = st.text_area(
+            "Описание проекта",
+            value=cfg.get("description") or "",
+            height=80,
+            key=f"description_input_{selected_project}",
+        )
+
+        meta_cols = st.columns(3)
+        with meta_cols[0]:
+            status_options = project_config.PROJECT_STATUSES
+            current_status = cfg.get("status")
+            status_index = status_options.index(current_status) if current_status in status_options else 0
+            status_input = st.selectbox(
+                "Статус проекта", status_options, index=status_index, key=f"status_input_{selected_project}"
+            )
+        with meta_cols[1]:
+            priority_options = project_config.PROJECT_PRIORITIES
+            current_priority = cfg.get("priority")
+            priority_index = priority_options.index(current_priority) if current_priority in priority_options else 0
+            priority_input = st.selectbox(
+                "Приоритет проекта", priority_options, index=priority_index, key=f"priority_input_{selected_project}"
+            )
+        with meta_cols[2]:
+            progress_input = st.number_input(
+                "Прогресс (%)",
+                min_value=0,
+                max_value=100,
+                value=int(cfg.get("progress") or 0),
+                step=5,
+                key=f"progress_input_{selected_project}",
+            )
+
+        owner_cols = st.columns(3)
+        with owner_cols[0]:
+            sprint_input = st.text_input(
+                "Текущий спринт", value=cfg.get("current_sprint") or "", key=f"sprint_input_{selected_project}"
+            )
+        with owner_cols[1]:
+            milestone_input = st.text_input(
+                "Текущая веха", value=cfg.get("current_milestone") or "", key=f"milestone_input_{selected_project}"
+            )
+        with owner_cols[2]:
+            owner_input = st.text_input(
+                "Владелец проекта", value=cfg.get("owner") or "", key=f"owner_input_{selected_project}"
+            )
+
+        if st.button(
+            "Сохранить настройки проекта", key=f"save_project_settings_{selected_project}", icon=":material/save:"
+        ):
+            candidate = dict(cfg)
+            candidate.update(
+                {
+                    "default_workspace_path": workspace_input.strip() or None,
+                    "default_branch": branch_input.strip() or None,
+                    "default_executor": None if executor_input == "(не задан)" else executor_input,
+                    "default_prompt": prompt_input.strip(),
+                    "description": description_input.strip(),
+                    "status": status_input,
+                    "priority": priority_input,
+                    "progress": int(progress_input),
+                    "current_sprint": sprint_input.strip() or None,
+                    "current_milestone": milestone_input.strip() or None,
+                    "owner": owner_input.strip(),
+                }
+            )
+            for warning_message in project_config.validate_project_settings(candidate):
+                st.warning(warning_message)
+
+            project_config.save_project_settings(
+                selected_project,
+                default_workspace_path=candidate["default_workspace_path"],
+                default_branch=candidate["default_branch"],
+                default_executor=candidate["default_executor"],
+                default_prompt=candidate["default_prompt"],
+                description=candidate["description"],
+                status=candidate["status"],
+                priority=candidate["priority"],
+                progress=candidate["progress"],
+                current_sprint=candidate["current_sprint"],
+                current_milestone=candidate["current_milestone"],
+                owner=candidate["owner"],
+            )
+            st.success("Настройки проекта сохранены.")
+            st.rerun()
 
 
 # --------------------------------------------------------------------------

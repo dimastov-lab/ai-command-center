@@ -223,3 +223,65 @@ def _init_repo(path) -> None:
     (path / "README.md").write_text("hello")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+
+# --------------------------------------------------------------------------
+# End-to-end: a task inherits its workspace at creation time (via
+# `project_config.task_defaults_from_project`) and Launch resolves that same
+# path unchanged — proving the two mechanisms agree rather than drifting.
+# --------------------------------------------------------------------------
+
+
+def test_launch_resolves_the_same_workspace_a_task_inherited_at_creation(tmp_path):
+    from command_center import project_config, tasks_repository
+
+    project_repo = tmp_path / "aios"
+    project_repo.mkdir()
+    _init_repo(project_repo)
+
+    project_default_workspace = tmp_path / "aios-worktree"
+    project_default_workspace.mkdir()
+    _init_repo(project_default_workspace)
+
+    cfg = project_config.default_project_config("AIOS")
+    cfg["repository_path"] = str(project_repo)
+    cfg["default_workspace_path"] = str(project_default_workspace)
+    cfg["default_branch"] = "main"
+
+    inherited = project_config.task_defaults_from_project(cfg)
+    task = tasks_repository.new_task_record(
+        "AIOS", "T", "implementation", "Backlog",
+        workspace_path=inherited["workspace_path"], branch=inherited["branch"],
+    )
+
+    # The task was never explicitly pointed at a workspace by hand — it
+    # inherited it from the project at creation — yet Launch still resolves
+    # to it (the "task" precedence tier), not the project repository.
+    selection = launch.resolve_workspace_path(task=task, project_config=cfg)
+    assert selection.path == str(project_default_workspace)
+    assert selection.source == launch.WORKSPACE_SOURCE_TASK
+
+
+def test_launch_resolves_repository_path_when_task_inherited_from_project_with_no_default_workspace(tmp_path):
+    """Legacy-shaped project (only `repository_path` configured, matching
+    every project before this feature existed): a task created against it
+    still inherits a usable workspace_path, and Launch resolves to the exact
+    same repository — proving no behavior changed for projects that never
+    configure `default_workspace_path`."""
+    from command_center import project_config, tasks_repository
+
+    project_repo = tmp_path / "aios"
+    project_repo.mkdir()
+    _init_repo(project_repo)
+
+    cfg = project_config.default_project_config("AIOS")
+    cfg["repository_path"] = str(project_repo)
+
+    inherited = project_config.task_defaults_from_project(cfg)
+    task = tasks_repository.new_task_record(
+        "AIOS", "T", "implementation", "Backlog", workspace_path=inherited["workspace_path"],
+    )
+
+    selection = launch.resolve_workspace_path(task=task, project_config=cfg)
+    assert selection.path == str(project_repo)
+    assert selection.source == launch.WORKSPACE_SOURCE_TASK
