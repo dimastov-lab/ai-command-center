@@ -233,6 +233,26 @@ def test_sanitize_strips_banned_fields_for_sensitive_project(project_id, tmp_pat
     assert sanitized_activity["event_type"] == "run_completed"
 
 
+@pytest.mark.parametrize("project_id", ["BANK", "LEGAL"])
+@pytest.mark.parametrize("failure_reason", [None, "timeout"])
+def test_sanitize_allows_failure_reason_for_sensitive_project(project_id, failure_reason, tmp_path):
+    """`failure_reason` is safe to allowlist because the Supervisor (the only writer,
+    `runtime/supervisor.py:_supervise`) constrains it to exactly `None` or the literal
+    string `"timeout"` — never raw exception text. This pins that the field survives
+    redaction with those two documented values."""
+    run = {
+        "run_id": "r1", "source": "v2", "project": project_id, "state": "FAILED",
+        "failure_reason": failure_reason,
+    }
+
+    result = workspace_home.sanitize_workspace_project_entry(
+        project_id, runs=[run], reports=[], artifacts=[], activity=[]
+    )
+
+    sanitized_run = result["runs"][0]
+    assert sanitized_run["failure_reason"] == failure_reason
+
+
 _BANNED_VALUES = ["TOP SECRET", "secret output", "secret-financial-data"]
 
 

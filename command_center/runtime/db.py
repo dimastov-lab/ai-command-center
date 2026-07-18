@@ -640,10 +640,16 @@ def list_runs(
     exclusive — passing both raises `ValueError` before any SQL is built, so a caller
     can never end up with an ambiguous, silently-ORed filter. `limit`, if given, is
     applied as a SQL `LIMIT` after the existing `ORDER BY created_at DESC`, bounding
-    the result set inside SQLite rather than truncating a full-table fetch in Python.
+    the result set inside SQLite rather than truncating a full-table fetch in Python;
+    a negative `limit` raises `ValueError` before any SQL runs (SQLite's own
+    `LIMIT -1` means "unlimited," which would silently defeat the bound this
+    parameter exists to provide) — `limit=0` remains a valid request that returns
+    `[]`.
     """
     if state is not None and states is not None:
         raise ValueError("Pass either `state` or `states`, not both.")
+    if limit is not None and limit < 0:
+        raise ValueError(f"limit must be >= 0, got {limit!r}")
     clauses = []
     params: list[Any] = []
     if session_id:

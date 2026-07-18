@@ -42,15 +42,20 @@ def project_from_path(path: Path, base: Path) -> str:
     return parts[0] if len(parts) > 1 else "—"
 
 
-# Recognized task types, mirrored from `app.py`'s `TASK_TYPES` — kept here as a
-# private constant (not re-exported) so this module has no dependency on `app.py`.
-_TASK_TYPES: frozenset[str] = frozenset(
-    {"implementation", "review", "remediation", "final_gate", "architecture_review"}
+# Canonical recognized task types, in display/selection order. This is the single
+# source of truth for the app's task-type set — `app.py` imports this instead of
+# defining its own duplicate list, so the two can never drift apart.
+TASK_TYPES: tuple[str, ...] = (
+    "implementation",
+    "review",
+    "remediation",
+    "final_gate",
+    "architecture_review",
 )
 
 
 def infer_task_type_from_filename(path: Path) -> str | None:
     parts = path.stem.split("_", 1)
-    if len(parts) == 2 and parts[1] in _TASK_TYPES:
+    if len(parts) == 2 and parts[1] in TASK_TYPES:
         return parts[1]
     return None
