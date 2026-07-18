@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow strict semantic versioning tags in Git; versions below refer to
 functional application milestones of `app.py`.
 
+## [Unreleased] — Desktop Architecture D0
+
+### Added
+- **`docs/desktop/`**: canonical, implementation-ready documentation set for a native
+  PySide6/Qt Widgets desktop application — product vision, target architecture, information
+  architecture, design directions (Professional Control Plane approved), design system, a
+  Workspace Home native-page spec built on the existing `build_workspace_home_snapshot` read
+  model, macOS/Windows platform behavior, frozen Desktop Increment 1 (D1–D4) scope, and a
+  commit-sized implementation roadmap. Documentation only — no desktop code, dependencies, or
+  packaging exist yet. Next implementation stage: D1A.
+
 ## [Unreleased] — Sprint 3 Increment 1: Workspace Home
 
 Implements `WORKSPACE_HOME_ARCHITECTURE.md` in full (all 10 steps of §17's implementation

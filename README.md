@@ -5,6 +5,11 @@ task creation, a Kanban board, generated AI task files, reports, repository/cont
 (as of v1.2) project chat plus a Claude Code agent-run workflow with a parsed-result run journal —
 all from one Streamlit application running on your machine.
 
+A native desktop application is planned as the future daily-use interface; the Streamlit
+application documented below remains the primary interface until then — see
+[`docs/desktop/README.md`](docs/desktop/README.md) for the desktop architecture and design
+documentation (status: D0, documentation only, no desktop code yet).
+
 ## Getting started
 
 ### 1. Create a virtual environment

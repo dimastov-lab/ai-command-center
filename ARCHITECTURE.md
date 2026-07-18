@@ -4,6 +4,12 @@ This document describes how the application is built as of **v1.2**. It reflects
 `app.py` and `command_center/`, not aspirations — if this file and the code disagree, the code is
 authoritative. §§1–10 describe the v1.1 baseline (still accurate); §11 describes what v1.2 added.
 
+A future native desktop application will reuse `command_center/` and `command_center/runtime/`
+unchanged, adding new `command_center.desktop`/`command_center.application`/
+`command_center.platform` packages alongside this Streamlit application rather than replacing
+any of it — see `docs/desktop/ARCHITECTURE.md` for that target architecture (status: D0,
+documentation only, no desktop code yet).
+
 ## 1. Shape of the system
 
 AI Command Center is a **single-process, single-file, local-only Streamlit application**. There
