@@ -760,3 +760,42 @@ def test_launching_set_is_cleared_after_a_popen_failure(git_repo, configure_proj
     )
     assert run["state"] == "FAILED"
     assert run["id"] not in sup._launching
+
+
+def test_launching_set_is_cleared_after_a_prepared_to_queued_transition_failure(
+    git_repo, configure_project_repo, monkeypatch
+):
+    """Regression test for the window this hardening closes: `self._launching`
+    must already hold the run id at the moment the PREPARED -> QUEUED
+    transition is attempted — proving registration happens immediately after
+    `db.create_run` returns, not after `QUEUED` is persisted — and must be
+    cleared if that transition itself raises, with the original exception
+    propagating untouched and no PREPARED row silently left both unguarded
+    and un-classifiable until the next `reconcile()`."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+
+    observed = {}
+    original_update_run_state = supervisor.db.update_run_state
+
+    def failing_update_run_state(db_path, run_id, *, expected_version, new_state, fields=None):
+        if new_state == "QUEUED":
+            observed["run_id_guarded_during_transition"] = run_id in sup._launching
+            raise RuntimeError("simulated PREPARED -> QUEUED failure")
+        return original_update_run_state(
+            db_path, run_id, expected_version=expected_version, new_state=new_state, fields=fields
+        )
+
+    monkeypatch.setattr(supervisor.db, "update_run_state", failing_update_run_state)
+
+    with pytest.raises(RuntimeError, match="simulated PREPARED -> QUEUED failure"):
+        sup.start_raw(
+            project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+        )
+
+    assert observed["run_id_guarded_during_transition"] is True
+    assert not sup._launching
+
+    runs = db.list_runs(sup.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert len(runs) == 1
+    assert runs[0]["state"] == "PREPARED"
