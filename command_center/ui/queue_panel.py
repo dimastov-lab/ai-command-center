@@ -14,6 +14,7 @@ from pathlib import Path
 import streamlit as st
 
 from command_center import execution_queue, recommend
+from command_center.ui.launch_feedback import render_skipped_launch
 
 
 def _pick_next(ready_entries: list[dict], tasks_by_id: dict[str, dict]) -> dict | None:
@@ -66,8 +67,14 @@ def render_execution_queue_panel(
     if flash:
         if flash["launched_count"]:
             st.success(f"Запущено: {flash['launched_count']}.")
-        for task_id, message in flash["skipped"]:
-            st.warning(f"Не запущено — {task_id}: {message}")
+        for skipped in flash["skipped"]:
+            render_skipped_launch(
+                f"Не запущено — {skipped['task_id']}",
+                message=skipped["message"],
+                warnings=skipped["warnings"],
+                validation_report=skipped["validation_report"],
+                details_label=skipped["task_id"],
+            )
 
     if not waiting and not ready:
         st.caption("Очередь пуста. Добавьте задачу из рекомендаций или карточки Kanban.")
@@ -103,7 +110,15 @@ def render_execution_queue_panel(
         skipped = [r for r in results if not r.launched]
         st.session_state[flash_key] = {
             "launched_count": len(launched),
-            "skipped": [(r.task_id, r.message) for r in skipped],
+            "skipped": [
+                {
+                    "task_id": r.task_id,
+                    "message": r.message,
+                    "warnings": list(r.warnings),
+                    "validation_report": r.validation_report,
+                }
+                for r in skipped
+            ],
         }
         st.rerun()
 

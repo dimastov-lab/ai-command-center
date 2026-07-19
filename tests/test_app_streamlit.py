@@ -734,8 +734,19 @@ def test_recommendations_panel_launch_blocked_by_dirty_tree_shows_reason(fake_cl
     at = launch_button.click().run()
     assert not at.exception
     warnings = [w.value for w in at.warning]
+    # The generic "требует подтверждения... запустите вручную" summary is
+    # gone — the exact `validate_launch` warnings are itemized as bullets.
     assert any("Не удалось запустить сразу" in w for w in warnings)
-    assert any("запустите вручную из карточки задачи" in w for w in warnings)
+    assert any("- Рабочее дерево не чистое" in w for w in warnings)
+    assert not any("запустите вручную из карточки задачи" in w for w in warnings)
+
+    # And the full validation report is available on demand, not forced on
+    # the reader by default.
+    details = next(e for e in at.expander if "Детали проверки" in e.label)
+    report = json.loads(details.json[0].value)
+    assert report["errors"] == []
+    assert any("Рабочее дерево не чистое" in w for w in report["warnings"])
+    assert report["git_status"]["dirty"] is True
 
 
 def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_path):
@@ -761,9 +772,17 @@ def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_
     at = launch_ready_btn.click().run()
     assert not at.exception
     warnings = [w.value for w in at.warning]
+    # The exact `validate_launch` warning is itemized as a bullet, naming
+    # the task — not collapsed into the old generic summary.
     assert any(
-        "seeded-task-1" in w and "запустите вручную из карточки задачи" in w for w in warnings
+        "seeded-task-1" in w and "- Рабочее дерево не чистое" in w for w in warnings
     )
+    assert not any("запустите вручную из карточки задачи" in w for w in warnings)
+
+    details = next(e for e in at.expander if "seeded-task-1" in e.label)
+    report = json.loads(details.json[0].value)
+    assert any("Рабочее дерево не чистое" in w for w in report["warnings"])
+    assert report["workspace_path"] == str(repo)
 
     entries_after = execution_queue.load_queue(data_dir)
     assert entries_after[0]["state"] == execution_queue.STATE_READY

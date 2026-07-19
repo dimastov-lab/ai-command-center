@@ -155,6 +155,10 @@ def test_launch_ready_skips_entry_with_no_workspace_configured(tmp_path):
     )
     assert results[0].launched is False
     assert "workspace" in results[0].message
+    # No `validate_launch` run happened for this skip reason (no workspace to
+    # even validate) — nothing to itemize, so both stay empty.
+    assert results[0].warnings == []
+    assert results[0].validation_report is None
     assert updated[0]["state"] == execution_queue.STATE_READY  # left in place, not silently dropped
 
 
@@ -173,6 +177,40 @@ def test_launch_ready_skips_entry_needing_warning_acknowledgement(tmp_path, git_
     assert results[0].launched is False
     assert "подтверждения" in results[0].message
     assert updated[0]["state"] == execution_queue.STATE_READY
+
+    # The exact `validate_launch` warning strings are surfaced separately
+    # from the generic `message` — so the UI can render each as its own
+    # bullet instead of paraphrasing them away.
+    assert len(results[0].warnings) == 1
+    assert "Рабочее дерево не чистое" in results[0].warnings[0]
+
+    # ...alongside the complete validation report, for an optional "Details"
+    # expander — never just the warning strings in isolation.
+    report = results[0].validation_report
+    assert report["workspace_path"] == str(git_repo)
+    assert report["errors"] == []
+    assert report["warnings"] == results[0].warnings
+    assert report["git_status"]["dirty"] is True
+    assert report["git_status"]["untracked_count"] == 1
+
+
+def test_launch_ready_skipped_result_warnings_never_used_to_gate_launch(tmp_path, git_repo):
+    # Regression guard for "do not change launch behavior, only visibility":
+    # populating `warnings`/`validation_report` on the result must not by
+    # itself alter whether the entry stays queued — it is still left in
+    # STATE_READY, still not launched, exactly as before this field existed.
+    (git_repo / "untracked.txt").write_text("x")
+    task = _task(id="a", workspace_path=str(git_repo))
+    tasks_by_id = {"a": task}
+    entries = execution_queue.enqueue([], task, tasks_by_id)
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+
+    updated, results = execution_queue.launch_ready(
+        tmp_path, entries, [task], tasks_by_id, {"AIOS": {}}, api
+    )
+    assert results[0].run_id is None
+    assert updated[0]["state"] == execution_queue.STATE_READY
+    assert updated[0]["run_id"] is None
 
 
 def test_launch_ready_launches_clean_ready_entry(tmp_path, git_repo, fake_claude):

@@ -12,6 +12,7 @@ from pathlib import Path
 import streamlit as st
 
 from command_center import execution_queue, recommendation_service
+from command_center.ui.launch_feedback import render_skipped_launch
 
 _QUEUED_STATE_LABELS: dict[str, str] = {
     execution_queue.STATE_WAITING: "В очереди · ожидает",
@@ -52,7 +53,12 @@ def render_recommendations_panel(
         if flash["launched"]:
             st.success(f"Запуск начат: `{flash['run_id']}`.")
         else:
-            st.warning(f"Не удалось запустить сразу: {flash['message']}")
+            render_skipped_launch(
+                "Не удалось запустить сразу",
+                message=flash["message"],
+                warnings=flash["warnings"],
+                validation_report=flash["validation_report"],
+            )
 
     if not views:
         st.info("Нет рекомендованных незаблокированных задач.")
@@ -128,5 +134,7 @@ def render_recommendations_panel(
                         "launched": bool(result and result.launched),
                         "run_id": result.run_id if result else None,
                         "message": (result.message if result else "запуск не выполнен"),
+                        "warnings": list(result.warnings) if result else [],
+                        "validation_report": result.validation_report if result else None,
                     }
                     st.rerun()

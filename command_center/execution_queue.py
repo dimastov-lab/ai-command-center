@@ -39,7 +39,7 @@ Supervisor schema.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from command_center import agent_runner, launch, launch_service, models, storage
@@ -174,6 +174,32 @@ class LaunchAttemptResult:
     launched: bool
     run_id: str | None = None
     message: str = ""
+    # Populated only for the "blocked by validation warnings" case (dirty
+    # tree, detached HEAD, branch mismatch) — the exact strings from
+    # `launch.LaunchValidation.warnings`, so the UI layer can render each as
+    # its own bullet instead of collapsing them into `message`'s generic
+    # summary. Empty for every other skip/failure reason (missing workspace,
+    # task not found, launch exception).
+    warnings: list[str] = field(default_factory=list)
+    # Full `launch.validate_launch` result for the same case, for an
+    # optional "Details" expander in the UI — never used to gate anything,
+    # purely informational.
+    validation_report: dict | None = None
+
+
+def _validation_report(validation: launch.LaunchValidation, *, expected_branch: str | None) -> dict:
+    """The complete pre-flight picture for one skipped launch — everything
+    `validate_launch` observed, not just the warning strings — for the UI's
+    "Details" expander. Read-only summary; never used for control flow."""
+    git_status = validation.git_status or {}
+    return {
+        "workspace_path": validation.workspace_path,
+        "expected_branch": expected_branch,
+        "actual_branch": git_status.get("branch"),
+        "errors": list(validation.errors),
+        "warnings": list(validation.warnings),
+        "git_status": dict(git_status),
+    }
 
 
 def launch_ready(
@@ -247,6 +273,8 @@ def launch_ready(
                     task_id,
                     False,
                     message="требует подтверждения предупреждений — запустите вручную из карточки задачи",
+                    warnings=list(validation.warnings),
+                    validation_report=_validation_report(validation, expected_branch=expected_branch),
                 )
             )
             continue
