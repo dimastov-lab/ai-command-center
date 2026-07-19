@@ -307,21 +307,25 @@ class Supervisor:
             )
         except db.WorkspaceLockedError as exc:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
-        run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
 
         # From here on this run is committed to being launched by *this*
-        # instance — recorded before `_launch_process` (which `Popen`s and
-        # only then adds it to `self._active`) so a concurrent `reconcile()`
-        # call in this same process (e.g. another browser tab's dashboard
-        # refresh) cannot see this QUEUED, not-yet-`Popen`'d, pid-less row
-        # and misclassify it as INTERRUPTED out from under the launch in
-        # progress. See `reconcile()`'s skip-guard and `_launch_process`'s
-        # `finally`, which removes this once the row has a real process (or
-        # has failed) recorded instead.
+        # instance — recorded the instant the row exists (still PREPARED),
+        # not after the QUEUED transition below, so a concurrent
+        # `reconcile()` call in this same process (e.g. another browser
+        # tab's dashboard refresh) — which now scans PREPARED rows too,
+        # since that's exactly what this hardening added — can never
+        # observe this row before it's guarded here. Registering it any
+        # later would reopen the same gap this set exists to close: a
+        # pid-less PREPARED/QUEUED row with no entry in `self._launching`
+        # is indistinguishable from one abandoned by a crashed predecessor.
+        # See `reconcile()`'s skip-guard and `_launch_process`'s `finally`,
+        # which removes this once the row has a real process (or has
+        # failed) recorded instead.
         with self._active_lock:
             self._launching.add(run["id"])
 
         try:
+            run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
             pre_run_status = agent_runner.git_snapshot(repo_path).get("status_summary")
             run = db.update_run_fields(
                 self.db_path,
@@ -710,12 +714,16 @@ class Supervisor:
           and persist the result, `identity.capture_identity(pid)` here
           would see "pid gone" and misclassify a run that is completing
           completely normally as `INTERRUPTED`.
-        - `self._launching`: now that `QUEUED` rows are in scope above, a
-          run this same instance is mid-`start_raw` for (row persisted as
-          `QUEUED`, no pid yet — `_launch_process` hasn't called `Popen`)
-          would otherwise look identical to a genuinely abandoned `QUEUED`
-          row from a crashed predecessor and get misclassified
-          `INTERRUPTED` out from under its own in-flight launch.
+        - `self._launching`: now that `PREPARED`/`QUEUED` rows are in scope
+          above, a run this same instance is mid-`start_raw` for (row
+          persisted as `PREPARED` or `QUEUED`, no pid yet — `_launch_process`
+          hasn't called `Popen`) would otherwise look identical to a
+          genuinely abandoned `PREPARED`/`QUEUED` row from a crashed
+          predecessor and get misclassified `INTERRUPTED` out from under its
+          own in-flight launch. `start_raw` adds the run id here immediately
+          once `db.create_run` returns (while the row is still `PREPARED`),
+          not after the subsequent `QUEUED` transition — registering it any
+          later would leave exactly that window unguarded.
 
         Classification:
 
