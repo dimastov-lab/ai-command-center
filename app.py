@@ -578,9 +578,13 @@ def render_agent_launcher(
     if not st.session_state[confirm_key]:
         return
 
-    with st.container(border=True):
-        st.markdown("#### Подтверждение запуска агента")
-
+    # Rendered as a dialog (not inline `with st.container(...)`) so this
+    # multi-column confirmation form always gets a full-width modal surface
+    # regardless of how narrow the caller's own layout is — e.g. a single
+    # Kanban lane (`st.columns(len(KANBAN_COLUMNS))`), which used to force
+    # this entire form into a sliver a few hundred pixels wide.
+    @st.dialog("Подтверждение запуска агента", width="large")
+    def _render_launch_confirmation() -> None:
         task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
         selection = launch.resolve_workspace_path(task=task_for_launch, project_config=cfg)
 
@@ -750,6 +754,8 @@ def render_agent_launcher(
         st.session_state.pending_nav = "execution_center"
         st.session_state.pending_exec_center_run = run["id"]
         st.rerun()
+
+    _render_launch_confirmation()
 
 
 def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str) -> None:

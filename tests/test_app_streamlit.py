@@ -169,6 +169,53 @@ def test_kanban_launcher_present_but_never_calls_subprocess_on_render(monkeypatc
     assert any(b.label == "Запустить Claude Code" for b in at.button)
 
 
+def test_kanban_launcher_confirmation_renders_as_dialog_not_inline_in_narrow_lane(monkeypatch, tmp_path):
+    """P1 layout regression test. The Kanban board renders one narrow
+    `st.columns(len(KANBAN_COLUMNS))` lane per status, and each task card's
+    "Запустить Claude Code" button used to expand its confirmation form
+    (workspace metadata, a 3-column workspace-action row, a 2-column
+    confirm/cancel row) *inline* into that single narrow lane — collapsing
+    it into a barely-readable, word-wrapped sliver with the rest of the page
+    left empty. The form must instead open as an `st.dialog`, which
+    Streamlit always gives its own full-width top-level surface, never a
+    descendant of `at.main`'s tree — asserted here by checking the
+    confirmation checkbox is queryable across the whole app (the dialog is
+    open) but is *not* a descendant of `at.main` (the narrow Kanban lane)."""
+
+    real_run = subprocess.run
+
+    def fail_if_claude_launched(command, **kwargs):
+        # `subprocess` is a single shared module object, so this also
+        # intercepts `git_info`'s legitimate (and expected) read-only status
+        # call for the dialog's branch/dirty-tree display — only the
+        # `claude` launch itself must be refused.
+        if command and command[0] == "claude":
+            raise AssertionError("claude must not be launched merely by opening the confirmation dialog")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fail_if_claude_launched)
+
+    repo = tmp_path / "aios-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    project_config.save_repository_path("AIOS", str(repo))
+
+    _seed_task()
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    open_button = next(b for b in at.button if b.label == "Запустить Claude Code")
+    at = open_button.click().run()
+    assert not at.exception
+
+    confirm_key = "kanban_seeded-task-1_launch_confirmed"
+    assert any(c.key == confirm_key for c in at.checkbox), "confirmation dialog did not open"
+    assert not any(c.key == confirm_key for c in at.main.checkbox), (
+        "launch confirmation is rendered inline inside the narrow Kanban lane column "
+        "instead of as a full-width st.dialog"
+    )
+
+
 def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
     def fail_if_called(*args, **kwargs):
         raise AssertionError("subprocess.run must not be called when the repository is unconfigured")
