@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -101,6 +102,80 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
     monkeypatch.setattr(chat_service, "CHATS_FILE", isolated_data_dir / "chats.json")
 
 
+@pytest.fixture(autouse=True)
+def isolated_generated_dir(isolated_data_dir, monkeypatch):
+    """Closes the same class of gap `isolated_reports_dir` closes for `REPORTS_ROOT`,
+    for `app.GENERATED_DIR` / `command_center.workspace_home.GENERATED_DIR` (both
+    `ROOT / "generated"`).
+
+    `workspace_home.GENERATED_DIR` is a normal cached import — `app.py`'s
+    `from command_center import workspace_home` resolves to the same `sys.modules`
+    entry patched below, so patching it here holds everywhere, including inside a
+    Streamlit `AppTest` run.
+
+    `app.GENERATED_DIR` cannot be isolated the same way: `AppTest.from_file` re-execs
+    `app.py`'s entire source fresh into a brand-new module registered as
+    `sys.modules["__main__"]` on *every* `.run()` (see
+    `streamlit/runtime/scriptrunner/script_runner.py`: `module = self._new_module
+    ("__main__")` then `sys.modules["__main__"] = module`). A separate `import app`
+    here is therefore a different module object than the one AppTest actually
+    executes, so `monkeypatch.setattr(app, "GENERATED_DIR", ...)` would silently do
+    nothing for any AppTest-driven test. It is still patched below for the benefit of
+    tests that `import app` directly instead of going through `AppTest` (the pattern
+    `test_kanban_page_registry_includes_aicos_with_no_local_projects_dict` already
+    uses for `app.PROJECTS`).
+
+    The actual leak into the real `generated/AIOS/` came from a different place:
+    `app.py`'s task-creation form calls `run_start_task_script`, which shells out to
+    `scripts/start-task.sh` — that script resolves its own `ROOT_DIR` from
+    `${BASH_SOURCE[0]}`'s on-disk location, bypassing `GENERATED_DIR` in either module
+    entirely. Patching the two `GENERATED_DIR` constants alone would leave every
+    task-creation test still invoking the real script and writing straight into the
+    developer's real `generated/AIOS/` (confirmed root cause: every stray
+    `*_implementation.md` there with objective text `"Do the overridden thing"` /
+    `"Do the inherited thing"` came from exactly this path — see
+    `test_app_streamlit.py`'s `test_created_task_inherits_project_workspace_and_branch_without_manual_entry`
+    / `test_created_task_override_wins_over_project_inheritance`). `subprocess.run` is
+    therefore guarded here too: any call whose command targets `start-task.sh` is
+    redirected to write its Markdown output under the isolated directory instead of
+    shelling out for real. `subprocess` is stdlib, always the same cached module
+    object process-wide, so this interception holds regardless of how/when the
+    calling code (including a freshly re-exec'd `app.py`) imported it — the same
+    technique `fake_claude` already uses for `supervisor_module.subprocess.Popen`.
+    Everything that isn't a `start-task.sh` call is forwarded to the real
+    `subprocess.run` unchanged (e.g. `git_repo`'s real `git init`)."""
+    import app
+    from command_center import workspace_home
+
+    generated_dir = isolated_data_dir / "generated"
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app, "GENERATED_DIR", generated_dir)
+    monkeypatch.setattr(workspace_home, "GENERATED_DIR", generated_dir)
+
+    original_run = subprocess.run
+
+    def guarded_run(command, *args, **kwargs):
+        argv = list(command) if isinstance(command, (list, tuple)) else [command]
+        if argv and str(argv[0]).endswith("start-task.sh"):
+            project = argv[1] if len(argv) > 1 else "AIOS"
+            task_type = argv[2] if len(argv) > 2 else "implementation"
+            objective = argv[3] if len(argv) > 3 else ""
+            target_dir = generated_dir / project.upper()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            (target_dir / f"{timestamp}_{task_type.lower()}.md").write_text(
+                "# Agent Task (test double written by isolated_generated_dir)\n\n"
+                f"Project: {project.upper()}\nTask type: {task_type.lower()}\n\n"
+                f"## Objective\n\n{objective}\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded_run)
+    return generated_dir
+
+
 _CONTAMINATION_MARKERS: tuple[str, ...] = (
     "pytest-of-",
     "aicc_test_data_",
@@ -152,7 +227,7 @@ def guard_real_project_files():
                         break
         return hits
 
-    hits = _scan(root / "data") + _scan(root / "reports")
+    hits = _scan(root / "data") + _scan(root / "reports") + _scan(root / "generated")
     assert not hits, "Found test-fixture contamination in real project files:\n" + "\n".join(hits)
 
 

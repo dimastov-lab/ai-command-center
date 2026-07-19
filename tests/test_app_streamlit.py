@@ -18,7 +18,7 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage
+from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
 from command_center.ui import project_selector
@@ -572,6 +572,46 @@ def test_created_task_override_wins_over_project_inheritance(tmp_path):
     assert len(tasks_on_disk) == 1
     assert tasks_on_disk[0]["workspace_path"] == override_path
     assert tasks_on_disk[0]["branch"] == "develop"  # not overridden — still inherited
+
+
+def _snapshot_dir(directory: Path) -> dict[str, tuple[int, float]]:
+    if not directory.is_dir():
+        return {}
+    return {
+        str(path.relative_to(directory)): (path.stat().st_size, path.stat().st_mtime)
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_created_task_generated_markdown_is_isolated_from_the_real_repository(isolated_generated_dir):
+    """Regression test for the `GENERATED_DIR` test-isolation leak (see
+    `tests/conftest.py`'s `isolated_generated_dir` fixture docstring for the full root
+    cause): submitting the create-task form shells out to `scripts/start-task.sh`,
+    which used to write real Markdown straight into this repository's real
+    `generated/AIOS/` on every run of a test like this one — that is exactly how the
+    stray `*_implementation.md` files with objective text `"Do the overridden thing"`/
+    `"Do the inherited thing"` (the two tests directly above this one) ended up there.
+    Proves the write now lands only under the isolated directory, the real
+    `generated/` tree is left byte-for-byte unchanged, and `workspace_home
+    .GENERATED_DIR` — the module `app.py`'s own "Generated tasks" viewer reads
+    through — resolves to that same isolated directory."""
+    real_generated_dir = Path(__file__).resolve().parent.parent / "generated"
+    before = _snapshot_dir(real_generated_dir)
+
+    at = _at_on_page("create", create_task_project="AIOS")
+    assert not at.exception
+    at = at.text_input(key="create_task_title").set_value("Isolation regression").run()
+    at = at.text_area(key="create_task_objective").set_value("Prove GENERATED_DIR isolation").run()
+    at = at.button(key="create_task_form_submit").click().run()
+    assert not at.exception
+
+    written = list((isolated_generated_dir / "AIOS").glob("*.md"))
+    assert len(written) == 1
+    assert "Prove GENERATED_DIR isolation" in written[0].read_text(encoding="utf-8")
+
+    assert _snapshot_dir(real_generated_dir) == before
+    assert workspace_home.GENERATED_DIR == isolated_generated_dir
 
 
 # --------------------------------------------------------------------------
