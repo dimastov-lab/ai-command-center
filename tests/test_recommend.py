@@ -61,3 +61,37 @@ def test_recommend_next_task_boosts_remediation_stage():
     remediation = _task(id="remediation", workflow_stage="Remediation")
     result = recommend.recommend_next_task([plain, remediation])
     assert result.task["id"] == "remediation"
+
+
+def test_list_recommendations_returns_top_n_best_first():
+    low = _task(id="low", priority="Low")
+    medium = _task(id="medium", priority="Medium")
+    critical = _task(id="critical", priority="Critical")
+    results = recommend.list_recommendations([low, medium, critical], limit=2)
+    assert [r.task["id"] for r in results] == ["critical", "medium"]
+
+
+def test_list_recommendations_top_1_matches_recommend_next_task():
+    tasks = [_task(id="a", priority="Low"), _task(id="b", priority="Critical")]
+    top = recommend.list_recommendations(tasks, limit=1)
+    assert len(top) == 1
+    assert top[0].task["id"] == recommend.recommend_next_task(tasks).task["id"]
+
+
+def test_list_recommendations_excludes_blocked_and_done_tasks():
+    blocker = _task(id="a", status="Backlog")
+    blocked = _task(id="b", depends_on=["a"])
+    done = _task(id="c", status="Done")
+    results = recommend.list_recommendations([blocker, blocked, done], limit=10)
+    assert [r.task["id"] for r in results] == ["a"]
+
+
+def test_list_recommendations_respects_project_scope():
+    aios_task = _task(id="a", project="AIOS")
+    aicos_task = _task(id="b", project="AICOS", priority="Critical")
+    results = recommend.list_recommendations([aios_task, aicos_task], project="AIOS", limit=10)
+    assert [r.task["id"] for r in results] == ["a"]
+
+
+def test_list_recommendations_empty_when_no_candidates():
+    assert recommend.list_recommendations([]) == []

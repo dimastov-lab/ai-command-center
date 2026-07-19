@@ -12,6 +12,7 @@ from command_center import (
     agent_runner,
     artifacts,
     chat_service,
+    execution_queue,
     executors,
     git_info,
     launch,
@@ -32,6 +33,7 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import log_tail, project_overview, session_view, task_sync
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
+from command_center.ui import project_intelligence_panel, project_selector, queue_panel, recommendations_panel
 
 ROOT = Path(__file__).resolve().parent
 PROJECTS_DIR = ROOT / "projects"
@@ -43,13 +45,18 @@ TASKS_FILE = DATA_DIR / "tasks.json"
 TASKS_EXAMPLE_FILE = DATA_DIR / "tasks.example.json"
 START_TASK_SCRIPT = ROOT / "scripts" / "start-task.sh"
 
-PROJECTS: dict[str, str] = {
-    "AIOS": "AIOS.md",
-    "BANK": "BANK_STRATEGY.md",
-    "LEGAL": "LEGAL.md",
-    "BUSINESS": "BUSINESS.md",
-    "PERSONAL": "PERSONAL.md",
-}
+# The project registry is `models.PROJECT_IDS` — the single canonical list —
+# never a second, hand-maintained dict here. A local `PROJECTS` dict used to
+# live in this spot and silently omitted AICOS from every selector/filter
+# that read it; see `docs/adr/` for the fix. `project_status_file_path`
+# below is the only remaining project-id-keyed lookup this module needs,
+# and it is backed by `project_config.PROJECT_STATUS_FILES` (itself keyed
+# over every `models.PROJECT_IDS` entry), not a local dict.
+
+
+def project_status_file_path(project_id: str) -> Path:
+    relative = project_config.PROJECT_STATUS_FILES.get(project_id, f"projects/{project_id}.md")
+    return ROOT / relative
 
 CONTEXT_FILES: dict[str, str] = {
     "AIOS": "AIOS_CONTEXT.md",
@@ -247,7 +254,7 @@ def parse_project_statuses() -> dict[str, str]:
         if stripped.startswith("## "):
             heading = stripped[3:].lower()
             current_project = next(
-                (key for key in PROJECTS if key.lower() in heading), None
+                (key for key in models.PROJECT_IDS if key.lower() in heading), None
             )
         elif stripped.lower().startswith("status:") and current_project and current_project not in statuses:
             statuses[current_project] = stripped.split(":", 1)[1].strip()
@@ -873,22 +880,48 @@ def render_task_card(
         stage = task.get("current_stage") or models.EXECUTION_STAGES[0]
         st.progress(progress / 100, text=f"{stage} — {progress}%")
 
+        # Three distinct, visually separated clusters — planning state
+        # (this Kanban lane, owned by the user), current execution state
+        # (`launch_status`, synced live from `runtime.db` per ADR 0003 —
+        # never a manual Kanban lane), and dependency readiness (derived,
+        # never stored) — deliberately never merged into one badge row, so
+        # "what lane is this in," "is an agent actually running against it
+        # right now," and "is it blocked on something else" each read as
+        # their own answer instead of one ambiguous chip soup.
         with st.container(horizontal=True):
             priority = task.get("priority", "Medium")
             st.badge(priority, color=PRIORITY_COLORS.get(priority, "blue"))
+            if task.get("owner"):
+                st.badge(task["owner"], color="gray", icon=":material/person:")
+            if task.get("estimate_hours"):
+                st.badge(format_estimate(task["estimate_hours"]), color="gray", icon=":material/schedule:")
+
+        with st.container(horizontal=True):
             launch_status = task.get("launch_status", "Ready")
-            st.badge(launch_status, color=LAUNCH_STATUS_COLORS.get(launch_status, "gray"))
+            running = launch_status == "Running"
+            st.badge(
+                f"⏺ {launch_status}" if running else launch_status,
+                color=LAUNCH_STATUS_COLORS.get(launch_status, "gray"),
+            )
             executor_id = task.get("executor")
             if executor_id:
                 st.badge(executors.get_executor(executor_id).label, color="blue", icon=":material/smart_toy:")
             if task.get("branch"):
                 st.badge(task["branch"], color="gray", icon=":material/fork_right:")
-            if task.get("owner"):
-                st.badge(task["owner"], color="gray", icon=":material/person:")
-            if task.get("estimate_hours"):
-                st.badge(format_estimate(task["estimate_hours"]), color="gray", icon=":material/schedule:")
-            if models.is_blocked(task, tasks_by_id):
+            if task.get("current_run_id"):
+                st.caption(f"run `{task['current_run_id'][:8]}` · Live Execution Center")
+
+        blocked = models.is_blocked(task, tasks_by_id)
+        if blocked:
+            with st.container(horizontal=True):
                 st.badge("Заблокировано", color="red", icon=":material/block:")
+                unmet_names = ", ".join(
+                    (tasks_by_id.get(dep_id, {}).get("title") or dep_id)
+                    for dep_id in models.unmet_dependencies(task, tasks_by_id)
+                )
+                st.caption(f"Ожидает: {unmet_names}")
+        elif task.get("depends_on"):
+            st.badge("Зависимости выполнены", color="green", icon=":material/check_circle:")
 
         git_status = task_view.cached_git_status(workspace_path, git_status_cache)
         with st.container(horizontal=True):
@@ -916,7 +949,7 @@ def render_task_card(
                 st.caption(f"Заметки: {task['notes']}")
             st.caption(f"Репозиторий: `{task.get('repository_path') or '—'}` · Workspace: `{workspace_path or '—'}`")
 
-            action_cols = st.columns(4)
+            action_cols = st.columns(5)
             with action_cols[0]:
                 if st.button("Workspace", key=f"{key_prefix}_action_workspace", icon=":material/folder_open:"):
                     if workspace_path:
@@ -933,6 +966,12 @@ def render_task_card(
                     (st.success if ok_action else st.error)(message_action)
             with action_cols[3]:
                 report_open = st.button("Отчёт", key=f"{key_prefix}_action_report", icon=":material/description:")
+            with action_cols[4]:
+                if st.button("В очередь", key=f"{key_prefix}_action_queue", icon=":material/playlist_add:"):
+                    existing_queue = execution_queue.load_queue(ROOT)
+                    updated_queue = execution_queue.enqueue(existing_queue, task, tasks_by_id)
+                    execution_queue.save_queue(ROOT, updated_queue)
+                    st.success("Добавлено в очередь запуска.")
 
             if git_open:
                 if workspace_path and git_status.get("is_repo"):
@@ -1086,7 +1125,7 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
     the Supervisor launches the subprocess and returns immediately with the
     run in state RUNNING) instead of `agent_runner.run_claude_code`
     (synchronous, blocks the whole script inside `st.spinner`)."""
-    launch_project = st.selectbox("Проект", list(PROJECTS.keys()), key="exec_center_launch_project")
+    launch_project = st.selectbox("Проект", models.PROJECT_IDS, key="exec_center_launch_project")
     cfg = project_config.get_project_config(launch_project)
     repo_path = cfg.get("repository_path")
 
@@ -1478,6 +1517,13 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     if mutated_tasks:
         save_tasks(tasks)
 
+    # Queue readiness has no poller of its own (see `execution_queue`'s
+    # module docstring — no hidden scheduler); it piggybacks on this
+    # existing reconcile-on-refresh-tick checkpoint instead, exactly like
+    # `Supervisor.reconcile()` does. Relabels waiting/ready only — never
+    # launches anything.
+    execution_queue.reevaluate_and_persist(ROOT, {t["id"]: t for t in tasks if t.get("id")})
+
     sessions, tasks_by_id = _build_execution_center_sessions(api, tasks, now=now)
     _render_execution_center_project_overview(sessions, now)
     _render_execution_center_sections(api, sessions, tasks_by_id, now=now)
@@ -1762,7 +1808,7 @@ def build_commands() -> list[dict]:
     ]
     commands.extend(
         {"label": f"Новая задача: {project}", "icon": ":material/add_task:", "action": ("new_task", project)}
-        for project in PROJECTS
+        for project in models.PROJECT_IDS
     )
     return commands
 
@@ -1786,7 +1832,7 @@ with st.sidebar:
         key="nav_page",
     )
     st.divider()
-    st.caption(f"Проектов в реестре: {len(PROJECTS)}")
+    st.caption(f"Проектов в реестре: {len(models.PROJECT_IDS)}")
     st.caption("Локальный режим · без внешних сервисов")
 
 tasks = load_tasks()
@@ -1849,7 +1895,7 @@ if page_key == "dashboard":
     reports_count = len(artifacts.list_markdown_files(REPORTS_DIR))
 
     with st.container(horizontal=True):
-        st.metric("Проекты", len(PROJECTS), border=True)
+        st.metric("Проекты", len(models.PROJECT_IDS), border=True)
         st.metric("Активные задачи", len(active_tasks), border=True)
         st.metric("Завершённые задачи", len(completed_tasks), border=True)
         st.metric("Файлы заданий", generated_count, border=True)
@@ -1861,7 +1907,7 @@ if page_key == "dashboard":
 
     with left:
         st.markdown("#### Активные задачи по проекту")
-        for project in PROJECTS:
+        for project in models.PROJECT_IDS:
             project_active = [task for task in active_tasks if task.get("project") == project]
             with st.container(border=True):
                 st.markdown(f"**{project}** · {len(project_active)}")
@@ -1928,12 +1974,12 @@ elif page_key == "executive":
     with left:
         st.markdown("#### Статус проектов")
         statuses = parse_project_statuses()
-        for project in PROJECTS:
+        for project in models.PROJECT_IDS:
             project_tasks = [task for task in tasks if task.get("project") == project]
             p_active = sum(1 for task in project_tasks if task.get("status") != "Done")
             p_blocked = sum(1 for task in project_tasks if task["id"] in blocked_ids)
             p_done = sum(1 for task in project_tasks if task.get("status") == "Done")
-            status_file = PROJECTS_DIR / PROJECTS[project]
+            status_file = project_status_file_path(project)
 
             with st.container(border=True):
                 header_cols = st.columns([2, 1, 1, 1])
@@ -2043,7 +2089,7 @@ elif page_key == "create":
     # available immediately (a form's inner widgets don't rerun the script
     # until submitted) so the inherited-defaults preview below reacts to the
     # project the user just picked, before they submit anything.
-    project = st.selectbox("Проект", list(PROJECTS.keys()), key="create_task_project")
+    project = st.selectbox("Проект", models.PROJECT_IDS, key="create_task_project")
     create_task_cfg = project_configs[project]
     inherited = project_config.task_defaults_from_project(create_task_cfg)
 
@@ -2137,7 +2183,7 @@ elif page_key == "create":
             st.error("Укажите название задачи.")
         elif not objective_clean:
             st.error("Укажите цель задачи.")
-        elif project not in PROJECTS:
+        elif project not in models.PROJECT_IDS:
             st.error("Неизвестный проект.")
         elif task_type not in TASK_TYPES:
             st.error("Неизвестный тип задачи.")
@@ -2188,7 +2234,7 @@ elif page_key == "chat":
     st.subheader("Чат по проекту")
 
     conversations = chat_service.load_conversations()
-    chat_project = st.selectbox("Проект", list(PROJECTS.keys()), key="chat_project_select")
+    chat_project = st.selectbox("Проект", models.PROJECT_IDS, key="chat_project_select")
     project_conversations = [c for c in conversations if c.get("project") == chat_project]
     chat_cfg = project_configs[chat_project]
 
@@ -2365,16 +2411,29 @@ elif page_key == "chat":
 elif page_key == "kanban":
     st.subheader("Kanban")
 
-    filter_cols = st.columns([1, 2])
-    with filter_cols[0]:
-        project_filter = st.selectbox("Фильтр по проекту", ["Все"] + list(PROJECTS.keys()))
-    with filter_cols[1]:
-        priority_filter = st.multiselect("Приоритет", PRIORITIES, default=PRIORITIES, key="kanban_priority_filter")
+    project_filter = project_selector.render_project_selector(tasks, key="kanban_project_selector")
+    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
+    st.divider()
+
+    project_configs = project_config.load_project_configs()
+    recommendations_panel.render_recommendations_panel(
+        tasks,
+        tasks_by_id,
+        ROOT,
+        get_execution_center_api(),
+        project_configs,
+        save_tasks,
+        project=project_filter,
+        key_prefix="kanban_reco",
+    )
+    st.divider()
+
+    priority_filter = st.multiselect("Приоритет", PRIORITIES, default=PRIORITIES, key="kanban_priority_filter")
 
     filtered_tasks = [
         task
         for task in tasks
-        if (project_filter == "Все" or task.get("project") == project_filter)
+        if (project_filter is None or task.get("project") == project_filter)
         and task.get("priority", "Medium") in priority_filter
     ]
 
@@ -2399,6 +2458,18 @@ elif page_key == "kanban":
                     git_status_cache=kanban_git_status_cache,
                     show_kanban_controls=True,
                 )
+
+    st.divider()
+    queue_panel.render_execution_queue_panel(
+        tasks,
+        tasks_by_id,
+        ROOT,
+        get_execution_center_api(),
+        project_configs,
+        save_tasks,
+        project=project_filter,
+        key_prefix="kanban_queue",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2442,7 +2513,7 @@ elif page_key == "agents":
 
             with st.expander(f"Запустить «{meta['title']}» напрямую", icon=":material/smart_toy:"):
                 agent_launch_project = st.selectbox(
-                    "Проект", list(PROJECTS.keys()), key=f"agent_launch_project_{task_type}"
+                    "Проект", models.PROJECT_IDS, key=f"agent_launch_project_{task_type}"
                 )
                 agent_launch_objective = st.text_area(
                     "Цель задачи",
@@ -2485,7 +2556,7 @@ elif page_key == "runs":
 
     filter_cols = st.columns(4)
     with filter_cols[0]:
-        runs_project_filter = st.selectbox("Проект", ["Все"] + list(PROJECTS.keys()), key="runs_project_filter")
+        runs_project_filter = st.selectbox("Проект", ["Все"] + models.PROJECT_IDS, key="runs_project_filter")
     with filter_cols[1]:
         runs_agent_filter = st.selectbox(
             "Агент", ["Все"] + sorted({run.get("agent", "—") for run in all_runs}), key="runs_agent_filter"
@@ -2636,7 +2707,7 @@ elif page_key == "runs":
 elif page_key == "timeline":
     st.subheader("Таймлайн")
 
-    project_filter = st.selectbox("Фильтр по проекту", ["Все"] + list(PROJECTS.keys()), key="timeline_project_filter")
+    project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="timeline_project_filter")
 
     events = build_timeline_events(
         tasks, runs=agent_runner.load_runs(), activity_events=activity_log.load_activity(limit=200), limit=200
@@ -2665,8 +2736,8 @@ elif page_key == "timeline":
 elif page_key == "projects":
     st.subheader("Проекты")
 
-    selected_project = st.selectbox("Проект", list(PROJECTS.keys()), key="project_browser_select")
-    project_file = PROJECTS_DIR / PROJECTS[selected_project]
+    selected_project = st.selectbox("Проект", models.PROJECT_IDS, key="project_browser_select")
+    project_file = project_status_file_path(selected_project)
 
     tab_status, tab_generated, tab_reports, tab_context, tab_settings = st.tabs(
         ["Статус проекта", "Сгенерированные задачи", "Отчёты", "Контекст", "Настройки репозитория"]
@@ -2891,7 +2962,7 @@ elif page_key == "projects":
 elif page_key == "generated":
     st.subheader("Сгенерированные задачи")
 
-    project_filter = st.selectbox("Фильтр по проекту", ["Все"] + list(PROJECTS.keys()), key="gen_filter")
+    project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="gen_filter")
 
     all_files = artifacts.list_markdown_files(GENERATED_DIR)
     filtered_files = (
@@ -2928,7 +2999,7 @@ elif page_key == "generated":
 elif page_key == "reports":
     st.subheader("Отчёты")
 
-    project_filter = st.selectbox("Фильтр по проекту", ["Все"] + list(PROJECTS.keys()), key="report_filter")
+    project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="report_filter")
 
     all_files = artifacts.list_markdown_files(REPORTS_DIR)
     filtered_files = (
@@ -3067,8 +3138,8 @@ elif page_key == "workspace":
     st.divider()
     st.markdown("#### Быстрый переход по проектам")
 
-    for project in PROJECTS:
-        project_file = PROJECTS_DIR / PROJECTS[project]
+    for project in models.PROJECT_IDS:
+        project_file = project_status_file_path(project)
         context_name = CONTEXT_FILES.get(project)
         project_active = sum(1 for task in tasks if task.get("project") == project and task.get("status") != "Done")
         project_generated = artifacts.list_markdown_files(GENERATED_DIR / project)
@@ -3124,7 +3195,7 @@ elif page_key == "focus":
     if not active_tasks:
         st.info("Нет активных задач для фокуса. Создайте задачу или откройте Kanban.")
     else:
-        project_filter = st.selectbox("Проект", ["Все"] + list(PROJECTS.keys()), key="focus_project_filter")
+        project_filter = st.selectbox("Проект", ["Все"] + models.PROJECT_IDS, key="focus_project_filter")
         candidates = [
             task
             for task in active_tasks

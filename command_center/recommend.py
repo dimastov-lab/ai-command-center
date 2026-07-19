@@ -46,7 +46,12 @@ def _repo_health(repository_path: str | None) -> tuple[bool, str | None]:
     return True, None
 
 
-def recommend_next_task(tasks: list[dict], project: str | None = None) -> Recommendation | None:
+def _score_candidates(tasks: list[dict], project: str | None = None) -> list[Recommendation]:
+    """The scoring core shared by `recommend_next_task` (top-1) and
+    `list_recommendations` (top-N) — one loop, one set of scoring rules, so
+    the two never drift into two different opinions about what to work on
+    next. Returns every eligible candidate, sorted best-first; callers slice
+    to however many they need."""
     tasks_by_id = {task["id"]: task for task in tasks if task.get("id")}
     running_repos = {
         task.get("repository_path")
@@ -104,8 +109,19 @@ def recommend_next_task(tasks: list[dict], project: str | None = None) -> Recomm
 
         candidates.append(Recommendation(task=task, score=score, reasons=reasons))
 
-    if not candidates:
-        return None
-
     candidates.sort(key=lambda rec: rec.score, reverse=True)
-    return candidates[0]
+    return candidates
+
+
+def recommend_next_task(tasks: list[dict], project: str | None = None) -> Recommendation | None:
+    candidates = _score_candidates(tasks, project=project)
+    return candidates[0] if candidates else None
+
+
+def list_recommendations(tasks: list[dict], project: str | None = None, limit: int = 3) -> list[Recommendation]:
+    """Top-`limit` recommendations, best-first — the same eligibility rules
+    and scoring as `recommend_next_task`, just not truncated to one. Exists
+    so a richer recommendation surface (dependencies, impact, launch/queue
+    actions — see `command_center.recommendation_service`) can show more
+    than a single suggestion without re-implementing the scoring loop."""
+    return _score_candidates(tasks, project=project)[:limit]

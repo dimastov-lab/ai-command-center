@@ -18,9 +18,10 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-from command_center import agent_runner, models, project_config, report_parser, storage
+from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
+from command_center.ui import project_selector
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
@@ -578,3 +579,162 @@ def test_runs_page_project_filter_narrows_results():
     body = " ".join(md.value for md in at.markdown)
     assert "BANK" in body
     assert "AIOS" not in body
+
+
+# --------------------------------------------------------------------------
+# Engineering Workspace redesign: canonical project registry, Kanban state
+# separation, recommendation surface, execution queue
+# --------------------------------------------------------------------------
+
+
+def _seed_tasks(tasks: list[dict]) -> None:
+    """Seeds several full task records at once — `_seed_task()` above only
+    ever writes a single task. Every record is run through
+    `models.default_task_workflow_fields`/`default_task_execution_fields`
+    first, same as `_seed_task`, so callers only have to specify what's
+    relevant to the scenario under test."""
+    data_dir = Path(os.environ["AICC_DATA_DIR"])
+    normalized = []
+    for overrides in tasks:
+        task = {
+            "id": overrides["id"],
+            "project": "AIOS",
+            "title": overrides["id"],
+            "task_type": "implementation",
+            "status": "Backlog",
+            "priority": "Medium",
+            "owner": "",
+            "estimate_hours": 0.0,
+            "depends_on": [],
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        }
+        task.update(models.default_task_workflow_fields())
+        task.update(models.default_task_execution_fields())
+        task.update(overrides)
+        normalized.append(task)
+    storage.atomic_write_json(data_dir / "tasks.json", normalized)
+
+
+def test_kanban_page_registry_includes_aicos_with_no_local_projects_dict():
+    # Regression: a second, hand-maintained `PROJECTS` dict used to live in
+    # app.py and silently omit AICOS from every Kanban selector/filter.
+    # `app` has no `PROJECTS` attribute at all anymore — `models.PROJECT_IDS`
+    # is the only registry.
+    import app
+
+    assert not hasattr(app, "PROJECTS")
+
+    _seed_tasks([{"id": "aicos-task", "project": "AICOS", "title": "AICOS task"}])
+    at = _at_on_page("kanban")
+    assert not at.exception
+    assert "Проектов в реестре: 6" in [c.value for c in at.caption]
+    body = " ".join(md.value for md in at.markdown)
+    assert "AICOS task" in body
+
+
+def test_kanban_project_selector_lets_every_registered_project_through():
+    at = _at_on_page("kanban")
+    assert not at.exception
+    assert at.session_state["kanban_project_selector_pills"] == project_selector.ALL_PROJECTS_LABEL
+
+
+def test_kanban_project_selector_filters_board_to_selected_project():
+    _seed_tasks(
+        [
+            {"id": "aios-task", "project": "AIOS", "title": "AIOS-only task"},
+            {"id": "aicos-task", "project": "AICOS", "title": "AICOS-only task"},
+        ]
+    )
+    at = _at_on_page("kanban", kanban_project_selector_pills="AICOS")
+    assert not at.exception
+    body = " ".join(md.value for md in at.markdown)
+    assert "AICOS-only task" in body
+    assert "AIOS-only task" not in body
+
+
+def test_kanban_card_separates_blocked_reason_from_planning_and_execution_badges():
+    _seed_tasks(
+        [
+            {"id": "blocker", "title": "Blocker task"},
+            {"id": "blocked", "title": "Blocked task", "depends_on": ["blocker"]},
+        ]
+    )
+    at = _at_on_page("kanban")
+    assert not at.exception
+    badges = " ".join(md.value for md in at.markdown if "badge" in md.value)
+    assert "Заблокировано" in badges
+    captions = [c.value for c in at.caption]
+    assert any(c.startswith("Ожидает: Blocker task") for c in captions)
+
+
+def test_kanban_card_shows_ready_launch_status_separately_from_priority():
+    _seed_tasks([{"id": "solo", "title": "Solo task", "priority": "High"}])
+    at = _at_on_page("kanban")
+    assert not at.exception
+    badges = [md.value for md in at.markdown if "badge" in md.value]
+    assert any("High" in b for b in badges)
+    assert any("Ready" in b for b in badges)
+
+
+def test_recommendations_panel_shows_dependencies_and_impact():
+    _seed_tasks(
+        [
+            {"id": "base", "title": "Base task", "status": "Done"},
+            {"id": "dependent", "title": "Dependent task", "depends_on": ["base"], "priority": "Critical"},
+        ]
+    )
+    at = _at_on_page("kanban")
+    assert not at.exception
+    captions = [c.value for c in at.caption]
+    assert any("Зависимости: Base task" in c for c in captions)
+
+
+def test_recommendations_panel_launch_button_starts_v2_run(fake_claude, tmp_path):
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps([json.dumps({"type": "result", "result": "done"})])
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    _seed_tasks([{"id": "reco-launch", "title": "Recommended task", "workspace_path": str(repo)}])
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    launch_button = next(b for b in at.button if b.key == "kanban_reco_reco-launch_launch")
+    at = launch_button.click().run()
+    assert not at.exception
+    successes = [s.value for s in at.success]
+    assert any("Запуск начат" in s for s in successes)
+
+    run_id = successes[0].split("`")[1]
+    db_path = Path(os.environ["AICC_DATA_DIR"]) / "runtime.db"
+    _wait_for_run_terminal(db_path, run_id)
+
+
+def test_kanban_card_enqueue_button_adds_task_to_execution_queue():
+    _seed_task(id="seeded-task-1", workspace_path=None)
+    at = _at_on_page("kanban")
+    assert not at.exception
+    enqueue_button = next(b for b in at.button if b.key == "kanban_seeded-task-1_action_queue")
+    at = enqueue_button.click().run()
+    assert not at.exception
+
+    entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
+    assert any(e["task_id"] == "seeded-task-1" for e in entries)
+    captions = [c.value for c in at.caption]
+    assert any("Готово к запуску" in c or "Ожидает зависимостей" in c for c in captions)
+
+
+def test_execution_queue_panel_launch_ready_button_present_once_queued():
+    _seed_task(id="seeded-task-1")
+    at = _at_on_page("kanban")
+    entries = execution_queue.enqueue(
+        execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"])),
+        {"id": "seeded-task-1", "status": "Backlog", "depends_on": []},
+        {"seeded-task-1": {"id": "seeded-task-1", "status": "Backlog", "depends_on": []}},
+    )
+    execution_queue.save_queue(Path(os.environ["AICC_DATA_DIR"]), entries)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    assert any(b.key == "kanban_queue_launch_ready" for b in at.button)
+    assert any(b.key == "kanban_queue_launch_next" for b in at.button)

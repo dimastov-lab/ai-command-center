@@ -67,8 +67,18 @@ DISPLAY_NAMES: dict[str, str] = {
 
 # Relative to ROOT. Empty/missing entries just mean "no dedicated file yet" — the UI
 # handles that gracefully rather than failing, matching the v1.1 behavior.
+#
+# Every key in `models.PROJECT_IDS` must appear here, even if the file doesn't
+# exist on disk yet (AICOS has none today) — this dict is consulted with
+# `.get(project_id, ...)` everywhere, so a missing *entry* silently degrades to
+# a generic guess instead of surfacing the gap. Omitting AICOS entirely was
+# the root cause of a real bug: `app.py` used to keep its own second,
+# hand-maintained project dict (not this one) that dropped AICOS from every
+# project selector/filter in the app. See `models.PROJECT_IDS` for the single
+# canonical id list `app.py` must iterate instead.
 PROJECT_STATUS_FILES: dict[str, str] = {
     "AIOS": "projects/AIOS.md",
+    "AICOS": "projects/AICOS.md",
     "BANK": "projects/BANK_STRATEGY.md",
     "LEGAL": "projects/LEGAL.md",
     "BUSINESS": "projects/BUSINESS.md",

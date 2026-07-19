@@ -21,6 +21,26 @@ def test_default_config_has_no_repository_path_for_any_project():
         assert cfg["repository_path"] is None
 
 
+def test_every_canonical_project_id_has_a_status_file_entry():
+    # Regression: `PROJECT_STATUS_FILES` used to omit AICOS entirely, and a
+    # second, hand-maintained `PROJECTS` dict in `app.py` (since removed)
+    # silently dropped AICOS from every project selector/filter in the app.
+    for project_id in models.PROJECT_IDS:
+        assert project_id in project_config.PROJECT_STATUS_FILES
+        assert project_config.PROJECT_STATUS_FILES[project_id].startswith("projects/")
+
+
+def test_aicos_has_a_display_name_and_status_file_mapping():
+    assert project_config.DISPLAY_NAMES["AICOS"] == "AICOS"
+    assert project_config.PROJECT_STATUS_FILES["AICOS"] == "projects/AICOS.md"
+
+
+def test_load_project_configs_returns_every_canonical_project_including_aicos():
+    configs = project_config.load_project_configs()
+    assert set(configs.keys()) == set(models.PROJECT_IDS)
+    assert "AICOS" in configs
+
+
 def test_sensitive_projects_flagged():
     assert project_config.is_sensitive("BANK") is True
     assert project_config.is_sensitive("LEGAL") is True
