@@ -33,7 +33,15 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import log_tail, project_overview, session_view, task_sync
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
-from command_center.ui import project_intelligence_panel, project_selector, queue_panel, recommendations_panel
+from command_center.ui import (
+    content_area,
+    project_intelligence_panel,
+    project_selector,
+    queue_panel,
+    recommendations_panel,
+    shell,
+    tokens,
+)
 
 ROOT = Path(__file__).resolve().parent
 PROJECTS_DIR = ROOT / "projects"
@@ -150,21 +158,10 @@ KANBAN_COLUMNS: list[str] = [
 
 PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
 
-PRIORITY_COLORS: dict[str, str] = {
-    "Low": "gray",
-    "Medium": "blue",
-    "High": "orange",
-    "Critical": "red",
-}
-
-LAUNCH_STATUS_COLORS: dict[str, str] = {
-    "Ready": "gray",
-    "Launching": "blue",
-    "Running": "blue",
-    "Completed": "green",
-    "Failed": "red",
-    "Requires Attention": "orange",
-}
+# Canonical source: command_center.ui.tokens — see that module's docstring
+# for why app.py must not define its own duplicate color dicts.
+PRIORITY_COLORS: dict[str, str] = tokens.PRIORITY_COLORS
+LAUNCH_STATUS_COLORS: dict[str, str] = tokens.LAUNCH_STATUS_COLORS
 
 GLOBAL_FILES: list[str] = ["CURRENT_STATE.md", "DECISIONS.md", "INBOX.md"]
 
@@ -1789,16 +1786,6 @@ for _pending_key, _target_key in _PENDING_KEY_MAP.items():
     if _pending_key in st.session_state:
         st.session_state[_target_key] = st.session_state.pop(_pending_key)
 
-st.set_page_config(
-    page_title="AI Command Center",
-    page_icon="🧭",
-    layout="wide",
-    initial_sidebar_state="collapsed" if st.session_state.get("nav_page") == "focus" else "expanded",
-)
-
-st.title("🧭 AI Command Center")
-st.caption("Единый центр управления проектами, задачами и AI-процессами")
-
 if "show_command_palette" not in st.session_state:
     st.session_state.show_command_palette = False
 
@@ -1819,27 +1806,16 @@ def build_commands() -> list[dict]:
     return commands
 
 
-with st.sidebar:
-    st.button(
-        "Командная палитра (Mod+K)",
-        icon=":material/search:",
-        shortcut="Mod+K",
-        on_click=_open_command_palette,
-        width="stretch",
-        key="open_palette_btn",
-    )
-    st.divider()
-    st.markdown("### Навигация")
-    page_key = st.radio(
-        "Раздел",
-        options=list(NAV.keys()),
-        format_func=lambda key: f"{NAV[key][1]} {NAV[key][0]}",
-        label_visibility="collapsed",
-        key="nav_page",
-    )
-    st.divider()
-    st.caption(f"Проектов в реестре: {len(models.PROJECT_IDS)}")
-    st.caption("Локальный режим · без внешних сервисов")
+page_key = shell.render_shell(
+    page_title="AI Command Center",
+    page_icon="🧭",
+    sidebar_collapsed=st.session_state.get("nav_page") == "focus",
+    title="🧭 AI Command Center",
+    caption="Единый центр управления проектами, задачами и AI-процессами",
+    nav=NAV,
+    project_count=len(models.PROJECT_IDS),
+    on_open_palette=_open_command_palette,
+)
 
 tasks = load_tasks()
 tasks_by_id = {task["id"]: task for task in tasks}
@@ -1942,10 +1918,10 @@ if page_key == "dashboard":
 # --------------------------------------------------------------------------
 
 elif page_key == "workspace_home":
-    st.subheader("Workspace Home")
-    st.caption(
+    content_area.page_header(
+        "Workspace Home",
         "Кросс-проектная сводка: репозитории, прогоны, артефакты и отчёты — "
-        "в одном месте, только для чтения."
+        "в одном месте, только для чтения.",
     )
     render_workspace_home_page(get_execution_center_api())
 
