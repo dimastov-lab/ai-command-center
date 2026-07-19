@@ -20,7 +20,20 @@ from pathlib import Path
 from command_center.models import iso_now
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-REPORTS_ROOT = ROOT / "reports"
+# `AICC_REPORTS_ROOT` mirrors `storage.resolve_data_dir`'s `AICC_DATA_DIR` override,
+# but for `reports/` specifically: `tests/conftest.py`'s `isolated_reports_dir`
+# monkeypatches this module's `REPORTS_ROOT` attribute for tests that run in-process,
+# but `tests/test_execution_center_debug_cli.py` runs `scripts/execution_center_debug.py`
+# as a genuinely separate OS subprocess (see that script's module docstring) — a
+# monkeypatch in the parent test process cannot reach a child process's own fresh
+# import of this module. Without an env-var-driven override, every subprocess-based
+# CLI test wrote a real (small, `fake_claude`-produced) report into the developer's
+# actual `reports/<PROJECT>/` directory on every single test run — confirmed as the
+# source of ~150 leaked report files accumulated over two days of this session's
+# `pytest` runs (see the runtime-integrity incident this comment responds to). The CLI
+# test's subprocess env now sets `AICC_REPORTS_ROOT` so the child process resolves the
+# same isolated directory the parent test's `AICC_DATA_DIR` already points at.
+REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
 
 
 def report_path_for(run: dict) -> Path:

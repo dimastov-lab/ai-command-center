@@ -376,7 +376,10 @@ def get_run(run_id: str) -> dict | None:
 # Full report storage (FEATURE 3) — never truncated
 # --------------------------------------------------------------------------
 
-REPORTS_ROOT = ROOT / "reports"
+# See `command_center.runtime.reports.REPORTS_ROOT` for why this honors
+# `AICC_REPORTS_ROOT` — same subprocess-isolation gap, same fix, applied here too
+# for consistency between the v1.2 and v2 report-writing paths.
+REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
 
 
 def report_path_for(run: dict) -> Path:
