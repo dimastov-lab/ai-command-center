@@ -1,9 +1,22 @@
 import json
+import subprocess
+import threading
 import time
 
 import pytest
 
 from command_center.runtime import context_service, db, identity, supervisor
+
+
+def _make_git_repo(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=path, check=True)
+    (path / "f.txt").write_text("hello\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -597,3 +610,153 @@ def test_timeout_does_not_fire_after_natural_completion(git_repo, configure_proj
     final = sup.wait_for_run(run["id"], timeout=10)
     assert final["state"] == "COMPLETED"
     assert final["failure_reason"] is None
+
+
+# --------------------------------------------------------------------------
+# Workspace locking — a workspace can have at most one active run, enforced
+# atomically by `db.create_run(enforce_workspace_lock=True)` (see
+# tests/test_runtime_db.py for the db-layer race proof); these tests cover
+# the Supervisor-facing contract (`WorkspaceLockedError`) and concurrent runs
+# across *different* workspaces still working normally.
+# --------------------------------------------------------------------------
+
+
+def test_workspace_locked_error_is_a_supervisor_error():
+    """Every existing caller that already catches `supervisor.SupervisorError`
+    (e.g. `app.py`'s launch handlers) must catch this without a new except
+    clause."""
+    assert issubclass(supervisor.WorkspaceLockedError, supervisor.SupervisorError)
+
+
+def test_start_raw_raises_workspace_locked_error_when_workspace_already_active(
+    git_repo, configure_project_repo, fake_claude
+):
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    first = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p1", confirmed=True
+    )
+    try:
+        with pytest.raises(supervisor.WorkspaceLockedError) as excinfo:
+            sup.start_raw(
+                project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p2",
+                confirmed=True,
+            )
+        assert excinfo.value.conflicting_run["id"] == first["id"]
+        # The rejected second launch must never have spawned a process or
+        # created a second run row for this workspace.
+        active = db.list_runs(sup.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+        assert [r["id"] for r in active] == [first["id"]]
+    finally:
+        sup.cancel(first["id"], confirmed=True, grace_seconds=2)
+
+
+def test_start_raw_allows_relaunch_of_same_workspace_after_prior_run_completes(
+    git_repo, configure_project_repo, fake_claude
+):
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    first = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p1", confirmed=True
+    )
+    sup.wait_for_run(first["id"], timeout=10)
+
+    second = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p2", confirmed=True
+    )
+    assert second["state"] == "RUNNING"
+    sup.wait_for_run(second["id"], timeout=10)
+
+
+def test_start_raw_allows_concurrent_runs_against_different_workspaces(tmp_path, fake_claude):
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "2"
+    repo_a = _make_git_repo(tmp_path / "repo_a")
+    repo_b = _make_git_repo(tmp_path / "repo_b")
+    sup = supervisor.Supervisor()
+    run_a = sup.start_raw(
+        project="AIOS", repository_path=str(repo_a), task_type="implementation", prompt="p", confirmed=True,
+        repository_already_validated=True,
+    )
+    run_b = sup.start_raw(
+        project="AIOS", repository_path=str(repo_b), task_type="implementation", prompt="p", confirmed=True,
+        repository_already_validated=True,
+    )
+    assert run_a["state"] == "RUNNING"
+    assert run_b["state"] == "RUNNING"
+    sup.cancel(run_a["id"], confirmed=True, grace_seconds=2)
+    sup.cancel(run_b["id"], confirmed=True, grace_seconds=2)
+
+
+def test_concurrent_start_raw_against_same_workspace_exactly_one_wins(git_repo, configure_project_repo, fake_claude):
+    """Two genuinely concurrent `start_raw` calls (not just two sequential
+    ones) against the same workspace — proves the lock is race-free at the
+    Supervisor layer, not just a sequential pre-flight check."""
+    configure_project_repo("AIOS", git_repo)
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "2"
+    sup = supervisor.Supervisor()
+
+    winners: list[dict] = []
+    losers: list[supervisor.WorkspaceLockedError] = []
+    lock = threading.Lock()
+
+    def attempt(idx: int) -> None:
+        try:
+            run = sup.start_raw(
+                project="AIOS", repository_path=str(git_repo), task_type="implementation",
+                prompt=f"p{idx}", confirmed=True,
+            )
+            with lock:
+                winners.append(run)
+        except supervisor.WorkspaceLockedError as exc:
+            with lock:
+                losers.append(exc)
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert len(winners) == 1, f"exactly one concurrent launch must win the workspace lock, got {winners}"
+    assert len(losers) == 5
+    winner = winners[0]
+    assert winner["state"] == "RUNNING"
+    assert all(exc.conflicting_run["id"] == winner["id"] for exc in losers)
+
+    sup.cancel(winner["id"], confirmed=True, grace_seconds=2)
+
+
+# --------------------------------------------------------------------------
+# Crash recovery: `self._launching` protects an in-flight (QUEUED, not yet
+# `Popen`'d) run of *this* instance from a concurrent `reconcile()` call —
+# see tests/test_runtime_reconciliation.py for reconcile()'s own widened
+# PREPARED/QUEUED scope.
+# --------------------------------------------------------------------------
+
+
+def test_launching_set_is_cleared_after_a_successful_launch(git_repo, configure_project_repo, fake_claude):
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+    )
+    assert run["id"] not in sup._launching
+    assert run["id"] in sup.active_run_ids()
+    sup.wait_for_run(run["id"], timeout=10)
+
+
+def test_launching_set_is_cleared_after_a_popen_failure(git_repo, configure_project_repo, monkeypatch):
+    configure_project_repo("AIOS", git_repo)
+
+    def raise_oserror(*args, **kwargs):
+        raise OSError("claude binary not found")
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", raise_oserror)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+    )
+    assert run["state"] == "FAILED"
+    assert run["id"] not in sup._launching

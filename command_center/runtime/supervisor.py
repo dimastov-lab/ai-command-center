@@ -73,6 +73,24 @@ class SupervisorError(Exception):
     """Raised for a launch/cancel request that cannot be carried out."""
 
 
+class WorkspaceLockedError(SupervisorError):
+    """Raised by `start_raw` when another run is already active
+    (`db.EXECUTION_CENTER_ACTIVE_STATES`) against the same resolved
+    workspace — wraps `db.WorkspaceLockedError` (the atomic, race-free check
+    performed inside `db.create_run`'s own transaction) so callers that
+    already catch `SupervisorError` (e.g. `app.py`'s launch handlers) need no
+    new except clause, while a caller that wants the conflicting run
+    specifically can catch this subclass and read `.conflicting_run`."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Workspace {conflicting_run['repository_path']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r}). Wait for it to "
+            "finish or cancel it before launching again."
+        )
+
+
 def build_claude_command(
     *,
     session_id: str,
@@ -146,6 +164,13 @@ class Supervisor:
         self.db_path = db_path or db.resolve_db_path()
         db.migrate(self.db_path)
         self._active: dict[str, _ActiveRun] = {}
+        # Run ids this instance has committed to launching (persisted as
+        # QUEUED) but has not yet `Popen`'d — the gap `self._active` alone
+        # cannot cover, because `_active` is only populated once a process
+        # actually exists (see `_launch_process`). Guarded by the same
+        # `_active_lock`. See `reconcile()` for why this must be included in
+        # its "don't touch this, it's mine" guard, not just `self._active`.
+        self._launching: set[str] = set()
         self._active_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -263,34 +288,74 @@ class Supervisor:
         )
         _assert_no_forbidden_flags(command)
 
-        run = db.create_run(
-            self.db_path,
-            session_id=session_id,
-            task_id=task_id,
-            project=project,
-            task_type=task_type,
-            repository_path=str(repo_path),
-            prompt=prompt,
-            is_resume=is_resume,
-            timeout_seconds=timeout_seconds,
-            command=command,
-            expected_branch=expected_branch,
-            launch_source=launch_source,
-            prompt_version=prompt_version,
-        )
+        try:
+            run = db.create_run(
+                self.db_path,
+                session_id=session_id,
+                task_id=task_id,
+                project=project,
+                task_type=task_type,
+                repository_path=str(repo_path),
+                prompt=prompt,
+                is_resume=is_resume,
+                timeout_seconds=timeout_seconds,
+                command=command,
+                expected_branch=expected_branch,
+                launch_source=launch_source,
+                prompt_version=prompt_version,
+                enforce_workspace_lock=True,
+            )
+        except db.WorkspaceLockedError as exc:
+            raise WorkspaceLockedError(exc.conflicting_run) from exc
         run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
 
-        pre_run_status = agent_runner.git_snapshot(repo_path).get("status_summary")
-        run = db.update_run_fields(
-            self.db_path,
-            run["id"],
-            expected_version=run["version"],
-            fields={"pre_run_git_status": pre_run_status},
-        )
+        # From here on this run is committed to being launched by *this*
+        # instance — recorded before `_launch_process` (which `Popen`s and
+        # only then adds it to `self._active`) so a concurrent `reconcile()`
+        # call in this same process (e.g. another browser tab's dashboard
+        # refresh) cannot see this QUEUED, not-yet-`Popen`'d, pid-less row
+        # and misclassify it as INTERRUPTED out from under the launch in
+        # progress. See `reconcile()`'s skip-guard and `_launch_process`'s
+        # `finally`, which removes this once the row has a real process (or
+        # has failed) recorded instead.
+        with self._active_lock:
+            self._launching.add(run["id"])
+
+        try:
+            pre_run_status = agent_runner.git_snapshot(repo_path).get("status_summary")
+            run = db.update_run_fields(
+                self.db_path,
+                run["id"],
+                expected_version=run["version"],
+                fields={"pre_run_git_status": pre_run_status},
+            )
+        except Exception:
+            # `_launch_process` (which owns clearing `self._launching` on
+            # every path it can reach — success or a failed `Popen`) was
+            # never entered, so nothing else will clear this run out of
+            # `_launching` if it's left here.
+            with self._active_lock:
+                self._launching.discard(run["id"])
+            raise
 
         return self._launch_process(run, command, repo_path)
 
     def _launch_process(self, run: dict, command: list[str], repo_path: Path) -> dict:
+        run_id = run["id"]
+        try:
+            return self._launch_process_unguarded(run, command, repo_path)
+        finally:
+            # Whatever happened above — a successful launch (`self._active`
+            # now has `run_id`) or a failed `Popen` (state already FAILED) —
+            # this run is no longer "committed to being launched but not yet
+            # observable" (see `start_raw`'s `self._launching.add`). Runs
+            # before `self._active[run_id] = active` so there is never a gap
+            # where `run_id` is in neither set for a concurrent `reconcile()`
+            # to see through.
+            with self._active_lock:
+                self._launching.discard(run_id)
+
+    def _launch_process_unguarded(self, run: dict, command: list[str], repo_path: Path) -> dict:
         run_id = run["id"]
         try:
             process = subprocess.Popen(
@@ -606,27 +671,51 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     def reconcile(self) -> list[dict]:
-        """Inspect every run currently recorded `RUNNING` and classify it
-        conservatively. Never signals a process based only on a reused pid,
-        and never guesses that a run silently completed. Does not consult
-        `claude agents --json` — this SQLite `run` table is the Supervisor's
-        own lifecycle registry, entirely independent of the `claude` CLI's
-        background-agent registry (which p-mode runs never touch anyway,
-        since `--background`/`--bg` is prohibited everywhere in this module).
+        """Inspect every run currently recorded in an active state
+        (`db.EXECUTION_CENTER_ACTIVE_STATES` — `PREPARED`, `QUEUED`, or
+        `RUNNING`) and classify it conservatively. Never signals a process
+        based only on a reused pid, and never guesses that a run silently
+        completed. Does not consult `claude agents --json` — this SQLite
+        `run` table is the Supervisor's own lifecycle registry, entirely
+        independent of the `claude` CLI's background-agent registry (which
+        p-mode runs never touch anyway, since `--background`/`--bg` is
+        prohibited everywhere in this module).
 
-        Skips any run currently in `self._active` — a run *this* instance is
-        actively supervising is never a candidate for reconciliation, it is
-        the opposite of orphaned: its own `_supervise` background thread
-        already holds the real waitable-child handle and will write the
-        authoritative terminal state itself the moment the process exits.
-        Without this guard, calling `reconcile()` repeatedly during normal
-        operation (the Live Execution Center v2 dashboard's refresh tick
-        calls it on every tick, not just at startup — see `task_sync.
-        reconcile_and_sync`) would race a fast-exiting process: if the OS
-        process happens to exit before this instance's own `_supervise`
-        thread gets to `process.wait()` and persist the result, `identity.
-        capture_identity(pid)` here would see "pid gone" and misclassify a
-        run that is completing completely normally as `INTERRUPTED`.
+        `PREPARED`/`QUEUED` rows are included, not just `RUNNING`, because a
+        Supervisor process can crash between `start_raw` creating the row
+        and `_launch_process` actually `Popen`-ing it — without this, such a
+        row would sit "active" forever (never reachable again once its
+        Supervisor is gone), permanently occupying its workspace's lock (see
+        `db.create_run`'s `enforce_workspace_lock`). In practice a `PREPARED`
+        row never has a `pid` (nothing has attempted `Popen` yet at that
+        point), so it always resolves to `INTERRUPTED` below; a `QUEUED` row
+        can rarely carry a `pid` (the narrow window between recording it and
+        persisting the `RUNNING` transition), in which case it goes through
+        the exact same pid/identity classification as a `RUNNING` row.
+
+        Skips any run currently in `self._active` **or** `self._launching` —
+        a run *this* instance is actively supervising, or has committed to
+        launching but not yet `Popen`'d, is never a candidate for
+        reconciliation:
+
+        - `self._active`: the opposite of orphaned — its own `_supervise`
+          background thread already holds the real waitable-child handle and
+          will write the authoritative terminal state itself the moment the
+          process exits. Without this guard, calling `reconcile()`
+          repeatedly during normal operation (the Live Execution Center v2
+          dashboard's refresh tick calls it on every tick, not just at
+          startup — see `task_sync.reconcile_and_sync`) would race a
+          fast-exiting process: if the OS process happens to exit before
+          this instance's own `_supervise` thread gets to `process.wait()`
+          and persist the result, `identity.capture_identity(pid)` here
+          would see "pid gone" and misclassify a run that is completing
+          completely normally as `INTERRUPTED`.
+        - `self._launching`: now that `QUEUED` rows are in scope above, a
+          run this same instance is mid-`start_raw` for (row persisted as
+          `QUEUED`, no pid yet — `_launch_process` hasn't called `Popen`)
+          would otherwise look identical to a genuinely abandoned `QUEUED`
+          row from a crashed predecessor and get misclassified
+          `INTERRUPTED` out from under its own in-flight launch.
 
         Classification:
 
@@ -640,17 +729,19 @@ class Supervisor:
         - pid exists but its current identity does not match what was
           recorded at launch -> `INTERRUPTED` (a reused pid now running a
           different process; the original process is gone).
-        - pid exists and its identity matches exactly -> left as `RUNNING`,
-          but flagged with a `reconciliation_orphaned` event and *not*
-          re-registered as an actively supervised run: this Supervisor
-          instance has no stdout/stderr pipe or waitable-child handle for a
-          process it did not itself `Popen`, so it cannot resume incremental
-          persistence and must not attempt to signal/cancel it.
+        - pid exists and its identity matches exactly -> classified/left as
+          `RUNNING` (transitioning a matched `QUEUED` row explicitly, since
+          we now have positive proof it is actually running), but flagged
+          with a `reconciliation_orphaned` event and *not* re-registered as
+          an actively supervised run: this Supervisor instance has no
+          stdout/stderr pipe or waitable-child handle for a process it did
+          not itself `Popen`, so it cannot resume incremental persistence
+          and must not attempt to signal/cancel it.
         """
         outcomes = []
         with self._active_lock:
-            actively_supervised_ids = set(self._active.keys())
-        for run in db.list_runs(self.db_path, state="RUNNING"):
+            actively_supervised_ids = set(self._active.keys()) | set(self._launching)
+        for run in db.list_runs(self.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES):
             run_id = run["id"]
             if run_id in actively_supervised_ids:
                 continue
@@ -676,6 +767,12 @@ class Supervisor:
                     detail = "pid exists but identity does not match recorded identity (pid reuse)"
 
             if classification == "RUNNING":
+                if run["state"] != "RUNNING":
+                    # Only reachable for a matched QUEUED row (see docstring)
+                    # — QUEUED -> RUNNING is an already-allowed transition.
+                    run = db.update_run_state(
+                        self.db_path, run_id, expected_version=run["version"], new_state="RUNNING"
+                    )
                 db.append_run_event(
                     self.db_path,
                     run_id,

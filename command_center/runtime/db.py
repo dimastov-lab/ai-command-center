@@ -85,9 +85,17 @@ EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED"
 # by `update_run_state` before it ever reaches SQL — in particular, no terminal
 # state can transition anywhere, so a terminal run can never be silently moved
 # back to RUNNING (or anywhere else).
+#
+# PREPARED/QUEUED both also allow INTERRUPTED/UNKNOWN — the same crash-
+# recovery targets RUNNING already allowed — because `Supervisor.reconcile()`
+# now inspects every `EXECUTION_CENTER_ACTIVE_STATES` row at startup, not just
+# RUNNING ones: a Supervisor process can crash between `create_run` (PREPARED)
+# or the QUEUED transition and the process actually being launched, leaving a
+# row that would otherwise sit stuck "active" forever (and, since Sprint
+# 2's workspace lock, forever blocking that workspace).
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "PREPARED": frozenset({"QUEUED", "CANCELLED", "FAILED"}),
-    "QUEUED": frozenset({"RUNNING", "CANCELLED", "FAILED"}),
+    "PREPARED": frozenset({"QUEUED", "CANCELLED", "FAILED", "INTERRUPTED", "UNKNOWN"}),
+    "QUEUED": frozenset({"RUNNING", "CANCELLED", "FAILED", "INTERRUPTED", "UNKNOWN"}),
     "RUNNING": frozenset({"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "UNKNOWN"}),
     "COMPLETED": frozenset(),
     "FAILED": frozenset(),
@@ -109,6 +117,27 @@ class InvalidTransitionError(Exception):
 
 class LostUpdateError(Exception):
     """Raised when a compare-and-set update loses the race (version mismatch)."""
+
+
+class WorkspaceLockedError(Exception):
+    """Raised by `create_run(..., enforce_workspace_lock=True)` when another
+    run is already active (`EXECUTION_CENTER_ACTIVE_STATES`) against the same
+    `repository_path`. Carries the conflicting run so the caller can report
+    it (id, state, task_id, ...) rather than just a message.
+
+    The check-then-insert this guards against is done inside the *same*
+    `BEGIN IMMEDIATE` transaction as the new row's `INSERT` (see
+    `create_run`), not as a separate query beforehand — `BEGIN IMMEDIATE`
+    takes SQLite's write lock up front, so two concurrent callers targeting
+    the same workspace serialize here instead of racing: whichever commits
+    first makes the row the second one's own conflict check will see."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Workspace {conflicting_run['repository_path']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r})."
+        )
 
 
 class UnknownRunFieldError(Exception):
@@ -603,13 +632,38 @@ def create_run(
     expected_branch: str | None = None,
     launch_source: str | None = None,
     prompt_version: int | None = None,
+    enforce_workspace_lock: bool = False,
 ) -> dict:
     """`expected_branch`/`launch_source`/`prompt_version` are write-once, like
     `project`/`task_type`/`repository_path` above — resolved by the caller
     once at launch time and never recomputed or overwritten afterward (they
-    are deliberately absent from `_UPDATABLE_RUN_FIELDS`)."""
+    are deliberately absent from `_UPDATABLE_RUN_FIELDS`).
+
+    `enforce_workspace_lock`, default `False`, preserves this function's
+    original behavior for every direct/low-level caller (including this
+    module's own test suite, which routinely creates several concurrently-
+    "active" `run` rows against the same throwaway `repository_path` purely
+    to exercise persistence mechanics, with no process ever actually
+    running). Only `Supervisor.start_raw` — the one path that actually spawns
+    a subprocess against `repository_path` — passes `True`. When it does, the
+    conflict check (any other row already in `EXECUTION_CENTER_ACTIVE_STATES`
+    for this exact `repository_path`) runs inside this same `BEGIN IMMEDIATE`
+    transaction as the `INSERT`, so it cannot lose a race against a second,
+    concurrent `create_run(..., enforce_workspace_lock=True)` call for the
+    same workspace the way a separate pre-flight query (e.g. `launch_service.
+    find_active_run_conflict`) can — raises `WorkspaceLockedError` instead of
+    inserting."""
     with connect(db_path) as conn:
         with transaction(conn):
+            if enforce_workspace_lock:
+                placeholders = ", ".join("?" for _ in EXECUTION_CENTER_ACTIVE_STATES)
+                conflict = conn.execute(
+                    f"SELECT * FROM run WHERE repository_path = ? AND state IN ({placeholders})",
+                    (repository_path, *EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()
+                if conflict is not None:
+                    raise WorkspaceLockedError(_row_to_dict(conflict))
+
             row = conn.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM run WHERE session_id = ?",
                 (session_id,),

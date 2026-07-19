@@ -507,6 +507,23 @@ def test_concurrent_cas_updates_exactly_one_writer_wins(tmp_path):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("origin_state", ["PREPARED", "QUEUED"])
+@pytest.mark.parametrize("crash_classification", ["INTERRUPTED", "UNKNOWN"])
+def test_prepared_and_queued_can_transition_to_crash_recovery_states(tmp_path, origin_state, crash_classification):
+    """`Supervisor.reconcile()` needs PREPARED/QUEUED -> INTERRUPTED/UNKNOWN
+    to classify a row abandoned mid-launch by a crashed Supervisor (see
+    `ALLOWED_TRANSITIONS`'s docstring) — this is a permission check, not a
+    reconciliation test (that's `tests/test_runtime_reconciliation.py`)."""
+    path = _fresh_db(tmp_path)
+    run = _make_run(path)
+    if origin_state == "QUEUED":
+        run = db.update_run_state(path, run["id"], expected_version=run["version"], new_state="QUEUED")
+    run = db.update_run_state(
+        path, run["id"], expected_version=run["version"], new_state=crash_classification
+    )
+    assert run["state"] == crash_classification
+
+
 @pytest.mark.parametrize("terminal_state", sorted(db.TERMINAL_STATES))
 def test_terminal_states_never_transition_anywhere(tmp_path, terminal_state):
     path = _fresh_db(tmp_path)
@@ -628,6 +645,170 @@ def test_session_can_have_multiple_runs_with_incrementing_sequence(tmp_path):
     assert r2["sequence"] == 2
     runs = db.list_runs(path, session_id=session["id"])
     assert {r["id"] for r in runs} == {r1["id"], r2["id"]}
+
+
+# --------------------------------------------------------------------------
+# Workspace locking — `create_run(enforce_workspace_lock=True)`
+# --------------------------------------------------------------------------
+
+
+def test_create_run_without_workspace_lock_allows_multiple_active_runs_same_path(tmp_path):
+    """Default (`enforce_workspace_lock=False`) behavior is unchanged — this
+    is what every other test in this file (and every direct db-layer test in
+    general) relies on when it creates several concurrently-"active" `run`
+    rows against the same throwaway `repository_path` with no real process
+    behind any of them."""
+    path = _fresh_db(tmp_path)
+    r1 = _make_run(path)
+    r2 = _make_run(path)
+    assert r1["state"] == "PREPARED"
+    assert r2["state"] == "PREPARED"
+
+
+def test_create_run_with_workspace_lock_raises_when_another_active_run_holds_workspace(tmp_path):
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    first = db.create_run(
+        path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p", is_resume=False, enforce_workspace_lock=True,
+    )
+    assert first["state"] == "PREPARED"
+
+    with pytest.raises(db.WorkspaceLockedError) as excinfo:
+        db.create_run(
+            path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+            repository_path="/tmp/x", prompt="p2", is_resume=False, enforce_workspace_lock=True,
+        )
+    assert excinfo.value.conflicting_run["id"] == first["id"]
+
+    # The rejected attempt must never have been inserted.
+    runs = db.list_runs(path, session_id=session["id"])
+    assert [r["id"] for r in runs] == [first["id"]]
+
+
+@pytest.mark.parametrize("active_state", sorted(db.EXECUTION_CENTER_ACTIVE_STATES))
+def test_create_run_with_workspace_lock_conflicts_on_every_active_state(tmp_path, active_state):
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    first = db.create_run(
+        path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p", is_resume=False,
+    )
+    path_to_state = {"PREPARED": [], "QUEUED": ["QUEUED"], "RUNNING": ["QUEUED", "RUNNING"]}
+    for target in path_to_state[active_state]:
+        first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state=target)
+    assert first["state"] == active_state
+
+    with pytest.raises(db.WorkspaceLockedError):
+        db.create_run(
+            path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+            repository_path="/tmp/x", prompt="p2", is_resume=False, enforce_workspace_lock=True,
+        )
+
+
+def test_create_run_with_workspace_lock_allows_when_conflict_is_terminal(tmp_path):
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    first = db.create_run(
+        path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p", is_resume=False,
+    )
+    first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="QUEUED")
+    first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="RUNNING")
+    db.update_run_state(path, first["id"], expected_version=first["version"], new_state="COMPLETED")
+
+    second = db.create_run(
+        path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p2", is_resume=True, enforce_workspace_lock=True,
+    )
+    assert second["state"] == "PREPARED"
+
+
+def test_create_run_with_workspace_lock_does_not_conflict_across_different_paths(tmp_path):
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session_a = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/a")
+    session_b = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/b")
+    run_a = db.create_run(
+        path, session_id=session_a["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/a", prompt="p", is_resume=False, enforce_workspace_lock=True,
+    )
+    run_b = db.create_run(
+        path, session_id=session_b["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/b", prompt="p", is_resume=False, enforce_workspace_lock=True,
+    )
+    assert run_a["state"] == "PREPARED"
+    assert run_b["state"] == "PREPARED"
+
+
+def test_create_run_workspace_lock_rejected_insert_does_not_advance_sequence(tmp_path):
+    """A rejected `create_run` must not have consumed a `sequence` number —
+    proof the `INSERT` genuinely never ran (the conflict check and the
+    insert share one transaction; see `WorkspaceLockedError`'s docstring)."""
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    first = db.create_run(
+        path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p", is_resume=False,
+    )
+    with pytest.raises(db.WorkspaceLockedError):
+        db.create_run(
+            path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+            repository_path="/tmp/x", prompt="p2", is_resume=False, enforce_workspace_lock=True,
+        )
+    db.update_run_state(path, first["id"], expected_version=first["version"], new_state="CANCELLED")
+    third = db.create_run(
+        path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p3", is_resume=False, enforce_workspace_lock=True,
+    )
+    assert third["sequence"] == 2, "the rejected attempt must not have consumed sequence 2"
+
+
+def test_create_run_workspace_lock_is_race_free_under_concurrent_callers(tmp_path):
+    """The check-then-insert must not lose a race between two genuinely
+    concurrent callers targeting the same workspace: `BEGIN IMMEDIATE`
+    serializes them, so exactly one must succeed and every other must see
+    the winner's row and raise `WorkspaceLockedError` — never two active
+    rows for the same `repository_path` at once."""
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+
+    n_threads = 8
+    successes: list[dict] = []
+    conflicts: list[db.WorkspaceLockedError] = []
+    lock = threading.Lock()
+
+    def attempt(idx: int) -> None:
+        try:
+            run = db.create_run(
+                path, session_id=session["id"], task_id=task["id"], project="AIOS",
+                task_type="implementation", repository_path="/tmp/x", prompt=f"p{idx}",
+                is_resume=False, enforce_workspace_lock=True,
+            )
+            with lock:
+                successes.append(run)
+        except db.WorkspaceLockedError as exc:
+            with lock:
+                conflicts.append(exc)
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len(successes) == 1, f"exactly one concurrent caller must win the workspace lock, got {successes}"
+    assert len(conflicts) == n_threads - 1
+    winner_id = successes[0]["id"]
+    assert all(exc.conflicting_run["id"] == winner_id for exc in conflicts)
+
+    active = db.list_runs(path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert len(active) == 1, "no more than one active run for this workspace must ever have been persisted"
 
 
 def test_report_is_at_most_one_per_run(tmp_path):
