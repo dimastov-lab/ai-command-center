@@ -710,6 +710,66 @@ def test_recommendations_panel_launch_button_starts_v2_run(fake_claude, tmp_path
     _wait_for_run_terminal(db_path, run_id)
 
 
+def test_recommendations_panel_launch_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_path):
+    """Root-cause regression for the "launch button does nothing" bug:
+    `execution_queue.launch_ready` deliberately refuses to launch a task
+    whose workspace has validation warnings (dirty working tree, detached
+    HEAD, branch mismatch) — a batch/one-click action has no per-task human
+    to acknowledge them, unlike the task card's own launcher. Before the fix,
+    the resulting message was rendered and then immediately discarded by the
+    `st.rerun()` the same click handler issues, so this refusal was
+    indistinguishable from the button doing nothing at all (exactly what was
+    reported: every AIOS task launch through this button silently no-ops,
+    because the real AIOS repository normally has a dirty working tree)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "f.txt").write_text("dirty change")
+    (repo / "untracked.txt").write_text("new")
+    _seed_tasks([{"id": "reco-launch", "title": "Recommended task", "workspace_path": str(repo)}])
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    launch_button = next(b for b in at.button if b.key == "kanban_reco_reco-launch_launch")
+    at = launch_button.click().run()
+    assert not at.exception
+    warnings = [w.value for w in at.warning]
+    assert any("Не удалось запустить сразу" in w for w in warnings)
+    assert any("запустите вручную из карточки задачи" in w for w in warnings)
+
+
+def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_path):
+    """Same regression as above, for the "🚀 Запустить готовые" / "Запустить
+    следующую готовую задачу" queue-panel buttons: a skipped entry (dirty
+    tree, branch mismatch, etc.) must show its blocking reason instead of
+    silently doing nothing, and the entry must stay in the queue (not be
+    dropped) so the user can act on it from the task card."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "f.txt").write_text("dirty change")
+    (repo / "untracked.txt").write_text("new")
+    task = _seed_task(id="seeded-task-1", workspace_path=str(repo))
+
+    data_dir = Path(os.environ["AICC_DATA_DIR"])
+    entries = execution_queue.enqueue([], task, {task["id"]: task})
+    execution_queue.save_queue(data_dir, entries)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    launch_ready_btn = next(b for b in at.button if b.key == "kanban_queue_launch_ready")
+    at = launch_ready_btn.click().run()
+    assert not at.exception
+    warnings = [w.value for w in at.warning]
+    assert any(
+        "seeded-task-1" in w and "запустите вручную из карточки задачи" in w for w in warnings
+    )
+
+    entries_after = execution_queue.load_queue(data_dir)
+    assert entries_after[0]["state"] == execution_queue.STATE_READY
+    assert entries_after[0]["run_id"] is None
+
+
 def test_kanban_card_enqueue_button_adds_task_to_execution_queue():
     _seed_task(id="seeded-task-1", workspace_path=None)
     at = _at_on_page("kanban")

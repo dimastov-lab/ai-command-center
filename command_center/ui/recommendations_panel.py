@@ -37,6 +37,23 @@ def render_recommendations_panel(
     )
 
     st.markdown("#### Рекомендованные задачи")
+
+    # See `queue_panel.render_execution_queue_panel`'s identical comment: a
+    # message rendered here and immediately followed by `st.rerun()` (as the
+    # "Запустить" button below used to do) is discarded by that rerun before
+    # the browser ever shows it — this is what made a *blocked* launch (e.g.
+    # the AIOS repository's normal dirty working tree) look like the button
+    # did nothing at all. Stashing the outcome in `session_state` and
+    # rendering it on the next run, before the (possibly now-empty, if the
+    # task launched and dropped off this list) `views`, keeps it visible.
+    flash_key = f"{key_prefix}_launch_flash"
+    flash = st.session_state.pop(flash_key, None)
+    if flash:
+        if flash["launched"]:
+            st.success(f"Запуск начат: `{flash['run_id']}`.")
+        else:
+            st.warning(f"Не удалось запустить сразу: {flash['message']}")
+
     if not views:
         st.info("Нет рекомендованных незаблокированных задач.")
         return
@@ -107,8 +124,9 @@ def render_recommendations_panel(
                     )
                     save_tasks_fn(tasks)
                     result = results[0] if results else None
-                    if result and result.launched:
-                        st.success(f"Запуск начат: `{result.run_id}`.")
-                    elif result:
-                        st.warning(f"Не удалось запустить сразу: {result.message}")
+                    st.session_state[flash_key] = {
+                        "launched": bool(result and result.launched),
+                        "run_id": result.run_id if result else None,
+                        "message": (result.message if result else "запуск не выполнен"),
+                    }
                     st.rerun()
