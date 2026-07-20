@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -406,6 +407,110 @@ def test_launch_portfolio_task_rolls_back_worktree_and_branch_on_launch_failure(
     # The claim must have been released so a retry is possible.
     assert portfolio_launch._claim(tmp_path, task.task_id) is True
     portfolio_launch._release(tmp_path, task.task_id)
+
+
+def test_concurrent_rollback_does_not_lose_a_parallel_successful_registration(
+    git_repo, tmp_path, monkeypatch, fake_claude, portfolio_worktrees_root
+):
+    """Founder Gate Major-1 rollback/release-path regression: a launch that
+    fails and rolls back must never be able to clobber a *different* task's
+    registry entry being written concurrently. The rollback path itself
+    never touches the registry (only a fully successful launch does) — this
+    proves that holds under genuine concurrent execution of two different
+    tasks, one failing and one succeeding, not just sequentially."""
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    base_branch = _current_branch(git_repo)
+    ok_task = _write_card(tmp_path, task_id="AICC-RACE-OK", base_branch=base_branch, repository=str(git_repo))
+    fail_task = _write_card(tmp_path, task_id="AICC-RACE-FAIL", base_branch=base_branch, repository=str(git_repo))
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+
+    real_launch_ready = execution_queue.launch_ready
+
+    def selective_launch_ready(root, entries, tasks, tasks_by_id, project_configs, execution_center_api, *, entry_ids=None):
+        if any(t["id"] == "AICC-RACE-FAIL" for t in tasks):
+            updated = [dict(e) for e in entries]
+            results = [
+                execution_queue.LaunchAttemptResult(
+                    entry_ids[0], "AICC-RACE-FAIL", False, message="forced failure for test"
+                )
+            ]
+            return updated, results
+        return real_launch_ready(
+            root, entries, tasks, tasks_by_id, project_configs, execution_center_api, entry_ids=entry_ids
+        )
+
+    monkeypatch.setattr(portfolio_launch.execution_queue, "launch_ready", selective_launch_ready)
+
+    start = threading.Barrier(2)
+    results: dict[str, portfolio_launch.PortfolioLaunchResult] = {}
+
+    def run(task, key):
+        start.wait()
+        results[key] = portfolio_launch.launch_portfolio_task(
+            tmp_path, task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)},
+            execution_center_api=api, confirmed=True,
+        )
+
+    threads = [
+        threading.Thread(target=run, args=(ok_task, "ok")),
+        threading.Thread(target=run, args=(fail_task, "fail")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    try:
+        assert results["ok"].launched is True, results["ok"].message
+        assert results["fail"].launched is False
+
+        registry = portfolio_launch.load_registry(tmp_path)
+        assert "AICC-RACE-OK" in registry
+        assert "AICC-RACE-FAIL" not in registry
+        assert not Path(results["fail"].plan.worktree).exists()
+        assert results["fail"].plan.branch not in git_info.get_branches(git_repo)
+    finally:
+        if results.get("ok") and results["ok"].run_id:
+            api.request_cancel(results["ok"].run_id, confirmed=True)
+
+
+def test_launch_batch_persists_entries_via_the_shared_registry_lock_mechanism(
+    git_repo, tmp_path, fake_claude, portfolio_worktrees_root, monkeypatch
+):
+    """Founder Gate Major-1 requirement: batch launch must reuse the exact
+    same atomic registry write path as a single launch (`_persist_registry_
+    entry`, backed by `_registry_lock`), not a separate, potentially unsafe
+    implementation."""
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    base_branch = _current_branch(git_repo)
+    task_a = _write_card(tmp_path, task_id="AICC-BATCH-LOCK-A", base_branch=base_branch, repository=str(git_repo))
+    task_b = _write_card(tmp_path, task_id="AICC-BATCH-LOCK-B", base_branch=base_branch, repository=str(git_repo))
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+
+    calls: list[str] = []
+    real_persist = portfolio_launch._persist_registry_entry
+
+    def spy_persist(root, task_id, entry):
+        calls.append(task_id)
+        return real_persist(root, task_id, entry)
+
+    monkeypatch.setattr(portfolio_launch, "_persist_registry_entry", spy_persist)
+
+    results = portfolio_launch.launch_batch(
+        tmp_path, [task_a, task_b], tasks_by_id={}, repository_paths={"AICC": str(git_repo)},
+        execution_center_api=api, confirmed=True,
+    )
+
+    try:
+        assert all(r.launched for r in results), [r.message for r in results]
+        assert sorted(calls) == ["AICC-BATCH-LOCK-A", "AICC-BATCH-LOCK-B"]
+        registry = portfolio_launch.load_registry(tmp_path)
+        assert "AICC-BATCH-LOCK-A" in registry
+        assert "AICC-BATCH-LOCK-B" in registry
+    finally:
+        for r in results:
+            if r.run_id:
+                api.request_cancel(r.run_id, confirmed=True)
 
 
 # --------------------------------------------------------------------------

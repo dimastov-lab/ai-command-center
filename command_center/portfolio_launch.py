@@ -56,25 +56,49 @@ Safety model:
   against every other task's registry entry / the rest of the same batch.
 - A small local registry (`data/portfolio_launches.json`, gitignored) records
   every task once successfully launched, purely for fast duplicate rejection
-  and UI history — never the sole authority (git's own state is), and never
-  required to be perfectly race-free on its own: the exclusive-create lock
-  file in `data/portfolio_locks/` (`os.open(..., O_CREAT | O_EXCL)`) is what
-  actually serializes two concurrent launch attempts for the same task_id,
-  the same technique this module needs because — unlike the SQLite-backed
-  workspace lock in `runtime.db` — worktree/branch creation has no existing
-  atomic primitive in this codebase to reuse.
+  and UI history — never the sole authority (git's own state is). Two
+  independent locks guard it, for two different races:
+  - The exclusive-create lock file in `data/portfolio_locks/<task_id>.lock`
+    (`os.open(..., O_CREAT | O_EXCL)`) serializes two concurrent launch
+    *attempts for the same task_id* — the same technique this module needs
+    for worktree/branch creation because, unlike the SQLite-backed
+    workspace lock in `runtime.db`, that has no existing atomic primitive
+    in this codebase to reuse.
+  - `_registry_lock` (`data/portfolio_locks/registry.lock`, an OS advisory
+    file lock — `fcntl.flock` on POSIX, `msvcrt.locking` on Windows) guards
+    the registry file's read-modify-write cycle itself, across *every*
+    task_id, in every process. Two concurrent launches of *different*
+    task_ids each hold their own `<task_id>.lock` and so never block each
+    other on it — but both still read-modify-write the same
+    `portfolio_launches.json`. Without `_registry_lock`, both could load the
+    same pre-write snapshot, each add their own entry, and the second
+    `save_registry` call would silently overwrite the first task's entry (a
+    lost update): a temp-file + `os.replace` write is atomic *on its own*
+    but does nothing to prevent that, since the race is between the two
+    reads, not the two writes. `_persist_registry_entry` is the only
+    function that writes the registry, and it holds `_registry_lock` for
+    its entire read-modify-write cycle.
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from command_center import execution_queue, git_info, models, storage
 from command_center.portfolio_models import PortfolioTask, unmet_requirements
 from command_center.runtime import db as runtime_db
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 WORKTREES_ROOT_ENV = "AICC_PORTFOLIO_WORKTREES_ROOT"
 DEFAULT_WORKTREES_ROOT = Path.home() / "Projects" / "worktrees"
@@ -250,10 +274,14 @@ def _locks_dir(root: Path) -> Path:
 
 def _claim(root: Path, task_id: str) -> bool:
     """Atomically claim `task_id` for launch. Returns False if another
-    in-flight (or crashed-and-never-released) claim already exists —
-    `release_stale_claim` is the explicit, operator-triggered way to clear a
-    claim orphaned by a crash; this function itself never clears one, so two
-    genuinely concurrent callers can never both proceed."""
+    in-flight (or crashed-and-never-released) claim already exists. This
+    function itself never clears an existing claim — a claim orphaned by a
+    launch that crashed between `_claim` succeeding and the `finally:
+    _release(...)` in `launch_portfolio_task` running is cleared by deleting
+    its lock file directly (`data/portfolio_locks/<task_id>.lock`). There is
+    deliberately no in-app helper for that: it's a rare, operator-triggered
+    recovery action on one well-known file, not a code path this module
+    needs to expose."""
     locks_dir = _locks_dir(root)
     locks_dir.mkdir(parents=True, exist_ok=True)
     lock_path = locks_dir / f"{task_id}.lock"
@@ -268,6 +296,147 @@ def _claim(root: Path, task_id: str) -> bool:
 def _release(root: Path, task_id: str) -> None:
     lock_path = _locks_dir(root) / f"{task_id}.lock"
     lock_path.unlink(missing_ok=True)
+
+
+REGISTRY_LOCK_FILE_NAME = "registry.lock"
+REGISTRY_LOCK_TIMEOUT_SECONDS = 30.0
+_REGISTRY_LOCK_POLL_SECONDS = 0.05
+
+
+def _registry_lock_path(root: Path) -> Path:
+    locks_dir = _locks_dir(root)
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    return locks_dir / REGISTRY_LOCK_FILE_NAME
+
+
+def _try_acquire_lock(handle) -> bool:
+    """Non-blocking attempt to take the OS advisory lock on `handle`. Returns
+    `False` (never raises) if another holder — thread, process, doesn't
+    matter, both primitives below are OS-level, not Python-level — already
+    holds it."""
+    try:
+        if sys.platform == "win32":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _release_lock(handle) -> None:
+    if sys.platform == "win32":
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _registry_lock(root: Path, *, timeout: float = REGISTRY_LOCK_TIMEOUT_SECONDS):
+    """Cross-process, cross-thread mutual exclusion for the *entire*
+    read-modify-write cycle on `data/portfolio_launches.json` — every writer
+    of the registry (currently just `_persist_registry_entry`) must acquire
+    this for its whole read+write, not just around the final `os.replace`:
+    acquiring it only around the write would still let two callers both read
+    the same pre-write state and each write back a version missing the
+    other's entry (the lost update this lock exists to prevent).
+
+    A dedicated `registry.lock` file (never the registry file itself, so a
+    lock holder never blocks a plain `load_registry` read) holds an OS
+    advisory lock — `fcntl.flock` on POSIX, `msvcrt.locking` on Windows,
+    both stdlib, no third-party dependency. Both are released by the
+    kernel the instant the holding process's file descriptor closes,
+    including on a crash or kill, so — unlike the `_claim` exclusive-create
+    lock file — a dead holder can never wedge every future launch.
+
+    Acquisition polls with a bounded `timeout` (rather than blocking
+    forever) so a bug that fails to release the lock surfaces as a clear
+    `PortfolioLaunchError` instead of an indefinite hang; release always
+    happens in `finally`, so a normal exception raised by the code running
+    inside this context still releases the lock immediately.
+    """
+    lock_path = _registry_lock_path(root)
+    handle = open(lock_path, "a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            # Windows byte-range locking needs at least one real byte to
+            # lock; POSIX flock ignores file content/length entirely.
+            handle.write(b"0")
+            handle.flush()
+        deadline = time.monotonic() + timeout
+        while not _try_acquire_lock(handle):
+            if time.monotonic() >= deadline:
+                raise PortfolioLaunchError(
+                    f"не удалось получить блокировку реестра запусков Portfolio за {timeout:.0f}с: {lock_path}"
+                )
+            time.sleep(_REGISTRY_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            _release_lock(handle)
+    finally:
+        handle.close()
+
+
+def _load_registry_strict(root: Path) -> dict[str, dict]:
+    """Like `load_registry`, but raises `PortfolioLaunchError` instead of
+    silently treating a corrupt or non-object registry file as an empty
+    registry. `load_registry`'s tolerant default suits its callers (dry-run
+    planning, UI history — for those, "nothing recorded yet" and
+    "unreadable" are both safe to treat the same way, non-destructively);
+    this one guards the write path inside `_registry_lock`, where silently
+    treating unreadable-but-nonempty content as `{}` and then persisting
+    that would silently discard every previously registered launch."""
+    path = _registry_file(root)
+    if not path.exists():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PortfolioLaunchError(f"не удалось прочитать реестр запусков Portfolio ({path}): {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PortfolioLaunchError(
+            f"реестр запусков Portfolio повреждён и не будет тихо перезаписан ({path}): {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise PortfolioLaunchError(
+            f"реестр запусков Portfolio имеет неожиданный формат (ожидался JSON-объект): {path}"
+        )
+    return data
+
+
+def _persist_registry_entry(root: Path, task_id: str, entry: dict) -> str | None:
+    """The only function that writes `data/portfolio_launches.json`. Re-reads
+    the registry, re-checks for a duplicate/conflicting registration, and
+    writes the merged result — all inside one `_registry_lock` acquisition,
+    so the read this decision is based on and the write that commits it are
+    always adjacent: no other concurrent writer (this process or another)
+    can slip a write in between. `launch_batch` gets the exact same
+    guarantee for free, by calling `launch_portfolio_task` (which calls this)
+    rather than writing the registry itself.
+
+    Returns `None` on success, or a blocking message if `task_id` (or its
+    branch/worktree) was claimed by someone else in the window between this
+    launch's own `_claim` and this call — vanishingly unlikely given `_claim`
+    already serializes same-`task_id` launches, but the guarantee this
+    function gives is unconditional rather than assumed.
+    """
+    with _registry_lock(root):
+        registry = _load_registry_strict(root)
+        if task_id in registry:
+            return "задача уже была запущена ранее — см. журнал запусков Portfolio"
+        conflict_owner = _find_conflicting_registration(
+            registry, branch=entry.get("branch"), worktree=entry.get("worktree"), exclude_task_id=task_id
+        )
+        if conflict_owner:
+            return f"конфликт: ветка/worktree уже используется задачей {conflict_owner}"
+        registry[task_id] = entry
+        save_registry(root, registry)
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -885,7 +1054,7 @@ def launch_portfolio_task(
             message = result.message if result else "запуск не выполнен"
             return PortfolioLaunchResult(task_id=task.task_id, launched=False, message=message, plan=plan)
 
-        registry[task.task_id] = {
+        entry = {
             "task_id": task.task_id,
             "project": task.project,
             "branch": plan.branch,
@@ -899,7 +1068,16 @@ def launch_portfolio_task(
             "launched_at": models.iso_now(),
             "source_path": str(task.source_path),
         }
-        save_registry(root, registry)
+        # The agent run has already started (`result.launched` above) — from
+        # here on nothing is rolled back regardless of what happens (see
+        # module docstring), so a registry conflict at this point (someone
+        # else registered this exact task_id/branch/worktree in the window
+        # between our `_claim` and here) is reported but the live run stands.
+        conflict_message = _persist_registry_entry(root, task.task_id, entry)
+        if conflict_message is not None:
+            return PortfolioLaunchResult(
+                task_id=task.task_id, launched=True, run_id=result.run_id, message=conflict_message, plan=plan
+            )
 
         return PortfolioLaunchResult(task_id=task.task_id, launched=True, run_id=result.run_id, plan=plan)
     finally:

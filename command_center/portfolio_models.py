@@ -11,12 +11,16 @@ that turns a `PortfolioTask` into a real launch.
 
 The frontmatter parser below is deliberately not a general YAML parser: every
 card observed in Portfolio uses a flat, single-line, flow-style subset (quoted
-string scalars, `null`, and `[...]` lists of quoted strings — never nested
-maps, block scalars, or multi-line values), and this project takes no new
-third-party dependency (only `streamlit` is declared) to parse it. A card
-using a YAML feature outside that subset fails to parse with a clear
-`PortfolioCardError` naming the offending line, rather than being silently
-misread.
+string scalars, `null`, booleans, numbers, and `[...]` lists of quoted
+strings — never nested maps, block-style lists, block scalars, or multi-line
+values), and this project takes no new third-party dependency (only
+`streamlit` is declared) to parse it. A card using a YAML feature outside
+that subset — a nested mapping (block-indented or inline `{...}`), a
+block-style (`- item`) list, a block scalar (`|`/`>`), an unterminated quoted
+string or flow list, or a duplicate key — fails closed with a clear
+`PortfolioCardError` naming the offending field, rather than being silently
+flattened, truncated, or misread. A card that fails to parse never produces a
+partially-built `PortfolioTask`.
 """
 
 from __future__ import annotations
@@ -198,8 +202,14 @@ _INT_RE = re.compile(r"^-?\d+$")
 _FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
 _QUOTED_ITEM_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
+# YAML block-scalar indicators (`|`, `>`, with optional chomping/indentation
+# modifiers) — a value of exactly one of these on its own signals a
+# multi-line block scalar is about to follow, which this flat, single-line
+# subset does not support.
+_BLOCK_SCALAR_MARKERS = frozenset({"|", ">", "|-", "|+", ">-", ">+"})
 
-def _parse_scalar(raw: str) -> Any:
+
+def _parse_scalar(raw: str, *, field_name: str, source_path: Path) -> Any:
     raw = raw.strip()
     if raw == "null" or raw == "":
         return None
@@ -207,9 +217,27 @@ def _parse_scalar(raw: str) -> Any:
         return True
     if raw == "false":
         return False
-    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-        return raw[1:-1].replace('\\"', '"')
-    if raw.startswith("[") and raw.endswith("]"):
+    if raw in _BLOCK_SCALAR_MARKERS:
+        raise PortfolioCardError(
+            f"{source_path}: field {field_name!r} uses a YAML block scalar ({raw!r}) — "
+            "multi-line values are not supported, only flat single-line scalars"
+        )
+    if raw.startswith("{"):
+        raise PortfolioCardError(
+            f"{source_path}: field {field_name!r} is a nested mapping ({raw!r}) — "
+            "nested mappings are not supported, only flat scalar/list fields"
+        )
+    if raw.startswith('"'):
+        if raw.endswith('"') and len(raw) >= 2:
+            return raw[1:-1].replace('\\"', '"')
+        raise PortfolioCardError(
+            f"{source_path}: field {field_name!r} has an unterminated quoted string: {raw!r}"
+        )
+    if raw.startswith("["):
+        if not raw.endswith("]"):
+            raise PortfolioCardError(
+                f"{source_path}: field {field_name!r} has an unterminated flow list: {raw!r}"
+            )
         inner = raw[1:-1].strip()
         if not inner:
             return []
@@ -223,9 +251,22 @@ def _parse_scalar(raw: str) -> Any:
 
 def _parse_frontmatter_block(lines: list[str], *, source_path: Path) -> dict[str, Any]:
     data: dict[str, Any] = {}
+    last_key: str | None = None
     for raw_line in lines:
         if not raw_line.strip():
             continue
+        if raw_line[:1] in (" ", "\t"):
+            owner = f" (nested under {last_key!r})" if last_key else ""
+            raise PortfolioCardError(
+                f"{source_path}: indented/nested frontmatter content is not supported{owner}: {raw_line!r}"
+            )
+        stripped = raw_line.strip()
+        if stripped == "-" or stripped.startswith("- "):
+            owner = f" (nested under {last_key!r})" if last_key else ""
+            raise PortfolioCardError(
+                f"{source_path}: block-style list item is not supported{owner} — "
+                f"use an inline flow list instead, e.g. field: [\"a\", \"b\"]: {raw_line!r}"
+            )
         if ":" not in raw_line:
             raise PortfolioCardError(
                 f"{source_path}: malformed frontmatter line (no ':'): {raw_line!r}"
@@ -234,7 +275,10 @@ def _parse_frontmatter_block(lines: list[str], *, source_path: Path) -> dict[str
         key = key.strip()
         if not key:
             raise PortfolioCardError(f"{source_path}: empty frontmatter key in line {raw_line!r}")
-        data[key] = _parse_scalar(value)
+        if key in data:
+            raise PortfolioCardError(f"{source_path}: duplicate frontmatter key {key!r}")
+        data[key] = _parse_scalar(value, field_name=key, source_path=source_path)
+        last_key = key
     return data
 
 
