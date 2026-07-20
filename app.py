@@ -35,6 +35,7 @@ from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
     content_area,
+    portfolio_panel,
     project_intelligence_panel,
     project_selector,
     queue_panel,
@@ -185,6 +186,7 @@ NAV: dict[str, tuple[str, str]] = {
     "git_center": ("Git Center", ":material/commit:"),
     "workspace": ("Workspace Launcher", ":material/rocket_launch:"),
     "focus": ("Focus Mode", ":material/center_focus_strong:"),
+    "portfolio": ("Portfolio Execution", ":material/inventory_2:"),
 }
 
 
@@ -3247,3 +3249,15 @@ elif page_key == "focus":
                 ):
                     update_task_status(tasks, task_id, "Done")
                     st.rerun()
+
+
+# --------------------------------------------------------------------------
+# Portfolio Execution
+# --------------------------------------------------------------------------
+
+elif page_key == "portfolio":
+    st.subheader("Portfolio Execution")
+    portfolio_panel.render_portfolio_execution_panel(
+        root=ROOT,
+        execution_center_api=get_execution_center_api(),
+    )

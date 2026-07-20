@@ -1,0 +1,5 @@
+{
+  "AIOS": "/path/to/your/aios/checkout",
+  "AICOS": "/path/to/your/aicos-specs/checkout",
+  "INFRA": "/path/to/your/infra/checkout"
+}

@@ -90,7 +90,7 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
     to). Directly monkeypatching each module's constants — rather than relying solely
     on import ordering — makes isolation hold regardless of when/how each module was
     first imported into the test process."""
-    from command_center import activity_log, agent_runner, chat_service, project_config
+    from command_center import activity_log, agent_runner, chat_service, portfolio_config, project_config
 
     monkeypatch.setattr(project_config, "DATA_DIR", isolated_data_dir)
     monkeypatch.setattr(project_config, "CONFIG_FILE", isolated_data_dir / "project_config.json")
@@ -100,6 +100,8 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
     monkeypatch.setattr(activity_log, "ACTIVITY_FILE", isolated_data_dir / "activity.jsonl")
     monkeypatch.setattr(chat_service, "DATA_DIR", isolated_data_dir)
     monkeypatch.setattr(chat_service, "CHATS_FILE", isolated_data_dir / "chats.json")
+    monkeypatch.setattr(portfolio_config, "DATA_DIR", isolated_data_dir)
+    monkeypatch.setattr(portfolio_config, "CONFIG_FILE", isolated_data_dir / "portfolio_config.json")
 
 
 @pytest.fixture(autouse=True)

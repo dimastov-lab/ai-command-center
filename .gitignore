@@ -5,6 +5,9 @@ data/chats.json
 data/activity.jsonl
 data/project_config.json
 data/execution_queue.json
+data/portfolio_config.json
+data/portfolio_launches.json
+data/portfolio_locks/
 
 # Transient AI task artifacts and agent reports generated at runtime
 # (scripts/start-task.sh and the v1.2 Claude Code runner)
