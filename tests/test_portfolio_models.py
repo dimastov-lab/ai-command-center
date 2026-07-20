@@ -4,6 +4,7 @@ import pytest
 
 from command_center.portfolio_models import (
     PortfolioCardError,
+    _parse_scalar,
     load_portfolio_tasks,
     parse_card,
     unmet_requirements,
@@ -243,6 +244,107 @@ def test_parse_card_raises_on_duplicate_frontmatter_key(tmp_path):
     path = _write_card(tmp_path, "ready", "AICC", "dup-key.md", text)
     with pytest.raises(PortfolioCardError, match="status"):
         parse_card(path, lane="ready")
+
+
+def test_parse_card_raises_accurate_message_for_top_level_orphan_list_item(tmp_path):
+    """`- orphan item` straight after a key that already has its own value
+    (`status: "ready"`) is not nested under that key — it's an unrelated
+    top-level line. The error must say so plainly instead of claiming a
+    nesting relationship that doesn't exist (Founder Gate re-review Minor 1)."""
+    text = VALID_CARD.replace('status: "ready"', 'status: "ready"\n- orphan item')
+    path = _write_card(tmp_path, "ready", "AICC", "orphan-top-level.md", text)
+    with pytest.raises(PortfolioCardError) as exc_info:
+        parse_card(path, lane="ready")
+    message = str(exc_info.value)
+    assert "top-level" in message
+    assert "nested under" not in message
+
+
+def test_parse_card_block_list_after_empty_key_still_reports_nesting(tmp_path):
+    """Regression guard for the fix above: when the preceding key genuinely
+    has no value (`deliverables:` with nothing after the colon), a following
+    `- item` line is still plausibly that key's value, so the message should
+    keep naming it as nested under that key."""
+    text = VALID_CARD.replace(
+        'deliverables: ["app.py change committed"]',
+        'deliverables:\n- "app.py change committed"',
+    )
+    path = _write_card(tmp_path, "ready", "AICC", "block-list-owned.md", text)
+    with pytest.raises(PortfolioCardError, match="nested under 'deliverables'"):
+        parse_card(path, lane="ready")
+
+
+# --------------------------------------------------------------------------
+# Flow-list contract — only single-/double-quoted items are supported. An
+# unquoted, non-empty item must fail closed rather than being silently
+# dropped, since `_QUOTED_ITEM_RE.findall` used to extract only the quoted
+# items and silently discard the rest (Founder Gate re-review Blocker 1):
+#   _parse_scalar('[a, "b"]', ...) used to wrongly return ["b"]
+#   _parse_scalar("[1, 2]", ...) used to wrongly return []
+#   _parse_scalar("[true, false]", ...) used to wrongly return []
+# --------------------------------------------------------------------------
+
+
+def test_parse_scalar_direct_repro_rejects_mixed_quoted_and_bare_item():
+    """Exact repro from the Founder Gate re-review finding."""
+    with pytest.raises(PortfolioCardError):
+        _parse_scalar('[a, "b"]', field_name="deliverables", source_path=Path("x.md"))
+
+
+@pytest.mark.parametrize(
+    "flow_list",
+    [
+        '[a, "b"]',
+        '["a", b]',
+        "[a]",
+        "[1, 2]",
+        "[true, false]",
+        "[null]",
+        '["a", 2, "b"]',
+    ],
+)
+def test_parse_card_rejects_unquoted_flow_list_items(tmp_path, flow_list):
+    text = VALID_CARD.replace(
+        'deliverables: ["app.py change committed"]', f"deliverables: {flow_list}"
+    )
+    path = _write_card(tmp_path, "ready", "AICC", "unquoted-item.md", text)
+    with pytest.raises(PortfolioCardError, match="deliverables"):
+        parse_card(path, lane="ready")
+
+
+def test_parse_card_rejects_unquoted_flow_list_item_without_partial_task(tmp_path):
+    """A mixed list must never yield a partially-parsed list or task — the
+    whole card fails, nothing downstream sees a truncated `deliverables`."""
+    text = VALID_CARD.replace(
+        'deliverables: ["app.py change committed"]', 'deliverables: ["a", 2, "b"]'
+    )
+    path = _write_card(tmp_path, "ready", "AICC", "mixed-list.md", text)
+    result = None
+    try:
+        result = parse_card(path, lane="ready")
+    except PortfolioCardError:
+        pass
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    "flow_list,expected",
+    [
+        ("[]", []),
+        ('["a"]', ["a"]),
+        ('["a", "b"]', ["a", "b"]),
+        ("['a', 'b']", ["a", "b"]),
+        ('["app.py", "tests/test_x.py"]', ["app.py", "tests/test_x.py"]),
+        ('["value, with comma", "other"]', ["value, with comma", "other"]),
+    ],
+)
+def test_parse_card_accepts_valid_quoted_flow_lists(tmp_path, flow_list, expected):
+    text = VALID_CARD.replace(
+        'deliverables: ["app.py change committed"]', f"deliverables: {flow_list}"
+    )
+    path = _write_card(tmp_path, "ready", "AICC", "valid-list.md", text)
+    task = parse_card(path, lane="ready")
+    assert task.deliverables == expected
 
 
 def test_parse_card_failure_never_yields_a_partial_task(tmp_path):

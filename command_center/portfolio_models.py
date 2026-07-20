@@ -200,13 +200,76 @@ class PortfolioLoadResult:
 
 _INT_RE = re.compile(r"^-?\d+$")
 _FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
-_QUOTED_ITEM_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_DOUBLE_QUOTED_ITEM_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"$')
+_SINGLE_QUOTED_ITEM_RE = re.compile(r"^'([^']*)'$")
 
 # YAML block-scalar indicators (`|`, `>`, with optional chomping/indentation
 # modifiers) — a value of exactly one of these on its own signals a
 # multi-line block scalar is about to follow, which this flat, single-line
 # subset does not support.
 _BLOCK_SCALAR_MARKERS = frozenset({"|", ">", "|-", "|+", ">-", ">+"})
+
+
+def _split_flow_list_items(inner: str, *, field_name: str, source_path: Path, raw_value: str) -> list[str]:
+    """Split the inside of a `[...]` flow list on top-level commas, treating
+    commas inside a quoted item (single or double) as part of that item
+    rather than a separator. Raises on an unterminated quoted string so the
+    caller never has to guess where an item actually ends."""
+    items: list[str] = []
+    buf: list[str] = []
+    quote_char: str | None = None
+    index = 0
+    length = len(inner)
+    while index < length:
+        char = inner[index]
+        if quote_char is not None:
+            if quote_char == '"' and char == "\\" and index + 1 < length:
+                buf.append(char)
+                buf.append(inner[index + 1])
+                index += 2
+                continue
+            buf.append(char)
+            if char == quote_char:
+                quote_char = None
+            index += 1
+            continue
+        if char in ('"', "'"):
+            quote_char = char
+            buf.append(char)
+            index += 1
+            continue
+        if char == ",":
+            items.append("".join(buf))
+            buf = []
+            index += 1
+            continue
+        buf.append(char)
+        index += 1
+    if quote_char is not None:
+        raise PortfolioCardError(
+            f"{source_path}: field {field_name!r} has an unterminated quoted string in flow list: {raw_value!r}"
+        )
+    items.append("".join(buf))
+    return items
+
+
+def _parse_flow_list_item(item: str, *, field_name: str, source_path: Path, raw_value: str) -> str:
+    """A single flow-list element. Only single- or double-quoted strings are
+    supported — any other token (bare word, number, `true`/`false`, `null`)
+    is rejected rather than silently dropped, since `_QUOTED_ITEM_RE.findall`
+    previously extracted only the quoted items and quietly discarded every
+    unquoted one (Founder Gate Blocker 1)."""
+    stripped = item.strip()
+    double_match = _DOUBLE_QUOTED_ITEM_RE.match(stripped)
+    if double_match:
+        return double_match.group(1).replace('\\"', '"')
+    single_match = _SINGLE_QUOTED_ITEM_RE.match(stripped)
+    if single_match:
+        return single_match.group(1)
+    raise PortfolioCardError(
+        f"{source_path}: field {field_name!r} has an unsupported flow-list item {stripped!r} "
+        f"in {raw_value!r} — flow-list items must be single- or double-quoted strings"
+    )
 
 
 def _parse_scalar(raw: str, *, field_name: str, source_path: Path) -> Any:
@@ -241,7 +304,11 @@ def _parse_scalar(raw: str, *, field_name: str, source_path: Path) -> Any:
         inner = raw[1:-1].strip()
         if not inner:
             return []
-        return [match.replace('\\"', '"') for match in _QUOTED_ITEM_RE.findall(inner)]
+        items = _split_flow_list_items(inner, field_name=field_name, source_path=source_path, raw_value=raw)
+        return [
+            _parse_flow_list_item(item, field_name=field_name, source_path=source_path, raw_value=raw)
+            for item in items
+        ]
     if _INT_RE.match(raw):
         return int(raw)
     if _FLOAT_RE.match(raw):
@@ -252,6 +319,14 @@ def _parse_scalar(raw: str, *, field_name: str, source_path: Path) -> Any:
 def _parse_frontmatter_block(lines: list[str], *, source_path: Path) -> dict[str, Any]:
     data: dict[str, Any] = {}
     last_key: str | None = None
+    # True only when the most recently parsed key had an empty value (e.g.
+    # `deliverables:` with nothing after the colon) — the one case where a
+    # following unindented `- item` line is a plausible (if unsupported)
+    # block-list value for that key. A key that already had its own value
+    # (e.g. `status: "ready"`) cannot own a later `- item` line, so a block
+    # item straight after it is a genuinely top-level/orphaned line, not
+    # nested under that key (Founder Gate re-review Minor 1).
+    last_key_awaits_list = False
     for raw_line in lines:
         if not raw_line.strip():
             continue
@@ -262,9 +337,13 @@ def _parse_frontmatter_block(lines: list[str], *, source_path: Path) -> dict[str
             )
         stripped = raw_line.strip()
         if stripped == "-" or stripped.startswith("- "):
-            owner = f" (nested under {last_key!r})" if last_key else ""
+            if last_key and last_key_awaits_list:
+                raise PortfolioCardError(
+                    f"{source_path}: block-style list item is not supported (nested under {last_key!r}) — "
+                    f"use an inline flow list instead, e.g. field: [\"a\", \"b\"]: {raw_line!r}"
+                )
             raise PortfolioCardError(
-                f"{source_path}: block-style list item is not supported{owner} — "
+                f"{source_path}: top-level block-style list item is not supported — "
                 f"use an inline flow list instead, e.g. field: [\"a\", \"b\"]: {raw_line!r}"
             )
         if ":" not in raw_line:
@@ -279,6 +358,7 @@ def _parse_frontmatter_block(lines: list[str], *, source_path: Path) -> dict[str
             raise PortfolioCardError(f"{source_path}: duplicate frontmatter key {key!r}")
         data[key] = _parse_scalar(value, field_name=key, source_path=source_path)
         last_key = key
+        last_key_awaits_list = value.strip() == ""
     return data
 
 

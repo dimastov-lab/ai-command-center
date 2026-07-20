@@ -491,6 +491,11 @@ def build_launch_plan(
     if task.lane != "ready":
         blockers.append(f"задача находится в статусе «{task.lane}», автозапуск разрешён только для «ready»")
 
+    # Advisory/fast-path only: `registry` here is whatever the caller loaded
+    # (unlocked), so this can race with a concurrent launch. The authoritative
+    # duplicate/conflict decision is made inside `_persist_registry_entry`
+    # under `_registry_lock` — do not remove that locked re-check in favor of
+    # this one.
     if task.task_id and task.task_id in registry:
         blockers.append("задача уже была запущена ранее — см. журнал запусков Portfolio")
 
@@ -580,6 +585,10 @@ def build_launch_plan(
                     sha_result = git_info.run_git_command(repo_root, ["rev-parse", base_branch])
                     base_sha = sha_result.stdout.strip() if sha_result and sha_result.returncode == 0 else None
 
+    # Advisory/fast-path only, same caveat as the duplicate check above — this
+    # `registry` snapshot is unlocked and can be stale. The authoritative
+    # conflict decision is `_find_conflicting_registration` called again
+    # inside `_persist_registry_entry` under `_registry_lock`.
     conflict_owner = _find_conflicting_registration(
         registry, branch=branch or None, worktree=worktree or None, exclude_task_id=task.task_id
     )
