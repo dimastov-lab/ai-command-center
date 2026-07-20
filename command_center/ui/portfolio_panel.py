@@ -70,8 +70,24 @@ _WORKTREE_MODE_LABELS: dict[str, str] = {
     portfolio_launch.WORKTREE_MODE_NEW: "новый (будет создан)",
 }
 
+# Headline-status badge color per `PortfolioCardPresentation.status_key` —
+# the one place this module maps the framework-agnostic `severity`/
+# `status_key` from `portfolio_launch` onto Streamlit's `st.badge` palette.
+_STATUS_BADGE_COLORS: dict[str, str] = {
+    portfolio_launch.STATUS_READY: "green",
+    portfolio_launch.STATUS_RUNNING: "blue",
+    portfolio_launch.STATUS_COMPLETED: "green",
+    portfolio_launch.STATUS_FAILED: "red",
+    portfolio_launch.STATUS_CANCELLED: "gray",
+    portfolio_launch.STATUS_ALREADY_LAUNCHED: "orange",
+    portfolio_launch.STATUS_BLOCKED: "red",
+}
 
-def _render_plan_details(plan: portfolio_launch.LaunchPlan) -> None:
+_MESSAGE_RENDERERS = {"info": st.info, "warning": st.warning, "error": st.error}
+
+
+def _render_plan_details(task: PortfolioTask, plan: portfolio_launch.LaunchPlan) -> None:
+    st.caption(f"Task workflow status: `{task.status or plan.lane}`")
     st.write(f"- Repository: `{plan.repository_root or '—'}`")
     st.write(f"- Base branch: `{plan.base_branch or '—'}` · SHA: `{plan.base_sha or '—'}`")
     st.write(f"- Запрошенная ветка (карточка): `{plan.requested_branch or '—'}`")
@@ -82,7 +98,14 @@ def _render_plan_details(plan: portfolio_launch.LaunchPlan) -> None:
     )
     st.write(f"- Режим worktree: {_WORKTREE_MODE_LABELS.get(plan.worktree_mode, plan.worktree_mode)}")
     st.write(f"- Тип задачи для агента: `{plan.task_type}`")
+    # The "already launched" blocker is rendered as its own info/warning
+    # message above the expander (via `PortfolioCardPresentation.message`) —
+    # it is not a precondition error, so it is deliberately excluded from
+    # this `st.error` loop to avoid showing it twice, once correctly framed
+    # and once as a red error.
     for blocker in plan.blockers:
+        if blocker == portfolio_launch.ALREADY_LAUNCHED_BLOCKER:
+            continue
         st.error(blocker)
     for warning in plan.warnings:
         st.warning(warning)
@@ -136,15 +159,23 @@ def render_portfolio_execution_panel(
         plan = portfolio_launch.build_launch_plan(
             task, tasks_by_id=tasks_by_id, repository_paths=repository_paths, registry=registry
         )
-        already_launched = task.task_id in registry
+        registry_entry = registry.get(task.task_id) if task.task_id else None
+        existing_run = (
+            execution_center_api.get_run(registry_entry["run_id"])
+            if registry_entry and registry_entry.get("run_id")
+            else None
+        )
+        presentation = portfolio_launch.build_card_presentation(
+            plan, registry_entry=registry_entry, existing_run=existing_run
+        )
 
         with st.container(border=True):
-            header_cols = st.columns([0.5, 3, 1, 1])
+            header_cols = st.columns([0.5, 3, 1.5])
             checked = header_cols[0].checkbox(
                 "Выбрать",
                 key=f"{key_prefix}_check_{task.task_id}",
                 label_visibility="collapsed",
-                disabled=not plan.launchable,
+                disabled=not presentation.launch_allowed,
             )
             if checked:
                 st.session_state[selected_key].add(task.task_id)
@@ -152,22 +183,33 @@ def render_portfolio_execution_panel(
                 st.session_state[selected_key].discard(task.task_id)
 
             header_cols[1].markdown(f"**{_task_label(task)}**")
-            header_cols[2].badge(task.status or "—", color="green" if plan.launchable else "orange")
-            header_cols[3].badge("Launchable" if plan.launchable else "Blocked", color="blue" if plan.launchable else "red")
+            header_cols[2].badge(
+                presentation.status_label,
+                color=_STATUS_BADGE_COLORS.get(presentation.status_key, "gray"),
+            )
 
-            if already_launched and task.task_id:
-                entry = registry[task.task_id]
-                st.caption(f"Уже запущено: run `{entry.get('run_id')}` · {entry.get('launched_at')}")
+            if presentation.message:
+                _MESSAGE_RENDERERS[presentation.message_severity](presentation.message)
+
+            if presentation.existing_run_id:
+                if st.button(
+                    "Open run",
+                    key=f"{key_prefix}_open_run_{task.task_id}",
+                    icon=":material/open_in_new:",
+                ):
+                    st.session_state.pending_nav = "execution_center"
+                    st.session_state.pending_exec_center_run = presentation.existing_run_id
+                    st.rerun()
 
             with st.expander("Детали и dry-run"):
-                _render_plan_details(plan)
+                _render_plan_details(task, plan)
 
             action_cols = st.columns(2)
             with action_cols[0]:
                 if st.button("Dry run", key=f"{key_prefix}_dryrun_{task.task_id}", width="stretch"):
                     st.session_state[f"{key_prefix}_dryrun_shown_{task.task_id}"] = True
             with action_cols[1]:
-                launch_disabled = not plan.launchable
+                launch_disabled = not presentation.launch_allowed
                 if st.button(
                     "Launch",
                     key=f"{key_prefix}_launch_open_{task.task_id}",
