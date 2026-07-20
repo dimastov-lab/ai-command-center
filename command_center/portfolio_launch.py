@@ -114,6 +114,12 @@ SOURCE_GENERATED_DEFAULT = "generated_default"
 WORKTREE_MODE_EXISTING = "existing"
 WORKTREE_MODE_NEW = "new"
 
+# `build_launch_plan`'s blocker text for "this task_id is already in the
+# registry" — a named constant (rather than a string literal repeated at the
+# append site and every reader) so `build_card_presentation` can reliably
+# split it out from genuine precondition blockers without string-matching.
+ALREADY_LAUNCHED_BLOCKER = "задача уже была запущена ранее — см. журнал запусков Portfolio"
+
 # Card `type` values that map to a read-only agent role
 # (`agent_runner.READ_ONLY_TASK_TYPES`). Everything else — including
 # `implementation`/`design`/`documentation`/`infrastructure`/`audit`, none of
@@ -566,7 +572,7 @@ def build_launch_plan(
     # under `_registry_lock` — do not remove that locked re-check in favor of
     # this one.
     if task.task_id and task.task_id in registry:
-        blockers.append("задача уже была запущена ранее — см. журнал запусков Portfolio")
+        blockers.append(ALREADY_LAUNCHED_BLOCKER)
 
     repo_root: Path | None = None
     repo_root_raw = repository_paths.get(task.project) if task.project else None
@@ -694,6 +700,162 @@ def build_launch_plan(
         worktree_mode=worktree_mode,
         blockers=blockers,
         warnings=warnings,
+    )
+
+
+# --------------------------------------------------------------------------
+# Card presentation — single, unambiguous launch-state for the UI
+# --------------------------------------------------------------------------
+#
+# `LaunchPlan.launchable` alone cannot drive a card's headline status: it is
+# `False` both when a precondition is genuinely broken (missing repo mapping,
+# bad worktree, ...) and when the *only* reason is that this task was already
+# launched before — and those two cases must never look the same (a prior
+# launch is not an error). `build_card_presentation` is the one place that
+# tells them apart and picks exactly one headline status to show.
+
+STATUS_READY = "ready"
+STATUS_RUNNING = "running"
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
+STATUS_ALREADY_LAUNCHED = "already_launched"
+STATUS_BLOCKED = "blocked"
+
+STATUS_LABELS: dict[str, str] = {
+    STATUS_READY: "Ready",
+    STATUS_RUNNING: "Running",
+    STATUS_COMPLETED: "Completed",
+    STATUS_FAILED: "Failed",
+    STATUS_CANCELLED: "Cancelled",
+    STATUS_ALREADY_LAUNCHED: "Already launched",
+    STATUS_BLOCKED: "Blocked",
+}
+
+# Maps a v2 run's `state` (`command_center.runtime.db`) onto a card status.
+# `CANCELLED`/`INTERRUPTED` both read as "Cancelled" here — from the card's
+# point of view (should a plain `Launch` ever be offered again?) they mean
+# the same thing: the run stopped without succeeding or reporting a failure.
+# Any state not listed here (or no run found at all) falls back to
+# `STATUS_ALREADY_LAUNCHED` in `build_card_presentation` — the safe fallback
+# the task description calls for when the real status can't be determined.
+_RUN_STATE_TO_STATUS: dict[str, str] = {
+    "PREPARED": STATUS_RUNNING,
+    "QUEUED": STATUS_RUNNING,
+    "RUNNING": STATUS_RUNNING,
+    "COMPLETED": STATUS_COMPLETED,
+    "FAILED": STATUS_FAILED,
+    "CANCELLED": STATUS_CANCELLED,
+    "INTERRUPTED": STATUS_CANCELLED,
+}
+
+_EXISTING_RUN_SEVERITY: dict[str, str] = {
+    STATUS_RUNNING: "info",
+    STATUS_COMPLETED: "success",
+    STATUS_FAILED: "error",
+    STATUS_CANCELLED: "warning",
+    STATUS_ALREADY_LAUNCHED: "warning",
+}
+
+# The message *alert box* severity for an existing-run card — deliberately
+# never "error", even when the run itself `STATUS_FAILED`: the badge can (and
+# should) say "Failed" in red, but the explanatory message is informational/
+# advisory ("here's what happened, duplicate prevention is working as
+# intended"), not a report of something wrong with *this* render.
+_EXISTING_RUN_MESSAGE_SEVERITY: dict[str, str] = {
+    STATUS_RUNNING: "info",
+    STATUS_COMPLETED: "info",
+    STATUS_FAILED: "warning",
+    STATUS_CANCELLED: "warning",
+    STATUS_ALREADY_LAUNCHED: "warning",
+}
+
+
+@dataclass(frozen=True)
+class PortfolioCardPresentation:
+    """The single, unambiguous launch-state a Portfolio task card renders as.
+    Exactly one of `status_key`/`status_label` is the card's headline status;
+    `launch_allowed` alone gates the `Launch` button. A card's workflow
+    status (`PortfolioTask.status`/`.lane`, e.g. "ready") is metadata about
+    the *card*, never this launch-state, and must only ever be shown
+    labelled as such (e.g. inside an expander), never as the headline."""
+
+    status_key: str
+    status_label: str
+    severity: str  # "success" | "info" | "warning" | "error" — headline badge
+    launch_allowed: bool
+    existing_run_id: str | None
+    message: str | None
+    message_severity: str = "info"  # "info" | "warning" | "error" — the alert box, if any
+
+
+def build_card_presentation(
+    plan: LaunchPlan,
+    *,
+    registry_entry: dict | None = None,
+    existing_run: dict | None = None,
+) -> PortfolioCardPresentation:
+    """Pure — never touches the filesystem, the registry file, or the
+    execution database itself. `registry_entry` is this task's own
+    `registry.get(task_id)` (if any); `existing_run` is whatever the caller
+    got back from `ExecutionCenterAPI.get_run(registry_entry["run_id"])` —
+    `None` (run row not found, or the caller has no run_id/api to look it up
+    with) always falls back to the safe `STATUS_ALREADY_LAUNCHED`, never a
+    guess.
+
+    A genuine precondition blocker (missing repo mapping, bad worktree, an
+    unmet `requires`, ...) always wins over "already launched" — the mere
+    existence of a prior run must never mask a real error (task description
+    §6)."""
+    real_blockers = [b for b in plan.blockers if b != ALREADY_LAUNCHED_BLOCKER]
+
+    if real_blockers:
+        return PortfolioCardPresentation(
+            status_key=STATUS_BLOCKED,
+            status_label=STATUS_LABELS[STATUS_BLOCKED],
+            severity="error",
+            launch_allowed=False,
+            existing_run_id=(registry_entry or {}).get("run_id"),
+            message="; ".join(real_blockers),
+            message_severity="error",
+        )
+
+    if registry_entry is not None:
+        run_id = registry_entry.get("run_id")
+        run_state = (existing_run or {}).get("state")
+        status_key = _RUN_STATE_TO_STATUS.get(run_state, STATUS_ALREADY_LAUNCHED)
+
+        detail_parts = [f"run `{run_id}`"] if run_id else []
+        started_at = (existing_run or {}).get("started_at") or registry_entry.get("launched_at")
+        if started_at:
+            detail_parts.append(f"начат: {started_at}")
+        completed_at = (existing_run or {}).get("completed_at")
+        if completed_at:
+            detail_parts.append(f"завершён: {completed_at}")
+        message = (
+            f"Задача уже была запущена ранее ({STATUS_LABELS[status_key]}"
+            + (" — " + " · ".join(detail_parts) if detail_parts else "")
+            + "). Повторный запуск отключён — это ожидаемая защита от дублирования; "
+            "откройте существующий запуск или журнал запусков Portfolio, чтобы посмотреть детали."
+        )
+
+        return PortfolioCardPresentation(
+            status_key=status_key,
+            status_label=STATUS_LABELS[status_key],
+            severity=_EXISTING_RUN_SEVERITY[status_key],
+            launch_allowed=False,
+            existing_run_id=run_id,
+            message=message,
+            message_severity=_EXISTING_RUN_MESSAGE_SEVERITY[status_key],
+        )
+
+    return PortfolioCardPresentation(
+        status_key=STATUS_READY,
+        status_label=STATUS_LABELS[STATUS_READY],
+        severity="success",
+        launch_allowed=plan.launchable,
+        existing_run_id=None,
+        message=None,
     )
 
 

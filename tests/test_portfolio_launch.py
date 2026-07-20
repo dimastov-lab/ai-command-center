@@ -1138,3 +1138,164 @@ def test_real_aicc_ui_001_card_plans_according_to_declared_intent(tmp_path, port
     # Command Center could safely launch against the primary worktree.
     assert not plan.launchable
     assert any("на ветке" in b or "сменил ветку" in b for b in plan.blockers)
+
+
+# --------------------------------------------------------------------------
+# Card presentation — single, unambiguous launch-state (duplicate-status fix)
+# --------------------------------------------------------------------------
+#
+# `build_card_presentation` is pure: it never touches the filesystem, the
+# registry file, or the execution database — every `LaunchPlan` below is
+# hand-built with only the fields these tests actually exercise, and
+# `existing_run` is just a plain dict standing in for whatever
+# `ExecutionCenterAPI.get_run` would have returned.
+
+
+def _plan(*, blockers: list[str] | None = None, launchable_lane: str = "ready") -> portfolio_launch.LaunchPlan:
+    return portfolio_launch.LaunchPlan(
+        task_id="AICC-CARD-001",
+        project="AICC",
+        title="Card presentation test",
+        source_path="tasks/ready/AICC/AICC-CARD-001.md",
+        lane=launchable_lane,
+        repository_root="/tmp/aicc",
+        base_branch="main",
+        base_sha="deadbeef",
+        branch="task/aicc-card-001",
+        worktree="/tmp/worktrees/aicc-card-001",
+        task_type="general",
+        blockers=list(blockers or []),
+    )
+
+
+def test_build_card_presentation_ready_when_no_registry_entry():
+    presentation = portfolio_launch.build_card_presentation(_plan(), registry_entry=None, existing_run=None)
+
+    assert presentation.status_key == portfolio_launch.STATUS_READY
+    assert presentation.status_label == "Ready"
+    assert presentation.launch_allowed is True
+    assert presentation.existing_run_id is None
+    assert presentation.message is None
+
+
+@pytest.mark.parametrize("run_state", ["PREPARED", "QUEUED", "RUNNING"])
+def test_build_card_presentation_running_for_any_active_run_state(run_state):
+    plan = _plan(blockers=[portfolio_launch.ALREADY_LAUNCHED_BLOCKER])
+    registry_entry = {"run_id": "run-1", "launched_at": "2026-01-01T00:00:00"}
+
+    presentation = portfolio_launch.build_card_presentation(
+        plan, registry_entry=registry_entry, existing_run={"state": run_state, "started_at": "2026-01-01T00:00:05"}
+    )
+
+    assert presentation.status_key == portfolio_launch.STATUS_RUNNING
+    assert presentation.status_label == "Running"
+    # The exact bug this fix targets: a headline status must never look like
+    # both `ready` (launchable) and `Blocked` (an error) at once.
+    assert presentation.status_key not in (portfolio_launch.STATUS_READY, portfolio_launch.STATUS_BLOCKED)
+    assert presentation.launch_allowed is False
+    assert presentation.existing_run_id == "run-1"
+    assert presentation.message_severity != "error"
+
+
+def test_build_card_presentation_completed_is_not_shown_as_blocked():
+    plan = _plan(blockers=[portfolio_launch.ALREADY_LAUNCHED_BLOCKER])
+    registry_entry = {"run_id": "run-2", "launched_at": "2026-01-01T00:00:00"}
+
+    presentation = portfolio_launch.build_card_presentation(
+        plan, registry_entry=registry_entry, existing_run={"state": "COMPLETED", "completed_at": "2026-01-01T01:00:00"}
+    )
+
+    assert presentation.status_key == portfolio_launch.STATUS_COMPLETED
+    assert presentation.status_key != portfolio_launch.STATUS_BLOCKED
+    assert presentation.launch_allowed is False
+    assert presentation.message_severity != "error"
+
+
+@pytest.mark.parametrize("run_state", ["FAILED", "CANCELLED", "INTERRUPTED"])
+def test_build_card_presentation_failed_and_cancelled_show_real_terminal_status(run_state):
+    plan = _plan(blockers=[portfolio_launch.ALREADY_LAUNCHED_BLOCKER])
+    registry_entry = {"run_id": "run-3", "launched_at": "2026-01-01T00:00:00"}
+
+    presentation = portfolio_launch.build_card_presentation(
+        plan, registry_entry=registry_entry, existing_run={"state": run_state}
+    )
+
+    assert presentation.status_key != portfolio_launch.STATUS_BLOCKED
+    assert presentation.status_key in (portfolio_launch.STATUS_FAILED, portfolio_launch.STATUS_CANCELLED)
+    assert presentation.launch_allowed is False
+    # Duplicate prevention must hold even after a terminal failure/cancel —
+    # no formalized retry model exists in this codebase (task description §6).
+    assert presentation.message_severity != "error"
+
+
+def test_build_card_presentation_falls_back_to_already_launched_when_run_state_unknown():
+    plan = _plan(blockers=[portfolio_launch.ALREADY_LAUNCHED_BLOCKER])
+    registry_entry = {"run_id": "run-4", "launched_at": "2026-01-01T00:00:00"}
+
+    # `existing_run=None` covers both "run row not found" and "no
+    # execution_center_api available to look it up" — the caller's job, not
+    # this function's, to tell those apart.
+    presentation = portfolio_launch.build_card_presentation(plan, registry_entry=registry_entry, existing_run=None)
+
+    assert presentation.status_key == portfolio_launch.STATUS_ALREADY_LAUNCHED
+    assert presentation.launch_allowed is False
+    assert presentation.existing_run_id == "run-4"
+    assert presentation.message_severity != "error"
+
+    # An unrecognized `state` string (e.g. a future run state this code
+    # doesn't know about yet) is exactly as safe as no run at all.
+    unknown_state_presentation = portfolio_launch.build_card_presentation(
+        plan, registry_entry=registry_entry, existing_run={"state": "SOME_FUTURE_STATE"}
+    )
+    assert unknown_state_presentation.status_key == portfolio_launch.STATUS_ALREADY_LAUNCHED
+
+
+def test_build_card_presentation_real_precondition_blocker_is_not_masked_by_prior_run():
+    """A genuine precondition failure (unmapped repository, bad worktree,
+    ...) must still read as `Blocked` with its real reason — even when the
+    task also happens to already have a registered run — never silently
+    replaced by an "already launched" status (task description §6)."""
+    plan = _plan(
+        blockers=[
+            "репозиторий для проекта «AICC» не сопоставлен — настройте его в конфигурации",
+            portfolio_launch.ALREADY_LAUNCHED_BLOCKER,
+        ]
+    )
+    registry_entry = {"run_id": "run-5", "launched_at": "2026-01-01T00:00:00"}
+
+    presentation = portfolio_launch.build_card_presentation(
+        plan, registry_entry=registry_entry, existing_run={"state": "RUNNING"}
+    )
+
+    assert presentation.status_key == portfolio_launch.STATUS_BLOCKED
+    assert presentation.launch_allowed is False
+    assert "не сопоставлен" in presentation.message
+    # The duplicate-launch blocker text itself must not leak into the
+    # user-facing Blocked reason — it has its own, separate presentation.
+    assert portfolio_launch.ALREADY_LAUNCHED_BLOCKER not in presentation.message
+
+
+def test_build_card_presentation_real_precondition_blocker_without_any_prior_run():
+    plan = _plan(blockers=["задача находится в статусе «blocked», автозапуск разрешён только для «ready»"])
+
+    presentation = portfolio_launch.build_card_presentation(plan, registry_entry=None, existing_run=None)
+
+    assert presentation.status_key == portfolio_launch.STATUS_BLOCKED
+    assert presentation.launch_allowed is False
+    assert presentation.existing_run_id is None
+    assert "автозапуск разрешён только" in presentation.message
+
+
+def test_build_card_presentation_never_uses_error_message_severity_for_an_existing_run():
+    """Task description §4: the alert for an existing run must be
+    info/warning, never a red error box — even when the run itself failed
+    (the badge can say "Failed" in red; the message stays advisory)."""
+    registry_entry = {"run_id": "run-6", "launched_at": "2026-01-01T00:00:00"}
+    plan = _plan(blockers=[portfolio_launch.ALREADY_LAUNCHED_BLOCKER])
+
+    for run_state in ("PREPARED", "QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", None):
+        existing_run = {"state": run_state} if run_state else None
+        presentation = portfolio_launch.build_card_presentation(
+            plan, registry_entry=registry_entry, existing_run=existing_run
+        )
+        assert presentation.message_severity in ("info", "warning")
