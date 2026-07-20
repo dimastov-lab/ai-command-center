@@ -203,6 +203,38 @@ _FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
 _DOUBLE_QUOTED_ITEM_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"$')
 _SINGLE_QUOTED_ITEM_RE = re.compile(r"^'([^']*)'$")
 
+# `task_id` becomes a filesystem path component (git branch name, worktree
+# directory name, per-task lock filename) in `command_center.portfolio_launch`
+# — a card-authored, external, untrusted value, so it is never allowed to
+# contain a path separator, `.`/`..`, whitespace, or any other character that
+# could let it escape the sandboxed worktrees/locks roots it's joined onto
+# there (Founder Gate re-review Blocker 1). This is the single definition of
+# that rule: every module that turns a `task_id` into a path calls
+# `validate_task_id` rather than re-deriving the allowlist.
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+MAX_TASK_ID_LENGTH = 128
+
+
+def validate_task_id(task_id: str, *, source_path: Path | str | None = None) -> str:
+    """Returns `task_id` unchanged if it is safe to use as a filesystem path
+    component — letters/digits/`_`/`-` only, starting with a letter or digit,
+    1-`MAX_TASK_ID_LENGTH` characters. Raises `PortfolioCardError` for
+    anything else (a path separator, `.`/`..`, whitespace, an empty string, an
+    over-length value): an invalid `task_id` is always rejected outright,
+    never silently normalized/sanitized into something safe-looking."""
+    prefix = f"{source_path}: " if source_path is not None else ""
+    if not isinstance(task_id, str) or not task_id or len(task_id) > MAX_TASK_ID_LENGTH:
+        raise PortfolioCardError(
+            f"{prefix}task_id {task_id!r} is invalid — must be a non-empty string of at most "
+            f"{MAX_TASK_ID_LENGTH} characters"
+        )
+    if not _TASK_ID_RE.match(task_id):
+        raise PortfolioCardError(
+            f"{prefix}task_id {task_id!r} is invalid — only letters, digits, '_' and '-' are allowed, "
+            "and it must start with a letter or digit (no path separators, '.', '..', or whitespace)"
+        )
+    return task_id
+
 # YAML block-scalar indicators (`|`, `>`, with optional chomping/indentation
 # modifiers) — a value of exactly one of these on its own signals a
 # multi-line block scalar is about to follow, which this flat, single-line
@@ -274,6 +306,12 @@ def _parse_flow_list_item(item: str, *, field_name: str, source_path: Path, raw_
 
 def _parse_scalar(raw: str, *, field_name: str, source_path: Path) -> Any:
     raw = raw.strip()
+    # Intentionally lowercase-only (Founder Gate re-review Nit): this flat
+    # subset recognizes exactly `null`/`true`/`false`, not YAML 1.1/1.2's
+    # other case variants (`Null`/`True`/`Yes`/...). A differently-cased
+    # value is not a supported literal here — it falls through and is kept
+    # as its own opaque string, never misread as a bool/null. Not expanding
+    # this to broader YAML compatibility is deliberate, not an oversight.
     if raw == "null" or raw == "":
         return None
     if raw == "true":
@@ -394,6 +432,12 @@ def parse_card(path: Path, *, lane: str) -> PortfolioTask:
             raise PortfolioCardError(
                 f"{path}: field {list_field!r} must be a flow-style list, got {frontmatter[list_field]!r}"
             )
+    raw_task_id = frontmatter.get("task_id")
+    if raw_task_id is not None:
+        # A missing `task_id` is reported later via `missing_required_fields`
+        # (it's a required field, not a parse error) — this only validates
+        # the *shape* of a `task_id` that is actually present.
+        validate_task_id(raw_task_id, source_path=path)
     return PortfolioTask(lane=lane, source_path=path, frontmatter=frontmatter, body=body, raw_text=raw_text)
 
 

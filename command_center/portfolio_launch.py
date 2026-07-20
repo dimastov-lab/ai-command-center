@@ -92,7 +92,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from command_center import execution_queue, git_info, models, storage
-from command_center.portfolio_models import PortfolioTask, unmet_requirements
+from command_center.portfolio_models import PortfolioCardError, PortfolioTask, unmet_requirements, validate_task_id
 from command_center.runtime import db as runtime_db
 
 if sys.platform == "win32":
@@ -137,12 +137,50 @@ def worktrees_root() -> Path:
     return Path(override) if override else DEFAULT_WORKTREES_ROOT
 
 
+def _validate_task_id_for_launch(task_id: str) -> str:
+    """Defense-in-depth re-check of `task_id`, independent of whatever the
+    caller already validated (`command_center.portfolio_models.parse_card`
+    validates every card-loaded `task_id` at parse time — this is the second,
+    unconditional gate for every function here that turns a `task_id` into a
+    filesystem path, so a bypass of the parser — a hand-built `PortfolioTask`,
+    a future call site that forgets to go through `parse_card` — can never
+    turn into a path-traversal write (Founder Gate re-review Blocker 1).
+    Raises `PortfolioLaunchError` (this module's exception, not the parser's
+    `PortfolioCardError`) since every caller here is on the mutation/launch
+    path, not the card-parsing path."""
+    try:
+        return validate_task_id(task_id)
+    except PortfolioCardError as exc:
+        raise PortfolioLaunchError(str(exc)) from exc
+
+
+def _assert_within_root(candidate: Path, root: Path, *, what: str) -> None:
+    """Raises `PortfolioLaunchError` if `candidate` does not resolve to a
+    location inside `root` — the last-line defense against a symlinked
+    ancestor directory redirecting a syntactically-safe `task_id`-derived
+    path outside its intended sandbox. Resolves both sides (symlinks
+    included) before comparing; does not require either path to exist yet."""
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve(strict=False)
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise PortfolioLaunchError(
+            f"resolved {what} path escapes the configured sandbox root ({resolved_root}): {resolved_candidate}"
+        ) from exc
+
+
 def branch_name_for(task_id: str) -> str:
+    task_id = _validate_task_id_for_launch(task_id)
     return f"task/{task_id.lower()}"
 
 
 def worktree_path_for(task_id: str) -> Path:
-    return worktrees_root() / task_id.lower()
+    task_id = _validate_task_id_for_launch(task_id)
+    root = worktrees_root()
+    candidate = root / task_id.lower()
+    _assert_within_root(candidate, root, what="worktree")
+    return candidate
 
 
 # --------------------------------------------------------------------------
@@ -179,7 +217,17 @@ def resolve_branch(task: PortfolioTask) -> tuple[str | None, str, str | None]:
     default."""
     raw = task.branch
     if raw is None:
-        default = branch_name_for(task.task_id) if task.task_id else None
+        if not task.task_id:
+            return None, SOURCE_GENERATED_DEFAULT, None
+        try:
+            default = branch_name_for(task.task_id)
+        except PortfolioLaunchError as exc:
+            # `build_launch_plan`/`build_batch_plan` are pure and must never
+            # raise (see their docstring) — a `task_id` invalid enough that
+            # `branch_name_for` rejects it (Founder Gate re-review Blocker 1)
+            # is surfaced as an ordinary plan blocker instead, same as any
+            # other resolution failure here.
+            return None, SOURCE_GENERATED_DEFAULT, str(exc)
         return default, SOURCE_GENERATED_DEFAULT, None
 
     stripped = raw.strip()
@@ -198,7 +246,14 @@ def resolve_worktree(task: PortfolioTask) -> tuple[Path | None, str, str | None]
     (relative to what?) rather than silently interpreted."""
     raw = task.worktree
     if raw is None:
-        default = worktree_path_for(task.task_id) if task.task_id else None
+        if not task.task_id:
+            return None, SOURCE_GENERATED_DEFAULT, None
+        try:
+            default = worktree_path_for(task.task_id)
+        except PortfolioLaunchError as exc:
+            # Same rationale as the generated-branch case in `resolve_branch`
+            # above — never raise out of a pure planning function.
+            return None, SOURCE_GENERATED_DEFAULT, str(exc)
         return default, SOURCE_GENERATED_DEFAULT, None
 
     stripped = raw.strip()
@@ -272,6 +327,21 @@ def _locks_dir(root: Path) -> Path:
     return storage.resolve_data_dir(root) / LOCKS_DIR_NAME
 
 
+def _claim_lock_path(root: Path, task_id: str) -> Path:
+    """The per-task claim lock path for `task_id`, validated end to end
+    before any filesystem call: `task_id` shape first (Founder Gate
+    re-review Blocker 1 — the same defense-in-depth gate as
+    `branch_name_for`/`worktree_path_for`), then that the resulting path is
+    actually contained under the locks directory (belt-and-suspenders
+    against a symlinked ancestor, since a valid `task_id` alone can no
+    longer contain a path separator)."""
+    task_id = _validate_task_id_for_launch(task_id)
+    locks_dir = _locks_dir(root)
+    candidate = locks_dir / f"{task_id}.lock"
+    _assert_within_root(candidate, locks_dir, what="lock")
+    return candidate
+
+
 def _claim(root: Path, task_id: str) -> bool:
     """Atomically claim `task_id` for launch. Returns False if another
     in-flight (or crashed-and-never-released) claim already exists. This
@@ -282,9 +352,8 @@ def _claim(root: Path, task_id: str) -> bool:
     deliberately no in-app helper for that: it's a rare, operator-triggered
     recovery action on one well-known file, not a code path this module
     needs to expose."""
-    locks_dir = _locks_dir(root)
-    locks_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = locks_dir / f"{task_id}.lock"
+    lock_path = _claim_lock_path(root, task_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
@@ -294,7 +363,7 @@ def _claim(root: Path, task_id: str) -> bool:
 
 
 def _release(root: Path, task_id: str) -> None:
-    lock_path = _locks_dir(root) / f"{task_id}.lock"
+    lock_path = _claim_lock_path(root, task_id)
     lock_path.unlink(missing_ok=True)
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from command_center import execution_queue, git_info, portfolio_launch
-from command_center.portfolio_models import parse_card
+from command_center.portfolio_models import PortfolioTask, parse_card
 from command_center.runtime import api as runtime_api
 
 CARD_TEMPLATE = """---
@@ -105,6 +105,130 @@ def portfolio_worktrees_root(tmp_path, monkeypatch):
 def test_branch_and_worktree_naming_is_deterministic_and_lowercased(portfolio_worktrees_root):
     assert portfolio_launch.branch_name_for("AICC-UI-001") == "task/aicc-ui-001"
     assert portfolio_launch.worktree_path_for("AICC-UI-001") == portfolio_worktrees_root / "aicc-ui-001"
+
+
+# --------------------------------------------------------------------------
+# task_id path-safety (Founder Gate re-review Blocker 1) — `task_id` becomes
+# a filesystem path component (branch name, worktree directory, per-task
+# lock filename) in this module. `parse_card` already rejects an unsafe
+# `task_id` at parse time (see `test_portfolio_models.py`); everything below
+# proves the *second*, independent gate inside this module also holds, by
+# calling the low-level helpers directly — bypassing the parser entirely, as
+# a hand-built `PortfolioTask` or a future call site that forgets to go
+# through `parse_card` would.
+# --------------------------------------------------------------------------
+
+_UNSAFE_TASK_IDS = [
+    "../escaped_dir/evil",
+    "../../OUTSIDE_LOCK_ESCAPE",
+    "foo/bar",
+    "foo\\bar",
+    ".",
+    "..",
+    " leading-space",
+    "trailing-space ",
+    "foo bar",
+    "/absolute/path",
+]
+
+
+@pytest.mark.parametrize("bad_task_id", _UNSAFE_TASK_IDS)
+def test_branch_name_for_rejects_unsafe_task_id(portfolio_worktrees_root, bad_task_id):
+    with pytest.raises(portfolio_launch.PortfolioLaunchError):
+        portfolio_launch.branch_name_for(bad_task_id)
+
+
+@pytest.mark.parametrize("bad_task_id", _UNSAFE_TASK_IDS)
+def test_worktree_path_for_rejects_unsafe_task_id_and_creates_nothing_outside_sandbox(
+    portfolio_worktrees_root, bad_task_id
+):
+    """Direct repro of the Founder Gate re-review Blocker 1 path traversal:
+    `worktree_path_for("../escaped_dir/evil")` used to return
+    `<worktrees_root>/../escaped_dir/evil`, and `create_worktree` would then
+    `mkdir(parents=True)` that escaped directory into existence before git
+    ever validated the (also escaped) branch name. Confirms both the raise
+    and that nothing new appears anywhere near the sandbox root."""
+    parent = portfolio_worktrees_root.parent
+    siblings_before = set(parent.iterdir()) if parent.exists() else set()
+
+    with pytest.raises(portfolio_launch.PortfolioLaunchError):
+        portfolio_launch.worktree_path_for(bad_task_id)
+
+    siblings_after = set(parent.iterdir()) if parent.exists() else set()
+    assert siblings_after == siblings_before
+
+
+def test_claim_rejects_unsafe_task_id_and_creates_no_lock_file(tmp_path):
+    """Direct repro for the per-task claim lock path, which is built
+    independently of `branch_name_for`/`worktree_path_for` and does not go
+    through git validation at all — `os.open(..., O_CREAT)` would otherwise
+    unconditionally create a real file at the escaped path."""
+    root = tmp_path / "aicc_root"
+    with pytest.raises(portfolio_launch.PortfolioLaunchError):
+        portfolio_launch._claim(root, "../../OUTSIDE_LOCK_ESCAPE")
+    assert not root.exists()
+    assert not (tmp_path / "OUTSIDE_LOCK_ESCAPE.lock").exists()
+
+
+def test_release_rejects_unsafe_task_id(tmp_path):
+    root = tmp_path / "aicc_root"
+    with pytest.raises(portfolio_launch.PortfolioLaunchError):
+        portfolio_launch._release(root, "../../OUTSIDE_LOCK_ESCAPE")
+
+
+def test_build_launch_plan_blocks_unsafe_task_id_without_raising(git_repo, tmp_path, portfolio_worktrees_root):
+    """`build_launch_plan` is documented pure/non-raising even for a
+    `task_id` invalid enough that generated-default resolution rejects it —
+    surfaced as an ordinary plan blocker, never an unhandled exception, and
+    never `launchable=True`. Uses a hand-built `PortfolioTask` since
+    `parse_card` itself already refuses to produce one with this `task_id`."""
+    base_branch = _current_branch(git_repo)
+    task = PortfolioTask(
+        lane="ready",
+        source_path=tmp_path / "malicious.md",
+        frontmatter={
+            "task_id": "../escaped_dir/evil",
+            "project": "AICC",
+            "title": "malicious card",
+            "repository": str(git_repo),
+            "base_branch": base_branch,
+            "status": "ready",
+        },
+        body="",
+        raw_text="",
+    )
+
+    plan = portfolio_launch.build_launch_plan(task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)})
+
+    assert plan.launchable is False
+    assert plan.blockers
+    assert not (portfolio_worktrees_root.parent / "escaped_dir").exists()
+
+
+def test_assert_within_root_rejects_crafted_path_outside_root(tmp_path):
+    """Unit test of the containment check itself, independent of `task_id`
+    validation — the belt-and-suspenders layer for a `task_id`-derived path
+    construction that changes in the future, or a symlinked ancestor
+    directory that redirects an otherwise valid-looking candidate outside
+    its intended root."""
+    root = tmp_path / "root"
+    root.mkdir()
+    escaping_candidate = tmp_path / "elsewhere" / "evil"
+    with pytest.raises(portfolio_launch.PortfolioLaunchError):
+        portfolio_launch._assert_within_root(escaping_candidate, root, what="worktree")
+
+
+def test_assert_within_root_accepts_contained_path(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    contained_candidate = root / "task-001"
+    portfolio_launch._assert_within_root(contained_candidate, root, what="worktree")  # must not raise
+
+
+@pytest.mark.parametrize("good_task_id", ["TASK-001", "task_001", "task-001", "A1", "portfolio_task_7"])
+def test_branch_name_for_and_worktree_path_for_accept_safe_task_id(portfolio_worktrees_root, good_task_id):
+    assert portfolio_launch.branch_name_for(good_task_id) == f"task/{good_task_id.lower()}"
+    assert portfolio_launch.worktree_path_for(good_task_id) == portfolio_worktrees_root / good_task_id.lower()
 
 
 # --------------------------------------------------------------------------
@@ -414,10 +538,17 @@ def test_concurrent_rollback_does_not_lose_a_parallel_successful_registration(
 ):
     """Founder Gate Major-1 rollback/release-path regression: a launch that
     fails and rolls back must never be able to clobber a *different* task's
-    registry entry being written concurrently. The rollback path itself
-    never touches the registry (only a fully successful launch does) — this
-    proves that holds under genuine concurrent execution of two different
-    tasks, one failing and one succeeding, not just sequentially."""
+    registry entry. The rollback path itself never touches the registry
+    (only a fully successful launch does), so this test's two tasks never
+    actually contend for `_registry_lock` at the same time — the failing
+    task's `launch_ready` is forced to fail before it would ever reach
+    `_persist_registry_entry`. What this proves is that running a failing
+    launch and a succeeding launch concurrently (real threads, real
+    rollback) doesn't let the failure's cleanup path interfere with the
+    other task's registration. The actual concurrent-registry-write race,
+    with genuine write contention, is covered separately in
+    `test_portfolio_registry_concurrency.py` (Founder Gate re-review
+    Minor 1)."""
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     base_branch = _current_branch(git_repo)
     ok_task = _write_card(tmp_path, task_id="AICC-RACE-OK", base_branch=base_branch, repository=str(git_repo))

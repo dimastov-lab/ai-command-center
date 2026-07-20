@@ -372,6 +372,86 @@ def test_parse_card_valid_existing_card_still_parses_unchanged(tmp_path):
     assert task.blocks == ["AICC-HYG-001"]
 
 
+def test_parse_card_unquoted_requires_item_raises_instead_of_silently_dropping_dependency(tmp_path):
+    """Founder Gate re-review Blocker 1's concrete danger scenario: before the
+    fix, `requires: [BLOCKING-TASK-1, BLOCKING-TASK-2]` (unquoted — a
+    plausible authoring mistake, not just a contrived adversarial input)
+    silently parsed to `task.requires == []`, which `unmet_requirements`
+    would then treat as "no dependencies" — silently bypassing the
+    dependency gate `build_launch_plan` exists to enforce. This must now
+    raise instead of ever producing that empty list."""
+    text = VALID_CARD.replace("requires: []", "requires: [BLOCKING-TASK-1, BLOCKING-TASK-2]")
+    path = _write_card(tmp_path, "ready", "AICC", "unquoted-requires.md", text)
+    with pytest.raises(PortfolioCardError, match="requires"):
+        parse_card(path, lane="ready")
+
+
+# --------------------------------------------------------------------------
+# `task_id` path-safety contract (Founder Gate re-review Blocker 1) — a
+# `task_id` becomes a filesystem path component in
+# `command_center.portfolio_launch` (branch name, worktree directory name,
+# per-task lock filename), so it must never contain a path separator, `.`/
+# `..`, whitespace, or any other character that could escape the sandboxed
+# roots it's joined onto there.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_task_id",
+    [
+        "../escaped_dir/evil",
+        "../../OUTSIDE_LOCK_ESCAPE",
+        "foo/bar",
+        "foo\\bar",
+        ".",
+        "..",
+        " leading-space",
+        "trailing-space ",
+        "foo bar",
+        "/absolute/path",
+        "",
+    ],
+)
+def test_parse_card_rejects_unsafe_task_id(tmp_path, bad_task_id):
+    text = VALID_CARD.replace('task_id: "AICC-UI-001"', f'task_id: "{bad_task_id}"')
+    path = _write_card(tmp_path, "ready", "AICC", "unsafe-task-id.md", text)
+    with pytest.raises(PortfolioCardError, match="task_id"):
+        parse_card(path, lane="ready")
+
+
+@pytest.mark.parametrize(
+    "good_task_id",
+    ["TASK-001", "task_001", "task-001", "A1", "portfolio_task_7"],
+)
+def test_parse_card_accepts_safe_task_id(tmp_path, good_task_id):
+    text = VALID_CARD.replace('task_id: "AICC-UI-001"', f'task_id: "{good_task_id}"')
+    path = _write_card(tmp_path, "ready", "AICC", "safe-task-id.md", text)
+    task = parse_card(path, lane="ready")
+    assert task.task_id == good_task_id
+
+
+def test_parse_card_unsafe_task_id_never_yields_a_partial_task(tmp_path):
+    text = VALID_CARD.replace('task_id: "AICC-UI-001"', 'task_id: "../escaped"')
+    path = _write_card(tmp_path, "ready", "AICC", "unsafe-task-id-partial.md", text)
+    result = None
+    try:
+        result = parse_card(path, lane="ready")
+    except PortfolioCardError:
+        pass
+    assert result is None
+
+
+def test_validate_task_id_rejects_non_string(tmp_path):
+    """Defense-in-depth: `task_id: 123` (an integer, not a quoted string) —
+    `_parse_scalar` would happily coerce it — must still be rejected by
+    `validate_task_id` rather than being accepted as a non-string value that
+    downstream f-string path construction would silently stringify."""
+    from command_center.portfolio_models import validate_task_id
+
+    with pytest.raises(PortfolioCardError):
+        validate_task_id(123)  # type: ignore[arg-type]
+
+
 # --------------------------------------------------------------------------
 # Directory loading
 # --------------------------------------------------------------------------
