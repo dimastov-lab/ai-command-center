@@ -2419,11 +2419,13 @@ elif page_key == "kanban":
         and task.get("priority", "Medium") in priority_filter
     ]
 
-    columns = st.columns(len(KANBAN_COLUMNS))
     kanban_git_status_cache: dict[str, dict] = {}
 
-    for column, status in zip(columns, KANBAN_COLUMNS, strict=True):
-        with column:
+    # Полноширинные вертикальные дорожки Kanban.
+    # Горизонтальная разметка через st.columns сжимала карточки
+    # и делала заголовки и элементы управления нечитаемыми.
+    for status in KANBAN_COLUMNS:
+        with st.container(border=True):
             status_tasks = [task for task in filtered_tasks if task.get("status") == status]
             st.markdown(f"**{status}**")
             st.caption(f"{len(status_tasks)} задач")
