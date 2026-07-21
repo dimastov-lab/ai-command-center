@@ -1304,10 +1304,26 @@ def _execution_center_status_badge_color(status: str) -> str:
         session_view.STATUS_RUNNING: "blue",
         session_view.STATUS_WAITING: "orange",
         session_view.STATUS_REQUIRES_ATTENTION: "orange",
+        session_view.STATUS_BLOCKED: "red",
+        session_view.STATUS_INCOMPLETE: "orange",
         session_view.STATUS_COMPLETED: "green",
         session_view.STATUS_FAILED: "red",
         session_view.STATUS_CANCELLED: "gray",
     }.get(status, "gray")
+
+
+def _execution_center_display_status(session: dict) -> str:
+    """`session["status"]` as computed by `session_view.derive_status`, with
+    one additional UI-level guard on top: `Completed` must never be rendered
+    while `progress` is below 100 (Required fix 7's explicit invariant),
+    even if a future caller/bug manages to produce that combination — this
+    is belt-and-suspenders on top of `task_sync`'s own enforcement
+    (`task_sync._resolve_target_launch_status`), not a replacement for it."""
+    status = session["status"]
+    progress = session.get("progress")
+    if status == session_view.STATUS_COMPLETED and progress is not None and progress < 100:
+        return session_view.STATUS_REQUIRES_ATTENTION
+    return status
 
 
 def _execution_center_record_heartbeat(run_id: str, pid: int | None, now: datetime) -> None:
@@ -1365,15 +1381,16 @@ def _render_execution_center_card(
     api: runtime_api.ExecutionCenterAPI, session: dict, tasks_by_id: dict[str, dict], *, now: datetime
 ) -> None:
     run_id = session["run_id"]
+    display_status = _execution_center_display_status(session)
     with st.container(border=True):
         header_cols = st.columns([3, 1])
         header_cols[0].markdown(f"##### {session['task_title']}")
-        header_cols[1].badge(session["status"], color=_execution_center_status_badge_color(session["status"]))
-        # `session["status"]` is repeated here as plain caption text (not just
+        header_cols[1].badge(display_status, color=_execution_center_status_badge_color(display_status))
+        # `display_status` is repeated here as plain caption text (not just
         # the `st.badge` pill above) so the run's display status stays
         # queryable in tests and screen readers alike.
         st.caption(
-            f"Статус: **{session['status']}** · Проект: **{session['project_id']}** · "
+            f"Статус: **{display_status}** · Проект: **{session['project_id']}** · "
             f"Executor: `{session['executor']}` · Источник: {session['launch_source']}"
         )
 
@@ -1412,7 +1429,9 @@ def _render_execution_center_card(
                 f"Последнее событие ({session['latest_event'].get('at') or '—'}): "
                 f"{session['latest_event'].get('summary') or '—'}"
             )
-        if session["last_error"]:
+        if session.get("blocker_reason"):
+            st.warning(f"Причина блокировки: {session['blocker_reason']}")
+        elif session["last_error"]:
             st.error(f"Последняя ошибка: {session['last_error']}")
 
         button_cols = st.columns(6)
@@ -1543,19 +1562,23 @@ def _render_execution_center_project_overview(sessions: list[dict], now: datetim
     st.divider()
 
 
-# (title, statuses-bucketed-into-this-section) — 5 sections per the mission.
-# Cancelled sessions render inside Failed, labeled distinctly by their own
-# status badge — `models.LAUNCH_STATUSES` has no dedicated Cancelled value
-# either (see `task_sync.py`).
+# (title, statuses-bucketed-into-this-section). Originally 5 sections; this
+# remediation adds dedicated `Blocked`/`Incomplete` sections (Required fix
+# 7 — the UI must clearly distinguish Blocked/Failed/Incomplete, not fold a
+# denied-permission run into the same generic "Failed" bucket as a crashed
+# process). Cancelled sessions render inside Completed, labeled distinctly
+# by their own status badge — `models.LAUNCH_STATUSES` has no dedicated
+# Cancelled value either (see `task_sync.py`).
 _EXECUTION_CENTER_SECTIONS: list[tuple[str, frozenset[str]]] = [
     ("Running", frozenset({session_view.STATUS_RUNNING})),
     # A `PREPARED`/`QUEUED` run (`Launching`) has no subprocess yet — it is
     # "waiting to start" in exactly the same practical sense as a run whose
     # cancellation is in flight, so it is folded into the same section
-    # rather than getting its own (the mission enumerates exactly 5
-    # sections, with no dedicated "Launching" bucket).
+    # rather than getting its own.
     ("Waiting", frozenset({session_view.STATUS_WAITING, session_view.STATUS_LAUNCHING})),
     ("Requires Attention", frozenset({session_view.STATUS_REQUIRES_ATTENTION})),
+    ("Blocked", frozenset({session_view.STATUS_BLOCKED})),
+    ("Incomplete", frozenset({session_view.STATUS_INCOMPLETE})),
     ("Completed", frozenset({session_view.STATUS_COMPLETED, session_view.STATUS_CANCELLED})),
     ("Failed", frozenset({session_view.STATUS_FAILED})),
 ]
@@ -1566,7 +1589,7 @@ def _render_execution_center_sections(
 ) -> None:
     sessions_by_status: dict[str, list[dict]] = {}
     for session in sessions:
-        sessions_by_status.setdefault(session["status"], []).append(session)
+        sessions_by_status.setdefault(_execution_center_display_status(session), []).append(session)
 
     for title, statuses in _EXECUTION_CENTER_SECTIONS:
         section_sessions: list[dict] = []

@@ -60,7 +60,16 @@ def test_sync_task_from_run_running_sets_launch_status_running(tmp_path):
     assert task["current_run_id"] == run["id"]
 
 
-def test_sync_task_from_run_completed_sets_launch_status_completed_and_extracts_fields(tmp_path):
+def test_sync_task_from_run_completed_advances_progress_and_extracts_fields(tmp_path):
+    """A `Completed` run's terminal sync now advances `current_stage`/
+    `progress` (mirroring v1's `launch_service._apply_run_outcome_to_task`)
+    instead of leaving it frozen at whatever `launch.begin_launch` set it to
+    at launch time. A PR-ready result reaches "PR Ready" (progress 95) — not
+    100 ("Merged", which no agent run here is ever permitted to reach on its
+    own, since none of them call `git commit`/`push`/`merge`) — so per the
+    "Completed implies progress == 100" invariant (see `task_sync.
+    _resolve_target_launch_status`), `launch_status` becomes "Needs Review",
+    not "Completed"."""
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)
     run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00")
@@ -74,16 +83,51 @@ def test_sync_task_from_run_completed_sets_launch_status_completed_and_extracts_
     mutated = task_sync.sync_task_from_run(task, run, db_path=db_path)
 
     assert mutated is True
-    assert task["launch_status"] == "Completed"
+    assert task["launch_status"] == "Needs Review"
+    assert task["current_stage"] == "PR Ready"
+    assert task["progress"] == 95
     assert task["latest_verdict"] == "APPROVED_FOR_COMMIT"
     assert task["pull_request_url"] == "https://example.invalid/pr/1"
     assert task["report_path"] == f"reports/AIOS/{run['id'][:8]}.md"
-    assert len(task["timeline"]) == 1
-    assert task["timeline"][0]["type"] == "completed"
+    assert [event["type"] for event in task["timeline"]] == ["pr_created", "completed"]
 
     reloaded_run = db.get_run(db_path, run["id"])
     assert reloaded_run["commit_hash"] == "abcdef1"
     assert reloaded_run["pull_request_url"] == "https://example.invalid/pr/1"
+
+
+def test_sync_task_from_run_completed_becomes_launch_status_completed_only_at_progress_100(tmp_path):
+    """The one way `launch_status` legitimately reaches "Completed": the task
+    was already manually advanced to progress 100 (`progress_mode="manual"`,
+    e.g. by a human marking the PR merged) *before* this run's terminal
+    sync — `models.set_current_stage`'s own manual-override guard means the
+    sync's stage advancement is then a no-op, so progress stays at 100."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00")
+    db.append_run_event(db_path, run["id"], "result", {"result": "Verdict: APPROVED FOR COMMIT"})
+    task = _make_task(progress=100, progress_mode="manual", current_stage="Merged")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Completed"
+    assert task["progress"] == 100
+
+
+def test_sync_task_from_run_completed_with_no_verdict_or_pr_needs_review(tmp_path):
+    """No extractable verdict/PR at all: progress is never advanced (neither
+    `set_current_stage` branch fires) and a fresh task's progress (0, below
+    100) means launch_status is "Needs Review", never "Completed" — an
+    ambiguous/empty report is never treated as a confident success."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00")
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Needs Review"
+    assert task["progress"] == 0
 
 
 def test_sync_task_from_run_failed_sets_launch_status_failed(tmp_path):
@@ -121,6 +165,34 @@ def test_sync_task_from_run_cancelled_maps_to_failed_launch_status(tmp_path):
     task_sync.sync_task_from_run(task, run, db_path=db_path)
 
     assert task["launch_status"] == "Failed"
+
+
+def test_sync_task_from_run_blocked_maps_to_blocked_launch_status(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="FAILED", completed_at="2026-01-01T00:01:00",
+        failure_reason="blocked:permission_denied:Write",
+    )
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Blocked"
+
+
+def test_sync_task_from_run_incomplete_maps_to_incomplete_launch_status(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="FAILED", completed_at="2026-01-01T00:01:00",
+        failure_reason="incomplete:working_tree_unchanged",
+    )
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Incomplete"
 
 
 def test_sync_task_from_run_waiting_maps_to_requires_attention(tmp_path):
@@ -184,7 +256,9 @@ def test_sync_task_from_run_is_idempotent_for_the_same_terminal_run(tmp_path, mo
     # terminal outcome must not mutate it again or re-parse the report.
     assert second is False
     assert len(parse_calls) == 1
-    assert len(task["timeline"]) == 1
+    # "APPROVED FOR COMMIT" is a passing verdict with no PR URL -> stage
+    # advances to "Validation" ("tests_passed") in addition to "completed".
+    assert [event["type"] for event in task["timeline"]] == ["tests_passed", "completed"]
 
 
 def test_sync_task_from_run_running_updates_are_cheap_and_repeatable(tmp_path):

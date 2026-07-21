@@ -2,14 +2,20 @@
 truth) onto the Kanban task it was launched for.
 
 Never re-derives execution state from a task field — always reads the
-`run` row fresh via `ExecutionCenterAPI`/`db`. Never advances
-`workflow_stage`/`progress`/`current_stage`: those remain governed entirely
-by the existing v1.2 rules (`models.set_current_stage`,
-`workflow.suggest_next_task`) and by manual user action — this module only
-ever touches `launch_status` and the small set of display/bookkeeping
-fields (`current_run_id`, `report_path`, `repository_path`, `branch`,
-`last_run_at`, `latest_verdict`, `pull_request_url`) that already exist on
-every task record.
+`run` row fresh via `ExecutionCenterAPI`/`db`. Touches `launch_status` and
+the small set of display/bookkeeping fields (`current_run_id`,
+`report_path`, `repository_path`, `branch`, `last_run_at`,
+`latest_verdict`, `pull_request_url`) that already exist on every task
+record — and, as of this remediation, also `current_stage`/`progress` for a
+genuinely `Completed` run's terminal sync (see `_apply_terminal_fields`),
+mirroring the exact `models.set_current_stage` calls the v1 synchronous
+flow (`launch_service._apply_run_outcome_to_task`) already makes. Before
+this fix, progress/stage were *never* advanced for a v2-launched task: a
+task launched once (which sets stage to "Workspace Verified", progress 5 —
+see `launch.begin_launch`) stayed frozen at 5% forever, even after its run
+reached `launch_status="Completed"` — a direct violation of "Completed
+implies progress == 100" and the literal shape of the reported defect
+(`state=COMPLETED`, `progress` stuck at 5%).
 """
 
 from __future__ import annotations
@@ -18,15 +24,20 @@ from command_center import models, report_parser
 from command_center.runtime import db, reports, session_view
 from command_center.runtime.api import ExecutionCenterAPI
 
-# Session-view display status -> Kanban `models.LAUNCH_STATUSES` value. Every
-# value on the right is already a member of `models.LAUNCH_STATUSES` — no new
-# status is introduced here, in the `run` table, or on the task record.
+# Session-view display status -> Kanban `models.LAUNCH_STATUSES` value, for
+# every status *except* `STATUS_COMPLETED` — a genuinely-completed run does
+# not automatically become launch_status "Completed"; see
+# `_resolve_target_launch_status` for why (progress must reach 100 first,
+# per the "Completed implies progress == 100" invariant — otherwise the
+# task is "Needs Review": the agent's work is done, but nothing has
+# reviewed/merged it yet).
 _LAUNCH_STATUS_BY_DISPLAY_STATUS: dict[str, str] = {
     session_view.STATUS_LAUNCHING: "Launching",
     session_view.STATUS_RUNNING: "Running",
     session_view.STATUS_WAITING: "Requires Attention",
     session_view.STATUS_REQUIRES_ATTENTION: "Requires Attention",
-    session_view.STATUS_COMPLETED: "Completed",
+    session_view.STATUS_BLOCKED: "Blocked",
+    session_view.STATUS_INCOMPLETE: "Incomplete",
     # `models.LAUNCH_STATUSES` has no dedicated "Cancelled" value — the
     # closest existing one is "Failed" (the task did not finish its work),
     # documented as a known simplification (see the plan's Limitations).
@@ -34,14 +45,37 @@ _LAUNCH_STATUS_BY_DISPLAY_STATUS: dict[str, str] = {
     session_view.STATUS_CANCELLED: "Failed",
 }
 
-_TERMINAL_LAUNCH_STATUSES = frozenset({"Completed", "Failed"})
+_TERMINAL_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review", "Failed", "Blocked", "Incomplete"})
 
 
-def _apply_terminal_fields(task: dict, run: dict, *, db_path) -> None:
+def _resolve_target_launch_status(status: str, task: dict) -> str:
+    """`status` is the process-level `session_view.derive_status` result.
+    Every non-`Completed` status maps 1:1 via `_LAUNCH_STATUS_BY_DISPLAY_
+    STATUS`. `Completed` is resolved dynamically against the task's *current*
+    `progress` (already advanced by `_apply_terminal_fields`, which always
+    runs — for a terminal, not-yet-finalized run — before this is called):
+    `progress == 100` is "Merged" (see `models.STAGE_PROGRESS`), the only
+    stage this codebase's agent-safety model ever lets an *agent* run reach
+    on its own is "PR Ready" (95) — reaching "Merged" requires a human/
+    process action this project's agents are never permitted to take (no
+    run here ever calls `git commit`/`push`/`merge`). So a successful run
+    is "Needs Review" (PR ready, awaiting human review/merge) rather than
+    "Completed" until that happens — this is what makes "Completed implies
+    progress == 100" a real, permanently-held invariant instead of a
+    tautology that's vacuously true because nothing ever reaches it."""
+    if status != session_view.STATUS_COMPLETED:
+        return _LAUNCH_STATUS_BY_DISPLAY_STATUS[status]
+    return "Completed" if (task.get("progress") or 0) >= 100 else "Needs Review"
+
+
+def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> None:
     """The one-time work done exactly once per terminal run, guarded by the
     caller (`sync_task_from_run`). Reads the run's final result text via the
     same deterministic `report_parser.parse_report` v1.2 already uses — no
-    new extraction logic."""
+    new extraction logic. `status` is the already-computed
+    `session_view.derive_status(run)` value, passed in rather than re-read
+    from `task["launch_status"]` (which has not been updated for this sync
+    yet — see `sync_task_from_run`'s ordering)."""
     report_row = db.get_report(db_path, run["id"])
     if report_row:
         task["report_path"] = report_row["path"]
@@ -72,7 +106,21 @@ def _apply_terminal_fields(task: dict, run: dict, *, db_path) -> None:
         except db.LostUpdateError:
             pass  # cosmetic run-row enrichment only; the task fields above are already set
 
-    event_type = "completed" if task.get("launch_status") == "Completed" else "launch_requires_attention"
+    # Advance `current_stage`/`progress` for a genuinely completed run —
+    # same rule v1's `launch_service._apply_run_outcome_to_task` already
+    # uses. Never for `Blocked`/`Incomplete`/`Failed`/`Cancelled`: none of
+    # those represent real forward progress, so `progress` must stay exactly
+    # where it was (whatever stage the task was actually verified to reach),
+    # not be nudged forward by a run that didn't deliver.
+    if status == session_view.STATUS_COMPLETED:
+        if pull_request_url:
+            models.set_current_stage(task, "PR Ready")
+            models.append_timeline_event(task, "pr_created", pull_request_url)
+        elif models.is_passing_verdict(parsed.get("verdict")):
+            models.set_current_stage(task, "Validation")
+            models.append_timeline_event(task, "tests_passed", f"Вердикт: {parsed.get('verdict')}")
+
+    event_type = "completed" if status == session_view.STATUS_COMPLETED else "launch_requires_attention"
     models.append_timeline_event(
         task, event_type, f"Синхронизировано из прогона `{run['id'][:8]}` (Live Execution Center v2)."
     )
@@ -82,7 +130,6 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     """Returns whether `task` was mutated (so the caller knows to persist
     via `save_tasks`)."""
     status = session_view.derive_status(run)
-    target_launch_status = _LAUNCH_STATUS_BY_DISPLAY_STATUS[status]
     mutated = False
 
     is_new_run_for_task = task.get("current_run_id") != run["id"]
@@ -94,12 +141,16 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task["current_run_id"] = run["id"]
         mutated = True
 
-    if task.get("launch_status") != target_launch_status:
-        task["launch_status"] = target_launch_status
+    if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
+        # Must run *before* `target_launch_status` is resolved below: a
+        # `Completed` run's launch status depends on `task["progress"]`
+        # *after* this call's own stage advancement, not before it.
+        _apply_terminal_fields(task, run, status=status, db_path=db_path)
         mutated = True
 
-    if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
-        _apply_terminal_fields(task, run, db_path=db_path)
+    target_launch_status = _resolve_target_launch_status(status, task)
+    if task.get("launch_status") != target_launch_status:
+        task["launch_status"] = target_launch_status
         mutated = True
 
     if mutated:

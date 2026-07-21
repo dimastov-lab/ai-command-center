@@ -28,6 +28,26 @@ def test_derive_status_terminal_states():
     assert session_view.derive_status({"state": "CANCELLED"}) == session_view.STATUS_CANCELLED
 
 
+def test_derive_status_failed_with_blocked_reason_is_blocked():
+    run = {"state": "FAILED", "failure_reason": "blocked:permission_denied:Write"}
+    assert session_view.derive_status(run) == session_view.STATUS_BLOCKED
+
+
+def test_derive_status_failed_with_incomplete_reason_is_incomplete():
+    run = {"state": "FAILED", "failure_reason": "incomplete:working_tree_unchanged"}
+    assert session_view.derive_status(run) == session_view.STATUS_INCOMPLETE
+
+
+def test_derive_status_failed_with_other_reason_stays_failed():
+    assert session_view.derive_status({"state": "FAILED", "failure_reason": "timeout"}) == session_view.STATUS_FAILED
+    assert session_view.derive_status({"state": "FAILED", "failure_reason": None}) == session_view.STATUS_FAILED
+
+
+def test_blocked_and_incomplete_are_terminal_display_statuses():
+    assert session_view.STATUS_BLOCKED in session_view.TERMINAL_DISPLAY_STATUSES
+    assert session_view.STATUS_INCOMPLETE in session_view.TERMINAL_DISPLAY_STATUSES
+
+
 def test_derive_status_interrupted_and_unknown_are_requires_attention():
     assert session_view.derive_status({"state": "INTERRUPTED"}) == session_view.STATUS_REQUIRES_ATTENTION
     assert session_view.derive_status({"state": "UNKNOWN"}) == session_view.STATUS_REQUIRES_ATTENTION
@@ -162,6 +182,26 @@ def test_build_session_view_repository_path_prefers_project_cfg_over_workspace()
     )
     assert session["repository_path"] == "/canonical/repo"
     assert session["workspace_path"] == "/some/workspace"
+
+
+def test_build_session_view_blocker_reason_populated_for_blocked_status():
+    now = datetime(2026, 1, 1, 0, 0, 0)
+    run = _run(state="FAILED", failure_reason="blocked:permission_denied:Write")
+    session = session_view.build_session_view(
+        run, kanban_task=None, project_cfg=None, latest_event=None, report_path=None, now=now
+    )
+    assert session["status"] == session_view.STATUS_BLOCKED
+    assert session["blocker_reason"] == "blocked:permission_denied:Write"
+
+
+def test_build_session_view_blocker_reason_none_for_ordinary_failed():
+    now = datetime(2026, 1, 1, 0, 0, 0)
+    run = _run(state="FAILED", failure_reason="timeout")
+    session = session_view.build_session_view(
+        run, kanban_task=None, project_cfg=None, latest_event=None, report_path=None, now=now
+    )
+    assert session["status"] == session_view.STATUS_FAILED
+    assert session["blocker_reason"] is None
 
 
 def test_build_session_view_last_error_uses_failure_reason_first():
