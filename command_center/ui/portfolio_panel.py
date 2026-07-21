@@ -86,6 +86,32 @@ _STATUS_BADGE_COLORS: dict[str, str] = {
 _MESSAGE_RENDERERS = {"info": st.info, "warning": st.warning, "error": st.error}
 
 
+def _render_launch_summary(
+    plan: portfolio_launch.LaunchPlan,
+    presentation: portfolio_launch.PortfolioCardPresentation,
+) -> None:
+    """The always-visible worktree-launcher summary (task AICC-LAUNCH-001 UI):
+    Repository, Worktree, Branch, Launch profile, Permission profile, and the
+    current execution state — never hidden behind an expander, so it is
+    unambiguous *which* worktree and *which* permission model a launch will
+    use before it is confirmed."""
+    left, right = st.columns(2)
+    left.caption("Repository")
+    left.markdown(f"`{plan.repository_root or '—'}`")
+    left.caption("Worktree")
+    left.markdown(f"`{plan.worktree or '—'}`")
+    left.caption("Branch")
+    left.markdown(f"`{plan.branch or '—'}`")
+    right.caption("Launch profile")
+    right.markdown(plan.launch_profile_label or "—")
+    right.caption("Permission profile")
+    right.markdown(f"{plan.permission_profile_label or '—'}")
+    if plan.permission_profile_summary:
+        right.caption(plan.permission_profile_summary)
+    right.caption("Current execution state")
+    right.markdown(f"**{presentation.status_label}**")
+
+
 def _render_plan_details(task: PortfolioTask, plan: portfolio_launch.LaunchPlan) -> None:
     st.caption(f"Task workflow status: `{task.status or plan.lane}`")
     st.write(f"- Repository: `{plan.repository_root or '—'}`")
@@ -98,6 +124,8 @@ def _render_plan_details(task: PortfolioTask, plan: portfolio_launch.LaunchPlan)
     )
     st.write(f"- Режим worktree: {_WORKTREE_MODE_LABELS.get(plan.worktree_mode, plan.worktree_mode)}")
     st.write(f"- Тип задачи для агента: `{plan.task_type}`")
+    st.write(f"- Launch profile: `{plan.launch_profile_label or '—'}`")
+    st.write(f"- Permission profile: `{plan.permission_profile_label or '—'}` — {plan.permission_profile_summary or '—'}")
     # The "already launched" blocker is rendered as its own info/warning
     # message above the expander (via `PortfolioCardPresentation.message`) —
     # it is not a precondition error, so it is deliberately excluded from
@@ -187,6 +215,8 @@ def render_portfolio_execution_panel(
                 presentation.status_label,
                 color=_STATUS_BADGE_COLORS.get(presentation.status_key, "gray"),
             )
+
+            _render_launch_summary(plan, presentation)
 
             if presentation.message:
                 _MESSAGE_RENDERERS[presentation.message_severity](presentation.message)
