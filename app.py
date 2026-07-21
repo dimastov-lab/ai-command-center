@@ -2592,14 +2592,21 @@ elif page_key == "kanban":
     )
     st.divider()
 
-    priority_filter = st.multiselect("Приоритет", PRIORITIES, default=PRIORITIES, key="kanban_priority_filter")
+    # Options come from the tasks themselves (canonical priorities + any
+    # extra value actually in use, e.g. an imported `P0`), not just the
+    # canonical PRIORITIES — otherwise a task whose priority is outside the
+    # canonical set is neither selectable nor matched by the default
+    # all-selected filter, and silently disappears from every lane (this is
+    # exactly why AICC-CI-001, priority `P0`, was missing). See
+    # `task_view.kanban_priority_options`.
+    priority_options = task_view.kanban_priority_options(tasks)
+    priority_filter = st.multiselect(
+        "Приоритет", priority_options, default=priority_options, key="kanban_priority_filter"
+    )
 
-    filtered_tasks = [
-        task
-        for task in tasks
-        if (project_filter is None or task.get("project") == project_filter)
-        and task.get("priority", "Medium") in priority_filter
-    ]
+    filtered_tasks = task_view.filter_kanban_tasks(
+        tasks, project=project_filter, priorities=priority_filter
+    )
 
     kanban_git_status_cache: dict[str, dict] = {}
 
