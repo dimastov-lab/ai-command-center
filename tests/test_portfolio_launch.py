@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import threading
 from pathlib import Path
 
 import pytest
 
-from command_center import execution_queue, git_info, portfolio_launch
+from command_center import execution_queue, git_info, portfolio_launch, worktree_launcher
 from command_center.portfolio_models import PortfolioTask, parse_card
 from command_center.runtime import api as runtime_api
 
@@ -874,6 +875,83 @@ def test_dirty_existing_worktree_is_blocked(git_repo, tmp_path, portfolio_worktr
     plan = portfolio_launch.build_launch_plan(task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)})
     assert not plan.launchable
     assert any("не чист" in b for b in plan.blockers)
+
+
+def test_existing_directory_that_is_not_a_registered_worktree_is_blocked(git_repo, tmp_path, portfolio_worktrees_root):
+    """An existing directory that shares the mapped repository's git-common-dir
+    but is not actually a *registered* worktree (a hand-built `.git` gitfile /
+    a copied worktree dir) must be blocked — the AICC-LAUNCH-001 registered-
+    worktree guarantee, stronger than the git-common-dir equality check."""
+    existing_path = tmp_path / "existing-worktree"
+    _add_worktree(git_repo, path=existing_path, branch="existing-branch")
+
+    # Copy the linked worktree to a *new* path git never registered, but whose
+    # `.git` gitfile still points at the same common dir. `git worktree list`
+    # does not know about this copy, so it must be rejected as unregistered.
+    unregistered = tmp_path / "unregistered-copy"
+    shutil.copytree(existing_path, unregistered)
+
+    base_branch = _current_branch(git_repo)
+    task = _write_card(
+        tmp_path, base_branch=base_branch, repository=str(git_repo),
+        branch="existing-branch", worktree=str(unregistered),
+    )
+
+    plan = portfolio_launch.build_launch_plan(task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)})
+    assert not plan.launchable
+    assert any("зарегистрированным worktree" in b for b in plan.blockers), plan.blockers
+
+
+def test_launch_plan_exposes_launch_and_permission_profiles(git_repo, tmp_path, portfolio_worktrees_root):
+    base_branch = _current_branch(git_repo)
+    task = _write_card(tmp_path, base_branch=base_branch, repository=str(git_repo))
+    plan = portfolio_launch.build_launch_plan(task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)})
+
+    assert plan.executor_id == "claude_code"
+    assert plan.launch_profile_label == "Claude Code · Implementation"
+    assert plan.permission_profile_key == worktree_launcher.PROFILE_IMPLEMENTATION
+    assert plan.permission_profile_label == "Implementation"
+    assert plan.permission_profile_summary
+
+
+def test_read_only_card_type_maps_to_read_only_permission_profile(git_repo, tmp_path, portfolio_worktrees_root):
+    base_branch = _current_branch(git_repo)
+    task = _write_card(tmp_path, base_branch=base_branch, repository=str(git_repo))
+    # Re-shape the parsed card's frontmatter to a read-only type without
+    # rewriting the whole template — `type` drives `_map_task_type`.
+    task.frontmatter["type"] = "review"
+    plan = portfolio_launch.build_launch_plan(task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)})
+    assert plan.task_type == "review"
+    assert plan.permission_profile_key == worktree_launcher.PROFILE_READ_ONLY
+    assert plan.launch_profile_label == "Claude Code · Read-only"
+
+
+def test_launch_cwd_is_the_selected_worktree_not_the_main_repository(
+    git_repo, tmp_path, fake_claude, portfolio_worktrees_root
+):
+    """The launched run's working directory must be the resolved worktree,
+    never the main repository — the central AICC-LAUNCH-001 guarantee (cwd ==
+    selected worktree; never silently falls back to main)."""
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    base_branch = _current_branch(git_repo)
+    task = _write_card(tmp_path, base_branch=base_branch, repository=str(git_repo))
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+
+    result = portfolio_launch.launch_portfolio_task(
+        tmp_path, task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)},
+        execution_center_api=api, confirmed=True,
+    )
+    try:
+        assert result.launched is True, result.message
+        worktree_path = Path(result.plan.worktree)
+        assert worktree_path != git_repo  # not the main repo
+
+        run = api.get_run(result.run_id)
+        assert run is not None
+        assert Path(run["repository_path"]).resolve() == worktree_path.resolve()
+    finally:
+        if result.run_id:
+            api.request_cancel(result.run_id, confirmed=True)
 
 
 def test_existing_worktree_is_never_removed_during_rollback(git_repo, tmp_path, monkeypatch, portfolio_worktrees_root):
