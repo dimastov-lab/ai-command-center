@@ -615,6 +615,122 @@ def test_created_task_generated_markdown_is_isolated_from_the_real_repository(is
 
 
 # --------------------------------------------------------------------------
+# Create Task page: "Импорт пакета задач" uploader
+# --------------------------------------------------------------------------
+
+
+def _import_task(**overrides) -> dict:
+    base = {
+        "id": "PKG-001",
+        "title": "Imported task",
+        "goal": "Imported task goal",
+        "repository_path": "/repo",
+        "workspace_path": "/repo",
+        "branch": "main",
+        "status": "Backlog",
+        "project": "AIOS",
+        "task_type": "implementation",
+        "priority": "Medium",
+        "depends_on": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def _upload_package(at, tasks, filename="package.json"):
+    payload = json.dumps(tasks).encode("utf-8")
+    at.file_uploader(key="import_task_package_uploader").set_value((filename, payload, "application/json"))
+    return at.run()
+
+
+def test_import_task_package_uploader_renders_on_create_page():
+    at = _at_on_page("create", create_task_project="AIOS")
+    assert not at.exception
+    assert any(u.key == "import_task_package_uploader" for u in at.file_uploader)
+
+
+def test_import_task_package_preview_shows_counts_for_valid_package():
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_package(at, [_import_task(id="PKG-001"), _import_task(id="PKG-002")])
+    assert not at.exception
+    metric_values = [m.value for m in at.metric]
+    assert metric_values[:5] == ["2", "2", "0", "0", "0"]  # total/new/dup/errors/warnings
+    assert any(b.key == "import_task_package_confirm_btn" for b in at.button)
+
+
+def test_import_task_package_confirm_writes_tasks_to_store_for_kanban():
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_package(at, [_import_task(id="PKG-001"), _import_task(id="PKG-002")])
+    assert not at.exception
+
+    confirm = next(b for b in at.button if b.key == "import_task_package_confirm_btn")
+    at = confirm.click().run()
+    assert not at.exception
+    assert "Импортировано задач: 2" in " ".join(s.value for s in at.success)
+
+    stored = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    assert sorted(t["id"] for t in stored) == ["PKG-001", "PKG-002"]
+    assert stored[0]["status"] == "Backlog"  # visible on the Kanban board via the same store
+
+
+def test_import_task_package_reimport_shows_zero_new_and_all_duplicates():
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_package(at, [_import_task(id="PKG-001")])
+    confirm = next(b for b in at.button if b.key == "import_task_package_confirm_btn")
+    at = confirm.click().run()
+    assert not at.exception
+
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_package(at, [_import_task(id="PKG-001")])
+    assert not at.exception
+    metric_values = [m.value for m in at.metric]
+    assert metric_values[:3] == ["1", "0", "1"]  # total=1, new=0, duplicates=1
+    assert not any(b.key == "import_task_package_confirm_btn" for b in at.button)
+    assert any("Нет новых задач" in i.value for i in at.info)
+
+
+def test_import_task_package_malformed_json_shows_error():
+    at = _at_on_page("create", create_task_project="AIOS")
+    at.file_uploader(key="import_task_package_uploader").set_value(("bad.json", b"not json", "application/json"))
+    at = at.run()
+    assert not at.exception
+    assert any("Ошибка разбора пакета" in e.value for e in at.error)
+
+
+def test_import_task_package_validation_error_blocks_import_button():
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_package(at, [_import_task(id="PKG-001", status="Someday")])
+    assert not at.exception
+    assert not any(b.key == "import_task_package_confirm_btn" for b in at.button)
+    assert any("ошибки валидации" in e.value for e in at.error)
+
+
+def test_import_task_package_unresolved_dependency_blocks_import_button():
+    """Founder Review remediation: a typo'd/unknown depends_on id must block
+    the whole package by default — same UI treatment as any other blocking
+    validation error (no Import button, an error shown)."""
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_package(at, [_import_task(id="PKG-001", depends_on=["PKG-TYPO-NONEXISTENT"])])
+    assert not at.exception
+    assert not any(b.key == "import_task_package_confirm_btn" for b in at.button)
+    assert any("PKG-TYPO-NONEXISTENT" in e.value for e in at.error)
+
+    stored = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    assert stored == []
+
+
+def test_import_task_package_normalizes_project_name_before_writing():
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_package(at, [_import_task(id="PKG-001", project="AI Command Center")])
+    confirm = next(b for b in at.button if b.key == "import_task_package_confirm_btn")
+    at = confirm.click().run()
+    assert not at.exception
+
+    stored = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    assert stored[0]["project"] == "AICC"
+
+
+# --------------------------------------------------------------------------
 # Projects settings tab: extended project configuration fields
 # --------------------------------------------------------------------------
 
@@ -715,7 +831,7 @@ def test_kanban_page_registry_includes_aicos_with_no_local_projects_dict():
     _seed_tasks([{"id": "aicos-task", "project": "AICOS", "title": "AICOS task"}])
     at = _at_on_page("kanban")
     assert not at.exception
-    assert "Проектов в реестре: 6" in [c.value for c in at.caption]
+    assert f"Проектов в реестре: {len(models.PROJECT_IDS)}" in [c.value for c in at.caption]
     body = " ".join(md.value for md in at.markdown)
     assert "AICOS task" in body
 
@@ -738,6 +854,37 @@ def test_kanban_project_selector_filters_board_to_selected_project():
     body = " ".join(md.value for md in at.markdown)
     assert "AICOS-only task" in body
     assert "AIOS-only task" not in body
+
+
+def test_kanban_project_filter_isolates_each_split_project():
+    """Founder Review regression: AICC/AIOS/AICOS/PRODUCT/ECOSYSTEM must each
+    show only their own tasks on the filtered Kanban board — before the
+    registry split, "AI Command Center" and "Ecosystem" tasks both landed
+    under the single id AICOS and could never be told apart here."""
+    _seed_tasks(
+        [
+            {"id": "aicc-task", "project": "AICC", "title": "AICC-only task"},
+            {"id": "aios-task", "project": "AIOS", "title": "AIOS-only task"},
+            {"id": "aicos-task", "project": "AICOS", "title": "AICOS-only task"},
+            {"id": "product-task", "project": "PRODUCT", "title": "PRODUCT-only task"},
+            {"id": "ecosystem-task", "project": "ECOSYSTEM", "title": "ECOSYSTEM-only task"},
+        ]
+    )
+    titles = {
+        "AICC": "AICC-only task",
+        "AIOS": "AIOS-only task",
+        "AICOS": "AICOS-only task",
+        "PRODUCT": "PRODUCT-only task",
+        "ECOSYSTEM": "ECOSYSTEM-only task",
+    }
+    for project_id, own_title in titles.items():
+        at = _at_on_page("kanban", kanban_project_selector_pills=project_id)
+        assert not at.exception
+        body = " ".join(md.value for md in at.markdown)
+        assert own_title in body
+        for other_project_id, other_title in titles.items():
+            if other_project_id != project_id:
+                assert other_title not in body
 
 
 def test_kanban_card_separates_blocked_reason_from_planning_and_execution_badges():

@@ -42,13 +42,13 @@ def _api(tmp_path) -> ExecutionCenterAPI:
 # --------------------------------------------------------------------------
 
 
-def test_snapshot_all_six_unconfigured_renders_without_exception(tmp_path):
+def test_snapshot_all_projects_unconfigured_renders_without_exception(tmp_path):
     """The default fresh-checkout state: every project's repository_path is None."""
     api = _api(tmp_path)
     snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
 
     assert {p["id"] for p in snapshot["projects"]} == set(models.PROJECT_IDS)
-    assert len(snapshot["projects"]) == 6
+    assert len(snapshot["projects"]) == len(models.PROJECT_IDS)
     for project in snapshot["projects"]:
         assert project["repository_path"] is None
         assert workspace_home_state_for(snapshot, project["id"]) == "unconfigured"

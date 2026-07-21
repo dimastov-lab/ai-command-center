@@ -73,6 +73,72 @@ def test_validate_repository_path_rejects_empty():
     assert ok is False
 
 
+# --------------------------------------------------------------------------
+# Project registry split (Founder Review remediation of AICC-AUDIT-001):
+# AICC/AIOS/AICOS/PRODUCT/ECOSYSTEM must be five genuinely distinct canonical
+# ids — an earlier version of `normalize_project_id` collapsed "AI Command
+# Center"/"Ecosystem" into AICOS and "AIOS Product" into AIOS, which made
+# their tasks, filters, and metrics indistinguishable on the Kanban board.
+# --------------------------------------------------------------------------
+
+
+def test_five_split_project_ids_are_all_registered_and_pairwise_distinct():
+    split_ids = ["AICC", "AIOS", "AICOS", "PRODUCT", "ECOSYSTEM"]
+    for project_id in split_ids:
+        assert project_id in models.PROJECT_IDS
+    assert len(set(split_ids)) == 5  # no accidental duplicate in the literal list itself
+
+
+def test_ai_command_center_normalizes_to_aicc_not_aicos():
+    assert project_config.normalize_project_id("AI Command Center") == "AICC"
+    assert project_config.normalize_project_id("AI Command Center") != "AICOS"
+
+
+def test_aios_product_normalizes_to_product_not_aios():
+    assert project_config.normalize_project_id("AIOS Product") == "PRODUCT"
+    assert project_config.normalize_project_id("AIOS Product") != "AIOS"
+
+
+def test_ecosystem_normalizes_to_ecosystem_not_aicc_or_aicos():
+    assert project_config.normalize_project_id("Ecosystem") == "ECOSYSTEM"
+    assert project_config.normalize_project_id("Ecosystem") != "AICC"
+    assert project_config.normalize_project_id("Ecosystem") != "AICOS"
+
+
+def test_aicos_and_aios_still_normalize_to_themselves():
+    """Regression guard: fixing AICC/PRODUCT/ECOSYSTEM must not disturb the
+    two ids that were already correct."""
+    assert project_config.normalize_project_id("AIOS") == "AIOS"
+    assert project_config.normalize_project_id("AICOS") == "AICOS"
+
+
+@pytest.mark.parametrize(
+    "alias,canonical",
+    [
+        ("AI Command Center", "AICC"),
+        ("AICC", "AICC"),
+        ("AIOS", "AIOS"),
+        ("AICOS", "AICOS"),
+        ("AIOS Product", "PRODUCT"),
+        ("PRODUCT", "PRODUCT"),
+        ("Ecosystem", "ECOSYSTEM"),
+        ("ECOSYSTEM", "ECOSYSTEM"),
+    ],
+)
+def test_every_founder_specified_alias_resolves_to_its_own_canonical_id(alias, canonical):
+    assert project_config.normalize_project_id(alias) == canonical
+
+
+def test_unknown_project_name_is_not_silently_mapped_to_any_split_project():
+    assert project_config.normalize_project_id("Something Else Entirely") is None
+
+
+def test_every_split_project_id_has_a_distinct_display_name():
+    split_ids = ["AICC", "AIOS", "AICOS", "PRODUCT", "ECOSYSTEM"]
+    display_names = [project_config.DISPLAY_NAMES[p] for p in split_ids]
+    assert len(set(display_names)) == len(split_ids)
+
+
 def test_validate_repository_path_rejects_relative():
     ok, _ = project_config.validate_repository_path("relative/path")
     assert ok is False

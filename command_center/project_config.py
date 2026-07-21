@@ -57,8 +57,11 @@ PROJECT_STATUSES: list[str] = ["Planning", "Active", "Paused", "Blocked", "Done"
 PROJECT_PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
 
 DISPLAY_NAMES: dict[str, str] = {
+    "AICC": "AI Command Center",
     "AIOS": "AIOS",
     "AICOS": "AICOS",
+    "PRODUCT": "AIOS Product",
+    "ECOSYSTEM": "Ecosystem",
     "BANK": "Bank Strategy",
     "LEGAL": "Legal",
     "BUSINESS": "Business",
@@ -69,16 +72,19 @@ DISPLAY_NAMES: dict[str, str] = {
 # handles that gracefully rather than failing, matching the v1.1 behavior.
 #
 # Every key in `models.PROJECT_IDS` must appear here, even if the file doesn't
-# exist on disk yet (AICOS has none today) — this dict is consulted with
-# `.get(project_id, ...)` everywhere, so a missing *entry* silently degrades to
-# a generic guess instead of surfacing the gap. Omitting AICOS entirely was
-# the root cause of a real bug: `app.py` used to keep its own second,
+# exist on disk yet (AICC/AICOS/PRODUCT/ECOSYSTEM have none today) — this dict is
+# consulted with `.get(project_id, ...)` everywhere, so a missing *entry* silently
+# degrades to a generic guess instead of surfacing the gap. Omitting AICOS entirely
+# was the root cause of a real bug: `app.py` used to keep its own second,
 # hand-maintained project dict (not this one) that dropped AICOS from every
 # project selector/filter in the app. See `models.PROJECT_IDS` for the single
 # canonical id list `app.py` must iterate instead.
 PROJECT_STATUS_FILES: dict[str, str] = {
+    "AICC": "projects/AICC.md",
     "AIOS": "projects/AIOS.md",
     "AICOS": "projects/AICOS.md",
+    "PRODUCT": "projects/PRODUCT.md",
+    "ECOSYSTEM": "projects/ECOSYSTEM.md",
     "BANK": "projects/BANK_STRATEGY.md",
     "LEGAL": "projects/LEGAL.md",
     "BUSINESS": "projects/BUSINESS.md",
@@ -206,6 +212,62 @@ def save_repository_path(project_id: str, repository_path: str | None) -> None:
 
 def is_sensitive(project_id: str) -> bool:
     return project_id in models.SENSITIVE_PROJECT_IDS
+
+
+# --------------------------------------------------------------------------
+# Project name normalization (task import)
+# --------------------------------------------------------------------------
+
+# Founder-authored task packages (see `command_center.task_import`) refer to
+# projects by free-text names, not by `models.PROJECT_IDS`. This table is the
+# single, explicit mapping from every name a package is allowed to use onto a
+# canonical id already registered in `models.PROJECT_IDS` — it is deliberately
+# not a fallback/default: a name absent from this table fails validation in
+# `task_import.validate_task_package` rather than being silently assigned to
+# a guessed project.
+#
+# Founder Review (AICC-AUDIT-001 remediation) rejected an earlier version of
+# this table that folded "AI Command Center"/"Ecosystem" into AICOS and
+# "AIOS Product" into AIOS — collapsing genuinely distinct entities into one
+# id made their tasks, filters, and metrics indistinguishable in the Kanban
+# board. Every package name below now maps to its own canonical id, never to
+# another project's id:
+#
+#   "AI Command Center" / "AICC"   -> AICC       (this repository/product)
+#   "AIOS"                         -> AIOS       (unchanged, already canonical)
+#   "AICOS"                        -> AICOS      (unchanged, already canonical)
+#   "AIOS Product" / "PRODUCT"     -> PRODUCT    (AIOS's commercial/product layer — a
+#                                                  distinct deliverable from AIOS core,
+#                                                  tracked separately on its own board)
+#   "Ecosystem" / "ECOSYSTEM"      -> ECOSYSTEM  (cross-project gate tasks that span
+#                                                  AICC/AIOS/AICOS/PRODUCT — belong to
+#                                                  none of them individually)
+PROJECT_NAME_ALIASES: dict[str, str] = {
+    "ai command center": "AICC",
+    "aicc": "AICC",
+    "aios": "AIOS",
+    "aicos": "AICOS",
+    "aios product": "PRODUCT",
+    "product": "PRODUCT",
+    "ecosystem": "ECOSYSTEM",
+}
+
+
+def normalize_project_id(raw: str | None) -> str | None:
+    """Resolve a task package's free-text `project` field to a canonical
+    `models.PROJECT_IDS` entry, or `None` if it cannot be resolved.
+
+    Already-canonical ids pass through unchanged; every other supported name
+    is looked up case/whitespace-insensitively in `PROJECT_NAME_ALIASES`.
+    Returning `None` on a miss (rather than guessing a default project) is
+    deliberate — see the module-level note above.
+    """
+    if not raw or not raw.strip():
+        return None
+    if raw in models.PROJECT_IDS:
+        return raw
+    key = " ".join(raw.strip().lower().split())
+    return PROJECT_NAME_ALIASES.get(key)
 
 
 def save_project_settings(project_id: str, **fields: object) -> None:

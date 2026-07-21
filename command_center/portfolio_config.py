@@ -1,13 +1,23 @@
 """Portfolio project-id -> local repository path mapping.
 
 Portfolio task cards carry a `project` field (`AICC`, `PRODUCT`, `AIOS`,
-`AICOS`, `INFRA`, ...) that is a *different* namespace from
-`command_center.models.PROJECT_IDS` (the AI Command Center's own six business
-projects) — a Portfolio `project` id names an external repository this app
-must launch agents against, not one of this app's own Kanban projects. This
-module is the single place that mapping is resolved, kept deliberately
-separate from `command_center.project_config` so the two id spaces never get
-merged into one and never collide.
+`AICOS`, `INFRA`, ...) that names an external repository this app must launch
+agents against — a functionally *independent* namespace from
+`command_center.models.PROJECT_IDS` (the AI Command Center's own Kanban
+projects). This module is the single place the repository-path mapping is
+resolved, kept deliberately separate from `command_center.project_config`:
+neither ever validates a project id against the other's table, and a
+`load_repository_paths()` id is never required to appear in
+`models.PROJECT_IDS` (e.g. `INFRA` has no Kanban counterpart) or vice versa
+(`BANK`/`LEGAL`/`BUSINESS`/`PERSONAL` have no Portfolio repository mapping).
+
+Since the AICC-AUDIT-001 remediation split `models.PROJECT_IDS` into distinct
+`AICC`/`AIOS`/`AICOS`/`PRODUCT`/`ECOSYSTEM` ids, several of the *literal id
+strings* now intentionally match between the two tables — by design, since
+both name the same real project/product from two different angles (Portfolio:
+"which repository to launch agents into"; Kanban: "which project a task
+belongs to"), not a naming collision. The two tables still never cross-
+reference each other.
 
 Local, machine-specific, gitignored: `data/portfolio_config.json` (see
 `.gitignore`), mirroring `project_config.py`'s own `project_config.json`
