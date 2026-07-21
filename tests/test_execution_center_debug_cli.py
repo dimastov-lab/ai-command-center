@@ -52,6 +52,13 @@ def _cli_env(**overrides) -> dict:
     env["AICC_CLAUDE_BINARY"] = str(FAKE_CLAUDE_SCRIPT)
     if "AICC_DATA_DIR" in env:
         env["AICC_REPORTS_ROOT"] = str(Path(env["AICC_DATA_DIR"]) / "reports")
+    # Same default as `tests/conftest.py`'s `fake_claude` fixture: a plain
+    # "implementation"-type fake run genuinely touches the working tree, so
+    # `runtime.outcome.classify_process_result` classifies it `COMPLETED`
+    # rather than `INCOMPLETE` (`REQUIRES_CHANGES_TASK_TYPES` + an unchanged
+    # tree). A test exercising the unchanged-tree path overrides this back
+    # to `""` via `overrides`.
+    env["FAKE_CLAUDE_TOUCH_FILE"] = "fake_claude_default_touch.txt"
     env.update(overrides)
     return env
 

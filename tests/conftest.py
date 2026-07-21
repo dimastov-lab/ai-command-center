@@ -297,7 +297,15 @@ def fake_claude(monkeypatch):
 
     monkeypatch.setattr(supervisor_module, "build_claude_command", patched_build)
 
-    env_overrides: dict[str, str] = {}
+    # Defaults to touching a file every run, so a plain "implementation"-type
+    # fake run genuinely changes the working tree — matching what a real
+    # implementation run is expected to do, and what `runtime.outcome.
+    # classify_process_result` now requires (`REQUIRES_CHANGES_TASK_TYPES`)
+    # before it will classify an `exit_code == 0` implementation/remediation
+    # run `COMPLETED` rather than `INCOMPLETE`. A test that specifically
+    # wants to exercise the unchanged-working-tree path sets this back to
+    # `""` (falsy — see `fixtures/fake_claude.py`'s `if touch_file:` guard).
+    env_overrides: dict[str, str] = {"FAKE_CLAUDE_TOUCH_FILE": "fake_claude_default_touch.txt"}
     original_popen = subprocess.Popen
 
     def popen_with_env(*args, **kwargs):

@@ -88,7 +88,60 @@ RUNS_EXAMPLE_FILE = ROOT / "data" / "runs.example.jsonl"
 
 CLAUDE_BINARY = "claude"
 
+# --------------------------------------------------------------------------
+# Execution profiles — named, testable single source of truth for "what can
+# this run touch". Every `claude` invocation this project makes (v1 sync
+# `build_command` below, and v2 `runtime.supervisor.build_claude_command`)
+# resolves its task_type to exactly one of these two profiles and applies it
+# identically, so the two executors can never silently diverge on tool access.
+#
+# `PROFILE_READ_ONLY`: `READ_ONLY_ALLOWED_TOOLS` only (Read/Grep/Glob), via
+# `--tools` (tool-set replacement — see the module docstring). No Bash, no
+# file mutation, ever.
+#
+# `PROFILE_TRUSTED_DEVELOPMENT`: the full built-in tool set (Read, Grep,
+# Glob, Edit, Write, Bash, ...), so the agent can actually read, search,
+# edit/create files, run shell commands, run git (read/status/log/diff —
+# every git-write subcommand is still denied via `GIT_WRITE_DISALLOWED_
+# TOOLS`), and run tests/validators. This is deliberately *not* applied to
+# every task automatically — only task types that exist to modify a trusted
+# local repository (`implementation`, `remediation`) resolve to it; anything
+# else defaults to `PROFILE_READ_ONLY`, never the reverse.
+PROFILE_READ_ONLY = "read_only"
+PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
+
 READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+
+# `--permission-mode` for every profile. Both profiles use `acceptEdits`:
+# empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
+# that *without* an explicit `--permission-mode`, the CLI's implicit default
+# denies `Write`/`Edit` tool calls outright in non-interactive mode — the
+# call returns `is_error: false` and `permission_denials: [{"tool_name":
+# "Write", ...}]`, i.e. the process still exits 0 while the requested file
+# mutation silently never happened. `acceptEdits` was confirmed (same
+# method) to auto-accept `Write`/`Edit` and to leave `Bash` unaffected
+# (`permission_denials: []` in both cases). This is exactly the F-01-class
+# gap `runtime.supervisor.build_claude_command` had: it built `--tools`/
+# `--disallowedTools` but never set `--permission-mode` at all, so a
+# `trusted_development` v2 run could report "cannot execute" while its own
+# process exit code was 0 — see `runtime.outcome` for the terminal-state
+# classifier that also guards against this at the result-evaluation layer.
+PERMISSION_MODE_BY_PROFILE: dict[str, str] = {
+    PROFILE_READ_ONLY: "acceptEdits",
+    PROFILE_TRUSTED_DEVELOPMENT: "acceptEdits",
+}
+
+
+def profile_for_task_type(task_type: str) -> str:
+    """The execution profile a `task_type` resolves to: `PROFILE_READ_ONLY`
+    for exactly `READ_ONLY_TASK_TYPES`, `PROFILE_TRUSTED_DEVELOPMENT` for
+    everything else — the same membership check `build_command`/
+    `runtime.supervisor.build_claude_command` already branched on before
+    this was named, preserved exactly (an unrecognized/future task_type
+    still resolves to `PROFILE_TRUSTED_DEVELOPMENT`, matching that existing
+    "else" branch; `READ_ONLY_TASK_TYPES` is the explicit allow-list here,
+    not the other way around)."""
+    return PROFILE_READ_ONLY if task_type in READ_ONLY_TASK_TYPES else PROFILE_TRUSTED_DEVELOPMENT
 
 # The *complete* available tool set for read-only task types, passed via `--tools`
 # (not `--allowedTools`/`--disallowedTools`). Per `claude --help`, `--tools` replaces
@@ -206,6 +259,7 @@ def build_command(
     task_type: str,
     model: str | None = None,
 ) -> list[str]:
+    profile = profile_for_task_type(task_type)
     command = [
         CLAUDE_BINARY,
         "-p",
@@ -213,7 +267,7 @@ def build_command(
         "--output-format",
         "json",
         "--permission-mode",
-        "acceptEdits",
+        PERMISSION_MODE_BY_PROFILE[profile],
     ]
 
     if task_type in READ_ONLY_TASK_TYPES:

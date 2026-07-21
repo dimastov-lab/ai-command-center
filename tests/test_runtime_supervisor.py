@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from command_center import agent_runner
 from command_center.runtime import context_service, db, identity, supervisor
 
 
@@ -799,3 +800,209 @@ def test_launching_set_is_cleared_after_a_prepared_to_queued_transition_failure(
     runs = db.list_runs(sup.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
     assert len(runs) == 1
     assert runs[0]["state"] == "PREPARED"
+
+
+# --------------------------------------------------------------------------
+# --permission-mode — the empirically-confirmed root cause of the reported
+# defect: without it, the real `claude` CLI denies `Write`/`Edit` tool calls
+# in headless `-p` mode while the process itself still exits 0 (see
+# `agent_runner`'s profile docstring for the verification method/evidence).
+# --------------------------------------------------------------------------
+
+
+def test_build_claude_command_includes_permission_mode_for_trusted_development():
+    command = supervisor.build_claude_command(
+        session_id="88888888-8888-8888-8888-888888888888", prompt="x", task_type="implementation", is_resume=False
+    )
+    assert "--permission-mode" in command
+    assert command[command.index("--permission-mode") + 1] == agent_runner.PERMISSION_MODE_BY_PROFILE[
+        agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+    ]
+
+
+def test_build_claude_command_includes_permission_mode_for_read_only():
+    command = supervisor.build_claude_command(
+        session_id="99999999-9999-9999-9999-999999999999", prompt="x", task_type="review", is_resume=False
+    )
+    assert "--permission-mode" in command
+    assert command[command.index("--permission-mode") + 1] == agent_runner.PERMISSION_MODE_BY_PROFILE[
+        agent_runner.PROFILE_READ_ONLY
+    ]
+
+
+# --------------------------------------------------------------------------
+# EvaluatingResult end-to-end: exit_code == 0 is not the whole story — a
+# permission denial or an unchanged working tree must not be recorded
+# COMPLETED. Regression tests 1/2/5/6 from the remediation brief.
+# --------------------------------------------------------------------------
+
+
+def test_exit_zero_with_permission_denial_is_blocked_not_completed(git_repo, configure_project_repo, fake_claude):
+    lines = [
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps(
+            {
+                "type": "result",
+                "result": "DONE",
+                "permission_denials": [{"tool_name": "Write", "tool_use_id": "x", "tool_input": {}}],
+            }
+        ),
+    ]
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(lines)
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["exit_code"] == 0, "the CLI process itself must still exit 0 in this scenario"
+    assert final["state"] == "FAILED", "a permission-denied run must never be recorded COMPLETED"
+    assert final["failure_reason"] == "blocked:permission_denied:Write"
+
+
+def test_exit_zero_with_blocked_final_response_is_blocked_not_completed(git_repo, configure_project_repo, fake_claude):
+    """Required regression test 1: exit_code=0 plus an explicit blocked final
+    response -> Blocked, even with no structured `permission_denials`
+    evidence at all (Required fix 6's text-classifier fallback)."""
+    lines = [
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "result", "result": "I cannot execute this task: Bash is unavailable to me."}),
+    ]
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(lines)
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["exit_code"] == 0
+    assert final["state"] == "FAILED"
+    assert final["failure_reason"].startswith("blocked:final_response:")
+
+
+def test_exit_zero_with_unchanged_working_tree_is_incomplete_not_completed(
+    git_repo, configure_project_repo, fake_claude
+):
+    """Required regression test 5: task requiring changes plus
+    working_tree_changed=false -> Incomplete."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = ""  # override the fixture default: no file touched this run
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["exit_code"] == 0
+    assert final["working_tree_changed"] == 0
+    assert final["state"] == "FAILED"
+    assert final["failure_reason"] == "incomplete:working_tree_unchanged"
+
+
+def test_exit_zero_read_only_task_type_completes_even_without_working_tree_change(
+    git_repo, configure_project_repo, fake_claude
+):
+    """A `review` (read-only) run is never expected to change the working
+    tree — an unchanged tree must not make it `Incomplete`."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = ""
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="review", prompt="review this",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["state"] == "COMPLETED"
+
+
+def test_exit_zero_with_changes_and_no_blockers_is_genuinely_completed(
+    git_repo, configure_project_repo, fake_claude
+):
+    """The positive case: nothing blocked, changes were made -> COMPLETED,
+    exactly as before this remediation. Guards against the classifier being
+    so strict it never lets a real success through."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["exit_code"] == 0
+    assert final["working_tree_changed"] == 1
+    assert final["state"] == "COMPLETED"
+    assert final["failure_reason"] is None
+
+
+# --------------------------------------------------------------------------
+# Linked git worktrees — git commands must work normally via Bash from
+# inside a linked worktree, without any special-casing in this project's
+# own code (git resolves `.git`-file-pointer worktrees transparently on its
+# own; this only regresses if Bash/permission-mode is wrong for the run).
+# --------------------------------------------------------------------------
+
+
+def test_git_snapshot_works_from_inside_a_linked_worktree(git_repo, tmp_path):
+    worktree_path = tmp_path / "linked-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/from-worktree", str(worktree_path)],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+
+    snapshot = agent_runner.git_snapshot(worktree_path)
+
+    assert snapshot["is_git_repo"] is True
+    assert snapshot["branch"] == "feature/from-worktree"
+    assert snapshot["status_summary"] == "(чисто)"
+
+    worktrees = subprocess.run(
+        ["git", "worktree", "list"], cwd=worktree_path, check=True, capture_output=True, text=True,
+    ).stdout
+    assert str(git_repo) in worktrees
+    assert str(worktree_path) in worktrees
+
+
+def test_supervisor_run_completes_from_inside_a_linked_worktree(git_repo, tmp_path, fake_claude, monkeypatch):
+    """A v2 run launched with `repository_path` pointing at a linked
+    worktree (not the primary checkout) must supervise normally end to end —
+    `Popen(..., cwd=repo_path)` plus the run's own `git_snapshot` calls need
+    no special-casing for a linked worktree's `.git` *file* (vs. the primary
+    checkout's `.git` *directory*)."""
+    worktree_path = tmp_path / "linked-worktree-2"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/supervised-from-worktree", str(worktree_path)],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    assert (worktree_path / ".git").is_file(), "a linked worktree's .git is a file, not a directory"
+
+    from command_center import project_config
+
+    def fake_get_project_config(pid, _repo_path=str(worktree_path)):
+        cfg = project_config.default_project_config(pid)
+        cfg["repository_path"] = _repo_path
+        return cfg
+
+    monkeypatch.setattr(project_config, "get_project_config", fake_get_project_config)
+    monkeypatch.setattr(agent_runner.project_config, "get_project_config", fake_get_project_config)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(worktree_path), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["state"] == "COMPLETED"
+    reloaded = db.get_run(sup.db_path, run["id"])
+    assert reloaded["state"] == "COMPLETED"
