@@ -15,15 +15,32 @@ Two storage shapes are used in this project, deliberately:
   briefly risk the *entire* history during the rewrite window. JSONL reduces that risk to
   only the single new line being appended. The "current" state of a run is the last line
   seen for its id (last-write-wins fold), which the caller performs.
+
+`file_lock` below is a third, orthogonal primitive: `atomic_write_json`'s temp-file +
+`os.replace` makes any *single* write atomic, but does nothing to prevent a lost update
+across a read-modify-write *cycle` — two concurrent callers can both read the same
+pre-write state, each compute a result from it, and the second `atomic_write_json` call
+silently discards the first caller's update. Any read-modify-write cycle on a whole-file
+JSON document (the registry in `command_center.portfolio_launch`, the task-package import
+transaction in `command_center.task_import`) must hold `file_lock` for its *entire*
+read-through-write span, not just around the final write.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterable
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 
 def resolve_data_dir(root: Path) -> Path:
@@ -128,3 +145,91 @@ def fold_latest_by_id(records: Iterable[dict], id_key: str = "id") -> dict[str, 
             continue
         latest[record_id] = record
     return latest
+
+
+# --------------------------------------------------------------------------
+# Cross-process file locking — the whole-read-modify-write-cycle primitive
+# --------------------------------------------------------------------------
+#
+# Extracted (behavior-preserving) from `command_center.portfolio_launch`'s
+# original `_registry_lock`/`_try_acquire_lock`/`_release_lock`, which was the
+# first place this project needed real cross-process mutual exclusion around
+# a JSON read-modify-write cycle (`data/portfolio_launches.json`). Generalized
+# here so any future whole-file-JSON read-modify-write cycle — starting with
+# `command_center.task_import.apply_task_package`'s import transaction — reuses
+# the same primitive instead of re-implementing the fcntl/msvcrt dance.
+
+
+class LockTimeoutError(Exception):
+    """Raised by `file_lock` when the lock cannot be acquired within its timeout."""
+
+
+def _try_acquire_lock(handle) -> bool:
+    """Non-blocking attempt to take the OS advisory lock on `handle`. Returns
+    `False` (never raises) if another holder — thread or process, doesn't
+    matter, both primitives below are OS-level, not Python-level — already
+    holds it."""
+    try:
+        if sys.platform == "win32":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _release_lock(handle) -> None:
+    if sys.platform == "win32":
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def file_lock(lock_path: Path, *, timeout: float = 30.0, poll_seconds: float = 0.05):
+    """Cross-process, cross-thread mutual exclusion for the *entire*
+    critical section the caller runs inside this context — not just around
+    a single write. Correct usage for a read-modify-write cycle on some other
+    file (`registry.json`, `tasks.json`, ...) is to acquire this lock *before*
+    the read and hold it through the write; acquiring it only around the
+    write still lets two callers both read the same pre-write state and each
+    write back a version that discards the other's change (the lost-update
+    race this primitive exists to close).
+
+    Backed by a dedicated lock file at `lock_path` (never the file being
+    protected itself, so a lock holder never blocks a plain unlocked read of
+    that file) holding an OS advisory lock — `fcntl.flock` on POSIX,
+    `msvcrt.locking` on Windows, both stdlib, no third-party dependency.
+    Both are released by the kernel the instant the holding process's file
+    descriptor closes, including on a crash or kill, so a dead holder can
+    never wedge every future caller (unlike an exclusive-create marker file,
+    there is no "stale lock" state to manually clean up).
+
+    Acquisition polls with a bounded `timeout` (rather than blocking forever)
+    so a bug that fails to release the lock surfaces as `LockTimeoutError`
+    instead of an indefinite hang; release always happens in `finally`, so a
+    normal exception raised by the code running inside this context still
+    releases the lock immediately.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            # Windows byte-range locking needs at least one real byte to
+            # lock; POSIX flock ignores file content/length entirely.
+            handle.write(b"0")
+            handle.flush()
+        deadline = time.monotonic() + timeout
+        while not _try_acquire_lock(handle):
+            if time.monotonic() >= deadline:
+                raise LockTimeoutError(f"could not acquire lock within {timeout:.0f}s: {lock_path}")
+            time.sleep(poll_seconds)
+        try:
+            yield
+        finally:
+            _release_lock(handle)
+    finally:
+        handle.close()

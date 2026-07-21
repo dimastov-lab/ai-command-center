@@ -34,6 +34,28 @@ def test_rank_projects_by_activity_never_drops_a_zero_activity_project():
     assert len(ranked) == len(models.PROJECT_IDS)
 
 
+def test_rank_projects_by_activity_does_not_mix_counts_across_split_projects():
+    """Founder Review regression: AICC/AIOS/AICOS/PRODUCT/ECOSYSTEM must each
+    accrue their own activity count — a task tagged for one must never bump
+    another's count, which is exactly what happened before the registry
+    split (an "AI Command Center" task and an "AICOS" task both counted as
+    the single id AICOS)."""
+    tasks = [
+        _task(id="a", project="AICC"),
+        _task(id="b", project="AICC"),
+        _task(id="c", project="AICC"),
+        _task(id="d", project="ECOSYSTEM"),
+    ]
+    ranked = project_intelligence.rank_projects_by_activity(models.PROJECT_IDS, tasks)
+    assert ranked[0] == "AICC"
+    assert ranked[1] == "ECOSYSTEM"
+    # AICOS/AIOS/PRODUCT got zero tasks — their count must stay exactly 0,
+    # never inflated by AICC's or ECOSYSTEM's tasks.
+    assert ranked.index("AICOS") > 1
+    assert ranked.index("AIOS") > 1
+    assert ranked.index("PRODUCT") > 1
+
+
 def test_rank_projects_by_activity_is_deterministic_on_ties():
     ranked_a = project_intelligence.rank_projects_by_activity(models.PROJECT_IDS, [])
     ranked_b = project_intelligence.rank_projects_by_activity(models.PROJECT_IDS, [])

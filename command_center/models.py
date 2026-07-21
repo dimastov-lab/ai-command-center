@@ -15,8 +15,23 @@ from datetime import datetime
 # Projects
 # --------------------------------------------------------------------------
 
-PROJECT_IDS: list[str] = ["AIOS", "AICOS", "BANK", "LEGAL", "BUSINESS", "PERSONAL"]
+PROJECT_IDS: list[str] = ["AICC", "AIOS", "AICOS", "PRODUCT", "ECOSYSTEM", "BANK", "LEGAL", "BUSINESS", "PERSONAL"]
 SENSITIVE_PROJECT_IDS: set[str] = {"BANK", "LEGAL"}
+
+# --------------------------------------------------------------------------
+# Kanban status / task priority (single source of truth)
+#
+# Previously hand-duplicated as `app.py`'s own `KANBAN_COLUMNS`/`PRIORITIES`
+# module-level lists — moved here so `command_center.task_import` (which must
+# never import `app.py`) can validate an imported task's `status`/`priority`
+# against the same vocabulary the Kanban board and Create Task form use.
+# `app.py` now binds its existing names to these, so every pre-existing call
+# site (`KANBAN_COLUMNS`, `PRIORITIES`) is unchanged.
+# --------------------------------------------------------------------------
+
+KANBAN_STATUSES: list[str] = ["Backlog", "Next", "In Progress", "Review", "Done"]
+
+TASK_PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
 
 # --------------------------------------------------------------------------
 # Workflow stages (parallel to, not a replacement for, the Kanban status)

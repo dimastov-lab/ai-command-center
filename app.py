@@ -22,6 +22,7 @@ from command_center import (
     recommend,
     report_parser,
     storage,
+    task_import,
     task_view,
     tasks_repository,
     workflow,
@@ -149,15 +150,13 @@ AGENT_ROLES: dict[str, dict[str, object]] = {
     },
 }
 
-KANBAN_COLUMNS: list[str] = [
-    "Backlog",
-    "Next",
-    "In Progress",
-    "Review",
-    "Done",
-]
+# Canonical source: command_center.models.KANBAN_STATUSES / TASK_PRIORITIES —
+# see that module's docstring for why app.py must not define its own
+# duplicate lists (command_center.task_import validates against the same
+# vocabulary and must never import app.py).
+KANBAN_COLUMNS: list[str] = models.KANBAN_STATUSES
 
-PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
+PRIORITIES: list[str] = models.TASK_PRIORITIES
 
 # Canonical source: command_center.ui.tokens — see that module's docstring
 # for why app.py must not define its own duplicate color dicts.
@@ -280,8 +279,23 @@ def load_tasks() -> list[dict]:
     return tasks_repository.load_tasks(ROOT, example_file=TASKS_EXAMPLE_FILE)
 
 
-def save_tasks(tasks: list[dict]) -> None:
-    tasks_repository.save_tasks(ROOT, tasks)
+# No `save_tasks(tasks)` wrapper here (deliberately removed): writing back
+# whatever `tasks` this script run loaded at the top would silently discard
+# any concurrent writer's change made since that load (see
+# `tasks_repository`'s module docstring). Every write path in this file goes
+# through `create_task`/`update_task_status`/`delete_task`/`upsert_tasks`/
+# `tasks_repository.upsert_task`/`tasks_repository.mutate_tasks` instead,
+# each of which locks and reloads fresh immediately before writing.
+
+
+def upsert_tasks(tasks: list[dict]) -> None:
+    """The `save_tasks_fn` callback handed to `recommendations_panel`/
+    `queue_panel`: both mutate a subset of `tasks_by_id`'s dicts in place
+    (via `execution_queue.launch_ready`, exactly like `launch_service`) and
+    need to commit exactly those changes. Locked bulk upsert, not a blind
+    overwrite of this script run's entire (possibly-stale) `tasks` snapshot —
+    see `tasks_repository.upsert_tasks`."""
+    tasks_repository.upsert_tasks(ROOT, tasks)
 
 
 def new_task_record(
@@ -325,12 +339,59 @@ def new_task_record(
     )
 
 
-def update_task_status(tasks: list[dict], task_id: str, new_status: str) -> None:
-    tasks_repository.update_task_status(ROOT, tasks, task_id, new_status)
+def create_task(
+    project: str,
+    title: str,
+    task_type: str,
+    status: str,
+    *,
+    goal: str | None = None,
+    notes: str = "",
+    priority: str = "Medium",
+    owner: str = "",
+    estimate_hours: float = 0.0,
+    depends_on: list[str] | None = None,
+    parent_task_id: str | None = None,
+    prior_run_id: str | None = None,
+    workflow_stage: str = "Draft",
+    workspace_path: str | None = None,
+    branch: str | None = None,
+    executor: str | None = None,
+    prompt: str | None = None,
+) -> dict:
+    """Locked create — every page that adds a task to the Kanban board must
+    call this (never `tasks.append(new_task_record(...)); save_tasks(tasks)`
+    against its own possibly-stale in-memory `tasks` list, which is exactly
+    the pattern that silently drops a concurrent writer's task). See
+    `tasks_repository.create_task`/module docstring."""
+    return tasks_repository.create_task(
+        ROOT,
+        project,
+        title,
+        task_type,
+        status,
+        goal=goal,
+        notes=notes,
+        priority=priority,
+        owner=owner,
+        estimate_hours=estimate_hours,
+        depends_on=depends_on,
+        parent_task_id=parent_task_id,
+        prior_run_id=prior_run_id,
+        workflow_stage=workflow_stage,
+        workspace_path=workspace_path,
+        branch=branch,
+        executor=executor,
+        prompt=prompt,
+    )
 
 
-def delete_task(tasks: list[dict], task_id: str) -> None:
-    tasks_repository.delete_task(ROOT, tasks, task_id)
+def update_task_status(task_id: str, new_status: str) -> dict | None:
+    return tasks_repository.update_task_status(ROOT, task_id, new_status)
+
+
+def delete_task(task_id: str) -> None:
+    tasks_repository.delete_task(ROOT, task_id)
 
 
 def task_label(task: dict) -> str:
@@ -731,7 +792,11 @@ def render_agent_launcher(
                 executor_id="claude_code",
                 validation=validation,
                 expected_branch=expected_branch,
-                on_task_state_changed=(lambda: save_tasks(tasks)) if task_for_launch is not None else None,
+                on_task_state_changed=(
+                    (lambda: tasks_repository.upsert_task(ROOT, task_for_launch))
+                    if task_for_launch is not None
+                    else None
+                ),
             )
         except (
             runtime_context_service.ConfirmationRequiredError,
@@ -743,7 +808,15 @@ def render_agent_launcher(
             return
 
         if task_for_launch is not None:
-            save_tasks(tasks)
+            # `task_for_launch` was already committed via `on_task_state_changed`
+            # above at each of its in-place mutation checkpoints — this final
+            # upsert is a defense-in-depth flush in case any *future* code
+            # between here and the last checkpoint mutates it again. Never
+            # `save_tasks(tasks)`: `tasks` is this script run's own snapshot,
+            # loaded once at the top — persisting it verbatim would silently
+            # discard whatever a concurrent writer (another tab, an import,
+            # ...) committed to `tasks.json` in the meantime.
+            tasks_repository.upsert_task(ROOT, task_for_launch)
 
         st.session_state[confirm_key] = False
         st.success(
@@ -808,7 +881,7 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
             if not objective_clean:
                 st.error("Укажите цель задачи.")
                 return
-            new_task = new_task_record(
+            new_task = create_task(
                 project,
                 models.derive_short_title(objective_clean),
                 next_task_type,
@@ -818,8 +891,6 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
                 prior_run_id=run["id"],
                 workflow_stage=next_stage,
             )
-            tasks.append(new_task)
-            save_tasks(tasks)
             run["next_task_id"] = new_task["id"]
             agent_runner.append_run(run)
             activity_log.log_event(
@@ -843,8 +914,8 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
 # render_* functions only turn its plain-data output into widgets.
 
 
-def _set_launch_status(tasks: list[dict], task_id: str, status: str, note: str) -> None:
-    tasks_repository.set_manual_launch_status(ROOT, tasks, task_id, status, note)
+def _set_launch_status(task_id: str, status: str, note: str) -> None:
+    tasks_repository.set_manual_launch_status(ROOT, task_id, status, note)
 
 
 def render_task_timeline(task: dict) -> None:
@@ -996,15 +1067,15 @@ def render_task_card(
             status_cols = st.columns(3)
             with status_cols[0]:
                 if st.button("Pause", key=f"{key_prefix}_action_pause", icon=":material/pause:"):
-                    _set_launch_status(tasks, task_id, "Requires Attention", "Отмечено как приостановлено (вручную).")
+                    _set_launch_status(task_id, "Requires Attention", "Отмечено как приостановлено (вручную).")
                     st.rerun()
             with status_cols[1]:
                 if st.button("Resume", key=f"{key_prefix}_action_resume", icon=":material/play_arrow:"):
-                    _set_launch_status(tasks, task_id, "Ready", "Отмечено как возобновлено (вручную).")
+                    _set_launch_status(task_id, "Ready", "Отмечено как возобновлено (вручную).")
                     st.rerun()
             with status_cols[2]:
                 if st.button("Restart", key=f"{key_prefix}_action_restart", icon=":material/restart_alt:"):
-                    _set_launch_status(tasks, task_id, "Ready", "Отмечено для перезапуска (вручную).")
+                    _set_launch_status(task_id, "Ready", "Отмечено для перезапуска (вручную).")
                     st.rerun()
             st.caption(
                 "Pause/Resume/Restart — это статус-метки для планирования, а не управление процессом: "
@@ -1045,11 +1116,11 @@ def render_task_card(
                 label_visibility="collapsed",
             )
             if new_status != current_status:
-                update_task_status(tasks, task_id, new_status)
+                update_task_status(task_id, new_status)
                 st.rerun()
 
             if st.button("Удалить", key=f"{key_prefix}_delete", icon=":material/delete:", width="stretch"):
-                delete_task(tasks, task_id)
+                delete_task(task_id)
                 st.rerun()
 
 
@@ -1516,11 +1587,22 @@ def _render_execution_center_sections(
 def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     """One refresh tick's worth of work: reconcile+sync, then re-render the
     whole dashboard from freshly-read state. Called directly (no
-    auto-refresh) or from one of the fixed-interval poller fragments below."""
+    auto-refresh) or from one of the fixed-interval poller fragments below.
+
+    Reconciliation runs against a *freshly loaded* task list inside
+    `tasks_repository.mutate_tasks` — never the possibly several-seconds-old
+    `tasks` this function was called with — and only persists when something
+    actually changed (`persist_if`), so an idle poll tick costs a lock
+    acquisition (cheap, uncontended) but not a disk write. `tasks` is then
+    rebound to that fresh, reconciled list for the rest of this render."""
     now = datetime.now()
-    mutated_tasks = task_sync.reconcile_and_sync(api, tasks)
-    if mutated_tasks:
-        save_tasks(tasks)
+
+    def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
+        return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
+
+    tasks, _mutated_tasks = tasks_repository.mutate_tasks(
+        ROOT, _sync_mutator, persist_if=lambda result: bool(result[1])
+    )
 
     # Queue readiness has no poller of its own (see `execution_queue`'s
     # module docstring — no hidden scheduler); it piggybacks on this
@@ -2179,25 +2261,22 @@ elif page_key == "create":
                 final_executor = (
                     None if override_executor == "(унаследовано из проекта)" else override_executor
                 )
-                tasks.append(
-                    new_task_record(
-                        project,
-                        title_clean,
-                        task_type,
-                        initial_status,
-                        goal=objective_clean,
-                        notes=notes.strip(),
-                        priority=priority,
-                        owner=owner.strip(),
-                        estimate_hours=float(estimate),
-                        depends_on=dependencies,
-                        workspace_path=override_workspace.strip() or inherited["workspace_path"],
-                        branch=override_branch.strip() or inherited["branch"],
-                        executor=final_executor or inherited["executor"],
-                        prompt=override_prompt.strip() or inherited["prompt"],
-                    )
+                create_task(
+                    project,
+                    title_clean,
+                    task_type,
+                    initial_status,
+                    goal=objective_clean,
+                    notes=notes.strip(),
+                    priority=priority,
+                    owner=owner.strip(),
+                    estimate_hours=float(estimate),
+                    depends_on=dependencies,
+                    workspace_path=override_workspace.strip() or inherited["workspace_path"],
+                    branch=override_branch.strip() or inherited["branch"],
+                    executor=final_executor or inherited["executor"],
+                    prompt=override_prompt.strip() or inherited["prompt"],
                 )
-                save_tasks(tasks)
                 st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
                 if stdout:
                     with st.expander("Вывод скрипта"):
@@ -2208,6 +2287,86 @@ elif page_key == "create":
                 if details:
                     with st.expander("Подробности ошибки", expanded=True):
                         st.code(details, language=None)
+
+    st.divider()
+    st.markdown("#### Импорт пакета задач")
+    st.caption(
+        "Загрузите JSON-файл со списком задач (например, пакет от Founder-аудита) — "
+        "поддерживаются как «конверт» `{schema_version, package_id, tasks}`, так и "
+        "простой список задач. Ничего не записывается в `data/tasks.json` до нажатия "
+        "«Импортировать задачи»."
+    )
+    uploaded_package = st.file_uploader(
+        "JSON-пакет задач", type=["json"], key="import_task_package_uploader"
+    )
+    if uploaded_package is not None:
+        try:
+            parsed_package = task_import.parse_task_package(uploaded_package.getvalue())
+        except task_import.TaskImportError as exc:
+            st.error(f"Ошибка разбора пакета: {exc}")
+        else:
+            import_validation = task_import.validate_task_package(parsed_package)
+            import_preview = task_import.build_import_preview(ROOT, parsed_package, import_validation)
+
+            info_cols = st.columns(5)
+            info_cols[0].metric("Всего задач", import_preview.total_tasks)
+            info_cols[1].metric("Новые", len(import_preview.new_items))
+            info_cols[2].metric("Дубликаты", len(import_preview.duplicate_ids))
+            info_cols[3].metric("Ошибки", len(import_preview.errors))
+            info_cols[4].metric("Предупреждения", len(import_preview.warnings))
+            st.caption(
+                f"Package id: `{import_preview.package_id}` · schema: `{import_preview.schema_version}` · "
+                f"hash: `{import_preview.package_hash}`"
+            )
+
+            if import_preview.rows:
+                st.dataframe(
+                    [
+                        {
+                            "ID": row.id,
+                            "Импорт": row.outcome,
+                            "Проект": row.project,
+                            "Kanban": row.status,
+                            "Приоритет": row.priority,
+                            "Тип": row.task_type,
+                            "Название": row.title,
+                        }
+                        for row in import_preview.rows
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+
+            for issue in import_preview.errors:
+                st.error(f"[{issue.task_ref or '—'}] {issue.message}")
+            for issue in import_preview.warnings:
+                st.warning(f"[{issue.task_ref or '—'}] {issue.message}")
+
+            if import_preview.has_blocking_errors:
+                st.error("Пакет содержит ошибки валидации — импорт заблокирован.")
+            elif not import_preview.new_items:
+                st.info("Нет новых задач для импорта — все задачи пакета уже присутствуют в хранилище.")
+            elif st.button(
+                f"Импортировать задачи ({len(import_preview.new_items)} новых)",
+                key="import_task_package_confirm_btn",
+                type="primary",
+                icon=":material/publish:",
+            ):
+                try:
+                    import_result = task_import.apply_task_package(ROOT, parsed_package, import_validation)
+                except task_import.TaskImportError as exc:
+                    # Re-checked fresh under lock inside `apply_task_package` — can
+                    # still fail here even though the preview above looked clean,
+                    # e.g. a concurrent import claimed a dependency's id, or the
+                    # lock timed out. Surfaced as an ordinary page error, never an
+                    # uncaught exception; nothing was written in either case.
+                    st.error(f"Импорт не выполнен: {exc}")
+                else:
+                    st.success(
+                        f"Импортировано задач: {len(import_result.imported_ids)}. "
+                        f"Пропущено дубликатов: {len(import_result.skipped_duplicate_ids)}."
+                    )
+                    st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -2308,15 +2467,13 @@ elif page_key == "chat":
                                 if not objective_clean:
                                     st.error("Укажите цель задачи.")
                                 else:
-                                    new_task_from_msg = new_task_record(
+                                    new_task_from_msg = create_task(
                                         active_conversation["project"],
                                         models.derive_short_title(objective_clean),
                                         conv_task_type,
                                         "Backlog",
                                         goal=objective_clean,
                                     )
-                                    tasks.append(new_task_from_msg)
-                                    save_tasks(tasks)
                                     activity_log.log_event(
                                         "task_created_from_message", project=active_conversation["project"],
                                         task_id=new_task_from_msg["id"], conversation_id=active_conversation["id"],
@@ -2406,7 +2563,7 @@ elif page_key == "kanban":
         ROOT,
         get_execution_center_api(),
         project_configs,
-        save_tasks,
+        upsert_tasks,
         project=project_filter,
         key_prefix="kanban_reco",
     )
@@ -2452,7 +2609,7 @@ elif page_key == "kanban":
         ROOT,
         get_execution_center_api(),
         project_configs,
-        save_tasks,
+        upsert_tasks,
         project=project_filter,
         key_prefix="kanban_queue",
     )
@@ -3238,7 +3395,7 @@ elif page_key == "focus":
                     key=f"focus_status_{task_id}",
                 )
                 if new_status != task.get("status"):
-                    update_task_status(tasks, task_id, new_status)
+                    update_task_status(task_id, new_status)
                     st.rerun()
 
                 if st.button(
@@ -3247,7 +3404,7 @@ elif page_key == "focus":
                     type="primary",
                     width="stretch",
                 ):
-                    update_task_status(tasks, task_id, "Done")
+                    update_task_status(task_id, "Done")
                     st.rerun()
 
 

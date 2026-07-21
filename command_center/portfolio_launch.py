@@ -86,19 +86,12 @@ import contextlib
 import json
 import os
 import subprocess
-import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from command_center import execution_queue, git_info, models, storage
 from command_center.portfolio_models import PortfolioCardError, PortfolioTask, unmet_requirements, validate_task_id
 from command_center.runtime import db as runtime_db
-
-if sys.platform == "win32":
-    import msvcrt
-else:
-    import fcntl
 
 WORKTREES_ROOT_ENV = "AICC_PORTFOLIO_WORKTREES_ROOT"
 DEFAULT_WORKTREES_ROOT = Path.home() / "Projects" / "worktrees"
@@ -384,30 +377,6 @@ def _registry_lock_path(root: Path) -> Path:
     return locks_dir / REGISTRY_LOCK_FILE_NAME
 
 
-def _try_acquire_lock(handle) -> bool:
-    """Non-blocking attempt to take the OS advisory lock on `handle`. Returns
-    `False` (never raises) if another holder — thread, process, doesn't
-    matter, both primitives below are OS-level, not Python-level — already
-    holds it."""
-    try:
-        if sys.platform == "win32":
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
-
-
-def _release_lock(handle) -> None:
-    if sys.platform == "win32":
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 @contextlib.contextmanager
 def _registry_lock(root: Path, *, timeout: float = REGISTRY_LOCK_TIMEOUT_SECONDS):
     """Cross-process, cross-thread mutual exclusion for the *entire*
@@ -418,41 +387,21 @@ def _registry_lock(root: Path, *, timeout: float = REGISTRY_LOCK_TIMEOUT_SECONDS
     the same pre-write state and each write back a version missing the
     other's entry (the lost update this lock exists to prevent).
 
-    A dedicated `registry.lock` file (never the registry file itself, so a
-    lock holder never blocks a plain `load_registry` read) holds an OS
-    advisory lock — `fcntl.flock` on POSIX, `msvcrt.locking` on Windows,
-    both stdlib, no third-party dependency. Both are released by the
-    kernel the instant the holding process's file descriptor closes,
-    including on a crash or kill, so — unlike the `_claim` exclusive-create
-    lock file — a dead holder can never wedge every future launch.
-
-    Acquisition polls with a bounded `timeout` (rather than blocking
-    forever) so a bug that fails to release the lock surfaces as a clear
-    `PortfolioLaunchError` instead of an indefinite hang; release always
-    happens in `finally`, so a normal exception raised by the code running
-    inside this context still releases the lock immediately.
+    Thin wrapper around `command_center.storage.file_lock` (a dedicated
+    `registry.lock` file, never the registry file itself, so a lock holder
+    never blocks a plain `load_registry` read) — see that function's
+    docstring for the underlying `fcntl`/`msvcrt` mechanism. Translates a
+    `storage.LockTimeoutError` into `PortfolioLaunchError` so every existing
+    caller here keeps seeing this module's own exception type.
     """
     lock_path = _registry_lock_path(root)
-    handle = open(lock_path, "a+b")
     try:
-        if handle.seek(0, os.SEEK_END) == 0:
-            # Windows byte-range locking needs at least one real byte to
-            # lock; POSIX flock ignores file content/length entirely.
-            handle.write(b"0")
-            handle.flush()
-        deadline = time.monotonic() + timeout
-        while not _try_acquire_lock(handle):
-            if time.monotonic() >= deadline:
-                raise PortfolioLaunchError(
-                    f"не удалось получить блокировку реестра запусков Portfolio за {timeout:.0f}с: {lock_path}"
-                )
-            time.sleep(_REGISTRY_LOCK_POLL_SECONDS)
-        try:
+        with storage.file_lock(lock_path, timeout=timeout, poll_seconds=_REGISTRY_LOCK_POLL_SECONDS):
             yield
-        finally:
-            _release_lock(handle)
-    finally:
-        handle.close()
+    except storage.LockTimeoutError as exc:
+        raise PortfolioLaunchError(
+            f"не удалось получить блокировку реестра запусков Portfolio за {timeout:.0f}с: {lock_path}"
+        ) from exc
 
 
 def _load_registry_strict(root: Path) -> dict[str, dict]:
