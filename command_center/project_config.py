@@ -219,38 +219,67 @@ def is_sensitive(project_id: str) -> bool:
 # --------------------------------------------------------------------------
 
 # Founder-authored task packages (see `command_center.task_import`) refer to
-# projects by free-text names, not by `models.PROJECT_IDS`. This table is the
-# single, explicit mapping from every name a package is allowed to use onto a
-# canonical id already registered in `models.PROJECT_IDS` — it is deliberately
-# not a fallback/default: a name absent from this table fails validation in
-# `task_import.validate_task_package` rather than being silently assigned to
-# a guessed project.
+# projects by free-text names, not by `models.PROJECT_IDS`. `PROJECT_NAME_ALIASES`
+# (built just below from `DISPLAY_NAMES`) maps every name a package is allowed to
+# use onto a canonical id — deliberately not a fallback/default: a name absent
+# from it fails validation in `task_import.validate_task_package` rather than
+# being silently assigned to a guessed project.
 #
-# Founder Review (AICC-AUDIT-001 remediation) rejected an earlier version of
-# this table that folded "AI Command Center"/"Ecosystem" into AICOS and
-# "AIOS Product" into AIOS — collapsing genuinely distinct entities into one
-# id made their tasks, filters, and metrics indistinguishable in the Kanban
-# board. Every package name below now maps to its own canonical id, never to
-# another project's id:
+# Founder Review (AICC-AUDIT-001 remediation) established the invariant that no
+# two distinct entities may fold into one id ("AI Command Center"/"Ecosystem"
+# must NOT collapse into AICOS, "AIOS Product" must NOT collapse into AIOS).
+# Deriving the table straight from `DISPLAY_NAMES` preserves that by
+# construction: each display name maps to its own id and to nothing else.
+def _alias_key(name: str) -> str:
+    """The single case/whitespace-insensitive normalization applied to both
+    every alias-table key and every lookup in `normalize_project_id`, so the
+    two can never disagree about how a name is matched."""
+    return " ".join(name.strip().lower().split())
+
+
+# Extra names founder task packages are historically allowed to use that are
+# NOT a project's display name — merged on top of the auto-derived table below.
+# Kept deliberately tiny: the display-name reverse mapping and the bare
+# canonical id are derived automatically in `_build_project_name_aliases`, so
+# this dict only ever needs a truly *aliased* spelling. (Empty today — every
+# supported name is either a display name or a bare id — but preserved as the
+# explicit merge point the module contract promises.)
+_EXPLICIT_PROJECT_ALIASES: dict[str, str] = {}
+
+
+def _build_project_name_aliases() -> dict[str, str]:
+    """Derive the free-text-name -> canonical-id table from `DISPLAY_NAMES`
+    (the single source of truth for a project's human name) rather than hand-
+    maintaining a second, drift-prone list. For every `models.PROJECT_IDS`
+    entry this registers both its display name (`"AI Command Center"` ->
+    `AICC`, `"Bank Strategy"` -> `BANK`) and its bare id (`"aicc"` -> `AICC`),
+    then merges `_EXPLICIT_PROJECT_ALIASES`. Guarantees every project — not
+    just the five that used to be listed — resolves from its display name, so
+    `canonical_project_id`'s "a display name matches its canonical id" promise
+    holds for all nine projects, not a subset."""
+    aliases: dict[str, str] = {}
+    for project_id in models.PROJECT_IDS:
+        aliases[_alias_key(DISPLAY_NAMES.get(project_id, project_id))] = project_id
+        aliases[_alias_key(project_id)] = project_id
+    for name, project_id in _EXPLICIT_PROJECT_ALIASES.items():
+        aliases[_alias_key(name)] = project_id
+    return aliases
+
+
+# Founder-authored task packages (see `command_center.task_import`) refer to
+# projects by free-text names, not by `models.PROJECT_IDS`. This table maps
+# every name a package is allowed to use onto a canonical id already registered
+# in `models.PROJECT_IDS` — it is deliberately not a fallback/default: a name
+# absent from this table fails validation in `task_import.validate_task_package`
+# rather than being silently assigned to a guessed project. It is *derived* from
+# `DISPLAY_NAMES` (see `_build_project_name_aliases`) so it can never drift out
+# of sync with the display names the UI renders.
 #
-#   "AI Command Center" / "AICC"   -> AICC       (this repository/product)
-#   "AIOS"                         -> AIOS       (unchanged, already canonical)
-#   "AICOS"                        -> AICOS      (unchanged, already canonical)
-#   "AIOS Product" / "PRODUCT"     -> PRODUCT    (AIOS's commercial/product layer — a
-#                                                  distinct deliverable from AIOS core,
-#                                                  tracked separately on its own board)
-#   "Ecosystem" / "ECOSYSTEM"      -> ECOSYSTEM  (cross-project gate tasks that span
-#                                                  AICC/AIOS/AICOS/PRODUCT — belong to
-#                                                  none of them individually)
-PROJECT_NAME_ALIASES: dict[str, str] = {
-    "ai command center": "AICC",
-    "aicc": "AICC",
-    "aios": "AIOS",
-    "aicos": "AICOS",
-    "aios product": "PRODUCT",
-    "product": "PRODUCT",
-    "ecosystem": "ECOSYSTEM",
-}
+# Every name maps to its OWN canonical id, never folding distinct entities into
+# one — the invariant Founder Review (AICC-AUDIT-001 remediation) established:
+#   "AI Command Center" -> AICC   "AIOS Product" -> PRODUCT   "Ecosystem" -> ECOSYSTEM
+#   "Bank Strategy" -> BANK        "Legal" -> LEGAL            "Business" -> BUSINESS ...
+PROJECT_NAME_ALIASES: dict[str, str] = _build_project_name_aliases()
 
 
 def normalize_project_id(raw: str | None) -> str | None:
@@ -266,8 +295,7 @@ def normalize_project_id(raw: str | None) -> str | None:
         return None
     if raw in models.PROJECT_IDS:
         return raw
-    key = " ".join(raw.strip().lower().split())
-    return PROJECT_NAME_ALIASES.get(key)
+    return PROJECT_NAME_ALIASES.get(_alias_key(raw))
 
 
 def canonical_project_id(value: str | None) -> str | None:
