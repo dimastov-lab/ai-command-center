@@ -1997,7 +1997,12 @@ if page_key == "dashboard":
     with left:
         st.markdown("#### Активные задачи по проекту")
         for project in models.PROJECT_IDS:
-            project_active = [task for task in active_tasks if task.get("project") == project]
+            # Canonical-id match (shared helper) so a task storing a display
+            # name ("AI Command Center") is counted under its project ("AICC"),
+            # consistent with the Kanban lane, pill, and intelligence strip.
+            project_active = [
+                task for task in active_tasks if project_config.project_matches(task.get("project"), project)
+            ]
             with st.container(border=True):
                 st.markdown(f"**{project}** · {len(project_active)}")
                 if not project_active:
@@ -2064,7 +2069,9 @@ elif page_key == "executive":
         st.markdown("#### Статус проектов")
         statuses = parse_project_statuses()
         for project in models.PROJECT_IDS:
-            project_tasks = [task for task in tasks if task.get("project") == project]
+            # Canonical-id match (shared helper) so display-name tasks count
+            # under their project — consistent with the Kanban lane and pill.
+            project_tasks = [task for task in tasks if project_config.project_matches(task.get("project"), project)]
             p_active = sum(1 for task in project_tasks if task.get("status") != "Done")
             p_blocked = sum(1 for task in project_tasks if task["id"] in blocked_ids)
             p_done = sum(1 for task in project_tasks if task.get("status") == "Done")
@@ -2424,7 +2431,7 @@ elif page_key == "chat":
             "Название нового разговора", key="chat_new_title", placeholder="Например: обсуждение архитектуры P1"
         )
         project_task_options = ["Без привязки"] + [
-            task["id"] for task in tasks if task.get("project") == chat_project
+            task["id"] for task in tasks if project_config.project_matches(task.get("project"), chat_project)
         ]
         link_task_id = st.selectbox(
             "Привязать к задаче (необязательно)",
@@ -2886,7 +2893,9 @@ elif page_key == "timeline":
         tasks, runs=agent_runner.load_runs(), activity_events=activity_log.load_activity(limit=200), limit=200
     )
     if project_filter != "Все":
-        events = [event for event in events if event.get("project") == project_filter]
+        # Canonical-id match (shared helper): task-sourced timeline events carry
+        # the task's raw `project`, which may be a display name.
+        events = [event for event in events if project_config.project_matches(event.get("project"), project_filter)]
 
     if not events:
         st.info("Событий пока нет.")
@@ -3314,7 +3323,11 @@ elif page_key == "workspace":
     for project in models.PROJECT_IDS:
         project_file = project_status_file_path(project)
         context_name = CONTEXT_FILES.get(project)
-        project_active = sum(1 for task in tasks if task.get("project") == project and task.get("status") != "Done")
+        project_active = sum(
+            1
+            for task in tasks
+            if project_config.project_matches(task.get("project"), project) and task.get("status") != "Done"
+        )
         project_generated = artifacts.list_markdown_files(GENERATED_DIR / project)
         last_activity = format_mtime(project_generated[0]) if project_generated else "—"
 
@@ -3372,7 +3385,7 @@ elif page_key == "focus":
         candidates = [
             task
             for task in active_tasks
-            if project_filter == "Все" or task.get("project") == project_filter
+            if project_filter == "Все" or project_config.project_matches(task.get("project"), project_filter)
         ]
 
         if not candidates:

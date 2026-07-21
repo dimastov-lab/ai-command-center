@@ -136,3 +136,40 @@ def test_filter_kanban_tasks_respects_project_filter():
     options = task_view.kanban_priority_options(tasks)
     visible = task_view.filter_kanban_tasks(tasks, project="AI Command Center", priorities=options)
     assert {t["id"] for t in visible} == {"a"}
+
+
+# --- Kanban project filter regression tests --------------------------------
+# Regression guard for AICC-UI-001: a task whose `project` field holds a
+# display name / alias ("AI Command Center") instead of the canonical
+# `models.PROJECT_IDS` id ("AICC") used to vanish the moment a project was
+# selected in the Kanban selector (which emits canonical ids). It rendered on
+# the "all projects" board but nowhere under its own project lane.
+
+
+def test_filter_kanban_tasks_matches_display_name_project_against_canonical_id():
+    # The real pipeline: task stores the display name, the selector emits the id.
+    tasks = [
+        {"id": "AICC-CI-001", "project": "AI Command Center", "priority": "P0", "status": "Backlog"},
+        {"id": "other", "project": "AIOS", "priority": "P0", "status": "Backlog"},
+    ]
+    options = task_view.kanban_priority_options(tasks)
+    # Selecting the canonical "AICC" pill must still render AICC-CI-001.
+    visible = task_view.filter_kanban_tasks(tasks, project="AICC", priorities=options)
+    assert {t["id"] for t in visible} == {"AICC-CI-001"}
+
+
+def test_filter_kanban_tasks_canonical_id_project_field_still_matches():
+    # A task already storing the canonical id keeps matching the id selection.
+    tasks = [{"id": "x", "project": "AICC", "priority": "High", "status": "Backlog"}]
+    options = task_view.kanban_priority_options(tasks)
+    visible = task_view.filter_kanban_tasks(tasks, project="AICC", priorities=options)
+    assert {t["id"] for t in visible} == {"x"}
+
+
+def test_filter_kanban_tasks_unresolvable_project_only_shows_under_all():
+    # A project that resolves to no canonical id must not match a real lane,
+    # but must still appear on the "all projects" (project=None) board.
+    tasks = [{"id": "y", "project": "Totally Unknown", "priority": "High", "status": "Backlog"}]
+    options = task_view.kanban_priority_options(tasks)
+    assert task_view.filter_kanban_tasks(tasks, project="AICC", priorities=options) == []
+    assert {t["id"] for t in task_view.filter_kanban_tasks(tasks, project=None, priorities=options)} == {"y"}

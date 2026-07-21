@@ -13,7 +13,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from command_center import execution_queue, recommend
+from command_center import execution_queue, project_config, recommend
 from command_center.ui.launch_feedback import render_skipped_launch
 
 
@@ -44,7 +44,11 @@ def render_execution_queue_panel(
 ) -> None:
     entries = execution_queue.reevaluate_and_persist(root, tasks_by_id)
     if project:
-        entries = [e for e in entries if e.get("project") == project]
+        # A queue entry copies its task's raw `project` (which may be a display
+        # name), while `project` here is the canonical id emitted by the Kanban
+        # selector — match on canonical ids (shared helper) so the queue on the
+        # Kanban page shows the same project's tasks the lane above it does.
+        entries = [e for e in entries if project_config.project_matches(e.get("project"), project)]
 
     waiting = execution_queue.waiting_entries(entries)
     ready = execution_queue.ready_entries(entries)

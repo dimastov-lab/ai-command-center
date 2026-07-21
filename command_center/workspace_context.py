@@ -195,8 +195,16 @@ def reconcile(root: Path, ctx: WorkspaceContext) -> WorkspaceContext:
         task = tasks_by_id.get(ctx.selected_task_id)
         if task is None:
             ctx = dataclasses.replace(ctx, selected_task_id=None, selected_run_id=None)
-        elif task.get("project") != ctx.active_project:
-            ctx = dataclasses.replace(ctx, active_project=task.get("project"))
+        else:
+            # Canonicalize the task's stored `project` (shared helper): a task
+            # may store a display name ("AI Command Center") while
+            # `active_project` — and the `models.PROJECT_IDS` guard just below —
+            # are canonical ids ("AICC"). Without this a display-name task set a
+            # non-canonical `active_project` that the guard then nulled out, so
+            # its project could never stay selected in the workspace.
+            task_project = project_config.canonical_project_id(task.get("project"))
+            if task_project != ctx.active_project:
+                ctx = dataclasses.replace(ctx, active_project=task_project)
 
     # Project.
     if ctx.active_project is not None and ctx.active_project not in models.PROJECT_IDS:
@@ -230,7 +238,10 @@ def _apply_select_project(root: Path, ctx: WorkspaceContext, command: SelectProj
     if ctx.selected_task_id:
         tasks = tasks_repository.load_tasks(root)
         task = next((t for t in tasks if t.get("id") == ctx.selected_task_id), None)
-        if task is None or task.get("project") != command.project_id:
+        # Compare the task's project on canonical ids (shared helper): a
+        # display-name task ("AI Command Center") must stay selected when its
+        # canonical project ("AICC") is chosen, not be deselected as a mismatch.
+        if task is None or not project_config.project_matches(task.get("project"), command.project_id):
             updates["selected_task_id"] = None
             updates["selected_run_id"] = None
     return dataclasses.replace(ctx, **updates)
@@ -242,7 +253,10 @@ def _apply_select_task(root: Path, ctx: WorkspaceContext, command: SelectTask) -
     if task is None:
         raise ValueError(f"Task not found: {command.task_id!r}")
 
-    project_id = task.get("project")
+    # Canonical id (shared helper) so a display-name task resolves to its real
+    # project config and sets a canonical `active_project` that survives the
+    # `models.PROJECT_IDS` reconciliation in `reconcile_context`.
+    project_id = project_config.canonical_project_id(task.get("project"))
     cfg = project_config.get_project_config(project_id) if project_id else None
     repository_path = task.get("workspace_path") or (cfg.get("repository_path") if cfg else None)
 
@@ -273,9 +287,12 @@ def _apply_open_run(root: Path, ctx: WorkspaceContext, command: OpenRun) -> Work
     matched_task = next((t for t in tasks if t.get("current_run_id") == command.run_id), None)
     if matched_task is not None:
         updates["selected_task_id"] = matched_task.get("id")
-        updates["active_project"] = matched_task.get("project")
+        # Canonical id (shared helper) so a display-name task/run sets a
+        # canonical `active_project` that survives `models.PROJECT_IDS`
+        # reconciliation instead of being nulled out.
+        updates["active_project"] = project_config.canonical_project_id(matched_task.get("project"))
     elif run.get("project"):
-        updates["active_project"] = run.get("project")
+        updates["active_project"] = project_config.canonical_project_id(run.get("project"))
     return dataclasses.replace(ctx, **updates)
 
 

@@ -42,7 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import agent_runner, launch, launch_service, models, storage
+from command_center import agent_runner, launch, launch_service, models, project_config, storage
 
 QUEUE_FILE_NAME = "execution_queue.json"
 
@@ -249,7 +249,11 @@ def launch_ready(
             results.append(LaunchAttemptResult(entry["id"], task_id, False, message="задача не найдена"))
             continue
 
-        cfg = project_configs.get(task.get("project"), {})
+        # `project_configs` is keyed by canonical id, but a task may store a
+        # display name / alias — resolve to the canonical id (shared helper) so
+        # a display-name task still finds its repository_path/default workspace
+        # instead of silently launching against an empty `{}` config.
+        cfg = project_configs.get(project_config.canonical_project_id(task.get("project")), {})
         selection = launch.resolve_workspace_path(task=task, project_config=cfg)
         if not selection.path:
             results.append(

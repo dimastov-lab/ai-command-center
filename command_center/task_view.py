@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from command_center import git_info, models
+from command_center import git_info, models, project_config
 
 
 DEFAULT_TASK_PRIORITY = "Medium"
@@ -54,11 +54,24 @@ def filter_kanban_tasks(
     """Tasks visible on the Kanban board for the given project and selected
     priorities. `project=None` means "all projects". Pure — the exact
     predicate `app.py` applies, extracted so it is regression-testable
-    without Streamlit."""
+    without Streamlit.
+
+    The project comparison is done on canonical project ids, not raw strings:
+    the Kanban project selector emits canonical `models.PROJECT_IDS` values
+    (e.g. `"AICC"`), but a task's stored `project` may be a display name or
+    alias (`AICC-CI-001` carries `"AI Command Center"`). Comparing the raw
+    strings dropped every such task the moment a project was selected —
+    present in `tasks.json`, rendered on the "all projects" board, yet
+    invisible under its own project lane (AICC-UI-001). Normalizing both
+    sides via `project_config.normalize_project_id` makes id, display name,
+    and alias all resolve to the same lane. The canonicalization lives in the
+    single shared `project_config.project_matches` helper every project-scoped
+    filter/counter/ranking in the app now routes through, so they can never
+    drift apart again."""
     return [
         task
         for task in tasks
-        if (project is None or task.get("project") == project)
+        if project_config.project_matches(task.get("project"), project)
         and task.get("priority", DEFAULT_TASK_PRIORITY) in priorities
     ]
 
