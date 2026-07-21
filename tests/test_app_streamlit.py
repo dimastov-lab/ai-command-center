@@ -234,6 +234,129 @@ def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
     assert any("не настроен" in message for message in errors)
 
 
+# --------------------------------------------------------------------------
+# AICC-UI-001: a task whose `project` field holds a display name renders under
+# its canonical project lane, not only on the "all projects" board.
+# --------------------------------------------------------------------------
+
+
+def test_kanban_renders_display_name_task_under_canonical_project_lane():
+    """End-to-end proof for AICC-UI-001. AICC-CI-001 stores its `project` as
+    the display name "AI Command Center", but the Kanban project selector
+    emits the canonical id "AICC". Before the fix the task rendered on the
+    "all projects" board yet vanished the moment the AICC pill was selected —
+    "not rendered anywhere" from the user working inside their project. This
+    seeds that exact shape, selects the AICC pill, and asserts the card's
+    title is actually rendered."""
+    task = _seed_task(
+        id="AICC-CI-001",
+        project="AI Command Center",  # display name, not the canonical "AICC" id
+        title="Main Branch Protection and Required CI Checks",
+        priority="P0",  # also non-canonical — guards the earlier priority fix too
+        status="Backlog",
+    )
+    # Select the canonical "AICC" project pill (what the selector actually emits).
+    at = _at_on_page("kanban", kanban_project_selector_pills="AICC")
+    assert not at.exception
+    rendered = "\n".join(node.value for node in at.markdown)
+    assert task["title"] in rendered, (
+        "AICC-CI-001 (project stored as display name 'AI Command Center') is not "
+        "rendered under the canonical 'AICC' Kanban lane"
+    )
+
+
+def test_kanban_display_name_task_hidden_under_a_different_project_lane():
+    """Control for the fix above: the normalization must not make the task
+    match *every* lane — selecting an unrelated project (AIOS) must still hide
+    an AICC task."""
+    task = _seed_task(
+        id="AICC-CI-001",
+        project="AI Command Center",
+        title="Main Branch Protection and Required CI Checks",
+        priority="P0",
+        status="Backlog",
+    )
+    at = _at_on_page("kanban", kanban_project_selector_pills="AIOS")
+    assert not at.exception
+    rendered = "\n".join(node.value for node in at.markdown)
+    assert task["title"] not in rendered
+
+
+def _seed_tasks(tasks: list[dict]) -> None:
+    """Seed a *list* of tasks (the single-task `_seed_task` overwrites with one
+    record). Each task gets the default workflow fields unless overridden."""
+    data_dir = Path(os.environ["AICC_DATA_DIR"])
+    seeded = []
+    for overrides in tasks:
+        task = {
+            "id": "t",
+            "project": "AIOS",
+            "title": "seeded",
+            "task_type": "implementation",
+            "status": "Backlog",
+            "priority": "Medium",
+            "owner": "",
+            "estimate_hours": 0.0,
+            "depends_on": [],
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        }
+        task.update(models.default_task_workflow_fields())
+        task.update(overrides)
+        seeded.append(task)
+    storage.atomic_write_json(data_dir / "tasks.json", seeded)
+
+
+def test_kanban_lane_pill_and_intelligence_strip_agree_for_display_name_tasks():
+    """End-to-end cross-component consistency for AICC-UI-001's remediation.
+
+    Seeds two AICC tasks — one storing the canonical id "AICC", one storing the
+    display name "AI Command Center" — plus an unrelated AIOS task, then selects
+    the canonical "AICC" pill. All three project-scoped views on the Kanban page
+    must agree that AICC has *two* tasks:
+
+      * the Kanban lane renders both AICC card titles (and not the AIOS one);
+      * the project-intelligence strip's "Осталось" (remaining) metric reads 2;
+      * the "AICC" project pill's own count reads 2.
+
+    Before the remediation the lane/pill were fixed to count the display-name
+    task but the strip still undercounted it — the pill/lane said 2 while the
+    strip directly above them said 1. This asserts the three can never disagree
+    again."""
+    _seed_tasks(
+        [
+            {"id": "AICC-CI-001", "project": "AI Command Center", "title": "Display-name AICC task",
+             "priority": "P0", "status": "Backlog"},
+            {"id": "AICC-X-002", "project": "AICC", "title": "Canonical AICC task",
+             "priority": "High", "status": "Backlog"},
+            {"id": "AIOS-1", "project": "AIOS", "title": "Unrelated AIOS task",
+             "priority": "High", "status": "Backlog"},
+        ]
+    )
+    at = _at_on_page("kanban", kanban_project_selector_pills="AICC")
+    assert not at.exception
+
+    rendered = "\n".join(node.value for node in at.markdown)
+    # Lane: both AICC tasks render, the AIOS one does not.
+    assert "Display-name AICC task" in rendered
+    assert "Canonical AICC task" in rendered
+    assert "Unrelated AIOS task" not in rendered
+
+    # Intelligence strip: the "Осталось" (remaining, = active count) metric must
+    # equal the two rendered AICC cards, not undercount the display-name one.
+    remaining = next(m for m in at.metric if m.label == "Осталось")
+    assert remaining.value == "2", (
+        f"intelligence strip 'Осталось' reads {remaining.value!r} but the AICC lane renders 2 cards"
+    )
+
+    # Pill: the "AICC" pill label carries its own count (the selector formats
+    # the canonical "AICC" option with its display name "AI Command Center"),
+    # which must also be 2.
+    pill_labels = at.pills[0].options
+    aicc_label = next(label for label in pill_labels if label.startswith("AI Command Center ·"))
+    assert aicc_label.endswith("· 2"), f"AICC pill label {aicc_label!r} disagrees with the 2-card lane"
+
+
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
     """`disabled=` on the launch button is the primary gate, but
     `streamlit.testing.v1.AppTest.click()` does not itself respect

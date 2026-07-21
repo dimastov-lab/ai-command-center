@@ -26,9 +26,16 @@ def render_project_selector(tasks: list[dict], *, key: str = "project_selector")
     rest_group = sorted((p for p in models.PROJECT_IDS if p not in top_group), key=models.PROJECT_IDS.index)
     options = [ALL_PROJECTS_LABEL, *top_group, *rest_group]
 
+    # Count on canonical ids, not raw strings: a task may store a display name
+    # or alias (`AICC-CI-001` -> "AI Command Center") rather than the canonical
+    # id ("AICC"). Counting the raw value undercounts the pill and, worse, would
+    # disagree with `task_view.filter_kanban_tasks` (which matches on canonical
+    # ids) — the pill would read "8" while the lane renders 14 cards. Both route
+    # through the same `project_config.canonical_project_id` helper so the pill
+    # count and the lane can never drift apart.
     counts = {project_id: 0 for project_id in models.PROJECT_IDS}
     for task in tasks:
-        project = task.get("project")
+        project = project_config.canonical_project_id(task.get("project"))
         if project in counts:
             counts[project] += 1
 

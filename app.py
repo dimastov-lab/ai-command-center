@@ -1997,7 +1997,12 @@ if page_key == "dashboard":
     with left:
         st.markdown("#### Активные задачи по проекту")
         for project in models.PROJECT_IDS:
-            project_active = [task for task in active_tasks if task.get("project") == project]
+            # Canonical-id match (shared helper) so a task storing a display
+            # name ("AI Command Center") is counted under its project ("AICC"),
+            # consistent with the Kanban lane, pill, and intelligence strip.
+            project_active = [
+                task for task in active_tasks if project_config.project_matches(task.get("project"), project)
+            ]
             with st.container(border=True):
                 st.markdown(f"**{project}** · {len(project_active)}")
                 if not project_active:

@@ -270,6 +270,45 @@ def normalize_project_id(raw: str | None) -> str | None:
     return PROJECT_NAME_ALIASES.get(key)
 
 
+def canonical_project_id(value: str | None) -> str | None:
+    """The single canonical-id function every project-scoped filter, counter,
+    ranking, and grouping in the app must use to compare a task's/run's stored
+    `project` against a selected project id.
+
+    It is `normalize_project_id` with a raw-value fallback: a resolvable name
+    (canonical id, display name, or alias — `"AICC"`, `"AI Command Center"`,
+    `"ai command center"`) collapses to its canonical `models.PROJECT_IDS` id,
+    while a genuinely unknown value falls back to itself so it still matches
+    only itself exactly and is never silently broadened onto a real lane.
+
+    Crucially this is the identity on already-canonical ids, so applying it at
+    a comparison site that already only ever saw canonical ids changes nothing
+    there — it only *additionally* makes display-name/alias values line up.
+    That is why it can be dropped in at every project comparison uniformly.
+
+    Root cause it fixes (AICC-UI-001): eight tasks store a display name
+    (`AICC-CI-001` -> `"AI Command Center"`) while the project selector emits
+    the canonical id (`"AICC"`). Comparing raw strings dropped those tasks from
+    their own project lane, undercounted every per-project pill/metric, and
+    excluded them from recommendations — present in `tasks.json`, invisible to
+    anyone working inside their project. Normalizing both sides of every such
+    comparison through this one helper keeps the Kanban lane, the pill count,
+    the project-intelligence strip, and the recommendation inputs in exact
+    agreement.
+    """
+    return normalize_project_id(value) or value
+
+
+def project_matches(stored: str | None, selected: str | None) -> bool:
+    """Whether a task/run whose stored `project` is `stored` belongs to the
+    `selected` project filter. `selected is None` means "all projects" and
+    always matches. Otherwise both sides are compared on canonical ids via
+    `canonical_project_id`, so a display name matches its canonical id."""
+    if selected is None:
+        return True
+    return canonical_project_id(stored) == canonical_project_id(selected)
+
+
 def save_project_settings(project_id: str, **fields: object) -> None:
     """Generic setter for any subset of `OVERRIDABLE_FIELDS` — the Projects
     settings UI's single save action for Default Workspace/Branch/Executor/
