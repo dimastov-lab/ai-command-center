@@ -26,3 +26,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+
+# Local virtual environments (machine-specific — e.g. the desktop PySide6 venv)
+.venv/
+.venv-*/
+venv/
