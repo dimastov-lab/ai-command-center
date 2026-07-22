@@ -11,6 +11,10 @@ without needing a new script per scenario:
   already a JSON string (so a test can also ask for a deliberately malformed
   line by including plain non-JSON text here). Defaults to a small realistic
   stream-json sequence.
+- `FAKE_CLAUDE_INITIAL_DELAY`: seconds to sleep *before* emitting the first
+  line (default 0) — simulates a spawned, alive process that produces no early
+  stdout (a late handshake). Distinct from `FAKE_CLAUDE_DELAY` (between lines)
+  and `FAKE_CLAUDE_EXTRA_SLEEP` (after the last line).
 - `FAKE_CLAUDE_DELAY`: seconds to sleep between lines (default 0.05).
 - `FAKE_CLAUDE_EXIT_CODE`: process exit code (default 0).
 - `FAKE_CLAUDE_STDERR`: a line to print to stderr before exiting, if set.
@@ -46,6 +50,10 @@ def main() -> int:
     lines_env = os.environ.get("FAKE_CLAUDE_LINES")
     lines = json.loads(lines_env) if lines_env else DEFAULT_LINES
     delay = float(os.environ.get("FAKE_CLAUDE_DELAY", "0.05"))
+
+    initial_delay = float(os.environ.get("FAKE_CLAUDE_INITIAL_DELAY", "0"))
+    if initial_delay:
+        time.sleep(initial_delay)
 
     for line in lines:
         print(line)

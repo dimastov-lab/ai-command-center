@@ -26,7 +26,9 @@ from command_center import git_info
 # --------------------------------------------------------------------------
 
 STATUS_LAUNCHING = "Launching"
+STATUS_STARTING = "Starting"
 STATUS_RUNNING = "Running"
+STATUS_STALE = "Stale"
 STATUS_WAITING = "Waiting"
 STATUS_REQUIRES_ATTENTION = "Requires Attention"
 STATUS_BLOCKED = "Blocked"
@@ -35,7 +37,21 @@ STATUS_COMPLETED = "Completed"
 STATUS_FAILED = "Failed"
 STATUS_CANCELLED = "Cancelled"
 
-ACTIVE_DISPLAY_STATUSES: frozenset[str] = frozenset({STATUS_LAUNCHING, STATUS_RUNNING, STATUS_WAITING})
+ACTIVE_DISPLAY_STATUSES: frozenset[str] = frozenset(
+    {STATUS_LAUNCHING, STATUS_STARTING, STATUS_RUNNING, STATUS_STALE, STATUS_WAITING}
+)
+
+# A live OS process either exists or provably existed a moment ago for every
+# one of these — the run is spawned and not terminal. `STATUS_STARTING` (PID
+# valid, no output yet) and `STATUS_STALE` (PID valid, liveness probe momentarily
+# old) are *warnings about a running process*, never failures: the UI treats
+# all three exactly like `STATUS_RUNNING` for cancel/heartbeat affordances, and
+# `task_sync` keeps their task non-terminal. This is the concrete guard behind
+# "a successfully spawned process must never be recorded Failed just because
+# early output / a fresh probe has not arrived yet."
+LIVE_PROCESS_DISPLAY_STATUSES: frozenset[str] = frozenset(
+    {STATUS_STARTING, STATUS_RUNNING, STATUS_STALE}
+)
 # `STATUS_BLOCKED`/`STATUS_INCOMPLETE` are terminal too — the process has
 # already exited (see `runtime.outcome`'s `EvaluatingResult` stage, which is
 # what produces these out of a `FAILED`-state run's `failure_reason`), it
@@ -54,7 +70,17 @@ _INCOMPLETE_REASON_PREFIX = "incomplete:"
 DEFAULT_HEARTBEAT_STALE_SECONDS = 90.0
 
 
-def derive_status(run: dict) -> str:
+def is_awaiting_handshake(run: dict) -> bool:
+    """`True` for a run whose process is spawned and RUNNING but has not yet
+    produced any output (`first_output_at` is unset) — the "started but early
+    output not yet received" window. Used to distinguish `STATUS_STARTING`
+    from `STATUS_RUNNING`. Never `True` for a terminal run (that a run
+    completed/failed/was cancelled without ever emitting output is decided on
+    exit facts, not on this flag)."""
+    return run.get("state") == "RUNNING" and not run.get("first_output_at")
+
+
+def derive_status(run: dict, *, awaiting_handshake: bool = False, heartbeat_stale: bool = False) -> str:
     """Maps `run["state"]` (+ `cancel_requested`/`failure_reason`) to the
     mission's display vocabulary. `INTERRUPTED`/`UNKNOWN`/any unrecognized
     state is conservatively mapped to `Requires Attention` — this module
@@ -68,12 +94,36 @@ def derive_status(run: dict) -> str:
     exits that did not deliver the requested work, but the reason differs
     (a denied tool call / explicit blocker language, vs. a clean exit that
     simply didn't produce the required repository changes) and the UI must
-    be able to tell them apart (Required fix 7)."""
+    be able to tell them apart (Required fix 7).
+
+    `awaiting_handshake`/`heartbeat_stale` are **opt-in** refinements of the
+    `RUNNING` case only, and both default to `False` so every existing
+    single-argument caller keeps its exact prior behavior (a plain RUNNING run
+    is still `Running`). When the live projection layer passes them:
+
+    - `heartbeat_stale=True` -> `STATUS_STALE`: the process is still recorded
+      RUNNING but the UI's liveness probe is momentarily old. A *warning about
+      a running process*, not a failure.
+    - `awaiting_handshake=True` -> `STATUS_STARTING`: a valid PID exists but no
+      output has arrived yet ("agent started but early output was not
+      received"). Also a warning, never a failure — this is exactly the state
+      a healthy-but-slow-to-first-token run occupies, and it must never be
+      shown as `Failed`.
+
+    Neither ever applies to a non-RUNNING state, and an explicit
+    `cancel_requested` still wins over both (a cancel in flight is `Waiting`,
+    regardless of handshake/probe)."""
     state = run.get("state", "UNKNOWN")
     if state in ("PREPARED", "QUEUED"):
         return STATUS_LAUNCHING
     if state == "RUNNING":
-        return STATUS_WAITING if run.get("cancel_requested") else STATUS_RUNNING
+        if run.get("cancel_requested"):
+            return STATUS_WAITING
+        if heartbeat_stale:
+            return STATUS_STALE
+        if awaiting_handshake:
+            return STATUS_STARTING
+        return STATUS_RUNNING
     if state == "COMPLETED":
         return STATUS_COMPLETED
     if state == "FAILED":
@@ -156,11 +206,19 @@ def build_session_view(
     latest_event: dict | None,
     report_path: str | None,
     now: datetime,
+    heartbeat_stale: bool = False,
 ) -> dict:
     """The canonical execution-session view model (mission field list). The
     only I/O performed here is one read-only `git status` call against the
-    run's own resolved workspace — never a switch/checkout/write."""
-    status = derive_status(run)
+    run's own resolved workspace — never a switch/checkout/write.
+
+    `heartbeat_stale` is the caller's (UI-owned) liveness-probe verdict for
+    this run — kept out of this pure module and passed in, exactly like
+    `project_overview` already takes `stale_run_ids`. When it is `True` for a
+    still-RUNNING run, `status` becomes `STATUS_STALE` (a warning about a
+    running process, never a failure)."""
+    awaiting_handshake = is_awaiting_handshake(run)
+    status = derive_status(run, awaiting_handshake=awaiting_handshake, heartbeat_stale=heartbeat_stale)
     started_at = run.get("started_at")
     finished_at = run.get("completed_at")
     workspace_path = run.get("repository_path")
@@ -195,6 +253,15 @@ def build_session_view(
         "process_id": run.get("pid"),
         "started_at": started_at,
         "finished_at": finished_at,
+        # Spawn confirmation vs. startup/handshake, kept as two distinct,
+        # explicit fields so the UI can say "started but early output not yet
+        # received" without re-deriving it: `process_id`/`started_at` prove
+        # the process was *created*; `first_output_at`/`handshake_received`
+        # prove it is *alive and talking*. `awaiting_handshake` is the window
+        # between the two.
+        "first_output_at": run.get("first_output_at"),
+        "handshake_received": bool(run.get("first_output_at")),
+        "awaiting_handshake": awaiting_handshake,
         "elapsed_seconds": elapsed_seconds(started_at, finished_at, now),
         "status": status,
         "current_stage": (kanban_task or {}).get("current_stage"),

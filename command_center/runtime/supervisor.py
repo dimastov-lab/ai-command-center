@@ -160,6 +160,16 @@ class _ActiveRun:
         # tell a timeout-triggered termination apart from an explicit,
         # human-confirmed cancellation when it decides the final state.
         self.timeout_triggered = threading.Event()
+        # Set the first time either reader thread sees a line of process
+        # output — the in-memory guard that makes the `first_output_at` /
+        # `handshake_received` write happen exactly once per run (see
+        # `_record_handshake`), without re-reading the run row on every line.
+        # `handshake_lock` makes the check-and-set atomic across the two
+        # concurrent reader threads, so a run whose stdout and stderr both
+        # produce their first line at the same instant still records the
+        # milestone exactly once.
+        self.handshake_recorded = threading.Event()
+        self.handshake_lock = threading.Lock()
 
 
 class Supervisor:
@@ -446,9 +456,69 @@ class Supervisor:
     # Streaming consumption (runs in background reader threads)
     # ------------------------------------------------------------------
 
-    def _drain_stdout(self, run_id: str, process: subprocess.Popen) -> None:
+    def _record_handshake(self, run_id: str, active: _ActiveRun) -> None:
+        """Record the "Claude startup/handshake" milestone — the first moment
+        the spawned process produced *any* output — exactly once per run.
+
+        This is deliberately separate from `process_started` (the moment
+        `Popen` returned a live PID, item 1 of the mission's lifecycle
+        separation): a valid PID proves the process was *created*, the first
+        line of output proves it is *alive and talking* (item 2). The gap
+        between the two is exactly the window in which a run is "started but
+        early output not yet received" — surfaced to the UI as
+        `session_view.STATUS_STARTING`, never as a failure.
+
+        Best-effort and non-fatal by construction:
+
+        - Guarded by an in-memory `threading.Event` so it runs once even
+          though both reader threads (stdout and stderr) call it, and without
+          re-reading the run row for every subsequent line.
+        - Any database error (a lost compare-and-set race against a
+          concurrent `cancel()`/watchdog write, the run already gone, ...) is
+          swallowed. Handshake timing is observability, not correctness — it
+          must never crash a reader thread or fail a run, and the run's
+          terminal state is decided entirely from process-exit facts
+          regardless of whether this ever succeeded.
+
+        The append-only `handshake_received` lifecycle event is written first
+        (it touches only `run_event`, never `run.version`, so it never races
+        anything), then the `first_output_at` column is set best-effort so the
+        live projection layer (`session_view.derive_status`), which reads only
+        the run row, can tell STARTING from RUNNING.
+        """
+        with active.handshake_lock:
+            if active.handshake_recorded.is_set():
+                return
+            # Claim the milestone first, atomically: even if the DB writes
+            # below fail or race, we must never spin re-attempting on every
+            # line, nor let the other reader thread also claim it.
+            active.handshake_recorded.set()
+        now = iso_now()
+        try:
+            db.append_run_event(
+                self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("handshake_received", at=now)["payload"]
+            )
+        except Exception:
+            pass
+        try:
+            run = db.get_run(self.db_path, run_id)
+            if run is None or run.get("first_output_at"):
+                return
+            db.update_run_fields(
+                self.db_path, run_id, expected_version=run["version"], fields={"first_output_at": now}
+            )
+        except Exception:
+            # LostUpdateError (a concurrent cancel/terminal write landed
+            # first), KeyError (run gone), or any other db hiccup — the
+            # milestone is best-effort; the append-only event above already
+            # captured the timing for the audit log.
+            pass
+
+    def _drain_stdout(self, run_id: str, active: _ActiveRun) -> None:
+        process = active.process
         try:
             for line in process.stdout:
+                self._record_handshake(run_id, active)
                 event = stream_parser.parse_stream_line(line)
                 if event is None:
                     continue
@@ -459,9 +529,11 @@ class Supervisor:
             except Exception:
                 pass
 
-    def _drain_stderr(self, run_id: str, process: subprocess.Popen) -> None:
+    def _drain_stderr(self, run_id: str, active: _ActiveRun) -> None:
+        process = active.process
         try:
             for line in process.stderr:
+                self._record_handshake(run_id, active)
                 event = stream_parser.stderr_event(line)
                 db.append_run_event(self.db_path, run_id, event["event_type"], event["payload"])
         finally:
@@ -484,8 +556,8 @@ class Supervisor:
 
     def _supervise(self, run_id: str, active: _ActiveRun, repo_path: Path) -> None:
         process = active.process
-        stdout_thread = threading.Thread(target=self._drain_stdout, args=(run_id, process), daemon=True)
-        stderr_thread = threading.Thread(target=self._drain_stderr, args=(run_id, process), daemon=True)
+        stdout_thread = threading.Thread(target=self._drain_stdout, args=(run_id, active), daemon=True)
+        stderr_thread = threading.Thread(target=self._drain_stderr, args=(run_id, active), daemon=True)
         stdout_thread.start()
         stderr_thread.start()
 
