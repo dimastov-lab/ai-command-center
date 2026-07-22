@@ -352,10 +352,16 @@ def test_launcher_launches_claude_against_task_workspace_not_project_repository(
     project_repo.mkdir()
     _init_repo(project_repo)
 
+    # The task's workspace is a real *isolated worktree* of the project repo on
+    # its own feature branch — what an isolated task workspace actually is. The
+    # workspace-isolation gate verifies it belongs to the project repo and is on
+    # the expected branch, so an unrelated repo standing in for it (the previous
+    # setup) is correctly rejected now.
     task_workspace = tmp_path / "aios-p1-deployment"
-    task_workspace.mkdir()
-    _init_repo(task_workspace)
-    subprocess.run(["git", "checkout", "-q", "-b", "feature/p1-7-deployment"], cwd=task_workspace, check=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/p1-7-deployment", str(task_workspace), "HEAD"],
+        cwd=project_repo, check=True, capture_output=True, text=True,
+    )
 
     project_config.save_repository_path("AIOS", str(project_repo))
     fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(

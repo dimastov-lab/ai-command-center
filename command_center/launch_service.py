@@ -23,7 +23,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from command_center import activity_log, agent_runner, executors, launch, models, report_parser, workflow
+from command_center import (
+    activity_log,
+    agent_runner,
+    executors,
+    launch,
+    models,
+    report_parser,
+    workflow,
+    workspace_provisioning,
+)
 from command_center.runtime import db as runtime_db
 
 
@@ -188,6 +197,10 @@ def execute_agent_launch_v2(
     executor_id: str = "claude_code",
     validation: launch.LaunchValidation | None = None,
     expected_branch: str | None = None,
+    base_branch: str | None = None,
+    source_repository_path: str | None = None,
+    status_policy: str = workspace_provisioning.STATUS_POLICY_ALLOW_DIRTY,
+    provision_workspace: bool = True,
     on_task_state_changed: Callable[[], None] | None = None,
 ) -> dict:
     """Async counterpart to `execute_agent_launch` above — same pre-launch
@@ -202,6 +215,18 @@ def execute_agent_launch_v2(
     before any subprocess is spawned — if the task already has an active
     run, or if any other active run is already using this exact resolved
     workspace.
+
+    When `provision_workspace` is true (the default), the resolved workspace
+    (`repository_path`) is provisioned if absent and then verified against
+    `expected_branch`/`base_branch`/`source_repository_path`/`status_policy`
+    via `command_center.workspace_provisioning` *before* any task state is
+    mutated. A failed check raises a structured
+    `workspace_provisioning.WorkspaceVerificationError` (here) or
+    `supervisor.WorkspaceVerificationFailed` (at the `start_raw` chokepoint) —
+    the run never starts and the workspace never silently falls back to the
+    source repository. `source_repository_path` is the project's canonical
+    repository (used to prove the worktree belongs to it and to create it);
+    `base_branch` is where a new feature/audit worktree is forked from.
 
     `execute_agent_launch` (old, synchronous) is left completely untouched —
     this is a pure addition, not a replacement, so anything not yet bridged
@@ -218,6 +243,28 @@ def execute_agent_launch_v2(
             f"this task or workspace (`{resolved_workspace}`). Wait for it to finish or cancel it "
             "before launching again."
         )
+
+    # Provision + verify the isolated worktree *before* any task state is
+    # mutated (so "Workspace Verified" — set by `launch.begin_launch` below —
+    # is never reached on a failed workspace) and *before* the run is started.
+    # The same spec is forwarded to `start_run` -> `start_raw`, whose gate is
+    # the authoritative fail-closed chokepoint; verifying here as well means a
+    # bad workspace is rejected with zero side effects, not after a run row and
+    # activity-log entries already exist. Raises
+    # `workspace_provisioning.WorkspaceVerificationError` (structured) — or, at
+    # the `start_raw` gate, `supervisor.WorkspaceVerificationFailed` — on any
+    # failed check; neither is caught here, so a failed launch never proceeds.
+    workspace_verification: workspace_provisioning.WorkspaceSpec | None = None
+    if provision_workspace:
+        workspace_verification = workspace_provisioning.WorkspaceSpec(
+            workspace_path=str(repository_path),
+            expected_branch=expected_branch,
+            base_branch=base_branch,
+            repository_path=source_repository_path,
+            task_type=task_type,
+            status_policy=status_policy,
+        )
+        workspace_provisioning.provision_and_verify(workspace_verification)
 
     if task is not None:
         models.push_prompt_history(task, prompt)
@@ -255,7 +302,18 @@ def execute_agent_launch_v2(
         # `render_agent_launcher`, already refuses to reach this call at all
         # when `not validation.can_launch`, but this must hold regardless of
         # caller discipline).
-        repository_already_validated=bool(validation is not None and validation.can_launch),
+        # A passed `workspace_verification` is a strictly stronger check than
+        # `agent_runner.validate_repository`'s project-repo-equality guard (it
+        # proves an isolated worktree of the configured repo on the expected
+        # branch), and it would *reject* a task's own worktree — whose path is
+        # deliberately not the project's configured `repository_path`. So a
+        # provisioned+verified workspace also counts as already-validated.
+        repository_already_validated=bool(
+            (validation is not None and validation.can_launch) or workspace_verification is not None
+        ),
+        # Re-verified at the `start_raw` chokepoint (fail-closed) — no launch
+        # path, present or future, can spawn the process without passing this.
+        workspace_verification=workspace_verification,
     )
 
     if task is not None:

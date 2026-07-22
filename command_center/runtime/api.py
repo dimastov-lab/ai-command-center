@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
+from command_center import workspace_provisioning
 from command_center.runtime import context_service, db, supervisor
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -61,6 +62,7 @@ class ExecutionCenterAPI:
         launch_source: str | None = None,
         prompt_version: int | None = None,
         repository_already_validated: bool = False,
+        workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -100,6 +102,7 @@ class ExecutionCenterAPI:
             launch_source=launch_source,
             prompt_version=prompt_version,
             repository_already_validated=repository_already_validated,
+            workspace_verification=workspace_verification,
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)

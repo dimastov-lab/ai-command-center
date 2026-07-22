@@ -258,6 +258,8 @@ def launch_ready(
             continue
 
         expected_branch = launch.resolve_expected_branch(task=task, project_config=cfg)
+        base_branch = launch.resolve_base_branch(task=task, project_config=cfg)
+        source_repository_path = cfg.get("repository_path")
         validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
         if not validation.can_launch:
             results.append(
@@ -293,6 +295,8 @@ def launch_ready(
                 executor_id=task.get("executor") or "claude_code",
                 validation=validation,
                 expected_branch=expected_branch,
+                base_branch=base_branch,
+                source_repository_path=source_repository_path,
             )
         except launch_service.DuplicateActiveLaunchError as exc:
             results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))

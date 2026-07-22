@@ -87,6 +87,19 @@ def resolve_expected_branch(*, task: dict | None, project_config: dict | None) -
     return (project_config or {}).get("default_branch") or None
 
 
+def resolve_base_branch(*, task: dict | None, project_config: dict | None) -> str | None:
+    """The branch a not-yet-existing feature/audit worktree should be created
+    *from*. Precedence: `task["base_branch"]` → `project_config["default_branch"]`
+    → `None`. Consumed by `command_center.workspace_provisioning` to run
+    `git worktree add -b <expected_branch> <path> <base_branch>` when the
+    workspace is absent — it is never the branch the agent runs on (that is
+    `resolve_expected_branch`), only the point it forks from."""
+    task_base = (task or {}).get("base_branch")
+    if task_base:
+        return task_base
+    return (project_config or {}).get("default_branch") or None
+
+
 @dataclass
 class LaunchValidation:
     errors: list[str] = field(default_factory=list)

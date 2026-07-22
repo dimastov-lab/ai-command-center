@@ -27,6 +27,7 @@ from command_center import (
     tasks_repository,
     workflow,
     workspace_home,
+    workspace_provisioning,
 )
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
@@ -698,6 +699,7 @@ def render_agent_launcher(
             full_prompt = f"{prompt}\n\n## Дополнительный контекст (предоставлен пользователем)\n\n{extra_context.strip()}"
 
         expected_branch = launch.resolve_expected_branch(task=task_for_launch, project_config=cfg)
+        base_branch = launch.resolve_base_branch(task=task_for_launch, project_config=cfg)
         validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
         actual_branch = (validation.git_status or {}).get("branch") if validation.git_status else None
 
@@ -792,12 +794,34 @@ def render_agent_launcher(
                 executor_id="claude_code",
                 validation=validation,
                 expected_branch=expected_branch,
+                base_branch=base_branch,
+                source_repository_path=repo_path,
                 on_task_state_changed=(
                     (lambda: tasks_repository.upsert_task(ROOT, task_for_launch))
                     if task_for_launch is not None
                     else None
                 ),
             )
+        except (
+            workspace_provisioning.WorkspaceVerificationError,
+            runtime_supervisor.WorkspaceVerificationFailed,
+        ) as exc:
+            # Fail closed: the workspace did not verify (wrong branch, not an
+            # isolated worktree, belongs to another repo, ...). The agent was
+            # never started; show the structured failure so the operator can
+            # fix it, and never fall back to the main repository.
+            structured = exc.structured if isinstance(exc, runtime_supervisor.WorkspaceVerificationFailed) else exc.as_dict()
+            st.error("Запуск заблокирован: workspace не прошёл обязательную проверку изоляции.")
+            st.markdown(
+                f"- Проваленная проверка: `{structured['failed_step']}`\n"
+                f"- Ожидаемый workspace: `{structured['expected_workspace']}`\n"
+                f"- Фактический workspace: `{structured.get('actual_workspace') or '—'}`\n"
+                f"- Ожидаемая ветка: `{structured.get('expected_branch') or '—'}`\n"
+                f"- Фактическая ветка: `{structured.get('actual_branch') or '—'}`\n"
+                f"- Причина: {structured.get('detail') or '—'}\n"
+                f"- Рекомендация: {structured.get('remediation') or '—'}"
+            )
+            return
         except (
             runtime_context_service.ConfirmationRequiredError,
             agent_runner.RunnerError,
