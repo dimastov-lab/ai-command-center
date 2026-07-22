@@ -20,9 +20,11 @@ implies progress == 100" and the literal shape of the reported defect
 
 from __future__ import annotations
 
-from command_center import models, report_parser
+from command_center import models, project_config, report_parser
+from command_center.runtime import completion as completion_states
 from command_center.runtime import db, reports, session_view
 from command_center.runtime.api import ExecutionCenterAPI
+from command_center.runtime.completion_service import CompletionOrchestrator
 
 # Session-view display status -> Kanban `models.LAUNCH_STATUSES` value, for
 # every status *except* `STATUS_COMPLETED` — a genuinely-completed run does
@@ -168,6 +170,94 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     return mutated
 
 
+# Completion-pipeline state -> Kanban `launch_status`. Once a run has a
+# completion row, the completion pipeline (not the raw run outcome) governs the
+# user-facing status: a finished process is "Needs Review" until something
+# actually advances it, "Running" only while the pipeline is *actively*
+# advancing (validating), "Needs Review" while a PR is open/merging/finalizing,
+# and only "Completed" once the change is verified in the target branch. Closed-
+# unmerged / validation-failed / blocked all surface as "Requires Attention".
+#
+# `EXECUTION_FINISHED` is the seed state every completion row is born in. It
+# means the Claude *process* has exited (a completion row is only ever created
+# for a terminal, `COMPLETED` run) — it is NOT evidence of any live activity.
+# With the completion autopilot disabled (the default; see
+# `Supervisor.start_completion_autopilot`), nothing advances the row past this
+# seed, so mapping it to "Running" would strand a finished, PR-ready task as
+# perpetually "Running" — a persisted, user-visible regression that conflates
+# execution activity with engineering-lifecycle progress. It therefore projects
+# to the honest, actionable "Needs Review" (matching the raw-run projection a
+# completed run already resolves to), preserving default behavior. When the
+# autopilot IS enabled, the row leaves `EXECUTION_FINISHED` within a tick and
+# surfaces the genuinely-active "Running"/"Needs Review" states below.
+_LAUNCH_STATUS_BY_COMPLETION_STATE: dict[str, str] = {
+    completion_states.CompletionState.EXECUTION_FINISHED: "Needs Review",
+    completion_states.CompletionState.VALIDATING_RESULT: "Running",
+    completion_states.CompletionState.RESULT_VALID: "Running",
+    completion_states.CompletionState.PREPARING_PULL_REQUEST: "Running",
+    completion_states.CompletionState.RECOVERY_PENDING: "Running",
+    completion_states.CompletionState.PULL_REQUEST_OPEN: "Needs Review",
+    completion_states.CompletionState.AWAITING_MERGE: "Needs Review",
+    completion_states.CompletionState.MERGED: "Needs Review",
+    completion_states.CompletionState.VERIFYING_TARGET_BRANCH: "Needs Review",
+    completion_states.CompletionState.COMPLETED: "Completed",
+    completion_states.CompletionState.VALIDATION_FAILED: "Requires Attention",
+    completion_states.CompletionState.PR_CLOSED_UNMERGED: "Requires Attention",
+    completion_states.CompletionState.MERGE_BLOCKED: "Requires Attention",
+    completion_states.CompletionState.REQUIRES_ATTENTION: "Requires Attention",
+    completion_states.CompletionState.RECOVERY_FAILED: "Requires Attention",
+}
+
+
+def sync_task_from_completion(task: dict, completion: dict) -> bool:
+    """Project a completion row onto its task. Once seeded, the completion
+    pipeline is the authority for `launch_status`; on terminal success it also
+    advances the task to stage "Merged"/progress 100 and sets
+    `pull_request_status="merged"` (the field `recommend.py` reads for
+    dependency gating). Returns whether the task was mutated."""
+    state = completion["completion_state"]
+    mutated = False
+
+    pr_url = completion.get("pull_request_url")
+    if pr_url and task.get("pull_request_url") != pr_url:
+        task["pull_request_url"] = pr_url
+        mutated = True
+
+    if state == completion_states.CompletionState.COMPLETED:
+        if (task.get("progress") or 0) < 100:
+            models.set_current_stage(task, "Merged")
+            models.append_timeline_event(task, "completed", "Merged into target branch (completion pipeline).")
+            mutated = True
+        if task.get("pull_request_status") != "merged":
+            task["pull_request_status"] = "merged"
+            mutated = True
+
+    target = _LAUNCH_STATUS_BY_COMPLETION_STATE.get(state)
+    if target and task.get("launch_status") != target:
+        task["launch_status"] = target
+        mutated = True
+
+    if mutated:
+        task["updated_at"] = models.iso_now()
+    return mutated
+
+
+def _seed_and_project_completion(api: ExecutionCenterAPI, task: dict, run: dict) -> bool:
+    """Ensure a completion row exists for a terminally-completed run (seeding is
+    cheap and DB-only — it never runs validation or touches GitHub; that
+    happens in the Supervisor's completion autopilot), then project its state
+    onto the task. No-op for runs that did not complete successfully."""
+    completion = db.get_completion(api.db_path, run["id"])
+    if completion is None:
+        if run.get("state") != "COMPLETED":
+            return False
+        cfg = project_config.get_project_config(run["project"])
+        completion = CompletionOrchestrator(api.db_path).begin_completion(run, task=task, project_cfg=cfg)
+        if completion is None:
+            return False
+    return sync_task_from_completion(task, completion)
+
+
 def reconcile_and_sync(api: ExecutionCenterAPI, tasks: list[dict]) -> list[dict]:
     """Reconciles every persisted `RUNNING` row against real OS processes
     (`Supervisor.reconcile()`, already implemented and tested — never
@@ -185,6 +275,10 @@ def reconcile_and_sync(api: ExecutionCenterAPI, tasks: list[dict]) -> list[dict]
         run = api.get_run(run_id)
         if run is None:
             continue
-        if sync_task_from_run(task, run, db_path=api.db_path):
+        changed = sync_task_from_run(task, run, db_path=api.db_path)
+        # Seed + project the completion pipeline (post-execution lifecycle).
+        if _seed_and_project_completion(api, task, run):
+            changed = True
+        if changed:
             mutated.append(task)
     return mutated

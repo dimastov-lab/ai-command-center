@@ -198,6 +198,67 @@ def _summarize_event(event: dict | None) -> dict | None:
     return {"summary": summary[:200] if summary else event_type, "at": event.get("created_at")}
 
 
+# Completion-pipeline state -> compact, human display label for the Execution
+# Center card. This is a pure projection: the UI reads `session["completion"]`
+# and renders it; it never derives completion decisions itself.
+_COMPLETION_DISPLAY_BY_STATE: dict[str, str] = {
+    "EXECUTION_FINISHED": "Process finished",
+    "VALIDATING_RESULT": "Verifying",
+    "RESULT_VALID": "Verifying",
+    "PREPARING_PULL_REQUEST": "Preparing PR",
+    "PULL_REQUEST_OPEN": "In Review",
+    "AWAITING_MERGE": "Awaiting merge",
+    "MERGE_BLOCKED": "Merge blocked",
+    "MERGED": "Finalizing",
+    "VERIFYING_TARGET_BRANCH": "Finalizing",
+    "COMPLETED": "Done",
+    "VALIDATION_FAILED": "Requires Attention",
+    "PR_CLOSED_UNMERGED": "Requires Attention",
+    "REQUIRES_ATTENTION": "Requires Attention",
+    "RECOVERY_PENDING": "Recovering",
+    "RECOVERY_FAILED": "Requires Attention",
+}
+
+
+def completion_display_status(state: str | None) -> str:
+    """Compact human label for a completion state (e.g. `AWAITING_MERGE` ->
+    "Awaiting merge"). Distinguishes "Process finished" from "Done" — the whole
+    point of the pipeline."""
+    if not state:
+        return "—"
+    return _COMPLETION_DISPLAY_BY_STATE.get(state, state)
+
+
+def completion_view(completion: dict | None) -> dict | None:
+    """Flatten a `completion` DB row into the fields the Execution Center card
+    renders. Returns None when the run has no completion row yet. Renders safely
+    with any missing optional data (all fields default to None/—)."""
+    if not completion:
+        return None
+    state = completion.get("completion_state")
+    return {
+        "state": state,
+        "display": completion_display_status(state),
+        "is_done": state == "COMPLETED",
+        "requires_human": bool(completion.get("requires_human")),
+        "is_recoverable": bool(completion.get("is_recoverable")),
+        "reason_code": completion.get("last_reason_code"),
+        "recommended_action": completion.get("recommended_action"),
+        "branch": completion.get("branch"),
+        "base_branch": completion.get("base_branch"),
+        "head_commit": completion.get("head_commit"),
+        "pull_request_number": completion.get("pull_request_number"),
+        "pull_request_url": completion.get("pull_request_url"),
+        "pull_request_state": completion.get("pull_request_state"),
+        "replaced_pull_request_number": completion.get("replaced_pull_request_number"),
+        "merge_commit": completion.get("merge_commit"),
+        "validation_summary": completion.get("validation_summary"),
+        "last_checked_at": completion.get("last_checked_at"),
+        "next_retry_at": completion.get("next_retry_at"),
+        "retry_count": completion.get("retry_count"),
+    }
+
+
 def build_session_view(
     run: dict,
     *,
@@ -207,6 +268,7 @@ def build_session_view(
     report_path: str | None,
     now: datetime,
     heartbeat_stale: bool = False,
+    completion: dict | None = None,
 ) -> dict:
     """The canonical execution-session view model (mission field list). The
     only I/O performed here is one read-only `git status` call against the
@@ -275,6 +337,10 @@ def build_session_view(
         "commit_hash": run.get("commit_hash"),
         "pull_request_url": run.get("pull_request_url"),
         "latest_event": _summarize_event(latest_event),
+        # Post-execution completion pipeline (None until the run completes and a
+        # completion row is seeded). This is what lets the UI distinguish
+        # "process finished" from "task completed and merged".
+        "completion": completion_view(completion),
     }
 
 
