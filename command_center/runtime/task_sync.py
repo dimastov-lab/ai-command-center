@@ -172,12 +172,26 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
 
 # Completion-pipeline state -> Kanban `launch_status`. Once a run has a
 # completion row, the completion pipeline (not the raw run outcome) governs the
-# user-facing status: a finished process is "Running"/Verifying while the
-# pipeline validates, "Needs Review" while a PR is open/merging/finalizing, and
-# only "Completed" once the change is verified in the target branch. Closed-
+# user-facing status: a finished process is "Needs Review" until something
+# actually advances it, "Running" only while the pipeline is *actively*
+# advancing (validating), "Needs Review" while a PR is open/merging/finalizing,
+# and only "Completed" once the change is verified in the target branch. Closed-
 # unmerged / validation-failed / blocked all surface as "Requires Attention".
+#
+# `EXECUTION_FINISHED` is the seed state every completion row is born in. It
+# means the Claude *process* has exited (a completion row is only ever created
+# for a terminal, `COMPLETED` run) — it is NOT evidence of any live activity.
+# With the completion autopilot disabled (the default; see
+# `Supervisor.start_completion_autopilot`), nothing advances the row past this
+# seed, so mapping it to "Running" would strand a finished, PR-ready task as
+# perpetually "Running" — a persisted, user-visible regression that conflates
+# execution activity with engineering-lifecycle progress. It therefore projects
+# to the honest, actionable "Needs Review" (matching the raw-run projection a
+# completed run already resolves to), preserving default behavior. When the
+# autopilot IS enabled, the row leaves `EXECUTION_FINISHED` within a tick and
+# surfaces the genuinely-active "Running"/"Needs Review" states below.
 _LAUNCH_STATUS_BY_COMPLETION_STATE: dict[str, str] = {
-    completion_states.CompletionState.EXECUTION_FINISHED: "Running",
+    completion_states.CompletionState.EXECUTION_FINISHED: "Needs Review",
     completion_states.CompletionState.VALIDATING_RESULT: "Running",
     completion_states.CompletionState.RESULT_VALID: "Running",
     completion_states.CompletionState.PREPARING_PULL_REQUEST: "Running",

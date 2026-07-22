@@ -46,6 +46,10 @@ EV_VALIDATION_STARTED = "VALIDATION_STARTED"
 EV_VALIDATION_PASSED = "VALIDATION_PASSED"
 EV_VALIDATION_FAILED = "VALIDATION_FAILED"
 EV_REMOTE_BRANCH_MISSING = "REMOTE_BRANCH_MISSING"
+# Ordinary first-time publication of a branch that never existed on the remote
+# (the normal open-PR path). Distinct from `REMOTE_BRANCH_RECREATED`, which is
+# reserved for actually re-pushing a branch during closed-unmerged *recovery*.
+EV_REMOTE_BRANCH_PUBLISHED = "REMOTE_BRANCH_PUBLISHED"
 EV_REMOTE_BRANCH_RECREATED = "REMOTE_BRANCH_RECREATED"
 EV_PR_CREATED = "PR_CREATED"
 EV_PR_CLOSED_UNMERGED = "PR_CLOSED_UNMERGED"
@@ -57,6 +61,10 @@ EV_TASK_COMPLETED = "TASK_COMPLETED"
 EV_REQUIRES_ATTENTION = "REQUIRES_ATTENTION"
 EV_RECOVERY_FAILED = "RECOVERY_FAILED"
 EV_STATE_CHANGED = "STATE_CHANGED"
+# A same-state backoff re-check was scheduled (no state change). Kept distinct
+# from `STATE_CHANGED` so the audit trail never claims a transition happened
+# when only `next_retry_at`/`retry_count` moved.
+EV_RETRY_SCHEDULED = "RETRY_SCHEDULED"
 
 _BACKOFF_BASE_SECONDS = 30
 _BACKOFF_CAP_SECONDS = 3600
@@ -204,6 +212,15 @@ class CompletionOrchestrator:
         for row in due:
             try:
                 results.append(self.advance(row["run_id"], now=now))
+            except runtime_db.LostUpdateError:
+                # Benign concurrent progress: another advancer (a second
+                # autopilot tick, an on-demand `advance_completions` call) won
+                # the compare-and-set race and already moved this row forward.
+                # This is NOT a failure — the winning actor's transition is
+                # persisted and correct. Skip without terminalizing the row and
+                # without bumping any retry/recovery counter; the row (if still
+                # non-terminal) is simply picked up on the next due poll.
+                continue
             except (GitHubError, git_ops.GitOpsError) as exc:
                 # Transient infrastructure failure (GitHub/network/git remote):
                 # schedule a backoff retry rather than giving up. Repeated
@@ -213,7 +230,15 @@ class CompletionOrchestrator:
                     message=f"Transient failure, will retry: {exc}",
                 )
             except Exception as exc:  # noqa: BLE001 - isolate one row's failure
-                fresh = runtime_db.get_completion(self.db_path, row["run_id"]) or row
+                fresh = runtime_db.get_completion(self.db_path, row["run_id"])
+                if fresh is None:
+                    # The completion row genuinely disappeared between listing
+                    # and advancing — its run/task was deleted and the row
+                    # cascaded away (legitimate concurrent cleanup). There is
+                    # nothing left to escalate: skip. (This also guards
+                    # `_mark_attention` itself, whose CAS would otherwise raise
+                    # a fresh KeyError against the now-missing row.)
+                    continue
                 self._mark_attention(
                     fresh,
                     now=now,
@@ -238,7 +263,7 @@ class CompletionOrchestrator:
             )
             return
         runtime_db.append_completion_event(
-            self.db_path, run_id, EV_STATE_CHANGED, reason_code=reason_code, message=message
+            self.db_path, run_id, EV_RETRY_SCHEDULED, reason_code=reason_code, message=message
         )
         self._transition(
             row,
@@ -489,8 +514,11 @@ class CompletionOrchestrator:
                 message=f"Remote branch {branch!r} missing; pushing.",
             )
         git_ops.push_branch(repo, remote=remote, branch=branch)
+        # First-time publication of this branch on the remote — not a recovery
+        # recreation (that path lives in `_recover_pull_request` and keeps the
+        # `REMOTE_BRANCH_RECREATED` label).
         runtime_db.append_completion_event(
-            self.db_path, row["run_id"], EV_REMOTE_BRANCH_RECREATED, reason_code=ReasonCode.PR_MISSING,
+            self.db_path, row["run_id"], EV_REMOTE_BRANCH_PUBLISHED, reason_code=ReasonCode.PR_MISSING,
             message=f"Pushed branch {branch!r} to {remote}.",
         )
         title, body = _pr_content(task, row, rstate, base_branch=base_branch, branch=branch)

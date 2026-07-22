@@ -38,6 +38,7 @@ from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from command_center import storage
 from command_center.models import iso_now, new_id
+from command_center.runtime import completion as completion_domain
 
 
 def _new_session_id() -> str:
@@ -113,6 +114,14 @@ class DatabaseBusyTimeoutError(Exception):
 
 class InvalidTransitionError(Exception):
     """Raised when a run-state transition is not in `ALLOWED_TRANSITIONS`."""
+
+
+class InvalidCompletionTransitionError(Exception):
+    """Raised when an `update_completion` call would move `completion_state`
+    along an illegal edge (a backward jump, or any move out of a terminal
+    state) — see `runtime.completion.COMPLETION_TRANSITIONS`. Same-state updates
+    (retry metadata / evidence enrichment) are always permitted. This is the
+    completion-pipeline analogue of `InvalidTransitionError` for `run.state`."""
 
 
 class LostUpdateError(Exception):
@@ -1313,9 +1322,23 @@ def update_completion(db_path: Path, run_id: str, *, expected_version: int, fiel
     _validate_updatable_completion_fields(fields)
     with connect(db_path) as conn:
         with transaction(conn):
-            row = conn.execute("SELECT version FROM completion WHERE run_id = ?", (run_id,)).fetchone()
+            row = conn.execute(
+                "SELECT completion_state, version FROM completion WHERE run_id = ?", (run_id,)
+            ).fetchone()
             if row is None:
                 raise KeyError(f"No such completion: {run_id!r}")
+            # Structural transition guard (mirrors `update_run_state`): reject an
+            # illegal completion-state move *before* the CAS check, so a backward
+            # jump or a move out of a terminal state is refused regardless of the
+            # caller's `expected_version`. A same-state / metadata-only update
+            # (no `completion_state` in `fields`) is always allowed.
+            new_state = fields.get("completion_state")
+            if new_state is not None and not completion_domain.is_valid_completion_transition(
+                row["completion_state"], new_state
+            ):
+                raise InvalidCompletionTransitionError(
+                    f"Completion {run_id!r} cannot transition {row['completion_state']!r} -> {new_state!r}"
+                )
             if row["version"] != expected_version:
                 raise LostUpdateError(
                     f"Completion {run_id!r} version mismatch: expected {expected_version}, actual {row['version']}"

@@ -21,7 +21,12 @@ def _task(**overrides):
 @pytest.mark.parametrize(
     "state,expected_status",
     [
-        ("EXECUTION_FINISHED", "Running"),
+        # `EXECUTION_FINISHED` is the seed state (process finished, pipeline not
+        # yet advanced) — it must project to the honest, actionable "Needs
+        # Review", never "Running" (Founder Gate blocking finding). Only the
+        # genuinely-active `VALIDATING_RESULT` (reachable only when the autopilot
+        # is advancing) is "Running".
+        ("EXECUTION_FINISHED", "Needs Review"),
         ("VALIDATING_RESULT", "Running"),
         ("PULL_REQUEST_OPEN", "Needs Review"),
         ("AWAITING_MERGE", "Needs Review"),

@@ -97,6 +97,164 @@ TERMINAL_STATES: frozenset[str] = frozenset(
 ACTIVE_STATES: frozenset[str] = ALL_STATES - TERMINAL_STATES
 
 
+# Explicit allowed-transition model for the completion state machine — the
+# domain-level structural guard analogous to `db.ALLOWED_TRANSITIONS` for
+# `run.state`. The orchestrator (`runtime.completion_service`) is the sole
+# writer and already refuses to advance terminal rows in its control flow; this
+# map makes the legal transition set explicit *data* so the persistence layer
+# (`db.update_completion`) can refuse an illegal completion-state change — a
+# backward jump, or any move out of a terminal state — independent of that
+# control flow. Every entry is derived from a real orchestrator transition:
+#
+#   * validation phase: EXECUTION_FINISHED/VALIDATING_RESULT -> RESULT_VALID |
+#     VALIDATION_FAILED | REQUIRES_ATTENTION | COMPLETED (already-in-target);
+#   * PR phase (RESULT_VALID/PREPARING_PULL_REQUEST/PULL_REQUEST_OPEN/
+#     AWAITING_MERGE/MERGE_BLOCKED): open/merge/verify/wait plus closed-unmerged
+#     recovery (-> PULL_REQUEST_OPEN | RECOVERY_PENDING | RECOVERY_FAILED),
+#     completion, and attention;
+#   * verify phase: MERGED <-> VERIFYING_TARGET_BRANCH -> COMPLETED | attention;
+#   * recovery: PR_CLOSED_UNMERGED/RECOVERY_PENDING -> PULL_REQUEST_OPEN |
+#     RECOVERY_FAILED.
+#
+# A *same-state* update (retry-metadata / evidence enrichment — the bulk of
+# `_transition` writes) is always permitted and is deliberately NOT encoded as a
+# self-edge here; see `is_valid_completion_transition`. Terminal states map to
+# an empty set: no ordinary advancement ever leaves them.
+COMPLETION_TRANSITIONS: dict[str, frozenset[str]] = {
+    CompletionState.EXECUTION_FINISHED: frozenset(
+        {
+            CompletionState.VALIDATING_RESULT,
+            CompletionState.RESULT_VALID,
+            CompletionState.VALIDATION_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.VALIDATING_RESULT: frozenset(
+        {
+            CompletionState.RESULT_VALID,
+            CompletionState.VALIDATION_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.RESULT_VALID: frozenset(
+        {
+            CompletionState.PREPARING_PULL_REQUEST,
+            CompletionState.PULL_REQUEST_OPEN,
+            CompletionState.AWAITING_MERGE,
+            CompletionState.MERGE_BLOCKED,
+            CompletionState.MERGED,
+            CompletionState.PR_CLOSED_UNMERGED,
+            CompletionState.RECOVERY_PENDING,
+            CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.PREPARING_PULL_REQUEST: frozenset(
+        {
+            CompletionState.PULL_REQUEST_OPEN,
+            CompletionState.AWAITING_MERGE,
+            CompletionState.MERGE_BLOCKED,
+            CompletionState.MERGED,
+            CompletionState.PR_CLOSED_UNMERGED,
+            CompletionState.RECOVERY_PENDING,
+            CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.PULL_REQUEST_OPEN: frozenset(
+        {
+            CompletionState.AWAITING_MERGE,
+            CompletionState.MERGE_BLOCKED,
+            CompletionState.MERGED,
+            CompletionState.PR_CLOSED_UNMERGED,
+            CompletionState.RECOVERY_PENDING,
+            CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.AWAITING_MERGE: frozenset(
+        {
+            CompletionState.PULL_REQUEST_OPEN,
+            CompletionState.MERGE_BLOCKED,
+            CompletionState.MERGED,
+            CompletionState.PR_CLOSED_UNMERGED,
+            CompletionState.RECOVERY_PENDING,
+            CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.MERGE_BLOCKED: frozenset(
+        {
+            CompletionState.PULL_REQUEST_OPEN,
+            CompletionState.AWAITING_MERGE,
+            CompletionState.MERGED,
+            CompletionState.PR_CLOSED_UNMERGED,
+            CompletionState.RECOVERY_PENDING,
+            CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.MERGED: frozenset(
+        {
+            CompletionState.VERIFYING_TARGET_BRANCH,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.VERIFYING_TARGET_BRANCH: frozenset(
+        {
+            CompletionState.MERGED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.PR_CLOSED_UNMERGED: frozenset(
+        {
+            CompletionState.PULL_REQUEST_OPEN,
+            CompletionState.RECOVERY_PENDING,
+            CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    CompletionState.RECOVERY_PENDING: frozenset(
+        {
+            CompletionState.PULL_REQUEST_OPEN,
+            CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    # Terminal — no outgoing transitions (defense in depth against reprocessing).
+    CompletionState.COMPLETED: frozenset(),
+    CompletionState.VALIDATION_FAILED: frozenset(),
+    CompletionState.REQUIRES_ATTENTION: frozenset(),
+    CompletionState.RECOVERY_FAILED: frozenset(),
+}
+
+
+def is_valid_completion_transition(current: str, new: str) -> bool:
+    """Whether persisting completion-state `current` -> `new` is legal.
+
+    A same-state update (`current == new`) is always allowed: it carries retry
+    metadata (`next_retry_at`/`retry_count`) or refreshed evidence, not a
+    lifecycle move, and is the common case for the poller's waiting/backoff
+    writes. Otherwise `new` must appear in `COMPLETION_TRANSITIONS[current]`; an
+    unrecognized `current` state permits no transition. Terminal states have an
+    empty target set, so no ordinary advancement can move a row out of
+    COMPLETED / VALIDATION_FAILED / REQUIRES_ATTENTION / RECOVERY_FAILED."""
+    if current == new:
+        return True
+    return new in COMPLETION_TRANSITIONS.get(current, frozenset())
+
+
 class CompletionAction:
     """What the orchestration layer should DO next to advance this run.
     `WAIT` means "no action; re-check later" (e.g. awaiting a human merge or
