@@ -1301,7 +1301,9 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
 def _execution_center_status_badge_color(status: str) -> str:
     return {
         session_view.STATUS_LAUNCHING: "blue",
+        session_view.STATUS_STARTING: "blue",
         session_view.STATUS_RUNNING: "blue",
+        session_view.STATUS_STALE: "orange",
         session_view.STATUS_WAITING: "orange",
         session_view.STATUS_REQUIRES_ATTENTION: "orange",
         session_view.STATUS_BLOCKED: "red",
@@ -1363,6 +1365,19 @@ def _build_execution_center_sessions(
         if not report_path:
             report_row = api.get_report(run["id"])
             report_path = report_row["path"] if report_row else None
+        # Probe liveness *before* deriving the display status, and key it off
+        # the persisted `run.state` (RUNNING) rather than the derived display
+        # status — otherwise staleness (which is itself an input to the display
+        # status) would be circular. A fresh probe on a live PID makes
+        # `heartbeat_stale` False (age ~0); only a RUNNING run whose PID can no
+        # longer be confirmed lets the last probe age past the threshold, at
+        # which point the run displays `STATUS_STALE` (a warning, not a
+        # failure).
+        if run.get("state") == "RUNNING":
+            _execution_center_record_heartbeat(run["id"], run.get("pid"), now)
+        heartbeat_stale = run.get("state") == "RUNNING" and session_view.is_heartbeat_stale(
+            _execution_center_heartbeat_probe_at(run["id"]), now
+        )
         session = session_view.build_session_view(
             run,
             kanban_task=kanban_task,
@@ -1370,9 +1385,8 @@ def _build_execution_center_sessions(
             latest_event=latest,
             report_path=report_path,
             now=now,
+            heartbeat_stale=heartbeat_stale,
         )
-        if session["status"] == session_view.STATUS_RUNNING:
-            _execution_center_record_heartbeat(run["id"], session["process_id"], now)
         sessions.append(session)
     return sessions, tasks_by_id
 
@@ -1417,12 +1431,29 @@ def _render_execution_center_card(
             st.write(f"Начат: {session['started_at'] or '—'}")
             st.write(f"Прошло: {session_view.format_elapsed(session['elapsed_seconds'])}")
             st.write(f"PID: `{session['process_id'] or '—'}`")
-            if session["status"] == session_view.STATUS_RUNNING:
+            if session["status"] in session_view.LIVE_PROCESS_DISPLAY_STATUSES:
                 probe_at = _execution_center_heartbeat_probe_at(run_id)
                 age = session_view.heartbeat_age_seconds(probe_at, now)
                 stale = session_view.is_heartbeat_stale(probe_at, now)
                 age_text = f"{int(age)} с назад" if age is not None else "ещё не подтверждено"
                 st.write("Heartbeat (проверка живости UI, не сигнал агента): " + age_text + (" ⚠️" if stale else ""))
+
+        # Explicitly distinguish "agent started but early output not yet
+        # received" (a valid PID exists; this is NOT a start failure) from
+        # "agent failed to start" (a FAILED run with no PID — rendered in the
+        # Failed section with its error). This is the direct UI counterpart to
+        # the mission's required distinction.
+        if session["status"] == session_view.STATUS_STARTING:
+            st.info(
+                "Агент запущен (процесс создан, PID есть), но первый вывод ещё не получен. "
+                "Это ожидание раннего вывода, а не ошибка запуска — Claude может не выдавать "
+                "stdout сразу."
+            )
+        elif session["status"] == session_view.STATUS_STALE:
+            st.warning(
+                "Процесс всё ещё числится запущенным, но UI давно не подтверждал его живость "
+                "(проверка живости устарела). Это предупреждение, а не отказ запуска."
+            )
 
         if session["latest_event"]:
             st.caption(
@@ -1468,7 +1499,7 @@ def _render_execution_center_card(
             ):
                 st.session_state[report_key] = not st.session_state.get(report_key, False)
         with button_cols[5]:
-            if session["status"] == session_view.STATUS_RUNNING:
+            if session["status"] in session_view.LIVE_PROCESS_DISPLAY_STATUSES:
                 cancel_ack = st.checkbox("Подтвердить", key=f"exec_card_cancel_ack_{run_id}")
                 if st.button(
                     "Cancel", key=f"exec_card_cancel_btn_{run_id}", icon=":material/stop_circle:",
@@ -1535,7 +1566,7 @@ def _render_execution_center_project_overview(sessions: list[dict], now: datetim
     stale_run_ids = frozenset(
         s["run_id"]
         for s in sessions
-        if s["status"] == session_view.STATUS_RUNNING
+        if s["status"] in session_view.LIVE_PROCESS_DISPLAY_STATUSES
         and session_view.is_heartbeat_stale(_execution_center_heartbeat_probe_at(s["run_id"]), now)
     )
 
@@ -1570,7 +1601,12 @@ def _render_execution_center_project_overview(sessions: list[dict], now: datetim
 # by their own status badge — `models.LAUNCH_STATUSES` has no dedicated
 # Cancelled value either (see `task_sync.py`).
 _EXECUTION_CENTER_SECTIONS: list[tuple[str, frozenset[str]]] = [
-    ("Running", frozenset({session_view.STATUS_RUNNING})),
+    # Every live-process display status shares one "Running" section — a
+    # `Starting` (spawned, awaiting first output) or `Stale` (spawned, probe
+    # old) run has a real PID up, exactly like a plain `Running` one; each is
+    # told apart by its own badge/notice, not by being hidden in a different
+    # section or, worse, dropped from the dashboard entirely.
+    ("Running", session_view.LIVE_PROCESS_DISPLAY_STATUSES),
     # A `PREPARED`/`QUEUED` run (`Launching`) has no subprocess yet — it is
     # "waiting to start" in exactly the same practical sense as a run whose
     # cancellation is in flight, so it is folded into the same section

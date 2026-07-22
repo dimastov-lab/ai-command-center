@@ -169,6 +169,12 @@ _UPDATABLE_RUN_FIELDS: frozenset[str] = frozenset(
         "started_at",
         "completed_at",
         "failure_reason",
+        # First moment the spawned process produced any output on stdout/
+        # stderr — the "Claude startup/handshake" milestone, distinct from
+        # `started_at` (the moment `Popen` returned a live PID). Written once,
+        # best-effort, by the stdout/stderr reader threads (see
+        # `supervisor._record_handshake`); its absence never fails a run.
+        "first_output_at",
         # v2 Live Execution Center fields (migration 3) — commit_hash/
         # pull_request_url are the only ones ever set post-create (once, at
         # terminal-state task sync, via `set_run_result_fields`);
@@ -192,7 +198,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -320,6 +326,31 @@ def _migration_3_add_live_execution_center_v2_fields(conn: sqlite3.Connection) -
             conn.execute("ALTER TABLE run ADD COLUMN prompt_version INTEGER")
 
 
+def _migration_4_add_first_output_at(conn: sqlite3.Connection) -> None:
+    """Adds `run.first_output_at` (ISO timestamp of the first stdout/stderr
+    line the spawned process produced — the "Claude startup/handshake"
+    milestone, recorded once, best-effort, by the supervisor's reader
+    threads; see `supervisor._record_handshake`).
+
+    This column is the persisted signal that lets the display layer
+    distinguish a run that has *spawned but not yet spoken* (a valid PID, no
+    output yet — `session_view.STATUS_STARTING`) from one that is genuinely
+    streaming output (`STATUS_RUNNING`), so a slow-to-handshake but perfectly
+    healthy run is never surfaced as a failure. Its absence is never itself a
+    failure — a run that exits cleanly having produced no stdout at all still
+    leaves this NULL and is classified purely on its exit facts.
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2
+    and 3 — safe to re-run against a db where this migration was already
+    (fully or partially) applied, and safe under genuine concurrent execution
+    via the same `BEGIN IMMEDIATE` transaction.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "first_output_at" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN first_output_at TEXT")
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -327,6 +358,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (1, _SCHEMA_V1),
     (2, _migration_2_add_failure_reason),
     (3, _migration_3_add_live_execution_center_v2_fields),
+    (4, _migration_4_add_first_output_at),
 ]
 
 

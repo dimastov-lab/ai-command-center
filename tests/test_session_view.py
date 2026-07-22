@@ -22,6 +22,58 @@ def test_derive_status_running_with_cancel_requested_is_waiting():
     assert session_view.derive_status({"state": "RUNNING", "cancel_requested": 1}) == session_view.STATUS_WAITING
 
 
+# --------------------------------------------------------------------------
+# Handshake / staleness — spawned-but-silent and probe-stale are warnings
+# about a *running* process, never failures. Opt-in kwargs keep every existing
+# single-arg caller unchanged.
+# --------------------------------------------------------------------------
+
+
+def test_derive_status_running_awaiting_handshake_is_starting():
+    run = {"state": "RUNNING"}
+    assert session_view.derive_status(run, awaiting_handshake=True) == session_view.STATUS_STARTING
+
+
+def test_derive_status_running_stale_probe_is_stale():
+    run = {"state": "RUNNING"}
+    assert session_view.derive_status(run, heartbeat_stale=True) == session_view.STATUS_STALE
+
+
+def test_derive_status_stale_beats_awaiting_handshake_but_cancel_beats_both():
+    run = {"state": "RUNNING"}
+    assert (
+        session_view.derive_status(run, awaiting_handshake=True, heartbeat_stale=True) == session_view.STATUS_STALE
+    )
+    cancelling = {"state": "RUNNING", "cancel_requested": 1}
+    assert (
+        session_view.derive_status(cancelling, awaiting_handshake=True, heartbeat_stale=True)
+        == session_view.STATUS_WAITING
+    )
+
+
+def test_derive_status_default_kwargs_preserve_plain_running():
+    """The opt-in kwargs default off, so an existing single-arg call is
+    byte-for-byte unchanged — a RUNNING run with no handshake info is still
+    `Running`, never `Starting`."""
+    assert session_view.derive_status({"state": "RUNNING"}) == session_view.STATUS_RUNNING
+
+
+def test_starting_and_stale_are_active_and_live_but_not_terminal():
+    for status in (session_view.STATUS_STARTING, session_view.STATUS_STALE):
+        assert status in session_view.ACTIVE_DISPLAY_STATUSES
+        assert status in session_view.LIVE_PROCESS_DISPLAY_STATUSES
+        assert status not in session_view.TERMINAL_DISPLAY_STATUSES
+
+
+def test_is_awaiting_handshake_true_only_for_running_without_first_output():
+    assert session_view.is_awaiting_handshake({"state": "RUNNING"}) is True
+    assert session_view.is_awaiting_handshake({"state": "RUNNING", "first_output_at": None}) is True
+    assert session_view.is_awaiting_handshake({"state": "RUNNING", "first_output_at": "2026-01-01T00:00:00"}) is False
+    # A terminal run that never produced output is not "awaiting" anything.
+    assert session_view.is_awaiting_handshake({"state": "COMPLETED"}) is False
+    assert session_view.is_awaiting_handshake({"state": "FAILED"}) is False
+
+
 def test_derive_status_terminal_states():
     assert session_view.derive_status({"state": "COMPLETED"}) == session_view.STATUS_COMPLETED
     assert session_view.derive_status({"state": "FAILED"}) == session_view.STATUS_FAILED
@@ -112,6 +164,10 @@ def _run(**overrides) -> dict:
         "expected_branch": "feature/x",
         "launch_source": "kanban_task",
         "pid": 12345,
+        # A normal running run has already handshaked (produced first output),
+        # so it displays as `Running`, not `Starting`. Tests that specifically
+        # want the awaiting-handshake window override this back to None.
+        "first_output_at": "2026-01-01T00:00:01",
         "started_at": "2026-01-01T00:00:00",
         "completed_at": None,
         "exit_code": None,
@@ -240,6 +296,42 @@ def test_build_session_view_no_latest_event_is_none():
         run, kanban_task=None, project_cfg=None, latest_event=None, report_path=None, now=now
     )
     assert session["latest_event"] is None
+
+
+def test_build_session_view_running_with_handshake_is_running_and_flags_received():
+    now = datetime(2026, 1, 1, 0, 0, 0)
+    run = _run()  # `_run()` includes first_output_at -> handshaked
+    session = session_view.build_session_view(
+        run, kanban_task=None, project_cfg=None, latest_event=None, report_path=None, now=now
+    )
+    assert session["status"] == session_view.STATUS_RUNNING
+    assert session["handshake_received"] is True
+    assert session["awaiting_handshake"] is False
+    assert session["first_output_at"] == "2026-01-01T00:00:01"
+
+
+def test_build_session_view_running_without_first_output_is_starting_not_failed():
+    now = datetime(2026, 1, 1, 0, 0, 0)
+    run = _run(first_output_at=None)
+    session = session_view.build_session_view(
+        run, kanban_task=None, project_cfg=None, latest_event=None, report_path=None, now=now
+    )
+    assert session["status"] == session_view.STATUS_STARTING
+    assert session["handshake_received"] is False
+    assert session["awaiting_handshake"] is True
+    # The PID is still present — this is a spawned, live process, not a start failure.
+    assert session["process_id"] == 12345
+
+
+def test_build_session_view_stale_probe_marks_status_stale_not_failed():
+    now = datetime(2026, 1, 1, 0, 0, 0)
+    run = _run()
+    session = session_view.build_session_view(
+        run, kanban_task=None, project_cfg=None, latest_event=None, report_path=None, now=now,
+        heartbeat_stale=True,
+    )
+    assert session["status"] == session_view.STATUS_STALE
+    assert session["process_id"] == 12345
 
 
 def test_build_session_view_workspace_path_missing_directory_gives_none_actual_branch(tmp_path):

@@ -401,7 +401,8 @@ def test_existing_pages_still_render_without_exception():
 
 
 def _make_run_row(
-    db_path, *, state: str, cancel_requested: bool = False, failure_reason: str | None = None, pid: int | None = None
+    db_path, *, state: str, cancel_requested: bool = False, failure_reason: str | None = None,
+    pid: int | None = None, first_output_at: str | None = "2026-01-01T00:00:01",
 ) -> dict:
     """`pid=None` (the default) is correct for every terminal state — only a
     hand-built `RUNNING` row needs a *real, currently-alive* pid (see the
@@ -427,6 +428,11 @@ def _make_run_row(
         run = runtime_db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     if state not in ("PREPARED", "QUEUED"):
         running_fields = {"started_at": "2026-01-01T00:00:00"}
+        # A handshaked running run (first output already received) displays as
+        # `Running`; passing `first_output_at=None` leaves it in the
+        # awaiting-handshake window, which displays as `Starting`.
+        if first_output_at is not None:
+            running_fields["first_output_at"] = first_output_at
         if pid is not None:
             running_fields["pid"] = pid
             recorded_identity = identity.capture_identity(pid)
@@ -469,6 +475,25 @@ def test_dashboard_renders_each_status_bucket(state, cancel_requested, expected_
         if proc is not None:
             proc.terminate()
             proc.wait()
+
+
+def test_dashboard_renders_spawned_but_silent_run_as_starting_not_failed():
+    """A RUNNING run with a live PID but no first output yet must render as
+    `Starting` (a warning), never `Failed` — the direct UI counterpart of the
+    reported defect (a live process shown as timeout/failed)."""
+    api = runtime_api.ExecutionCenterAPI()
+    proc = subprocess.Popen(["sleep", "5"])
+    try:
+        _make_run_row(api.db_path, state="RUNNING", pid=proc.pid, first_output_at=None)
+
+        at = _at_on_page("execution_center")
+        assert not at.exception
+        captions = [c.value for c in at.caption]
+        assert any(f"Статус: **{session_view.STATUS_STARTING}**" in c for c in captions)
+        assert not any(f"Статус: **{session_view.STATUS_FAILED}**" in c for c in captions)
+    finally:
+        proc.terminate()
+        proc.wait()
 
 
 # --------------------------------------------------------------------------

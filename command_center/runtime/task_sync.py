@@ -33,7 +33,17 @@ from command_center.runtime.api import ExecutionCenterAPI
 # reviewed/merged it yet).
 _LAUNCH_STATUS_BY_DISPLAY_STATUS: dict[str, str] = {
     session_view.STATUS_LAUNCHING: "Launching",
+    # `Starting` (spawned, awaiting first output) and `Stale` (spawned, probe
+    # momentarily old) are *live, non-terminal* states — the process exists.
+    # They map to the active Kanban launch statuses ("Launching"/"Running"),
+    # never to a terminal one: a successfully spawned run must never flip its
+    # task to Failed/Requires-Attention merely because early output or a fresh
+    # probe has not arrived. Because neither is in
+    # `session_view.TERMINAL_DISPLAY_STATUSES`, `_apply_terminal_fields` never
+    # runs for them either.
+    session_view.STATUS_STARTING: "Launching",
     session_view.STATUS_RUNNING: "Running",
+    session_view.STATUS_STALE: "Running",
     session_view.STATUS_WAITING: "Requires Attention",
     session_view.STATUS_REQUIRES_ATTENTION: "Requires Attention",
     session_view.STATUS_BLOCKED: "Blocked",
