@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""CLI for importing a JSON task package into `data/tasks.json`.
+"""CLI for importing a task package into `data/tasks.json`.
 
 Thin wrapper around `command_center.task_import` — the exact same
 parse/validate/preview/apply pipeline the Create Task page's "Импорт пакета
 задач" uploader uses, so a package validated here behaves identically when
 uploaded through the UI (and vice versa).
 
+The package may be JSON, YAML, Markdown or plain text (see
+`command_center.task_import`'s module docstring); the format is inferred from
+the file extension, overridable with --format.
+
 Usage:
-    python scripts/import_tasks.py PACKAGE.json --dry-run
+    python scripts/import_tasks.py PACKAGE.(json|yaml|md|txt) --dry-run
         Parses and validates the package, prints the preview (new/duplicate
         counts, errors, warnings, per-task table). Never writes to disk.
 
-    python scripts/import_tasks.py PACKAGE.json --apply
+    python scripts/import_tasks.py PACKAGE.(json|yaml|md|txt) --apply
         Same validation, then commits the new tasks in a single write.
         Refuses to run (exit code 2) if the package has any blocking
         validation error, including a `depends_on` id that resolves to
@@ -64,11 +68,17 @@ def _print_preview(preview: task_import.ImportPreview) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Import a JSON task package into data/tasks.json")
-    parser.add_argument("package", type=Path, help="Path to the task package JSON file")
+    parser = argparse.ArgumentParser(description="Import a JSON/YAML/Markdown/text task package into data/tasks.json")
+    parser.add_argument("package", type=Path, help="Path to the task package file (.json/.yaml/.yml/.md/.txt)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="Validate and preview only; write nothing")
     mode.add_argument("--apply", action="store_true", help="Validate and commit the new tasks in one write")
+    parser.add_argument(
+        "--format",
+        choices=["json", "yaml", "markdown", "text"],
+        default=None,
+        help="Override the format instead of inferring it from the file extension",
+    )
     parser.add_argument(
         "--allow-unresolved-dependencies",
         action="store_true",
@@ -81,7 +91,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        parsed = task_import.parse_task_package(args.package.read_text(encoding="utf-8"))
+        parsed = task_import.parse_task_package(
+            args.package.read_text(encoding="utf-8"), filename=str(args.package), fmt=args.format
+        )
     except task_import.TaskImportError as exc:
         print(f"Ошибка разбора пакета: {exc}", file=sys.stderr)
         return 2

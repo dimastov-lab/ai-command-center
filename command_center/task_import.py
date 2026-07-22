@@ -1,17 +1,39 @@
-"""Task package import: parse -> validate -> preview -> apply, for JSON task
+"""Task package import: parse -> validate -> preview -> apply, for task
 packages produced outside the app (e.g. by an AI-run Founder audit) — see
 `command_center.tasks_repository`'s own module docstring for why this must
 never become a second task store. Every write in this module goes through
 `tasks_repository.load_tasks`/`save_tasks`, the same store the Kanban board,
 Create Task page, and every other task-mutating code path already use.
 
+Supported input formats (all four converge on the *same* `ParsedPackage`, so
+validation/preview/apply are format-agnostic — see `parse_task_package`):
+
+- **JSON** (`.json`): a bare list of task objects, or an envelope
+  `{"schema_version", "package_id", "tasks": [...]}`.
+- **YAML** (`.yaml`/`.yml`): the exact same two shapes, parsed with
+  `yaml.safe_load` (never `yaml.load` — untrusted input must never construct
+  arbitrary Python objects). Requires PyYAML (declared in `requirements.txt`);
+  a missing dependency surfaces as an ordinary `TaskImportError`, never an
+  `ImportError` traceback.
+- **Markdown** (`.md`/`.markdown`): a human-authored document that *carries*
+  the structured task list, either as a leading YAML front-matter block
+  (`---` … `---`) or as the first fenced code block (```json / ```yaml /
+  ```yml / untagged). The extracted block is parsed as JSON or YAML and must
+  itself be one of the two shapes above.
+- **Plain text** (`.txt`, or any unknown/absent extension): sniffed — parsed
+  as JSON first, then YAML, so a `.txt` holding either structured form Just
+  Works. This is also the path a caller that passes no `filename` takes, which
+  is why a bare JSON string still parses exactly as it did before multi-format
+  support existed (full backward compatibility).
+
 Zero Streamlit coupling: `app.py`'s Create Task page and `scripts/import_tasks.py`
 are both thin callers of the four functions below.
 
 Pipeline
 --------
-`parse_task_package`  — bytes/str -> `ParsedPackage` (raises `TaskImportError`
-    on malformed JSON or an unrecognized root shape). Never touches disk.
+`parse_task_package`  — bytes/str (+ optional `filename`/`fmt` hint) ->
+    `ParsedPackage` (raises `TaskImportError` on malformed input in any format
+    or an unrecognized root shape). Never touches disk.
 `validate_task_package` — `ParsedPackage` -> `ValidationResult`: per-task field
     and vocabulary checks, project-name normalization. Never touches disk.
 `build_import_preview` — `(root, parsed, validation)` -> `ImportPreview`: reads
@@ -38,12 +60,41 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from command_center import artifacts, models, project_config, storage, tasks_repository
 
 SCHEMA_VERSION = "1"
+
+# Hard upper bound on the raw bytes `parse_task_package` will even attempt to
+# decode/parse. A task package is a hand/AI-authored manifest of a handful to a
+# few hundred tasks; anything past this ceiling is a mistake (a wrong file, a
+# runaway generator, a hostile upload) and is rejected as a plain
+# `TaskImportError` *before* any JSON/YAML parser is handed the blob — never an
+# unbounded parse of an arbitrarily large input. 5 MiB is many times the
+# largest real Founder-audit package and still trivially cheap to parse.
+# Callers that genuinely need a different ceiling pass `max_bytes` explicitly.
+MAX_PACKAGE_BYTES = 5 * 1024 * 1024
+
+# Extension -> canonical format name. Anything not listed (including no
+# extension at all) falls through to the "text" sniffer, which tries JSON then
+# YAML — so a bare JSON string with no filename parses exactly as it always
+# has (backward compatibility for every pre-multi-format caller).
+_FORMAT_BY_SUFFIX: dict[str, str] = {
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".txt": "text",
+    ".text": "text",
+}
+
+# File extensions the UI/CLI advertise as accepted, derived from the mapping
+# above so the two never drift apart.
+SUPPORTED_IMPORT_SUFFIXES: tuple[str, ...] = tuple(sorted(s.lstrip(".") for s in _FORMAT_BY_SUFFIX))
 
 # `apply_task_package`'s lock timeout — the *lock itself* is
 # `tasks_repository.tasks_lock` (shared with every other task-store write
@@ -148,21 +199,88 @@ class ImportResult:
     warnings: list[ImportIssue]
 
 
-def parse_task_package(raw: str | bytes) -> ParsedPackage:
-    """Accepts both supported formats: a bare JSON list of tasks (legacy —
-    what every Founder audit package produced so far looks like) or an
-    envelope object `{"schema_version": ..., "package_id": ..., "tasks": [...]}`.
-    A legacy list gets an auto-generated `package_id` derived from the
-    package's content hash, so it never requires manual conversion.
-    """
-    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+def _resolve_format(filename: str | None, fmt: str | None) -> str:
+    """Pick the parser: an explicit `fmt` wins; otherwise the file extension;
+    otherwise `"text"` (the JSON-then-YAML sniffer). Case-insensitive on both
+    the format name and the extension."""
+    if fmt is not None:
+        normalized = fmt.strip().lower()
+        if normalized not in {"json", "yaml", "markdown", "text"}:
+            raise TaskImportError(f"Неизвестный формат импорта: {fmt!r}")
+        return normalized
+    if filename:
+        suffix = Path(filename).suffix.lower()
+        if suffix in _FORMAT_BY_SUFFIX:
+            return _FORMAT_BY_SUFFIX[suffix]
+    return "text"
+
+
+def _load_yaml(text: str):
+    """`yaml.safe_load` with PyYAML imported lazily. A missing dependency or a
+    YAML syntax error is reported as a `TaskImportError`, never an
+    `ImportError`/`yaml.YAMLError` traceback — the caller (UI/CLI) treats every
+    parse failure uniformly. `safe_load` (not `load`) is mandatory: an imported
+    package is untrusted input and must never be able to construct arbitrary
+    Python objects."""
     try:
-        data = json.loads(text)
+        import yaml
+    except ImportError as exc:  # pragma: no cover - environment-dependent
+        raise TaskImportError(
+            "Для импорта YAML требуется пакет PyYAML (pip install pyyaml); установите зависимости из requirements.txt."
+        ) from exc
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise TaskImportError(f"Файл не является корректным YAML: {exc}") from exc
+
+
+def _load_json(text: str):
+    try:
+        return json.loads(text)
     except json.JSONDecodeError as exc:
         raise TaskImportError(f"Файл не является корректным JSON: {exc}") from exc
 
-    package_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
+# A leading YAML front-matter block: `---\n ... \n---` at the very start of the
+# document (a trailing `\n` after the closing fence is optional). Group 1 is
+# the block body.
+_FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
+# The first fenced code block; group 1 is the info string (e.g. "json"), group
+# 2 the body.
+_FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_-]*)[ \t]*\r?\n(.*?)\r?\n```", re.DOTALL)
+
+
+def _markdown_payload(text: str):
+    """Extract the structured task list a Markdown document carries. Two
+    conventions, tried in order:
+
+    1. A leading YAML **front-matter** block (`---` … `---`) — parsed as YAML.
+    2. The first **fenced code block**: a ```json fence is parsed as JSON; a
+       ```yaml/```yml or untagged fence is parsed as YAML.
+
+    Prose outside these carriers is ignored (it's the human-readable report the
+    block is embedded in). A document with neither carrier is a hard error —
+    Markdown import is deliberately structured, never a guess at free text."""
+    front = _FRONT_MATTER_RE.search(text)
+    if front:
+        return _load_yaml(front.group(1))
+
+    fence = _FENCE_RE.search(text)
+    if fence:
+        info = fence.group(1).lower()
+        body = fence.group(2)
+        return _load_json(body) if info == "json" else _load_yaml(body)
+
+    raise TaskImportError(
+        "Markdown-файл не содержит задач: добавьте YAML front-matter (--- … ---) "
+        "или блок кода ```json/```yaml со списком задач."
+    )
+
+
+def _package_from_data(data, package_hash: str) -> ParsedPackage:
+    """The single place the two accepted root shapes — a bare list of tasks or
+    an `{..., "tasks": [...]}` envelope — become a `ParsedPackage`, shared by
+    every format so JSON/YAML/Markdown/text behave identically once parsed."""
     if isinstance(data, list):
         return ParsedPackage(
             package_id=f"legacy-{package_hash}",
@@ -183,6 +301,61 @@ def parse_task_package(raw: str | bytes) -> ParsedPackage:
         )
 
     raise TaskImportError("Корневой элемент пакета должен быть списком задач либо объектом-конвертом.")
+
+
+def parse_task_package(
+    raw: str | bytes,
+    *,
+    filename: str | None = None,
+    fmt: str | None = None,
+    max_bytes: int = MAX_PACKAGE_BYTES,
+) -> ParsedPackage:
+    """Parse a task package in any supported format into a `ParsedPackage`.
+
+    The format is chosen by (in priority order) an explicit `fmt`, the
+    `filename`'s extension, or — with neither — content sniffing (JSON first,
+    then YAML). Both accepted root shapes — a bare list of tasks (legacy: what
+    every Founder audit package produced so far looks like) and an envelope
+    `{"schema_version", "package_id", "tasks": [...]}` — are valid in every
+    format; a legacy list gets an auto-generated `package_id` derived from the
+    package's content hash, so it never requires manual conversion.
+
+    `package_hash` is the SHA-256 of the *raw bytes as received*, independent
+    of format, so two uploads of byte-identical content always dedupe to the
+    same hash/`package_id` regardless of how they were parsed.
+
+    Passing neither `filename` nor `fmt` (the pre-multi-format call signature)
+    still parses a bare JSON string exactly as before — full backward
+    compatibility.
+
+    An input larger than `max_bytes` (default `MAX_PACKAGE_BYTES`) is rejected
+    up front with a `TaskImportError`, before any parser sees it — an oversized
+    or hostile blob can never trigger an unbounded parse.
+    """
+    raw_bytes = raw if isinstance(raw, bytes) else raw.encode("utf-8")
+    if len(raw_bytes) > max_bytes:
+        raise TaskImportError(
+            f"Файл слишком большой для импорта: {len(raw_bytes)} байт "
+            f"(максимум {max_bytes} байт). Разбейте пакет на несколько файлов."
+        )
+
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    package_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+    resolved = _resolve_format(filename, fmt)
+    if resolved == "json":
+        data = _load_json(text)
+    elif resolved == "yaml":
+        data = _load_yaml(text)
+    elif resolved == "markdown":
+        data = _markdown_payload(text)
+    else:  # "text": sniff JSON, then YAML
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = _load_yaml(text)
+
+    return _package_from_data(data, package_hash)
 
 
 def validate_task_package(parsed: ParsedPackage) -> ValidationResult:
