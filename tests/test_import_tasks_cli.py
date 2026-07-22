@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from command_center import tasks_repository
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -151,3 +153,39 @@ def test_envelope_format_package_is_accepted(tmp_path):
     result = _run_cli(str(package_path), "--apply")
     assert result.returncode == 0
     assert "wave-1" in result.stdout
+
+
+def test_apply_yaml_package_by_extension(tmp_path):
+    yaml = pytest.importorskip("yaml")
+    package_path = tmp_path / "package.yaml"
+    package_path.write_text(yaml.safe_dump([_task(id="PKG-Y1"), _task(id="PKG-Y2")]), encoding="utf-8")
+
+    result = _run_cli(str(package_path), "--apply")
+    assert result.returncode == 0, result.stderr
+    assert "Импортировано: 2" in result.stdout
+    stored = tasks_repository.load_tasks(ROOT)
+    assert sorted(t["id"] for t in stored) == ["PKG-Y1", "PKG-Y2"]
+
+
+def test_apply_markdown_front_matter_package(tmp_path):
+    yaml = pytest.importorskip("yaml")
+    package_path = tmp_path / "report.md"
+    body = yaml.safe_dump([_task(id="PKG-M1")])
+    package_path.write_text(f"---\n{body}---\n\n# Founder audit\n", encoding="utf-8")
+
+    result = _run_cli(str(package_path), "--apply")
+    assert result.returncode == 0, result.stderr
+    assert "Импортировано: 1" in result.stdout
+    stored = tasks_repository.load_tasks(ROOT)
+    assert [t["id"] for t in stored] == ["PKG-M1"]
+
+
+def test_format_override_flag_parses_yaml_from_a_misnamed_file(tmp_path):
+    yaml = pytest.importorskip("yaml")
+    # .json extension but genuine block YAML inside — --format yaml overrides.
+    package_path = tmp_path / "misnamed.json"
+    package_path.write_text(yaml.safe_dump([_task(id="PKG-OV")]), encoding="utf-8")
+
+    result = _run_cli(str(package_path), "--apply", "--format", "yaml")
+    assert result.returncode == 0, result.stderr
+    assert "Импортировано: 1" in result.stdout
