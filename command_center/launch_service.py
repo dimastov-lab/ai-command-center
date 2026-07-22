@@ -31,6 +31,7 @@ from pathlib import Path
 from command_center import (
     activity_log,
     agent_runner,
+    capabilities,
     git_info,
     launch,
     models,
@@ -47,6 +48,19 @@ LAUNCH_DECISION_READY = "ready"                      # workspace valid, launch n
 LAUNCH_DECISION_NEEDS_CONFIRMATION = "needs_confirmation"  # valid but has warnings
 LAUNCH_DECISION_PROVISIONABLE = "provisionable"      # workspace absent, can be created
 LAUNCH_DECISION_BLOCKED = "blocked"                  # fatal — never launch
+
+
+class CapabilityMismatchError(Exception):
+    """Raised by `execute_agent_launch` (the synchronous path) before any
+    executor subprocess is spawned when the task requires capabilities the
+    selected profile would not grant — the v1 analogue of
+    `runtime.supervisor.CapabilityMismatchError`. Carries the
+    `capabilities.CapabilityDecision` so the caller can show required vs.
+    granted."""
+
+    def __init__(self, decision) -> None:
+        self.decision = decision
+        super().__init__(decision.reason or "Executor capability mismatch.")
 
 
 @dataclass
@@ -256,6 +270,7 @@ def execute_agent_launch_v2(
     executor_id: str = "claude_code",
     validation: launch.LaunchValidation | None = None,
     expected_branch: str | None = None,
+    capability_override: str | None = None,
     base_branch: str | None = None,
     source_repository_path: str | None = None,
     status_policy: str = workspace_provisioning.STATUS_POLICY_ALLOW_DIRTY,
@@ -301,6 +316,12 @@ def execute_agent_launch_v2(
 
 
     task_id = (task or {}).get("id")
+    # An explicit `capability_override` argument wins; otherwise honor a
+    # per-task `capability_override` field if the task carries one. `None`
+    # everywhere means "derive the profile from task_type" (the default).
+    effective_override = capability_override if capability_override is not None else (task or {}).get(
+        "capability_override"
+    )
     resolved_workspace = str(Path(repository_path).expanduser().resolve())
     conflict = find_active_run_conflict(
         execution_center_api, task_id=task_id, resolved_workspace=resolved_workspace
@@ -386,6 +407,7 @@ def execute_agent_launch_v2(
         expected_branch=expected_branch,
         launch_source="kanban_task" if task is not None else "execution_center_adhoc",
         prompt_version=(task or {}).get("prompt_version"),
+        capability_override=effective_override,
         max_global_concurrency=max_global_concurrency,
         # Provenance-based capability gating (audit D7): a task imported from an
         # external package carries that package as its `source`; such untrusted
