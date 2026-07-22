@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from command_center.runtime import context_service, db, supervisor
+from command_center.runtime import context_service, db, scheduler, supervisor
 
 DEFAULT_TIMEOUT_SECONDS = 900
 
@@ -159,6 +159,35 @@ class ExecutionCenterAPI:
 
     def reconcile(self) -> list[dict]:
         return self.supervisor.reconcile()
+
+    # ------------------------------------------------------------------
+    # Scheduling (read-only decision layer — never launches anything here)
+    # ------------------------------------------------------------------
+
+    def plan_schedule(
+        self,
+        work_items: list[scheduler.WorkItem],
+        *,
+        registry: scheduler.AgentRegistry | None = None,
+        config: scheduler.SchedulerConfig | None = None,
+        policy: scheduler.RetryPolicy | None = None,
+        now: str | None = None,
+    ) -> scheduler.SchedulingPlan:
+        """Deterministically plan which `work_items` should be assigned,
+        deferred, or blocked *right now*, against the live in-flight load read
+        from this API's own `runtime.db`. Pure decision only — this returns a
+        `SchedulingPlan` and launches nothing. Acting on an `ASSIGN` decision
+        is a separate, explicit `start_run` call by the caller, so the launch
+        confirmation / sensitive-content boundary is never bypassed here."""
+        load = scheduler.build_load_snapshot(self.db_path)
+        return scheduler.plan(
+            work_items,
+            registry=registry or scheduler.default_registry(),
+            load=load,
+            config=config,
+            policy=policy,
+            now=now,
+        )
 
     # ------------------------------------------------------------------
     # Context assembly (BANK/LEGAL sensitive-project boundary)

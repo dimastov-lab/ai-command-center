@@ -1,0 +1,742 @@
+"""Deterministic scheduling & supervision-decision layer.
+
+This module is the *decision* layer that sits directly above
+`supervisor.Supervisor` (the process-lifecycle owner) and beside
+`execution_queue` (dependency readiness). It answers exactly one question,
+purely and deterministically:
+
+    Given the work that wants to run, the agents that could run it, and the
+    load already in flight — what should be assigned, deferred, or blocked
+    right now, and *why*?
+
+It embodies the same invariant `execution_queue` states in its own module
+docstring: **there is no hidden scheduler**. Nothing here launches a process,
+mutates a `run` row, spawns a thread, or touches a subprocess. `plan()` reads
+immutable inputs and returns an immutable, fully serializable `SchedulingPlan`
+— an ordered list of `SchedulingDecision`s, each carrying a machine-readable
+`reason_code` and a human-readable `explanation` (the "scheduling decisions
+must be explainable" invariant). The application layer decides whether to act
+on an `ASSIGN` decision by calling the existing explicit launch path
+(`ExecutionCenterAPI.start_run` -> `Supervisor.start_raw`); this module never
+does that itself.
+
+Why a pure planner rather than folding this into `Supervisor`:
+
+- **No launcher/handshake regression risk.** `Supervisor` owns the frozen
+  Sprint-1 process contract (Popen flags, the `process_started` vs
+  `handshake_received` separation, timeout/cancel signal handling,
+  reconciliation). None of that is imported, subclassed, or altered here.
+- **Deterministic and testable.** Every decision is a pure function of the
+  inputs plus an explicitly-passed `now` timestamp — no wall clock read
+  inside, no randomness (the backoff is deliberately jitter-free; see
+  `RetryPolicy`). The same inputs always produce byte-identical decisions,
+  which is exactly what "deterministic scheduling decisions" and "complete
+  audit trail" require.
+- **Fail-safe on malformed state.** A work item missing the fields needed to
+  schedule it safely resolves to `BLOCKED`/`malformed`, never to `ASSIGN` —
+  malformed runtime state can never cause an execution.
+
+The three actions:
+
+- `ASSIGN`  — schedule this task now, on the named agent, as an explicit new
+  attempt (`decision.attempt`). Emitted at most once per task per plan, and
+  only after every capacity/exclusivity check below passes.
+- `DEFER`   — the task is eligible in principle but a *transient* condition
+  (backoff not elapsed, capacity full, workspace busy, agent temporarily
+  unavailable, dependency not yet met) prevents scheduling it this tick. The
+  caller is expected to re-plan later; the condition is expected to clear.
+- `BLOCKED` — the task cannot be scheduled as-is and re-planning alone will
+  not change that (malformed, no capable agent exists, the prior failure was
+  terminal, or the retry budget is exhausted). A human/config change is
+  required.
+
+Duplicate-execution safety (`no duplicate execution of the same task
+attempt`): a plan emits at most one `ASSIGN` per `task_id`, and workspace
+exclusivity is enforced both against the live `LoadSnapshot.busy_workspaces`
+and against workspaces already consumed earlier *within the same plan*, so two
+items targeting one workspace can never both be assigned.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Mapping
+
+from command_center import agent_runner, executors, models
+from command_center.runtime import db
+
+# --------------------------------------------------------------------------
+# Actions & reason codes (the vocabulary of an explainable decision)
+# --------------------------------------------------------------------------
+
+ACTION_ASSIGN = "ASSIGN"
+ACTION_DEFER = "DEFER"
+ACTION_BLOCKED = "BLOCKED"
+
+# ASSIGN
+REASON_ASSIGNED = "assigned"
+# DEFER (transient — re-plan later, condition is expected to clear)
+REASON_WAITING_DEPENDENCY = "waiting_dependency"
+REASON_BACKOFF = "backoff"
+REASON_WORKSPACE_BUSY = "workspace_busy"
+REASON_GLOBAL_AT_CAPACITY = "global_at_capacity"
+REASON_AGENT_AT_CAPACITY = "agent_at_capacity"
+REASON_AGENT_UNAVAILABLE = "agent_unavailable"
+# BLOCKED (structural — re-planning alone will not help)
+REASON_MALFORMED = "malformed"
+REASON_NO_CAPABLE_AGENT = "no_capable_agent"
+REASON_TERMINAL_FAILURE = "terminal_failure"
+REASON_RETRY_EXHAUSTED = "retry_exhausted"
+
+# --------------------------------------------------------------------------
+# Failure classification: recoverable vs terminal
+# --------------------------------------------------------------------------
+
+RECOVERABLE = "recoverable"
+TERMINAL = "terminal"
+
+# `Supervisor` records a terminal `run.state` plus (for FAILED runs) a
+# `failure_reason` string. The classifier below maps those onto retry policy.
+# `blocked:` (a permission/policy denial — see `runtime.outcome`) and an
+# explicit human `CANCELLED` are terminal: retrying the identical attempt
+# cannot change the outcome. A `timeout`, an `incomplete:` result (the agent
+# produced no working-tree change), or a lost/unknown process (`INTERRUPTED`/
+# `UNKNOWN`, the reconcilable process-loss / app-restart cases) are
+# recoverable — a fresh attempt may well succeed.
+_TERMINAL_STATES: frozenset[str] = frozenset({"CANCELLED"})
+_TERMINAL_REASON_PREFIXES: tuple[str, ...] = ("blocked:",)
+
+
+def classify_failure(*, state: str | None, failure_reason: str | None) -> str:
+    """Classify a prior attempt's terminal outcome as `RECOVERABLE` or
+    `TERMINAL` for retry purposes. Conservative and total: any unrecognized
+    input classifies as `RECOVERABLE` (retry is bounded by
+    `RetryPolicy.max_attempts` regardless, so an over-eager `RECOVERABLE` can
+    at worst spend the retry budget — whereas an over-eager `TERMINAL` would
+    silently strand recoverable work)."""
+    if state in _TERMINAL_STATES:
+        return TERMINAL
+    reason = (failure_reason or "").strip()
+    if any(reason.startswith(prefix) for prefix in _TERMINAL_REASON_PREFIXES):
+        return TERMINAL
+    return RECOVERABLE
+
+
+# --------------------------------------------------------------------------
+# Capabilities & the agent registry
+# --------------------------------------------------------------------------
+
+# A general-purpose agent advertises this sentinel and matches any requirement
+# set — it is not the same as "an empty requirement set", which any agent
+# trivially satisfies.
+CAP_ANY = "*"
+
+
+def capabilities_for_task_type(task_type: str) -> frozenset[str]:
+    """The default capability set a `task_type` *requires* of an agent, derived
+    from the same vocabulary the real executor uses: the task type itself plus
+    its resolved execution profile (`read_only` vs `trusted_development`, via
+    `agent_runner.profile_for_task_type`). A capability-restricted agent (e.g.
+    a review-only agent that lacks `profile:trusted_development`) will
+    correctly fail to match an implementation task built with this helper."""
+    profile = agent_runner.profile_for_task_type(task_type)
+    return frozenset({f"task_type:{task_type}", f"profile:{profile}"})
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    """One registered execution agent — a capacity- and capability-bearing
+    binding over an `executors.Executor`.
+
+    `capabilities` holding `CAP_ANY` means "can run anything". `available`
+    gates scheduling without deregistering (a temporarily-down agent yields
+    `DEFER`/`agent_unavailable`, not `BLOCKED`). `weight` breaks ties between
+    otherwise-equal candidate agents deterministically (higher first)."""
+
+    agent_id: str
+    executor_id: str
+    capabilities: frozenset[str]
+    max_concurrency: int
+    available: bool = True
+    weight: int = 0
+
+    def can_run(self, required_capabilities: frozenset[str]) -> bool:
+        if CAP_ANY in self.capabilities:
+            return True
+        return required_capabilities <= self.capabilities
+
+
+class AgentRegistry:
+    """A deterministic, mutable-at-registration registry of `AgentSpec`s.
+
+    Registration order does not affect scheduling: every iteration over the
+    registry is sorted by a stable key (`weight` desc, then `agent_id` asc),
+    so two registries with the same agents added in different orders produce
+    identical plans."""
+
+    def __init__(self, agents: list[AgentSpec] | None = None) -> None:
+        self._agents: dict[str, AgentSpec] = {}
+        for agent in agents or []:
+            self.register(agent)
+
+    def register(self, spec: AgentSpec) -> None:
+        if spec.max_concurrency < 0:
+            raise ValueError(f"Agent {spec.agent_id!r} max_concurrency must be >= 0, got {spec.max_concurrency}")
+        if spec.executor_id not in executors.EXECUTORS:
+            raise ValueError(f"Agent {spec.agent_id!r} references unknown executor {spec.executor_id!r}")
+        self._agents[spec.agent_id] = spec
+
+    def deregister(self, agent_id: str) -> None:
+        self._agents.pop(agent_id, None)
+
+    def get(self, agent_id: str) -> AgentSpec | None:
+        return self._agents.get(agent_id)
+
+    def all(self) -> list[AgentSpec]:
+        return sorted(self._agents.values(), key=lambda a: (-a.weight, a.agent_id))
+
+    def capable_agents(self, required_capabilities: frozenset[str]) -> list[AgentSpec]:
+        return [a for a in self.all() if a.can_run(required_capabilities)]
+
+
+def default_registry(*, max_concurrency: int = 2) -> AgentRegistry:
+    """A registry seeded from `executors.EXECUTORS`: every *available* executor
+    becomes a general-purpose (`CAP_ANY`) agent whose id equals its executor
+    id. Today that is just `claude_code`; the moment another executor is
+    marked `available` in `executors.py` it is scheduled here with no change
+    to this module."""
+    agents = [
+        AgentSpec(
+            agent_id=executor.id,
+            executor_id=executor.id,
+            capabilities=frozenset({CAP_ANY}),
+            max_concurrency=max_concurrency,
+            available=True,
+        )
+        for executor in executors.EXECUTORS.values()
+        if executor.available
+    ]
+    return AgentRegistry(agents)
+
+
+# --------------------------------------------------------------------------
+# Retry policy — deterministic, jitter-free exponential backoff
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Bounds automatic retries and computes the earliest eligible time for the
+    next attempt after a recoverable failure.
+
+    The backoff is deliberately **jitter-free**: the "deterministic scheduling
+    decisions" invariant means the same inputs must always yield the same
+    `next_eligible_at`. (Jitter belongs — if anywhere — to a real distributed
+    scheduler with thundering-herd concerns; this single-host planner has
+    none, and determinism is worth more here.)"""
+
+    max_attempts: int = 3
+    base_backoff_seconds: float = 30.0
+    multiplier: float = 2.0
+    max_backoff_seconds: float = 900.0
+
+    def backoff_seconds(self, attempts_made: int) -> float:
+        """Delay after `attempts_made` failed attempts (>= 1) before the next
+        attempt becomes eligible. `30, 60, 120, ...` capped at
+        `max_backoff_seconds`."""
+        if attempts_made < 1:
+            return 0.0
+        raw = self.base_backoff_seconds * (self.multiplier ** (attempts_made - 1))
+        return min(raw, self.max_backoff_seconds)
+
+
+# --------------------------------------------------------------------------
+# Inputs: immutable work items and the current load snapshot
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    """One candidate unit of work the planner may schedule.
+
+    `attempts_made` is the count of attempts already *completed* for this task
+    (0 = never run). An `ASSIGN` proposes the explicit next attempt number,
+    `attempts_made + 1` (the "retries must create an explicit new attempt"
+    invariant — the actual new `run` row, with its own incremented
+    `sequence`, is created downstream by `create_run`, never by reusing a
+    prior attempt).
+
+    `last_state`/`last_failure_reason` describe the *previous* attempt's
+    terminal outcome (from `runtime.db`) and drive `classify_failure` +
+    backoff. `workspace` is the exclusivity key (a resolved repository/worktree
+    path); it is normalized (`~` expanded, `..`/`.` collapsed) before every
+    comparison, never resolved against the filesystem, so the planner stays
+    pure."""
+
+    task_id: str
+    workspace: str
+    required_capabilities: frozenset[str] = frozenset()
+    priority: str = "Medium"
+    preferred_agent: str | None = None
+    dependencies_met: bool = True
+    attempts_made: int = 0
+    last_state: str | None = None
+    last_failure_reason: str | None = None
+    last_completed_at: str | None = None
+    enqueued_at: str | None = None
+    sla_seconds: float | None = None
+
+    def is_wellformed(self) -> bool:
+        return bool(self.task_id) and bool(self.workspace) and self.attempts_made >= 0
+
+
+@dataclass(frozen=True)
+class LoadSnapshot:
+    """The execution load already in flight, against which capacity and
+    workspace-exclusivity are checked. Immutable; build one per planning tick
+    (see `build_load_snapshot` for the read-only DB projection)."""
+
+    running_by_agent: Mapping[str, int] = field(default_factory=dict)
+    busy_workspaces: frozenset[str] = frozenset()
+    global_running: int = 0
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    max_global_concurrency: int = 3
+
+
+# --------------------------------------------------------------------------
+# Output: decisions and the plan
+# --------------------------------------------------------------------------
+
+_PRIORITY_RANK: dict[str, int] = {name: rank for rank, name in enumerate(models.TASK_PRIORITIES)}
+
+
+def _priority_rank(priority: str | None) -> int:
+    """Higher = more urgent. An unknown/None priority ranks as the lowest known
+    priority rather than raising — malformed priority never crashes a plan."""
+    return _PRIORITY_RANK.get(priority or "", 0)
+
+
+def _normalize_workspace(path: str) -> str:
+    return os.path.normpath(os.path.expanduser(path))
+
+
+def _to_epoch(iso: str | None) -> float | None:
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+@dataclass(frozen=True)
+class SchedulingDecision:
+    """One explainable, serializable decision for one task — the atom of the
+    audit trail."""
+
+    task_id: str
+    action: str
+    reason_code: str
+    explanation: str
+    priority: str
+    priority_rank: int
+    decided_at: str
+    required_capabilities: frozenset[str] = frozenset()
+    agent_id: str | None = None
+    executor_id: str | None = None
+    attempt: int | None = None
+    failure_classification: str | None = None
+    next_eligible_at: str | None = None
+    queued_seconds: float | None = None
+    sla_seconds: float | None = None
+    sla_breached: bool | None = None
+    sla_remaining_seconds: float | None = None
+
+    def as_dict(self) -> dict:
+        data = {
+            "task_id": self.task_id,
+            "action": self.action,
+            "reason_code": self.reason_code,
+            "explanation": self.explanation,
+            "priority": self.priority,
+            "priority_rank": self.priority_rank,
+            "decided_at": self.decided_at,
+            "required_capabilities": sorted(self.required_capabilities),
+            "agent_id": self.agent_id,
+            "executor_id": self.executor_id,
+            "attempt": self.attempt,
+            "failure_classification": self.failure_classification,
+            "next_eligible_at": self.next_eligible_at,
+            "queued_seconds": self.queued_seconds,
+            "sla_seconds": self.sla_seconds,
+            "sla_breached": self.sla_breached,
+            "sla_remaining_seconds": self.sla_remaining_seconds,
+        }
+        return data
+
+
+@dataclass(frozen=True)
+class SchedulingPlan:
+    """The complete, ordered, deterministic result of one `plan()` call.
+
+    `decisions` is in the exact order the planner considered the work
+    (priority-desc, SLA-breach-first, then FIFO by `enqueued_at`, then
+    `task_id`), so it doubles as the scheduling audit trail: replaying the
+    same inputs reproduces it byte-for-byte."""
+
+    decided_at: str
+    config: SchedulerConfig
+    decisions: tuple[SchedulingDecision, ...]
+
+    def assignments(self) -> list[SchedulingDecision]:
+        return [d for d in self.decisions if d.action == ACTION_ASSIGN]
+
+    def deferrals(self) -> list[SchedulingDecision]:
+        return [d for d in self.decisions if d.action == ACTION_DEFER]
+
+    def blocked(self) -> list[SchedulingDecision]:
+        return [d for d in self.decisions if d.action == ACTION_BLOCKED]
+
+    def audit_records(self) -> list[dict]:
+        return [d.as_dict() for d in self.decisions]
+
+
+def _order_key(item: WorkItem, now_epoch: float | None) -> tuple:
+    """Deterministic scheduling order: highest priority first; within a
+    priority, an SLA-breached item jumps ahead; then FIFO by `enqueued_at`;
+    final tiebreak `task_id` (total order, so the sort is stable and
+    reproducible even for items identical in every other field)."""
+    breached = _sla_breached(item, now_epoch)
+    enqueued = _to_epoch(item.enqueued_at)
+    # `None` timestamps sort last within their group (treated as +inf).
+    enqueued_key = enqueued if enqueued is not None else float("inf")
+    return (-_priority_rank(item.priority), 0 if breached else 1, enqueued_key, item.task_id)
+
+
+def _queued_seconds(item: WorkItem, now_epoch: float | None) -> float | None:
+    enqueued = _to_epoch(item.enqueued_at)
+    if enqueued is None or now_epoch is None:
+        return None
+    return max(0.0, now_epoch - enqueued)
+
+
+def _sla_breached(item: WorkItem, now_epoch: float | None) -> bool:
+    if item.sla_seconds is None:
+        return False
+    queued = _queued_seconds(item, now_epoch)
+    if queued is None:
+        return False
+    return queued > item.sla_seconds
+
+
+def _sla_remaining(item: WorkItem, now_epoch: float | None) -> float | None:
+    if item.sla_seconds is None:
+        return None
+    queued = _queued_seconds(item, now_epoch)
+    if queued is None:
+        return None
+    return item.sla_seconds - queued
+
+
+def _iso_add(iso: str | None, seconds: float) -> str | None:
+    epoch = _to_epoch(iso)
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch + seconds).isoformat(timespec="seconds")
+
+
+def plan(
+    work_items: list[WorkItem],
+    *,
+    registry: AgentRegistry,
+    load: LoadSnapshot | None = None,
+    config: SchedulerConfig | None = None,
+    policy: RetryPolicy | None = None,
+    now: str | None = None,
+) -> SchedulingPlan:
+    """Produce a deterministic, explainable `SchedulingPlan` from immutable
+    inputs. Never launches, never mutates anything, never reads the wall clock
+    (pass `now`; defaults to `models.iso_now()` only as a convenience for
+    callers that genuinely want "as of this instant").
+
+    Capacity is consumed greedily in the deterministic order defined by
+    `_order_key`, so a higher-priority item always claims scarce global/agent
+    capacity ahead of a lower-priority one, and the result is reproducible."""
+    config = config or SchedulerConfig()
+    policy = policy or RetryPolicy()
+    load = load or LoadSnapshot()
+    now = now or models.iso_now()
+    now_epoch = _to_epoch(now)
+
+    ordered = sorted(work_items, key=lambda it: _order_key(it, now_epoch))
+
+    # Mutable, plan-local capacity ledgers — start from the live snapshot and
+    # are drawn down as ASSIGN decisions are made, so later (lower-priority)
+    # items see the capacity earlier items have already claimed.
+    global_used = load.global_running
+    agent_used: dict[str, int] = {a.agent_id: load.running_by_agent.get(a.agent_id, 0) for a in registry.all()}
+    consumed_workspaces: set[str] = {_normalize_workspace(w) for w in load.busy_workspaces}
+    scheduled_tasks: set[str] = set()
+
+    decisions: list[SchedulingDecision] = []
+
+    def _base(item: WorkItem) -> dict:
+        return {
+            "task_id": item.task_id,
+            "priority": item.priority,
+            "priority_rank": _priority_rank(item.priority),
+            "decided_at": now,
+            "required_capabilities": item.required_capabilities,
+            "queued_seconds": _queued_seconds(item, now_epoch),
+            "sla_seconds": item.sla_seconds,
+            "sla_breached": _sla_breached(item, now_epoch) if item.sla_seconds is not None else None,
+            "sla_remaining_seconds": _sla_remaining(item, now_epoch),
+        }
+
+    for item in ordered:
+        base = _base(item)
+
+        # 0) Malformed — fail safe. Never assign against unusable state.
+        if not item.is_wellformed():
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_BLOCKED,
+                    reason_code=REASON_MALFORMED,
+                    explanation="work item is missing a task_id or workspace, or has a negative attempt count",
+                    **base,
+                )
+            )
+            continue
+
+        workspace = _normalize_workspace(item.workspace)
+
+        # 1) Dependencies not satisfied — transient, will clear.
+        if not item.dependencies_met:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_DEFER,
+                    reason_code=REASON_WAITING_DEPENDENCY,
+                    explanation="task dependencies are not yet satisfied",
+                    **base,
+                )
+            )
+            continue
+
+        # 2) Retry gating on the previous attempt's terminal outcome.
+        if item.attempts_made > 0 and (item.last_failure_reason or item.last_state in _TERMINAL_STATES):
+            classification = classify_failure(state=item.last_state, failure_reason=item.last_failure_reason)
+            if item.last_state in ("COMPLETED",):
+                classification = None  # a completed prior attempt is not a failure to gate on
+            if classification == TERMINAL:
+                decisions.append(
+                    SchedulingDecision(
+                        action=ACTION_BLOCKED,
+                        reason_code=REASON_TERMINAL_FAILURE,
+                        explanation=(
+                            f"previous attempt ended terminally "
+                            f"(state={item.last_state!r}, reason={item.last_failure_reason!r}); "
+                            "retrying the identical attempt cannot change the outcome"
+                        ),
+                        failure_classification=TERMINAL,
+                        **base,
+                    )
+                )
+                continue
+            if classification == RECOVERABLE:
+                if item.attempts_made >= policy.max_attempts:
+                    decisions.append(
+                        SchedulingDecision(
+                            action=ACTION_BLOCKED,
+                            reason_code=REASON_RETRY_EXHAUSTED,
+                            explanation=(
+                                f"recoverable failure but retry budget exhausted "
+                                f"({item.attempts_made}/{policy.max_attempts} attempts made)"
+                            ),
+                            failure_classification=RECOVERABLE,
+                            **base,
+                        )
+                    )
+                    continue
+                backoff = policy.backoff_seconds(item.attempts_made)
+                next_eligible = _iso_add(item.last_completed_at, backoff)
+                last_epoch = _to_epoch(item.last_completed_at)
+                if last_epoch is not None and now_epoch is not None and now_epoch < last_epoch + backoff:
+                    decisions.append(
+                        SchedulingDecision(
+                            action=ACTION_DEFER,
+                            reason_code=REASON_BACKOFF,
+                            explanation=(
+                                f"recoverable failure; backing off {backoff:.0f}s after attempt "
+                                f"{item.attempts_made} before the next attempt"
+                            ),
+                            failure_classification=RECOVERABLE,
+                            next_eligible_at=next_eligible,
+                            **base,
+                        )
+                    )
+                    continue
+                # else: backoff already elapsed (or no timestamp to gate on) —
+                # fall through to normal assignment as a fresh attempt.
+
+        # 3) Capability match — structural. No capable agent is BLOCKED.
+        if item.preferred_agent is not None:
+            preferred = registry.get(item.preferred_agent)
+            if preferred is None or not preferred.can_run(item.required_capabilities):
+                decisions.append(
+                    SchedulingDecision(
+                        action=ACTION_BLOCKED,
+                        reason_code=REASON_NO_CAPABLE_AGENT,
+                        explanation=(
+                            f"preferred agent {item.preferred_agent!r} is not registered or cannot satisfy "
+                            f"required capabilities {sorted(item.required_capabilities)}"
+                        ),
+                        **base,
+                    )
+                )
+                continue
+            capable = [preferred]
+        else:
+            capable = registry.capable_agents(item.required_capabilities)
+        if not capable:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_BLOCKED,
+                    reason_code=REASON_NO_CAPABLE_AGENT,
+                    explanation=(
+                        f"no registered agent can satisfy required capabilities "
+                        f"{sorted(item.required_capabilities)}"
+                    ),
+                    **base,
+                )
+            )
+            continue
+
+        # 4) Availability — transient. Capable agents exist but are all down.
+        available = [a for a in capable if a.available]
+        if not available:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_DEFER,
+                    reason_code=REASON_AGENT_UNAVAILABLE,
+                    explanation="every capable agent is currently marked unavailable",
+                    **base,
+                )
+            )
+            continue
+
+        # 5) Workspace exclusivity — transient. Mirrors the DB workspace lock
+        #    (`create_run(enforce_workspace_lock=True)`) *and* guards against
+        #    two items in this same plan claiming one workspace.
+        if workspace in consumed_workspaces:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_DEFER,
+                    reason_code=REASON_WORKSPACE_BUSY,
+                    explanation=f"workspace {item.workspace!r} already has an active or just-assigned run",
+                    **base,
+                )
+            )
+            continue
+
+        # 6) Global capacity — transient.
+        if global_used >= config.max_global_concurrency:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_DEFER,
+                    reason_code=REASON_GLOBAL_AT_CAPACITY,
+                    explanation=(
+                        f"global concurrency limit reached "
+                        f"({global_used}/{config.max_global_concurrency} running)"
+                    ),
+                    **base,
+                )
+            )
+            continue
+
+        # 7) Per-agent capacity + workload distribution — pick the available,
+        #    capable agent with the most spare capacity (spreads load), tie
+        #    broken by weight desc then agent_id asc (both already the order
+        #    `registry.all()` yields, so `max` on a stable-sorted list is
+        #    deterministic).
+        def _spare(a: AgentSpec) -> int:
+            return a.max_concurrency - agent_used.get(a.agent_id, 0)
+
+        with_capacity = [a for a in available if _spare(a) > 0]
+        if not with_capacity:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_DEFER,
+                    reason_code=REASON_AGENT_AT_CAPACITY,
+                    explanation="every capable, available agent is at its concurrency limit",
+                    **base,
+                )
+            )
+            continue
+
+        chosen = max(with_capacity, key=lambda a: (_spare(a), a.weight, a.agent_id))
+
+        # 8) ASSIGN — draw down every ledger so later items see it.
+        global_used += 1
+        agent_used[chosen.agent_id] = agent_used.get(chosen.agent_id, 0) + 1
+        consumed_workspaces.add(workspace)
+        scheduled_tasks.add(item.task_id)
+        decisions.append(
+            SchedulingDecision(
+                action=ACTION_ASSIGN,
+                reason_code=REASON_ASSIGNED,
+                explanation=(
+                    f"assigned to agent {chosen.agent_id!r} as attempt {item.attempts_made + 1}"
+                ),
+                agent_id=chosen.agent_id,
+                executor_id=chosen.executor_id,
+                attempt=item.attempts_made + 1,
+                **base,
+            )
+        )
+
+    return SchedulingPlan(decided_at=now, config=config, decisions=tuple(decisions))
+
+
+# --------------------------------------------------------------------------
+# Read-only DB projection: the load already in flight
+# --------------------------------------------------------------------------
+
+
+def build_load_snapshot(db_path, *, agent_of_run=None) -> LoadSnapshot:
+    """Project the current in-flight load from `runtime.db` — read-only, never
+    mutates a row. `global_running` and `busy_workspaces` come straight from
+    every run in `db.EXECUTION_CENTER_ACTIVE_STATES` (`PREPARED`/`QUEUED`/
+    `RUNNING`), so the workspace exclusivity the planner enforces exactly
+    matches the DB workspace lock's own active-state set.
+
+    Run rows do not record which *agent* executed them (the v1 schema predates
+    this layer and is intentionally left frozen), so per-agent running counts
+    are attributed via `agent_of_run(run) -> agent_id`, defaulting every
+    active run to the `claude_code` agent — the only one that runs anything
+    today."""
+    if agent_of_run is None:
+        agent_of_run = lambda run: "claude_code"  # noqa: E731 — trivial default resolver
+    rows = db.list_runs(db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    running_by_agent: dict[str, int] = {}
+    busy: set[str] = set()
+    for run in rows:
+        agent_id = agent_of_run(run)
+        running_by_agent[agent_id] = running_by_agent.get(agent_id, 0) + 1
+        workspace = run.get("repository_path")
+        if workspace:
+            busy.add(_normalize_workspace(workspace))
+    return LoadSnapshot(
+        running_by_agent=running_by_agent,
+        busy_workspaces=frozenset(busy),
+        global_running=len(rows),
+    )
