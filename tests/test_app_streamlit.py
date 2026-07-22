@@ -338,6 +338,69 @@ def _init_repo(path: Path) -> None:
     (path / "f.txt").write_text("hello")
     subprocess.run(["git", "add", "f.txt"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=path, check=True)
+
+
+def test_launcher_provisions_missing_isolated_worktree_and_launches(fake_claude, tmp_path):
+    """Founder Gate regression, Kanban path: a task whose isolated worktree
+    does not exist yet must still be launchable — the launch control is
+    enabled (not permanently blocked), clicking it provisions the worktree,
+    and the agent runs *in that worktree*, never in the main repository."""
+    project_repo = tmp_path / "aios"
+    project_repo.mkdir()
+    _init_repo(project_repo)  # primary checkout on main
+
+    worktree = tmp_path / "worktrees" / "audit"  # absent — must be provisioned
+    project_config.save_repository_path("AIOS", str(project_repo))
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = "agent_ran_here.txt"
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(
+        [json.dumps({"type": "result", "result": "Verdict: APPROVED FOR COMMIT"})]
+    )
+
+    _seed_task(
+        workspace_path=str(worktree),
+        branch="audit/execution-queue",
+        base_branch="main",
+    )
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+    # The operator is told the worktree will be created, not shown a fatal error.
+    assert any("создан автоматически" in i.value for i in at.info)
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert not at.exception
+
+    launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
+    assert launch_button.disabled is False  # provisionable launch is actionable
+    at = launch_button.click().run()
+    assert not at.exception
+
+    db_path = runtime_db.resolve_db_path()
+    runs = runtime_db.list_runs(db_path, task_id="seeded-task-1")
+    assert len(runs) == 1
+    final = _wait_for_run_terminal(db_path, runs[0]["id"])
+    assert final["state"] == "COMPLETED"
+    assert final["repository_path"] == str(worktree.resolve())
+    assert final["expected_branch"] == "audit/execution-queue"
+
+    # The worktree exists on the expected branch; the agent ran inside it; the
+    # main repository was never touched.
+    assert worktree.is_dir()
+    status_out = subprocess.run(
+        ["git", "-C", str(worktree), "branch", "--show-current"],
+        capture_output=True, text=True, check=True,
+    )
+    assert status_out.stdout.strip() == "audit/execution-queue"
+    assert (worktree / "agent_ran_here.txt").exists()
+    assert not (project_repo / "agent_ran_here.txt").exists()
+    main_status = subprocess.run(
+        ["git", "-C", str(project_repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    assert main_status.stdout.strip() == ""
 
 
 def test_launcher_launches_claude_against_task_workspace_not_project_repository(fake_claude, tmp_path):

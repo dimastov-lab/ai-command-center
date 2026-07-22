@@ -27,6 +27,7 @@ from command_center import (
     activity_log,
     agent_runner,
     executors,
+    git_info,
     launch,
     models,
     report_parser,
@@ -42,6 +43,167 @@ class LaunchOutcome:
     parsed: dict
     result_status: str
     report_relpath: str
+
+
+# Decisions `prepare_task_launch` returns — the single classification both the
+# Kanban launcher and the execution queue branch on, so neither reimplements
+# the "is this launchable / provisionable / fatal?" logic.
+LAUNCH_DECISION_READY = "ready"                      # workspace valid, launch now
+LAUNCH_DECISION_NEEDS_CONFIRMATION = "needs_confirmation"  # valid but has warnings
+LAUNCH_DECISION_PROVISIONABLE = "provisionable"      # workspace absent, can be created
+LAUNCH_DECISION_BLOCKED = "blocked"                  # fatal — never launch
+
+
+@dataclass
+class LaunchPreparation:
+    """The result of classifying a task launch *without mutating anything*.
+
+    `decision` is one of the `LAUNCH_DECISION_*` constants. The remaining
+    fields are the single resolved inputs every downstream launch step must
+    use (never re-derived differently elsewhere): the workspace the agent
+    will run in, the expected/base branches, the canonical source repository,
+    and the (pre-provision) validation. `provision_notice` is a human-facing
+    string for the `PROVISIONABLE` case; `fatal_messages` collects the
+    blocking errors for the `BLOCKED` case."""
+
+    decision: str
+    selection: launch.WorkspaceSelection
+    resolved_workspace: str | None
+    expected_branch: str | None
+    base_branch: str | None
+    source_repository_path: str | None
+    validation: launch.LaunchValidation
+    provision_notice: str | None = None
+    fatal_messages: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.fatal_messages is None:
+            self.fatal_messages = []
+
+    @property
+    def launchable(self) -> bool:
+        """Whether the operator/queue may proceed to `execute_agent_launch_v2`
+        — either the workspace is already valid, or it is absent but
+        provisionable. The actual provisioning + the authoritative fail-closed
+        verification still happen downstream (in `execute_agent_launch_v2` ->
+        `provision_and_verify`, then again at `Supervisor.start_raw`); this
+        only decides whether that path may be entered at all."""
+        return self.decision in (
+            LAUNCH_DECISION_READY,
+            LAUNCH_DECISION_NEEDS_CONFIRMATION,
+            LAUNCH_DECISION_PROVISIONABLE,
+        )
+
+    @property
+    def provisionable(self) -> bool:
+        return self.decision == LAUNCH_DECISION_PROVISIONABLE
+
+
+def prepare_task_launch(*, task: dict | None, project_config: dict | None) -> LaunchPreparation:
+    """Shared, **non-mutating** pre-launch classification for the normal task
+    paths (Kanban launcher and execution queue). Resolves the single workspace
+    / expected-branch / base-branch / source-repository inputs, runs
+    `launch.validate_launch`, and classifies the result:
+
+    - already valid                     -> READY / NEEDS_CONFIRMATION
+    - absent but provisionable worktree -> PROVISIONABLE
+    - anything else                     -> BLOCKED (fail closed)
+
+    A workspace is *provisionable* only when validation's **sole** blocking
+    issue is the stable `launch.ISSUE_WORKSPACE_MISSING` code (never matched
+    from message text) **and** the provisioning inputs are sufficient: a real
+    git source repository, an expected branch, a base branch that exists, and
+    a feature/audit branch (isolated-worktree work — main-line branches are
+    not auto-provisioned into a second worktree). Every other failure — no
+    workspace configured, path is a file, not a git repo, missing/​unusable
+    provisioning inputs — stays fatal. This function never creates a worktree;
+    provisioning happens in `execute_agent_launch_v2` (which both callers
+    funnel through) and is re-verified at the `Supervisor.start_raw`
+    chokepoint."""
+    selection = launch.resolve_workspace_path(task=task, project_config=project_config)
+    expected_branch = launch.resolve_expected_branch(task=task, project_config=project_config)
+    base_branch = launch.resolve_base_branch(task=task, project_config=project_config)
+    source_repository_path = (project_config or {}).get("repository_path")
+
+    validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
+    resolved_workspace = (
+        str(Path(selection.path).expanduser().resolve()) if selection.path else None
+    )
+
+    if validation.can_launch:
+        decision = (
+            LAUNCH_DECISION_NEEDS_CONFIRMATION if validation.warnings else LAUNCH_DECISION_READY
+        )
+        return LaunchPreparation(
+            decision=decision,
+            selection=selection,
+            resolved_workspace=resolved_workspace,
+            expected_branch=expected_branch,
+            base_branch=base_branch,
+            source_repository_path=source_repository_path,
+            validation=validation,
+        )
+
+    provisionable, reason = _classify_provisionable(
+        validation=validation,
+        expected_branch=expected_branch,
+        base_branch=base_branch,
+        source_repository_path=source_repository_path,
+    )
+    if provisionable:
+        return LaunchPreparation(
+            decision=LAUNCH_DECISION_PROVISIONABLE,
+            selection=selection,
+            resolved_workspace=resolved_workspace,
+            expected_branch=expected_branch,
+            base_branch=base_branch,
+            source_repository_path=source_repository_path,
+            validation=validation,
+            provision_notice=reason,
+        )
+
+    return LaunchPreparation(
+        decision=LAUNCH_DECISION_BLOCKED,
+        selection=selection,
+        resolved_workspace=resolved_workspace,
+        expected_branch=expected_branch,
+        base_branch=base_branch,
+        source_repository_path=source_repository_path,
+        validation=validation,
+        fatal_messages=list(validation.errors),
+    )
+
+
+def _classify_provisionable(
+    *,
+    validation: launch.LaunchValidation,
+    expected_branch: str | None,
+    base_branch: str | None,
+    source_repository_path: str | None,
+) -> tuple[bool, str | None]:
+    """Return `(True, notice)` when the only reason `validation` failed is a
+    missing-but-provisionable workspace and the inputs to create it are
+    present and usable, else `(False, None)`. Read-only."""
+    if not validation.blocked_only_by(launch.ISSUE_WORKSPACE_MISSING):
+        return False, None
+    if not (source_repository_path and expected_branch and base_branch):
+        return False, None
+    if not workspace_provisioning.is_feature_task(expected_branch, base_branch):
+        # A main-line branch is not auto-provisioned into a second worktree
+        # (it is normally already checked out in the primary tree).
+        return False, None
+
+    repo = Path(source_repository_path).expanduser()
+    if not git_info.get_status(repo).get("is_repo"):
+        return False, None
+    base_ref = git_info.run_git_command(repo, ["rev-parse", "--verify", f"{base_branch}^{{commit}}"])
+    if base_ref is None or base_ref.returncode != 0:
+        return False, None
+
+    return True, (
+        f"Изолированный worktree для ветки «{expected_branch}» будет создан автоматически "
+        f"из «{base_branch}» перед запуском."
+    )
 
 
 def execute_agent_launch(
@@ -265,6 +427,19 @@ def execute_agent_launch_v2(
             status_policy=status_policy,
         )
         workspace_provisioning.provision_and_verify(workspace_verification)
+        # Post-provision validation: if the caller handed us a validation that
+        # was only failing because the workspace did not exist yet (the
+        # provisionable path — see `prepare_task_launch`), it is now stale. The
+        # worktree exists and has just passed the full isolation gate, so
+        # refresh it against the real, now-present workspace so `begin_launch`
+        # below records accurate branch/status instead of the pre-provision
+        # "not found" state. A genuinely fatal validation never reaches here
+        # (the caller blocks first) and would in any case have already raised
+        # from `provision_and_verify`.
+        if validation is not None and not validation.can_launch:
+            validation = launch.validate_launch(
+                workspace_path=str(repository_path), expected_branch=expected_branch
+            )
 
     if task is not None:
         models.push_prompt_history(task, prompt)
