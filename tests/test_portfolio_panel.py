@@ -89,6 +89,26 @@ def test_portfolio_page_lists_ready_task(tmp_path, monkeypatch, git_repo):
     assert "AICC-UI-777" in markdown_text
 
 
+def test_portfolio_page_shows_worktree_launcher_summary_fields(tmp_path, monkeypatch, git_repo):
+    """The always-visible launcher summary must surface every field
+    AICC-LAUNCH-001's UI section requires: Repository, Worktree, Branch, Launch
+    profile, Permission profile, Current execution state."""
+    _seed_portfolio(tmp_path, monkeypatch, git_repo)
+
+    at = _at_on_portfolio_page()
+    assert not at.exception
+    captions = "\n".join(c.value for c in at.caption)
+    markdown_text = "\n".join(m.value for m in at.markdown)
+
+    for field in ("Repository", "Worktree", "Branch", "Launch profile", "Permission profile", "Current execution state"):
+        assert field in captions, f"missing summary field: {field}"
+
+    # The worktree path, branch, and launch profile label are rendered as values.
+    assert str(tmp_path / "worktrees" / "aicc-ui-777") in markdown_text
+    assert "task/aicc-ui-777" in markdown_text
+    assert "Claude Code · Implementation" in markdown_text
+
+
 def test_portfolio_page_dry_run_makes_no_mutation(tmp_path, monkeypatch, git_repo):
     _seed_portfolio(tmp_path, monkeypatch, git_repo)
     branches_before = set(git_info.get_branches(git_repo))

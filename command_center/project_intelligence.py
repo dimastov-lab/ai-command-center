@@ -27,7 +27,7 @@ faked:
 
 from __future__ import annotations
 
-from command_center import models
+from command_center import models, project_config
 
 HEALTH_GOOD = "Good"
 HEALTH_ATTENTION = "Attention"
@@ -48,9 +48,13 @@ def rank_projects_by_activity(project_ids: list[str], tasks: list[dict]) -> list
     on dict/set iteration order. Used only to *prioritize/group* projects in
     a selector (e.g. "the 3 most active"); callers must still offer every id
     in `project_ids` — this function never drops one."""
+    # Count on canonical ids (via the shared `project_config.canonical_project_id`
+    # helper) so a task storing a display name / alias ("AI Command Center")
+    # ranks under its canonical project ("AICC") instead of being ignored — the
+    # same normalization the Kanban filter, pill count, and intelligence strip use.
     active_counts: dict[str, int] = dict.fromkeys(project_ids, 0)
     for task in tasks:
-        project = task.get("project")
+        project = project_config.canonical_project_id(task.get("project"))
         if project in active_counts and task.get("status") != "Done":
             active_counts[project] += 1
     return sorted(project_ids, key=lambda pid: (-active_counts[pid], project_ids.index(pid)))
@@ -98,7 +102,11 @@ def compute_project_intelligence(
     can depend on a task from another project, and understating that would
     misreport why something is blocked."""
     all_tasks_by_id = tasks_by_id or {task["id"]: task for task in tasks if task.get("id")}
-    project_tasks = [t for t in tasks if project_id is None or t.get("project") == project_id]
+    # Scope on canonical ids so a display-name/alias task ("AI Command Center")
+    # is included in its canonical project's ("AICC") rollup — otherwise the
+    # intelligence strip's total/health/completion silently undercounts and
+    # disagrees with the Kanban lane and pill for the very same project.
+    project_tasks = [t for t in tasks if project_config.project_matches(t.get("project"), project_id)]
 
     total = len(project_tasks)
     done_tasks = [t for t in project_tasks if t.get("status") == "Done"]

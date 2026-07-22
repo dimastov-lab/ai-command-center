@@ -47,7 +47,7 @@ from pathlib import Path
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.models import iso_now
-from command_center.runtime import context_service, db, identity, reports, stream_parser
+from command_center.runtime import context_service, db, identity, outcome, reports, stream_parser
 
 # `AICC_CLAUDE_BINARY` lets a test point a genuinely separate OS process
 # (e.g. `scripts/execution_center_debug.py`, invoked as a real subprocess, not
@@ -118,10 +118,23 @@ def build_claude_command(
     """Construct the exact `claude` argv for one run.
 
     Fresh run: `claude --session-id <uuid> -p <prompt> --output-format
-    stream-json --include-partial-messages --verbose --setting-sources ""`.
-    Resume: identical, except `--resume <uuid>` (the *exact* id — never a
-    bare `--resume` picker, never `--continue`) in place of `--session-id`.
+    stream-json --include-partial-messages --verbose --setting-sources ""
+    --permission-mode <profile mode>`. Resume: identical, except `--resume
+    <uuid>` (the *exact* id — never a bare `--resume` picker, never
+    `--continue`) in place of `--session-id`.
+
+    `--permission-mode` (via `agent_runner.PERMISSION_MODE_BY_PROFILE`) was a
+    genuine gap here until this fix: without it, the CLI's implicit default
+    permission mode denies `Write`/`Edit` tool calls outright in headless
+    `-p` mode — confirmed empirically against the real `claude` CLI — while
+    the process itself still exits 0, so a `trusted_development` run could
+    silently fail to make any of the changes it was asked for and still be
+    recorded `COMPLETED` (see `agent_runner`'s profile docstring and
+    `runtime.outcome` for the terminal-state classifier that also guards
+    against exactly this). `agent_runner.build_command` (the v1 synchronous
+    executor) already set this; this was the divergence between the two.
     """
+    profile = agent_runner.profile_for_task_type(task_type)
     command = [CLAUDE_BINARY]
     if is_resume:
         command += ["--resume", session_id]
@@ -136,6 +149,8 @@ def build_claude_command(
         "--verbose",
         "--setting-sources",
         "",
+        "--permission-mode",
+        agent_runner.PERMISSION_MODE_BY_PROFILE[profile],
     ]
     if task_type in agent_runner.READ_ONLY_TASK_TYPES:
         command += ["--tools", ",".join(agent_runner.READ_ONLY_ALLOWED_TOOLS)]
@@ -508,6 +523,18 @@ class Supervisor:
             except Exception:
                 pass
 
+    def _final_result_payload(self, run_id: str) -> dict | None:
+        """The payload of the run's own `result`-type event (the last line of
+        `claude -p --output-format stream-json`'s output — carries `result`
+        text and, when applicable, a `permission_denials` array), or `None`
+        if no such event was persisted. Called only after both stdout/stderr
+        reader threads have joined (see `_supervise`), so every event this
+        run will ever produce is already committed to `run_event`."""
+        result_events = db.list_run_events(self.db_path, run_id, after_seq=0, limit=1_000_000, event_type="result")
+        if not result_events:
+            return None
+        return result_events[-1]["payload"]
+
     def _supervise(self, run_id: str, active: _ActiveRun, repo_path: Path) -> None:
         process = active.process
         stdout_thread = threading.Thread(target=self._drain_stdout, args=(run_id, process), daemon=True)
@@ -535,10 +562,35 @@ class Supervisor:
         elif timed_out:
             new_state = "FAILED"
             failure_reason = "timeout"
-        elif exit_code == 0:
-            new_state = "COMPLETED"
-        else:
+        elif exit_code != 0:
             new_state = "FAILED"
+        else:
+            # exit_code == 0 only proves the `claude` process itself did not
+            # crash — it does not prove the requested work actually happened
+            # (a denied `Write`/`Edit` call, or the agent's own final
+            # message saying it could not proceed, both still exit 0; see
+            # `runtime.outcome`'s module docstring). EvaluatingResult stage:
+            # decide what this exit actually means before ever recording
+            # COMPLETED.
+            result_payload = self._final_result_payload(run_id)
+            classification, reason = outcome.classify_process_result(
+                task_type=run["task_type"],
+                result_text=(result_payload or {}).get("result"),
+                permission_denials=(result_payload or {}).get("permission_denials"),
+                working_tree_changed=working_tree_changed,
+            )
+            if classification == outcome.OK:
+                new_state = "COMPLETED"
+            else:
+                # `classification` (`"blocked"`/`"incomplete"`) is prefixed
+                # onto `reason` so `session_view.derive_status` can tell a
+                # blocked run apart from a merely incomplete one from
+                # `failure_reason` alone — both persist to the same `FAILED`
+                # `run.state` (see `runtime.db.ALLOWED_TRANSITIONS`, which
+                # this deliberately does not expand), but they are display-
+                # distinct outcomes.
+                new_state = "FAILED"
+                failure_reason = f"{classification}:{reason}"
 
         run = db.update_run_state(
             self.db_path,

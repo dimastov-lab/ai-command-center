@@ -29,12 +29,25 @@ STATUS_LAUNCHING = "Launching"
 STATUS_RUNNING = "Running"
 STATUS_WAITING = "Waiting"
 STATUS_REQUIRES_ATTENTION = "Requires Attention"
+STATUS_BLOCKED = "Blocked"
+STATUS_INCOMPLETE = "Incomplete"
 STATUS_COMPLETED = "Completed"
 STATUS_FAILED = "Failed"
 STATUS_CANCELLED = "Cancelled"
 
 ACTIVE_DISPLAY_STATUSES: frozenset[str] = frozenset({STATUS_LAUNCHING, STATUS_RUNNING, STATUS_WAITING})
-TERMINAL_DISPLAY_STATUSES: frozenset[str] = frozenset({STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED})
+# `STATUS_BLOCKED`/`STATUS_INCOMPLETE` are terminal too — the process has
+# already exited (see `runtime.outcome`'s `EvaluatingResult` stage, which is
+# what produces these out of a `FAILED`-state run's `failure_reason`), it
+# just did not reach a genuine `COMPLETED` outcome. Included here so
+# `task_sync._apply_terminal_fields` still runs for them (report path,
+# verdict, etc.) exactly as it does for `FAILED`/`CANCELLED`.
+TERMINAL_DISPLAY_STATUSES: frozenset[str] = frozenset(
+    {STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_BLOCKED, STATUS_INCOMPLETE}
+)
+
+_BLOCKED_REASON_PREFIX = "blocked:"
+_INCOMPLETE_REASON_PREFIX = "incomplete:"
 
 # Default staleness threshold for the heartbeat liveness probe (see
 # `get_heartbeat_age`/`is_heartbeat_stale` below).
@@ -42,11 +55,20 @@ DEFAULT_HEARTBEAT_STALE_SECONDS = 90.0
 
 
 def derive_status(run: dict) -> str:
-    """Maps `run["state"]` (+ `cancel_requested`) to the mission's display
-    vocabulary. `INTERRUPTED`/`UNKNOWN`/any unrecognized state is
-    conservatively mapped to `Requires Attention` — this module never
-    guesses a terminal-ok outcome for an ambiguous run, mirroring
-    `Supervisor.reconcile()`'s own conservatism."""
+    """Maps `run["state"]` (+ `cancel_requested`/`failure_reason`) to the
+    mission's display vocabulary. `INTERRUPTED`/`UNKNOWN`/any unrecognized
+    state is conservatively mapped to `Requires Attention` — this module
+    never guesses a terminal-ok outcome for an ambiguous run, mirroring
+    `Supervisor.reconcile()`'s own conservatism.
+
+    A `FAILED` run whose `failure_reason` carries the `"blocked:"`/
+    `"incomplete:"` prefix `runtime.outcome.classify_process_result`
+    produces (via `Supervisor._supervise`) is displayed as `Blocked`/
+    `Incomplete` rather than the generic `Failed` — both are still process
+    exits that did not deliver the requested work, but the reason differs
+    (a denied tool call / explicit blocker language, vs. a clean exit that
+    simply didn't produce the required repository changes) and the UI must
+    be able to tell them apart (Required fix 7)."""
     state = run.get("state", "UNKNOWN")
     if state in ("PREPARED", "QUEUED"):
         return STATUS_LAUNCHING
@@ -55,6 +77,11 @@ def derive_status(run: dict) -> str:
     if state == "COMPLETED":
         return STATUS_COMPLETED
     if state == "FAILED":
+        reason = run.get("failure_reason") or ""
+        if reason.startswith(_BLOCKED_REASON_PREFIX):
+            return STATUS_BLOCKED
+        if reason.startswith(_INCOMPLETE_REASON_PREFIX):
+            return STATUS_INCOMPLETE
         return STATUS_FAILED
     if state == "CANCELLED":
         return STATUS_CANCELLED
@@ -146,6 +173,12 @@ def build_session_view(
     if not last_error and status == STATUS_FAILED and latest_event and latest_event.get("event_type") == "stderr_line":
         last_error = (latest_event.get("payload") or {}).get("line")
 
+    # Explicit, unambiguous field for `Blocked`/`Incomplete` — distinct from
+    # `last_error` (which also covers plain `Failed` stderr output) so the UI
+    # can render "why this was blocked" without having to re-derive it from
+    # `status` + `last_error` itself (Required fix 7).
+    blocker_reason = run.get("failure_reason") if status in (STATUS_BLOCKED, STATUS_INCOMPLETE) else None
+
     return {
         "session_id": run.get("session_id"),
         "run_id": run.get("id"),
@@ -168,6 +201,7 @@ def build_session_view(
         "progress": (kanban_task or {}).get("progress"),
         "exit_code": run.get("exit_code"),
         "last_error": last_error,
+        "blocker_reason": blocker_reason,
         "prompt_version": run.get("prompt_version"),
         "prompt": run.get("prompt"),
         "report_path": report_path,

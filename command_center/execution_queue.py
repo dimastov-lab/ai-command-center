@@ -42,7 +42,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import agent_runner, launch, launch_service, models, storage, workspace_provisioning
+from command_center import (
+    agent_runner,
+    launch,
+    launch_service,
+    models,
+    project_config,
+    storage,
+    workspace_provisioning,
+)
 from command_center.runtime import supervisor as runtime_supervisor
 
 QUEUE_FILE_NAME = "execution_queue.json"
@@ -250,12 +258,15 @@ def launch_ready(
             results.append(LaunchAttemptResult(entry["id"], task_id, False, message="задача не найдена"))
             continue
 
-        cfg = project_configs.get(task.get("project"), {})
+        # `project_configs` is keyed by canonical id, but a task may store a
+        # display name / alias. Resolve it before preparing the launch so the
+        # queue receives the correct repository and workspace configuration.
+        canonical_project = project_config.canonical_project_id(task.get("project"))
+        cfg = project_configs.get(canonical_project, {})
+
         # Shared classification — same service the Kanban launcher uses. A
-        # missing but provisionable workspace is *not* skipped as invalid: it
-        # is routed to `execute_agent_launch_v2`, which provisions the isolated
-        # worktree and fail-closed verifies it (re-verified again at
-        # `Supervisor.start_raw`). Only genuinely fatal validation stays a skip.
+        # missing but provisionable workspace is routed through the isolated
+        # worktree provisioning and fail-closed verification path.
         prep = launch_service.prepare_task_launch(task=task, project_config=cfg)
         if not prep.selection.path:
             results.append(

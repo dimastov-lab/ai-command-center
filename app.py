@@ -1343,10 +1343,26 @@ def _execution_center_status_badge_color(status: str) -> str:
         session_view.STATUS_RUNNING: "blue",
         session_view.STATUS_WAITING: "orange",
         session_view.STATUS_REQUIRES_ATTENTION: "orange",
+        session_view.STATUS_BLOCKED: "red",
+        session_view.STATUS_INCOMPLETE: "orange",
         session_view.STATUS_COMPLETED: "green",
         session_view.STATUS_FAILED: "red",
         session_view.STATUS_CANCELLED: "gray",
     }.get(status, "gray")
+
+
+def _execution_center_display_status(session: dict) -> str:
+    """`session["status"]` as computed by `session_view.derive_status`, with
+    one additional UI-level guard on top: `Completed` must never be rendered
+    while `progress` is below 100 (Required fix 7's explicit invariant),
+    even if a future caller/bug manages to produce that combination — this
+    is belt-and-suspenders on top of `task_sync`'s own enforcement
+    (`task_sync._resolve_target_launch_status`), not a replacement for it."""
+    status = session["status"]
+    progress = session.get("progress")
+    if status == session_view.STATUS_COMPLETED and progress is not None and progress < 100:
+        return session_view.STATUS_REQUIRES_ATTENTION
+    return status
 
 
 def _execution_center_record_heartbeat(run_id: str, pid: int | None, now: datetime) -> None:
@@ -1404,15 +1420,16 @@ def _render_execution_center_card(
     api: runtime_api.ExecutionCenterAPI, session: dict, tasks_by_id: dict[str, dict], *, now: datetime
 ) -> None:
     run_id = session["run_id"]
+    display_status = _execution_center_display_status(session)
     with st.container(border=True):
         header_cols = st.columns([3, 1])
         header_cols[0].markdown(f"##### {session['task_title']}")
-        header_cols[1].badge(session["status"], color=_execution_center_status_badge_color(session["status"]))
-        # `session["status"]` is repeated here as plain caption text (not just
+        header_cols[1].badge(display_status, color=_execution_center_status_badge_color(display_status))
+        # `display_status` is repeated here as plain caption text (not just
         # the `st.badge` pill above) so the run's display status stays
         # queryable in tests and screen readers alike.
         st.caption(
-            f"Статус: **{session['status']}** · Проект: **{session['project_id']}** · "
+            f"Статус: **{display_status}** · Проект: **{session['project_id']}** · "
             f"Executor: `{session['executor']}` · Источник: {session['launch_source']}"
         )
 
@@ -1451,7 +1468,9 @@ def _render_execution_center_card(
                 f"Последнее событие ({session['latest_event'].get('at') or '—'}): "
                 f"{session['latest_event'].get('summary') or '—'}"
             )
-        if session["last_error"]:
+        if session.get("blocker_reason"):
+            st.warning(f"Причина блокировки: {session['blocker_reason']}")
+        elif session["last_error"]:
             st.error(f"Последняя ошибка: {session['last_error']}")
 
         button_cols = st.columns(6)
@@ -1582,19 +1601,23 @@ def _render_execution_center_project_overview(sessions: list[dict], now: datetim
     st.divider()
 
 
-# (title, statuses-bucketed-into-this-section) — 5 sections per the mission.
-# Cancelled sessions render inside Failed, labeled distinctly by their own
-# status badge — `models.LAUNCH_STATUSES` has no dedicated Cancelled value
-# either (see `task_sync.py`).
+# (title, statuses-bucketed-into-this-section). Originally 5 sections; this
+# remediation adds dedicated `Blocked`/`Incomplete` sections (Required fix
+# 7 — the UI must clearly distinguish Blocked/Failed/Incomplete, not fold a
+# denied-permission run into the same generic "Failed" bucket as a crashed
+# process). Cancelled sessions render inside Completed, labeled distinctly
+# by their own status badge — `models.LAUNCH_STATUSES` has no dedicated
+# Cancelled value either (see `task_sync.py`).
 _EXECUTION_CENTER_SECTIONS: list[tuple[str, frozenset[str]]] = [
     ("Running", frozenset({session_view.STATUS_RUNNING})),
     # A `PREPARED`/`QUEUED` run (`Launching`) has no subprocess yet — it is
     # "waiting to start" in exactly the same practical sense as a run whose
     # cancellation is in flight, so it is folded into the same section
-    # rather than getting its own (the mission enumerates exactly 5
-    # sections, with no dedicated "Launching" bucket).
+    # rather than getting its own.
     ("Waiting", frozenset({session_view.STATUS_WAITING, session_view.STATUS_LAUNCHING})),
     ("Requires Attention", frozenset({session_view.STATUS_REQUIRES_ATTENTION})),
+    ("Blocked", frozenset({session_view.STATUS_BLOCKED})),
+    ("Incomplete", frozenset({session_view.STATUS_INCOMPLETE})),
     ("Completed", frozenset({session_view.STATUS_COMPLETED, session_view.STATUS_CANCELLED})),
     ("Failed", frozenset({session_view.STATUS_FAILED})),
 ]
@@ -1605,7 +1628,7 @@ def _render_execution_center_sections(
 ) -> None:
     sessions_by_status: dict[str, list[dict]] = {}
     for session in sessions:
-        sessions_by_status.setdefault(session["status"], []).append(session)
+        sessions_by_status.setdefault(_execution_center_display_status(session), []).append(session)
 
     for title, statuses in _EXECUTION_CENTER_SECTIONS:
         section_sessions: list[dict] = []
@@ -2013,7 +2036,12 @@ if page_key == "dashboard":
     with left:
         st.markdown("#### Активные задачи по проекту")
         for project in models.PROJECT_IDS:
-            project_active = [task for task in active_tasks if task.get("project") == project]
+            # Canonical-id match (shared helper) so a task storing a display
+            # name ("AI Command Center") is counted under its project ("AICC"),
+            # consistent with the Kanban lane, pill, and intelligence strip.
+            project_active = [
+                task for task in active_tasks if project_config.project_matches(task.get("project"), project)
+            ]
             with st.container(border=True):
                 st.markdown(f"**{project}** · {len(project_active)}")
                 if not project_active:
@@ -2080,7 +2108,9 @@ elif page_key == "executive":
         st.markdown("#### Статус проектов")
         statuses = parse_project_statuses()
         for project in models.PROJECT_IDS:
-            project_tasks = [task for task in tasks if task.get("project") == project]
+            # Canonical-id match (shared helper) so display-name tasks count
+            # under their project — consistent with the Kanban lane and pill.
+            project_tasks = [task for task in tasks if project_config.project_matches(task.get("project"), project)]
             p_active = sum(1 for task in project_tasks if task.get("status") != "Done")
             p_blocked = sum(1 for task in project_tasks if task["id"] in blocked_ids)
             p_done = sum(1 for task in project_tasks if task.get("status") == "Done")
@@ -2440,7 +2470,7 @@ elif page_key == "chat":
             "Название нового разговора", key="chat_new_title", placeholder="Например: обсуждение архитектуры P1"
         )
         project_task_options = ["Без привязки"] + [
-            task["id"] for task in tasks if task.get("project") == chat_project
+            task["id"] for task in tasks if project_config.project_matches(task.get("project"), chat_project)
         ]
         link_task_id = st.selectbox(
             "Привязать к задаче (необязательно)",
@@ -2608,14 +2638,21 @@ elif page_key == "kanban":
     )
     st.divider()
 
-    priority_filter = st.multiselect("Приоритет", PRIORITIES, default=PRIORITIES, key="kanban_priority_filter")
+    # Options come from the tasks themselves (canonical priorities + any
+    # extra value actually in use, e.g. an imported `P0`), not just the
+    # canonical PRIORITIES — otherwise a task whose priority is outside the
+    # canonical set is neither selectable nor matched by the default
+    # all-selected filter, and silently disappears from every lane (this is
+    # exactly why AICC-CI-001, priority `P0`, was missing). See
+    # `task_view.kanban_priority_options`.
+    priority_options = task_view.kanban_priority_options(tasks)
+    priority_filter = st.multiselect(
+        "Приоритет", priority_options, default=priority_options, key="kanban_priority_filter"
+    )
 
-    filtered_tasks = [
-        task
-        for task in tasks
-        if (project_filter is None or task.get("project") == project_filter)
-        and task.get("priority", "Medium") in priority_filter
-    ]
+    filtered_tasks = task_view.filter_kanban_tasks(
+        tasks, project=project_filter, priorities=priority_filter
+    )
 
     kanban_git_status_cache: dict[str, dict] = {}
 
@@ -2895,7 +2932,9 @@ elif page_key == "timeline":
         tasks, runs=agent_runner.load_runs(), activity_events=activity_log.load_activity(limit=200), limit=200
     )
     if project_filter != "Все":
-        events = [event for event in events if event.get("project") == project_filter]
+        # Canonical-id match (shared helper): task-sourced timeline events carry
+        # the task's raw `project`, which may be a display name.
+        events = [event for event in events if project_config.project_matches(event.get("project"), project_filter)]
 
     if not events:
         st.info("Событий пока нет.")
@@ -3323,7 +3362,11 @@ elif page_key == "workspace":
     for project in models.PROJECT_IDS:
         project_file = project_status_file_path(project)
         context_name = CONTEXT_FILES.get(project)
-        project_active = sum(1 for task in tasks if task.get("project") == project and task.get("status") != "Done")
+        project_active = sum(
+            1
+            for task in tasks
+            if project_config.project_matches(task.get("project"), project) and task.get("status") != "Done"
+        )
         project_generated = artifacts.list_markdown_files(GENERATED_DIR / project)
         last_activity = format_mtime(project_generated[0]) if project_generated else "—"
 
@@ -3381,7 +3424,7 @@ elif page_key == "focus":
         candidates = [
             task
             for task in active_tasks
-            if project_filter == "Все" or task.get("project") == project_filter
+            if project_filter == "Все" or project_config.project_matches(task.get("project"), project_filter)
         ]
 
         if not candidates:

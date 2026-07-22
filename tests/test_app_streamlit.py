@@ -18,7 +18,7 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage, workspace_home
+from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage, task_view, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
 from command_center.ui import project_selector
@@ -232,6 +232,205 @@ def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
 
     errors = [e.value for e in at.error]
     assert any("не настроен" in message for message in errors)
+
+
+# --------------------------------------------------------------------------
+# AICC-UI-001: a task whose `project` field holds a display name renders under
+# its canonical project lane, not only on the "all projects" board.
+# --------------------------------------------------------------------------
+
+
+def test_kanban_renders_display_name_task_under_canonical_project_lane():
+    """End-to-end proof for AICC-UI-001. AICC-CI-001 stores its `project` as
+    the display name "AI Command Center", but the Kanban project selector
+    emits the canonical id "AICC". Before the fix the task rendered on the
+    "all projects" board yet vanished the moment the AICC pill was selected —
+    "not rendered anywhere" from the user working inside their project. This
+    seeds that exact shape, selects the AICC pill, and asserts the card's
+    title is actually rendered."""
+    task = _seed_task(
+        id="AICC-CI-001",
+        project="AI Command Center",  # display name, not the canonical "AICC" id
+        title="Main Branch Protection and Required CI Checks",
+        priority="P0",  # also non-canonical — guards the earlier priority fix too
+        status="Backlog",
+    )
+    # Select the canonical "AICC" project pill (what the selector actually emits).
+    at = _at_on_page("kanban", kanban_project_selector_pills="AICC")
+    assert not at.exception
+    rendered = "\n".join(node.value for node in at.markdown)
+    assert task["title"] in rendered, (
+        "AICC-CI-001 (project stored as display name 'AI Command Center') is not "
+        "rendered under the canonical 'AICC' Kanban lane"
+    )
+
+
+def test_kanban_display_name_task_hidden_under_a_different_project_lane():
+    """Control for the fix above: the normalization must not make the task
+    match *every* lane — selecting an unrelated project (AIOS) must still hide
+    an AICC task."""
+    task = _seed_task(
+        id="AICC-CI-001",
+        project="AI Command Center",
+        title="Main Branch Protection and Required CI Checks",
+        priority="P0",
+        status="Backlog",
+    )
+    at = _at_on_page("kanban", kanban_project_selector_pills="AIOS")
+    assert not at.exception
+    rendered = "\n".join(node.value for node in at.markdown)
+    assert task["title"] not in rendered
+
+
+def test_kanban_lane_pill_and_intelligence_strip_agree_for_display_name_tasks():
+    """End-to-end cross-component consistency for AICC-UI-001's remediation.
+
+    Seeds two AICC tasks — one storing the canonical id "AICC", one storing the
+    display name "AI Command Center" — plus an unrelated AIOS task, then selects
+    the canonical "AICC" pill. All three project-scoped views on the Kanban page
+    must agree that AICC has *two* tasks:
+
+      * the Kanban lane renders both AICC card titles (and not the AIOS one);
+      * the project-intelligence strip's "Осталось" (remaining) metric reads 2;
+      * the "AICC" project pill's own count reads 2.
+
+    Before the remediation the lane/pill were fixed to count the display-name
+    task but the strip still undercounted it — the pill/lane said 2 while the
+    strip directly above them said 1. This asserts the three can never disagree
+    again."""
+    _seed_tasks(
+        [
+            {"id": "AICC-CI-001", "project": "AI Command Center", "title": "Display-name AICC task",
+             "priority": "P0", "status": "Backlog"},
+            {"id": "AICC-X-002", "project": "AICC", "title": "Canonical AICC task",
+             "priority": "High", "status": "Backlog"},
+            {"id": "AIOS-1", "project": "AIOS", "title": "Unrelated AIOS task",
+             "priority": "High", "status": "Backlog"},
+        ]
+    )
+    at = _at_on_page("kanban", kanban_project_selector_pills="AICC")
+    assert not at.exception
+
+    rendered = "\n".join(node.value for node in at.markdown)
+    # Lane: both AICC tasks render, the AIOS one does not.
+    assert "Display-name AICC task" in rendered
+    assert "Canonical AICC task" in rendered
+    assert "Unrelated AIOS task" not in rendered
+
+    # Intelligence strip: the "Осталось" (remaining, = active count) metric must
+    # equal the two rendered AICC cards, not undercount the display-name one.
+    remaining = next(m for m in at.metric if m.label == "Осталось")
+    assert remaining.value == "2", (
+        f"intelligence strip 'Осталось' reads {remaining.value!r} but the AICC lane renders 2 cards"
+    )
+
+    # Pill: the "AICC" pill label carries its own count (the selector formats
+    # the canonical "AICC" option with its display name "AI Command Center"),
+    # which must also be 2.
+    pill_labels = at.pills[0].options
+    aicc_label = next(label for label in pill_labels if label.startswith("AI Command Center ·"))
+    assert aicc_label.endswith("· 2"), f"AICC pill label {aicc_label!r} disagrees with the 2-card lane"
+
+
+# --------------------------------------------------------------------------
+# AICC-UI-001 remediation, phase 2: the five remaining task-domain pages
+# (Executive, Workspace, Timeline, Chat, Focus) must count/filter a display-
+# name task under its canonical project, in agreement with the Kanban lane —
+# each of these compared raw strings before the fix. AICC is PROJECT_IDS[0],
+# so the per-project loops render it first.
+# --------------------------------------------------------------------------
+
+
+def _seed_two_display_name_and_one_canonical_aicc_active() -> int:
+    """Seed 2 display-name AICC + 1 canonical AICC active tasks (+ 1 AIOS),
+    none Done. Returns the Kanban-lane active-AICC count they must all match."""
+    _seed_tasks(
+        [
+            {"id": "AICC-D1", "project": "AI Command Center", "title": "DisplayName Task One", "status": "Backlog"},
+            {"id": "AICC-D2", "project": "AI Command Center", "title": "DisplayName Task Two", "status": "Review"},
+            {"id": "AICC-C1", "project": "AICC", "title": "Canonical Task", "status": "In Progress"},
+            {"id": "AIOS-1", "project": "AIOS", "title": "AIOS Task", "status": "Backlog"},
+        ]
+    )
+    tasks = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    options = task_view.kanban_priority_options(tasks)
+    lane = task_view.filter_kanban_tasks(tasks, project="AICC", priorities=options)
+    return sum(1 for t in lane if t.get("status") != "Done")  # 3
+
+
+def test_executive_project_active_count_equals_kanban_lane():
+    kanban_active = _seed_two_display_name_and_one_canonical_aicc_active()
+    assert kanban_active == 3
+    at = _at_on_page("executive")
+    assert not at.exception
+    # Per-project "Активн." metrics render in PROJECT_IDS order; AICC is first.
+    aicc_active_metrics = [m for m in at.metric if m.label == "Активн."]
+    assert aicc_active_metrics, "executive page rendered no per-project 'Активн.' metric"
+    assert int(aicc_active_metrics[0].value) == kanban_active, (
+        f"Executive AICC active count {aicc_active_metrics[0].value} != Kanban lane {kanban_active} "
+        "(display-name tasks dropped)"
+    )
+
+
+def test_workspace_project_active_count_equals_kanban_lane():
+    kanban_active = _seed_two_display_name_and_one_canonical_aicc_active()
+    at = _at_on_page("workspace")
+    assert not at.exception
+    aicc_active_metrics = [m for m in at.metric if m.label == "Активные"]
+    assert aicc_active_metrics, "workspace page rendered no per-project 'Активные' metric"
+    assert int(aicc_active_metrics[0].value) == kanban_active, (
+        f"Workspace AICC active count {aicc_active_metrics[0].value} != Kanban lane {kanban_active}"
+    )
+
+
+def test_timeline_project_filter_includes_display_name_task_under_canonical_lane():
+    _seed_tasks(
+        [{"id": "AICC-CI-001", "project": "AI Command Center", "title": "TimelineDisplayNameTask", "status": "Backlog"}]
+    )
+    at = _at_on_page("timeline", timeline_project_filter="AICC")
+    assert not at.exception
+    rendered = "\n".join([n.value for n in at.markdown] + [n.value for n in at.caption])
+    assert "TimelineDisplayNameTask" in rendered, "display-name task's timeline event dropped under the AICC filter"
+    # Control: selecting an unrelated project must hide it.
+    at_other = _at_on_page("timeline", timeline_project_filter="AIOS")
+    assert not at_other.exception
+    rendered_other = "\n".join([n.value for n in at_other.markdown] + [n.value for n in at_other.caption])
+    assert "TimelineDisplayNameTask" not in rendered_other
+
+
+def test_chat_task_link_options_include_display_name_task_under_canonical_project():
+    _seed_tasks(
+        [{"id": "AICC-CI-001", "project": "AI Command Center", "title": "ChatLinkTask", "status": "Backlog"}]
+    )
+    # chat_project defaults to PROJECT_IDS[0] == "AICC"; no conversations exist,
+    # so the "+ Новый разговор" branch renders the task-link selectbox.
+    at = _at_on_page("chat", chat_project_select="AICC")
+    assert not at.exception
+    link_box = next(box for box in at.selectbox if "Привязать к задаче" in box.label)
+    # Options are formatted via task_label(); the task appears as its label.
+    assert any("ChatLinkTask" in str(opt) for opt in link_box.options), (
+        "display-name AICC task missing from AICC chat task-link options"
+    )
+    # Control: under AIOS it must not be linkable.
+    at_other = _at_on_page("chat", chat_project_select="AIOS")
+    assert not at_other.exception
+    link_box_other = next(box for box in at_other.selectbox if "Привязать к задаче" in box.label)
+    assert not any("ChatLinkTask" in str(opt) for opt in link_box_other.options)
+
+
+def test_focus_project_filter_includes_display_name_task_under_canonical_lane():
+    _seed_tasks(
+        [{"id": "AICC-CI-001", "project": "AI Command Center", "title": "FocusDisplayNameTask", "status": "In Progress"}]
+    )
+    at = _at_on_page("focus", focus_project_filter="AICC")
+    assert not at.exception
+    rendered = "\n".join([n.value for n in at.markdown] + [n.value for n in at.caption])
+    assert "FocusDisplayNameTask" in rendered, "display-name task excluded from the AICC focus filter"
+    # Control: selecting AIOS must exclude it (page shows the empty-state info).
+    at_other = _at_on_page("focus", focus_project_filter="AIOS")
+    assert not at_other.exception
+    rendered_other = "\n".join([n.value for n in at_other.markdown] + [n.value for n in at_other.caption])
+    assert "FocusDisplayNameTask" not in rendered_other
 
 
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):

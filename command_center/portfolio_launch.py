@@ -89,7 +89,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import execution_queue, git_info, models, storage
+from command_center import execution_queue, git_info, models, storage, worktree_launcher
 from command_center.portfolio_models import PortfolioCardError, PortfolioTask, unmet_requirements, validate_task_id
 from command_center.runtime import db as runtime_db
 
@@ -486,6 +486,15 @@ class LaunchPlan:
     requested_worktree: str | None = None
     worktree_source: str = SOURCE_GENERATED_DEFAULT
     worktree_mode: str = WORKTREE_MODE_NEW
+    # Displayable "Launch profile" / "Permission profile" for this launch —
+    # which executor and which tool-permission model the run will actually get
+    # (see `command_center.worktree_launcher.describe_launch_profile`). Purely
+    # descriptive; the enforcement lives in `agent_runner`/`runtime.supervisor`.
+    executor_id: str = "claude_code"
+    launch_profile_label: str = ""
+    permission_profile_key: str = ""
+    permission_profile_label: str = ""
+    permission_profile_summary: str = ""
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -559,12 +568,28 @@ def build_launch_plan(
             if not status.get("is_repo"):
                 blockers.append(f"существующий worktree не является git-репозиторием: {resolved_worktree}")
             else:
+                metadata_ok, metadata_detail = worktree_launcher.git_metadata_accessible(resolved_worktree)
+                if not metadata_ok:
+                    blockers.append(metadata_detail)
                 if repo_root is not None:
                     existing_common = _git_common_dir(resolved_worktree)
                     canonical_common = _git_common_dir(repo_root)
                     if existing_common is None or canonical_common is None or existing_common != canonical_common:
                         blockers.append(
                             f"существующий worktree принадлежит другому репозиторию, а не сопоставленному «{repo_root}»"
+                        )
+                    # Stronger than the git-common-dir check above: require the
+                    # path to be an actually *registered* worktree of the
+                    # mapped repository (present in `git worktree list`), not
+                    # merely a directory sharing its common dir. Catches a
+                    # hand-built `.git` gitfile / a pruned-but-not-removed
+                    # worktree directory (task AICC-LAUNCH-001: "registered
+                    # worktree" validation; "never launches against the wrong
+                    # worktree").
+                    elif not worktree_launcher.is_registered_worktree(repo_root, resolved_worktree):
+                        blockers.append(
+                            f"существующий каталог не является зарегистрированным worktree репозитория «{repo_root}» "
+                            "(отсутствует в git worktree list)"
                         )
                 actual_branch = status.get("branch")
                 if branch and actual_branch != branch:
@@ -630,6 +655,11 @@ def build_launch_plan(
     if task.autonomy and task.autonomy != "confirmed":
         warnings.append(f"autonomy карточки: «{task.autonomy}» (ожидалось «confirmed»)")
 
+    resolved_task_type = _map_task_type(task.type)
+    launch_profile = worktree_launcher.describe_launch_profile(
+        executor_id="claude_code", task_type=resolved_task_type
+    )
+
     return LaunchPlan(
         task_id=task.task_id or "",
         project=task.project or "",
@@ -641,12 +671,17 @@ def build_launch_plan(
         base_sha=base_sha,
         branch=branch,
         worktree=worktree,
-        task_type=_map_task_type(task.type),
+        task_type=resolved_task_type,
         requested_branch=task.branch,
         branch_source=branch_source,
         requested_worktree=task.worktree,
         worktree_source=worktree_source,
         worktree_mode=worktree_mode,
+        executor_id=launch_profile.executor_id,
+        launch_profile_label=launch_profile.label,
+        permission_profile_key=launch_profile.permission.key,
+        permission_profile_label=launch_profile.permission.label,
+        permission_profile_summary=launch_profile.permission.summary,
         blockers=blockers,
         warnings=warnings,
     )
