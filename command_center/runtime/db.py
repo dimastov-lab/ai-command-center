@@ -38,6 +38,7 @@ from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from command_center import storage
 from command_center.models import iso_now, new_id
+from command_center.runtime import autonomy as autonomy_domain
 from command_center.runtime import completion as completion_domain
 
 
@@ -124,6 +125,14 @@ class InvalidCompletionTransitionError(Exception):
     completion-pipeline analogue of `InvalidTransitionError` for `run.state`."""
 
 
+class InvalidProposalTransitionError(Exception):
+    """Raised when an `update_proposal` call would move `state` along an illegal
+    edge (a backward jump, or any move out of a terminal state) — see
+    `runtime.autonomy.PROPOSAL_TRANSITIONS`. Same-state updates (evidence
+    enrichment / metadata) are always permitted. This is the autonomy-proposal
+    analogue of `InvalidCompletionTransitionError`."""
+
+
 class LostUpdateError(Exception):
     """Raised when a compare-and-set update loses the race (version mismatch)."""
 
@@ -207,7 +216,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -441,6 +450,83 @@ CREATE INDEX IF NOT EXISTS idx_completion_event_run_id ON completion_event(run_i
 """
 
 
+# Autonomy proposal foundation (AICC-AUTONOMY-002). The pre-execution decision
+# layer: a proposal is an evidence-backed, risk-classified suggestion that moves
+# through the `runtime.autonomy` state machine under an explicit policy. It never
+# executes anything itself — `dispatched_run_id`/`dispatched_task_id` only ever
+# *record* an execution the caller performed through the existing routes.
+#
+#   proposal          -- one mutable current-state row per proposal, guarded by
+#                        a `version` column (compare-and-set) and the
+#                        `autonomy.is_valid_proposal_transition` structural guard.
+#   proposal_evidence -- append-only, immutable. The observations a decision was
+#                        made on; never updated, so the audit trail cannot be
+#                        rewritten after the fact.
+#   proposal_event    -- append-only audit trail, ordered by per-proposal `seq`.
+_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS proposal (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    project TEXT NOT NULL,
+    task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    state TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    policy_json TEXT,
+    eligibility_json TEXT,
+    plan_json TEXT,
+    evidence_digest TEXT,
+    requires_human INTEGER NOT NULL DEFAULT 1,
+    last_reason_code TEXT,
+    decided_by TEXT,
+    decision_reason TEXT,
+    dispatched_run_id TEXT REFERENCES run(id) ON DELETE SET NULL,
+    dispatched_task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_state ON proposal(state);
+CREATE INDEX IF NOT EXISTS idx_proposal_project ON proposal(project);
+CREATE INDEX IF NOT EXISTS idx_proposal_task_id ON proposal(task_id);
+
+CREATE TABLE IF NOT EXISTS proposal_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id TEXT NOT NULL REFERENCES proposal(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    summary TEXT,
+    observed_at TEXT NOT NULL,
+    is_blocker INTEGER NOT NULL DEFAULT 0,
+    data_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(proposal_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_evidence_proposal_id ON proposal_evidence(proposal_id);
+
+CREATE TABLE IF NOT EXISTS proposal_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id TEXT NOT NULL REFERENCES proposal(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT,
+    actor TEXT,
+    reason_code TEXT,
+    message TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(proposal_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_event_proposal_id ON proposal_event(proposal_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -450,6 +536,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (3, _migration_3_add_live_execution_center_v2_fields),
     (4, _migration_4_add_first_output_at),
     (5, _SCHEMA_V5),
+    (6, _SCHEMA_V6),
 ]
 
 
@@ -1458,3 +1545,303 @@ def list_validation_results(db_path: Path, run_id: str, *, attempt: int | None =
                 (run_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------
+# Autonomy proposals (schema 6) — the pre-execution decision layer.
+#
+# Mirrors the completion-row idioms: a `create_proposal` write-once insert, a
+# compare-and-set `update_proposal` guarded by both a field allowlist and the
+# `autonomy.is_valid_proposal_transition` structural guard, an immutable
+# `append_proposal_evidence`, and an append-only `append_proposal_event` audit
+# trail. Identity columns (id/kind/project/created_at) are write-once and
+# deliberately absent from the updatable allowlist below.
+# --------------------------------------------------------------------------
+
+_UPDATABLE_PROPOSAL_FIELDS: frozenset[str] = frozenset(
+    {
+        "task_id",
+        "title",
+        "rationale",
+        "state",
+        "risk_level",
+        "policy_json",
+        "eligibility_json",
+        "plan_json",
+        "evidence_digest",
+        "requires_human",
+        "last_reason_code",
+        "decided_by",
+        "decision_reason",
+        "dispatched_run_id",
+        "dispatched_task_id",
+    }
+)
+
+
+def _validate_updatable_proposal_fields(fields: dict) -> None:
+    unknown = set(fields) - _UPDATABLE_PROPOSAL_FIELDS
+    if unknown:
+        raise UnknownRunFieldError(f"Not an updatable proposal field: {sorted(unknown)}")
+
+
+_PROPOSAL_INSERT_COLUMNS: tuple[str, ...] = (
+    "id",
+    "kind",
+    "project",
+    "task_id",
+    "title",
+    "rationale",
+    "state",
+    "risk_level",
+    "policy_json",
+    "eligibility_json",
+    "plan_json",
+    "evidence_digest",
+    "requires_human",
+    "last_reason_code",
+    "decided_by",
+    "decision_reason",
+    "dispatched_run_id",
+    "dispatched_task_id",
+    "version",
+    "created_at",
+    "updated_at",
+)
+
+
+def create_proposal(
+    db_path: Path,
+    *,
+    kind: str,
+    project: str,
+    title: str,
+    rationale: str,
+    state: str,
+    risk_level: str,
+    proposal_id: str | None = None,
+    task_id: str | None = None,
+    policy_json: str | None = None,
+    requires_human: bool = True,
+) -> dict:
+    """Create one `proposal` row in its initial state.
+
+    `rationale` is required and never blank — a proposal that cannot explain why
+    it exists is rejected here, enforcing the "all proposals must explain why
+    they were created" rule at the persistence boundary."""
+    if not rationale or not str(rationale).strip():
+        raise ValueError("proposal.rationale must be non-empty — every proposal must explain itself")
+    now = iso_now()
+    record = {name: None for name in _PROPOSAL_INSERT_COLUMNS}
+    record.update(
+        {
+            "id": proposal_id or new_id(),
+            "kind": kind,
+            "project": project,
+            "task_id": task_id,
+            "title": title,
+            "rationale": rationale,
+            "state": state,
+            "risk_level": risk_level,
+            "policy_json": policy_json,
+            "requires_human": 1 if requires_human else 0,
+            "version": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    columns = ", ".join(_PROPOSAL_INSERT_COLUMNS)
+    placeholders = ", ".join(f":{name}" for name in _PROPOSAL_INSERT_COLUMNS)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+    return record
+
+
+def get_proposal(db_path: Path, proposal_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+        return _row_to_dict(row)
+
+
+def list_proposals(
+    db_path: Path,
+    *,
+    project: str | None = None,
+    states: Iterable[str] | None = None,
+    kind: str | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """List proposal rows, newest first, optionally filtered by project, a set
+    of lifecycle `states`, and/or `kind`."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project is not None:
+        clauses.append("project = ?")
+        params.append(project)
+    if kind is not None:
+        clauses.append("kind = ?")
+        params.append(kind)
+    states = list(states) if states is not None else None
+    if states is not None:
+        if not states:
+            return []
+        placeholders = ", ".join("?" for _ in states)
+        clauses.append(f"state IN ({placeholders})")
+        params.extend(states)
+    if limit < 0:
+        raise ValueError(f"limit must be non-negative, got {limit}")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM proposal{where} ORDER BY created_at DESC, id DESC LIMIT ?", params
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_proposal(db_path: Path, proposal_id: str, *, expected_version: int, fields: dict) -> dict:
+    """Compare-and-set update of a `proposal` row, mirroring
+    `update_completion`: validates `fields` against `_UPDATABLE_PROPOSAL_FIELDS`,
+    refuses an illegal `state` transition (via
+    `autonomy.is_valid_proposal_transition`) *before* the CAS check, bumps
+    `version`, sets `updated_at`, and raises `LostUpdateError` on a version
+    mismatch. `requires_human` is coerced to 0/1 if supplied as a bool."""
+    fields = dict(fields)
+    fields.pop("version", None)
+    fields.pop("created_at", None)
+    _validate_updatable_proposal_fields(fields)
+    if "requires_human" in fields and isinstance(fields["requires_human"], bool):
+        fields["requires_human"] = 1 if fields["requires_human"] else 0
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT state, version FROM proposal WHERE id = ?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No such proposal: {proposal_id!r}")
+            new_state = fields.get("state")
+            if new_state is not None and not autonomy_domain.is_valid_proposal_transition(
+                row["state"], new_state
+            ):
+                raise InvalidProposalTransitionError(
+                    f"Proposal {proposal_id!r} cannot transition {row['state']!r} -> {new_state!r}"
+                )
+            if row["version"] != expected_version:
+                raise LostUpdateError(
+                    f"Proposal {proposal_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
+                )
+            fields["updated_at"] = iso_now()
+            set_clause = ", ".join(f"{key} = :{key}" for key in fields)
+            params = dict(fields)
+            params["proposal_id"] = proposal_id
+            params["expected_version"] = expected_version
+            cur = conn.execute(
+                f"""UPDATE proposal SET {set_clause}, version = version + 1
+                    WHERE id = :proposal_id AND version = :expected_version""",
+                params,
+            )
+            if cur.rowcount != 1:
+                raise LostUpdateError(f"Proposal {proposal_id!r} update affected {cur.rowcount} rows")
+            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            return dict(updated)
+
+
+def append_proposal_evidence(
+    db_path: Path,
+    proposal_id: str,
+    *,
+    kind: str,
+    source: str,
+    summary: str | None = None,
+    observed_at: str,
+    is_blocker: bool = False,
+    data: dict | None = None,
+) -> int:
+    """Append one immutable evidence row and return its per-proposal `seq`.
+    Evidence is never updated or deleted — the observations a decision rests on
+    stay fixed, so the decision remains reproducible from them."""
+    data_json = json.dumps(data, ensure_ascii=False) if data is not None else None
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM proposal_evidence WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            seq = row["next_seq"]
+            conn.execute(
+                """INSERT INTO proposal_evidence
+                       (proposal_id, seq, kind, source, summary, observed_at, is_blocker, data_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (proposal_id, seq, kind, source, summary, observed_at, 1 if is_blocker else 0, data_json, now),
+            )
+            return seq
+
+
+def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM proposal_evidence WHERE proposal_id = ? ORDER BY seq ASC",
+            (proposal_id,),
+        ).fetchall()
+        events = []
+        for row in rows:
+            item = dict(row)
+            raw = item.pop("data_json")
+            item["data"] = json.loads(raw) if raw else None
+            item["is_blocker"] = bool(item["is_blocker"])
+            events.append(item)
+        return events
+
+
+def append_proposal_event(
+    db_path: Path,
+    proposal_id: str,
+    event_type: str,
+    *,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    actor: str | None = None,
+    reason_code: str | None = None,
+    message: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    """Append one proposal audit event and return its per-proposal `seq`.
+    `metadata` is JSON-encoded; callers must never place credentials, tokens, or
+    environment dumps in it."""
+    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM proposal_event WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            seq = row["next_seq"]
+            conn.execute(
+                """INSERT INTO proposal_event
+                       (proposal_id, seq, event_type, from_state, to_state, actor,
+                        reason_code, message, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (proposal_id, seq, event_type, from_state, to_state, actor,
+                 reason_code, message, metadata_json, now),
+            )
+            return seq
+
+
+def list_proposal_events(db_path: Path, proposal_id: str, *, limit: int = 500) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT proposal_id, seq, event_type, from_state, to_state, actor,
+                      reason_code, message, metadata_json, created_at
+               FROM proposal_event WHERE proposal_id = ? ORDER BY seq ASC LIMIT ?""",
+            (proposal_id, limit),
+        ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            raw = event.pop("metadata_json")
+            event["metadata"] = json.loads(raw) if raw else None
+            events.append(event)
+        return events
