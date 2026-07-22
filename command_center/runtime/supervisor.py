@@ -197,6 +197,52 @@ class Supervisor:
         # its "don't touch this, it's mine" guard, not just `self._active`.
         self._launching: set[str] = set()
         self._active_lock = threading.Lock()
+        self._autopilot_thread: threading.Thread | None = None
+        self._autopilot_stop: threading.Event | None = None
+        # Opt-in: an env flag auto-starts the completion autopilot for a
+        # backend process (e.g. a headless/desktop host). Off by default, so
+        # tests and the plain Streamlit app never spawn it implicitly.
+        if os.environ.get("AICC_COMPLETION_AUTOPILOT"):
+            self.start_completion_autopilot()
+
+    # ------------------------------------------------------------------
+    # Completion pipeline (AICC-AUTONOMY-001) — advances the post-execution
+    # lifecycle *independently* of the original Claude process. Bounded (only
+    # due, non-terminal rows) and never blocks the UI: it is invoked either
+    # from the opt-in background autopilot thread below or on demand.
+    # ------------------------------------------------------------------
+
+    def advance_completions(self, *, now=None, limit: int = 50, github=None) -> list:
+        from command_center.runtime.completion_service import CompletionOrchestrator
+
+        orchestrator = CompletionOrchestrator(self.db_path, github=github)
+        return orchestrator.advance_pending(now=now, limit=limit)
+
+    def start_completion_autopilot(self, *, interval_seconds: float = 30.0) -> None:
+        """Start a bounded, daemon background poller that advances due
+        completion rows. Idempotent — a second call while one is running is a
+        no-op. This is the "Supervisor advances completion workflows
+        independently of the Claude process" integration, kept off the UI
+        thread so completion validation/GitHub calls never block rendering."""
+        if self._autopilot_thread is not None and self._autopilot_thread.is_alive():
+            return
+        stop = threading.Event()
+        self._autopilot_stop = stop
+
+        def _loop() -> None:
+            while not stop.wait(interval_seconds):
+                try:
+                    self.advance_completions()
+                except Exception:  # noqa: BLE001 - one bad tick must never kill the poller
+                    continue
+
+        thread = threading.Thread(target=_loop, name="completion-autopilot", daemon=True)
+        self._autopilot_thread = thread
+        thread.start()
+
+    def stop_completion_autopilot(self) -> None:
+        if self._autopilot_stop is not None:
+            self._autopilot_stop.set()
 
     # ------------------------------------------------------------------
     # Launch

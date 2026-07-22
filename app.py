@@ -1378,6 +1378,7 @@ def _build_execution_center_sessions(
         heartbeat_stale = run.get("state") == "RUNNING" and session_view.is_heartbeat_stale(
             _execution_center_heartbeat_probe_at(run["id"]), now
         )
+        completion = api.get_completion(run["id"])
         session = session_view.build_session_view(
             run,
             kanban_task=kanban_task,
@@ -1386,9 +1387,56 @@ def _build_execution_center_sessions(
             report_path=report_path,
             now=now,
             heartbeat_stale=heartbeat_stale,
+            completion=completion,
         )
         sessions.append(session)
     return sessions, tasks_by_id
+
+
+def _render_execution_center_completion(session: dict) -> None:
+    """Compact "autonomous completion" panel for a session card. Reads only
+    `session["completion"]` (a pure projection built in `session_view`) — no
+    orchestration happens here. Clearly separates "process finished" from "task
+    completed and merged", and renders safely when optional fields are missing."""
+    completion = session.get("completion")
+    if not completion:
+        return
+    with st.container(border=True):
+        badge_color = "green" if completion["is_done"] else (
+            "red" if completion["display"] == "Requires Attention" else "orange"
+        )
+        head = st.columns([3, 1])
+        head[0].markdown("**Автономное завершение задачи**")
+        head[1].badge(completion["display"], color=badge_color)
+        # Queryable caption text (used by tests / screen readers) that makes the
+        # process-vs-task distinction explicit.
+        if completion["is_done"]:
+            st.caption("Завершение: **Done** — задача завершена и смёржена в целевую ветку.")
+        else:
+            st.caption(
+                f"Завершение: **{completion['display']}** — процесс завершён, "
+                "но задача ещё не смёржена в целевую ветку."
+            )
+        cols = st.columns(2)
+        with cols[0]:
+            st.write(f"Состояние: `{completion['state'] or '—'}`")
+            st.write(f"Ветка → цель: `{completion['branch'] or '—'}` → `{completion['base_branch'] or '—'}`")
+            st.write(f"Коммит: `{(completion['head_commit'] or '—')[:12]}`")
+            st.write(f"Валидация: {completion['validation_summary'] or '—'}")
+        with cols[1]:
+            pr_number = completion["pull_request_number"]
+            pr_state = completion["pull_request_state"] or "—"
+            if pr_number and completion["pull_request_url"]:
+                st.write(f"PR: [#{pr_number}]({completion['pull_request_url']}) · {pr_state}")
+            else:
+                st.write(f"PR: #{pr_number or '—'} · {pr_state}")
+            if completion["replaced_pull_request_number"]:
+                st.write(f"Заменяет закрытый PR: #{completion['replaced_pull_request_number']}")
+            st.write(f"Merge-коммит: `{(completion['merge_commit'] or '—')[:12]}`")
+            st.write(f"Проверено: {completion['last_checked_at'] or '—'}")
+        if completion["recommended_action"]:
+            note = st.warning if (completion["requires_human"] or completion["display"] == "Requires Attention") else st.info
+            note(f"Рекомендуемое действие: {completion['recommended_action']}")
 
 
 def _render_execution_center_card(
@@ -1464,6 +1512,8 @@ def _render_execution_center_card(
             st.warning(f"Причина блокировки: {session['blocker_reason']}")
         elif session["last_error"]:
             st.error(f"Последняя ошибка: {session['last_error']}")
+
+        _render_execution_center_completion(session)
 
         button_cols = st.columns(6)
         with button_cols[0]:

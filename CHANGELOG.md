@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow strict semantic versioning tags in Git; versions below refer to
 functional application milestones of `app.py`.
 
+## [Unreleased] — Autonomous Task Completion Pipeline (AICC-AUTONOMY-001)
+
+Closes the gap between "Claude process finished" and "the engineering task is completed and
+merged into the target branch". See `docs/adr/0004-autonomous-task-completion-pipeline.md` and
+`docs/completion-pipeline.md`.
+
+### Added
+- **`command_center/runtime/completion.py`**: the pure domain core — completion state machine
+  (`EXECUTION_FINISHED → … → COMPLETED`, plus `VALIDATION_FAILED`/`PR_CLOSED_UNMERGED`/
+  `MERGE_BLOCKED`/`REQUIRES_ATTENTION`/`RECOVERY_PENDING`/`RECOVERY_FAILED`), reason codes,
+  `CompletionPolicy`, and `CompletionEvaluator` returning a structured `CompletionAssessment`
+  (never a bare boolean). Completion is evidence-based: a task is `COMPLETED` only when its
+  change is reachable from the target branch — exit code 0 is never sufficient.
+- **`command_center/runtime/completion_service.py`**: the restart-safe, idempotent orchestrator
+  (`begin_completion`, `advance`, `advance_pending`) that turns evaluator verdicts into real
+  side effects (validation, push, PR open/merge, target verification, closed-unmerged recovery)
+  with exponential backoff and a full audit trail.
+- **`command_center/runtime/repo_state.py`** (read-only git inspection), **`git_ops.py`** (git
+  write adapter — never force-pushes), **`github.py`** (first `gh` CLI integration; a closed PR
+  is never treated as merged; includes an in-memory `FakeGitHubClient`), **`validation.py`**
+  (configurable, allowlisted, bounded validation-plan execution).
+- **`runtime.db` migration 5**: `completion`, `completion_validation`, `completion_event` tables
+  with CAS-guarded updates; CRUD in `db.py`; reads exposed via `ExecutionCenterAPI`.
+- **Supervisor**: `advance_completions()` and an opt-in background autopilot
+  (`AICC_COMPLETION_AUTOPILOT`) that advances due completions off the UI thread.
+- **`task_sync`**: seeds completion rows for completed runs and projects completion state onto
+  the Kanban task (`launch_status`, and on success stage "Merged"/progress 100 +
+  `pull_request_status="merged"`).
+- **Execution Center UI**: a compact completion panel distinguishing "process finished" from
+  "task completed and merged" (state, validation, branch/commit, PR number+state, merge status,
+  last-checked, recommended action).
+- **`command_center/project_config.py`**: per-project completion policy defaults (merge mode/
+  method, PR recovery, validation plan) — conservative by default.
+- **`scripts/demo_completion_pipeline.py`**: deterministic Scenario A/B/C demonstration against
+  real git + a fake GitHub client.
+
 ## [Unreleased] — Desktop Architecture D0
 
 ### Added

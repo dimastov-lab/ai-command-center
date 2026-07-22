@@ -45,9 +45,26 @@ OVERRIDABLE_FIELDS: list[str] = [
     "current_sprint",
     "current_milestone",
     "owner",
+    # Autonomous completion pipeline policy (AICC-AUTONOMY-001). All optional;
+    # a project config that omits them keeps the conservative defaults below.
+    "merge_mode",
+    "merge_method",
+    "allow_pr_recovery",
+    "requires_pull_request",
+    "allow_local_only",
+    "validation_required",
+    "validation_commands",
+    "max_retries",
 ]
 
 PROJECT_STATUSES: list[str] = ["Planning", "Active", "Paused", "Blocked", "Done"]
+
+# Merge mode/method vocabulary the completion pipeline understands (mirrors
+# `command_center.runtime.completion`, kept independent so a `command_center`
+# module never imports a `runtime` one). Defaults are deliberately conservative:
+# manual merge, squash method, no automatic PR recovery.
+MERGE_MODES: list[str] = ["manual", "auto_after_checks", "auto_after_checks_and_review"]
+MERGE_METHODS: list[str] = ["squash", "merge", "rebase"]
 
 # Same value set as `app.py`'s task-level `PRIORITIES` — kept as an independent
 # constant here (rather than imported from `app.py`, which must never be
@@ -138,6 +155,19 @@ def default_project_config(project_id: str) -> dict:
         "context_file_paths": context_paths,
         "reports_dir": f"reports/{project_id}",
         "generated_dir": f"generated/{project_id}",
+        # Autonomous completion pipeline policy — conservative defaults. The
+        # pipeline never auto-merges and never auto-recovers a closed PR unless
+        # a project explicitly opts in via `project_config.json`. `merge_method`
+        # governs how an auto-merge (when enabled) is performed; `validation_
+        # commands=None` uses the safe built-in default (byte-compile).
+        "merge_mode": "manual",
+        "merge_method": "squash",
+        "allow_pr_recovery": False,
+        "requires_pull_request": True,
+        "allow_local_only": False,
+        "validation_required": True,
+        "validation_commands": None,
+        "max_retries": 20,
     }
 
 

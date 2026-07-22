@@ -198,7 +198,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -351,6 +351,87 @@ def _migration_4_add_first_output_at(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE run ADD COLUMN first_output_at TEXT")
 
 
+# Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
+# run drives a *separate* state machine — the post-execution "is the engineering
+# task actually merged into the target branch" lifecycle — distinct from and
+# additive to the `run` row's execution state machine (which stays terminal once
+# a process exits). It is a mutable current-state row, guarded by the same
+# `version` compare-and-set column pattern as `run`. `completion_validation`
+# records one row per validation command per attempt (bounded stdout/stderr
+# summaries, never unbounded logs). `completion_event` is an append-only audit
+# trail of the completion lifecycle (PR created, closed-unmerged, merged,
+# target-branch verified, ...), ordered by a per-run monotonic `seq`, mirroring
+# `run_event`.
+_SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS completion (
+    run_id TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES session(id) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    repository_path TEXT NOT NULL,
+    branch TEXT,
+    base_branch TEXT,
+    head_commit TEXT,
+    remote TEXT,
+    remote_branch TEXT,
+    pull_request_number INTEGER,
+    pull_request_url TEXT,
+    pull_request_state TEXT,
+    replaced_pull_request_number INTEGER,
+    replaced_pull_request_url TEXT,
+    merge_commit TEXT,
+    merge_mode TEXT,
+    merge_method TEXT,
+    completion_state TEXT NOT NULL,
+    last_reason_code TEXT,
+    requires_human INTEGER NOT NULL DEFAULT 0,
+    is_recoverable INTEGER NOT NULL DEFAULT 0,
+    recommended_action TEXT,
+    validation_summary TEXT,
+    policy_json TEXT,
+    last_checked_at TEXT,
+    next_retry_at TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    recovery_count INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_task_id ON completion(task_id);
+CREATE INDEX IF NOT EXISTS idx_completion_state ON completion(completion_state);
+
+CREATE TABLE IF NOT EXISTS completion_validation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL,
+    command TEXT NOT NULL,
+    exit_code INTEGER,
+    started_at TEXT,
+    finished_at TEXT,
+    stdout_summary TEXT,
+    stderr_summary TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_validation_run_id ON completion_validation(run_id);
+
+CREATE TABLE IF NOT EXISTS completion_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    reason_code TEXT,
+    message TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_event_run_id ON completion_event(run_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -359,6 +440,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (2, _migration_2_add_failure_reason),
     (3, _migration_3_add_live_execution_center_v2_fields),
     (4, _migration_4_add_first_output_at),
+    (5, _SCHEMA_V5),
 ]
 
 
@@ -1020,3 +1102,336 @@ def get_report(db_path: Path, run_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM report WHERE run_id = ?", (run_id,)).fetchone()
         return _row_to_dict(row)
+
+
+# --------------------------------------------------------------------------
+# Completion pipeline (AICC-AUTONOMY-001)
+#
+# One `completion` row per run. Like `run`, it is a mutable current-state row
+# updated only through a compare-and-set (`update_completion`) that bumps
+# `version`; the set of columns that update may touch is the allowlist below
+# (write-once identity columns — run_id/task_id/project/created_at — are
+# deliberately absent). The completion *state* string is validated by the
+# domain layer (`runtime.completion`), not here, so this module stays agnostic
+# to the lifecycle vocabulary.
+# --------------------------------------------------------------------------
+
+_UPDATABLE_COMPLETION_FIELDS: frozenset[str] = frozenset(
+    {
+        "session_id",
+        "branch",
+        "base_branch",
+        "head_commit",
+        "remote",
+        "remote_branch",
+        "pull_request_number",
+        "pull_request_url",
+        "pull_request_state",
+        "replaced_pull_request_number",
+        "replaced_pull_request_url",
+        "merge_commit",
+        "merge_mode",
+        "merge_method",
+        "completion_state",
+        "last_reason_code",
+        "requires_human",
+        "is_recoverable",
+        "recommended_action",
+        "validation_summary",
+        "policy_json",
+        "last_checked_at",
+        "next_retry_at",
+        "retry_count",
+        "recovery_count",
+    }
+)
+
+
+def _validate_updatable_completion_fields(fields: dict) -> None:
+    unknown = set(fields) - _UPDATABLE_COMPLETION_FIELDS
+    if unknown:
+        raise UnknownRunFieldError(f"Not an updatable completion field: {sorted(unknown)}")
+
+
+_COMPLETION_INSERT_COLUMNS: tuple[str, ...] = (
+    "run_id",
+    "task_id",
+    "session_id",
+    "project",
+    "repository_path",
+    "branch",
+    "base_branch",
+    "head_commit",
+    "remote",
+    "remote_branch",
+    "pull_request_number",
+    "pull_request_url",
+    "pull_request_state",
+    "replaced_pull_request_number",
+    "replaced_pull_request_url",
+    "merge_commit",
+    "merge_mode",
+    "merge_method",
+    "completion_state",
+    "last_reason_code",
+    "requires_human",
+    "is_recoverable",
+    "recommended_action",
+    "validation_summary",
+    "policy_json",
+    "last_checked_at",
+    "next_retry_at",
+    "retry_count",
+    "recovery_count",
+    "version",
+    "created_at",
+    "updated_at",
+)
+
+
+def create_completion(
+    db_path: Path,
+    *,
+    run_id: str,
+    task_id: str,
+    project: str,
+    repository_path: str,
+    completion_state: str,
+    session_id: str | None = None,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    head_commit: str | None = None,
+    remote: str | None = None,
+    remote_branch: str | None = None,
+    merge_mode: str | None = None,
+    merge_method: str | None = None,
+    policy_json: str | None = None,
+    last_reason_code: str | None = None,
+) -> dict:
+    """Create the single `completion` row for a run.
+
+    Raises `sqlite3.IntegrityError` if a completion row already exists for the
+    run (the PRIMARY KEY on `run_id`) — this is the pipeline's restart-safe
+    idempotency guard: callers (`runtime.completion_service.begin_completion`)
+    check `get_completion` first, so a re-processed terminal run never gets a
+    second completion row (and therefore never a duplicate PR)."""
+    now = iso_now()
+    record = {name: None for name in _COMPLETION_INSERT_COLUMNS}
+    record.update(
+        {
+            "run_id": run_id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "project": project,
+            "repository_path": repository_path,
+            "branch": branch,
+            "base_branch": base_branch,
+            "head_commit": head_commit,
+            "remote": remote,
+            "remote_branch": remote_branch,
+            "merge_mode": merge_mode,
+            "merge_method": merge_method,
+            "completion_state": completion_state,
+            "last_reason_code": last_reason_code,
+            "requires_human": 0,
+            "is_recoverable": 0,
+            "policy_json": policy_json,
+            "retry_count": 0,
+            "recovery_count": 0,
+            "version": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    columns = ", ".join(_COMPLETION_INSERT_COLUMNS)
+    placeholders = ", ".join(f":{name}" for name in _COMPLETION_INSERT_COLUMNS)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(f"INSERT INTO completion ({columns}) VALUES ({placeholders})", record)
+    return record
+
+
+def get_completion(db_path: Path, run_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM completion WHERE run_id = ?", (run_id,)).fetchone()
+        return _row_to_dict(row)
+
+
+def get_completion_by_task(db_path: Path, task_id: str) -> dict | None:
+    """The most recently created completion row for a task (there is one per
+    run, and a task may have several runs over time)."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def list_completions(
+    db_path: Path,
+    *,
+    states: Iterable[str] | None = None,
+    due_before: str | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """List completion rows, optionally restricted to a set of
+    `completion_state` values and to rows whose `next_retry_at` is due
+    (NULL, i.e. never scheduled, or `<= due_before`). Used by the bounded
+    completion poller to find work without scanning terminal rows."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    states = list(states) if states is not None else None
+    if states is not None:
+        if not states:
+            return []
+        placeholders = ", ".join("?" for _ in states)
+        clauses.append(f"completion_state IN ({placeholders})")
+        params.extend(states)
+    if due_before is not None:
+        clauses.append("(next_retry_at IS NULL OR next_retry_at <= ?)")
+        params.append(due_before)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    if limit < 0:
+        raise ValueError(f"limit must be non-negative, got {limit}")
+    params.append(limit)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM completion{where} ORDER BY created_at ASC LIMIT ?", params
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_completion(db_path: Path, run_id: str, *, expected_version: int, fields: dict) -> dict:
+    """Compare-and-set update of a `completion` row, mirroring
+    `update_run_fields`: validates `fields` against
+    `_UPDATABLE_COMPLETION_FIELDS`, bumps `version`, sets `updated_at`, and
+    raises `LostUpdateError` if `expected_version` no longer matches."""
+    fields = dict(fields)
+    fields.pop("version", None)
+    fields.pop("created_at", None)
+    _validate_updatable_completion_fields(fields)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute("SELECT version FROM completion WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"No such completion: {run_id!r}")
+            if row["version"] != expected_version:
+                raise LostUpdateError(
+                    f"Completion {run_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
+                )
+            fields["updated_at"] = iso_now()
+            set_clause = ", ".join(f"{key} = :{key}" for key in fields)
+            params = dict(fields)
+            params["run_id"] = run_id
+            params["expected_version"] = expected_version
+            cur = conn.execute(
+                f"""UPDATE completion SET {set_clause}, version = version + 1
+                    WHERE run_id = :run_id AND version = :expected_version""",
+                params,
+            )
+            if cur.rowcount != 1:
+                raise LostUpdateError(f"Completion {run_id!r} update affected {cur.rowcount} rows")
+            updated = conn.execute("SELECT * FROM completion WHERE run_id = ?", (run_id,)).fetchone()
+            return dict(updated)
+
+
+def append_completion_event(
+    db_path: Path,
+    run_id: str,
+    event_type: str,
+    *,
+    reason_code: str | None = None,
+    message: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    """Append one completion audit event and return its per-run sequence
+    number. `metadata` is JSON-encoded; callers must never place credentials,
+    tokens, or environment dumps in it (see `runtime.completion_service`)."""
+    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM completion_event WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            seq = row["next_seq"]
+            conn.execute(
+                """INSERT INTO completion_event
+                       (run_id, seq, event_type, reason_code, message, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, seq, event_type, reason_code, message, metadata_json, now),
+            )
+            return seq
+
+
+def list_completion_events(db_path: Path, run_id: str, *, limit: int = 500) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT run_id, seq, event_type, reason_code, message, metadata_json, created_at
+               FROM completion_event WHERE run_id = ? ORDER BY seq ASC LIMIT ?""",
+            (run_id, limit),
+        ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            raw = event.pop("metadata_json")
+            event["metadata"] = json.loads(raw) if raw else None
+            events.append(event)
+        return events
+
+
+def record_validation_result(
+    db_path: Path,
+    run_id: str,
+    *,
+    attempt: int,
+    command: str,
+    exit_code: int | None,
+    started_at: str | None,
+    finished_at: str | None,
+    stdout_summary: str | None,
+    stderr_summary: str | None,
+) -> dict:
+    """Record one validation-command result. `stdout_summary`/`stderr_summary`
+    must already be bounded by the caller (`runtime.validation`) — this table
+    never stores unlimited logs."""
+    now = iso_now()
+    record = {
+        "run_id": run_id,
+        "attempt": attempt,
+        "command": command,
+        "exit_code": exit_code,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "stdout_summary": stdout_summary,
+        "stderr_summary": stderr_summary,
+        "created_at": now,
+    }
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(
+                """INSERT INTO completion_validation
+                       (run_id, attempt, command, exit_code, started_at, finished_at,
+                        stdout_summary, stderr_summary, created_at)
+                   VALUES (:run_id, :attempt, :command, :exit_code, :started_at, :finished_at,
+                           :stdout_summary, :stderr_summary, :created_at)""",
+                record,
+            )
+    return record
+
+
+def list_validation_results(db_path: Path, run_id: str, *, attempt: int | None = None) -> list[dict]:
+    with connect(db_path) as conn:
+        if attempt is not None:
+            rows = conn.execute(
+                "SELECT * FROM completion_validation WHERE run_id = ? AND attempt = ? ORDER BY id ASC",
+                (run_id, attempt),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM completion_validation WHERE run_id = ? ORDER BY id ASC",
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
