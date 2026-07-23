@@ -318,8 +318,8 @@ def launch_ready(
     than clobbered by this call's snapshot. The actual process launches happen
     *outside* the lock — it is held only for the final merge-and-save, never
     across a subprocess spawn. This function still saves the queue itself; the
-    returned entry list is the merged result (callers may persist it again
-    harmlessly), and callers must separately persist `tasks` via
+    returned entry list is the merged result and must be treated as a snapshot,
+    not saved again outside the lock. Callers must separately persist `tasks` via
     `tasks_repository.save_tasks` — this function mutates `task` dicts in place
     exactly like `launch_service.execute_agent_launch_v2` already does. One
     `LaunchAttemptResult` per entry considered is returned, in order, for the
@@ -456,44 +456,30 @@ def _commit_launch_results(
     blindly overwriting it.
 
     `base_entries` is the caller's in-memory view (what it passed to
-    `launch_ready`). The on-disk queue is re-read under the lock and wins for
-    every entry present in both, so a concurrent `reevaluate_and_persist` /
-    enqueue in another process is preserved, not clobbered (the lost update
-    this lock closes). Entries the caller holds that are absent from disk are
-    still kept (an empty/never-persisted queue file is the in-memory-only case
-    the unit tests exercise), and disk entries the caller never saw are
-    appended, never dropped. The launch patches are applied last, so a
-    freshly-launched entry always reflects its `LAUNCHED` state regardless of
-    which copy won the merge.
+    `launch_ready`). Once a queue file exists, its current contents are the
+    merge base: concurrent enqueue, reevaluation, ordering, and deletion all
+    win over the stale caller snapshot. The only absent entry restored from
+    `base_entries` is one with a successful launch patch, because that process
+    has actually started and the queue must retain its `LAUNCHED` record.
 
-    Note on a concurrently-deleted launched entry: a launched entry is always
-    one this call took from `base_entries`, so when a concurrent process has
-    since dequeued it from disk the fallback above keeps the caller's copy in
-    the merge and the launch patch is applied to it — i.e. it is re-added and
-    recorded `LAUNCHED`, not dropped. That is deliberate: the run has actually
-    started (and is independently tracked in `runtime.db`), so the queue should
-    reflect it rather than silently lose it behind a racing delete. The
-    `if target is not None` guard below therefore never fires for a launched
-    entry today; it is defensive only, for any future caller that might pass a
-    patch id not present in `base_entries`."""
+    When no queue file has ever been persisted, `base_entries` seeds it for
+    compatibility with in-memory callers and tests."""
     with queue_lock(root):
+        persisted = queue_file_path(root).exists()
         disk = load_queue(root)
-        disk_by_id = {e.get("id"): e for e in disk}
-        merged: list[dict] = []
-        seen: set[str | None] = set()
-        for entry in base_entries:
-            entry_id = entry.get("id")
-            seen.add(entry_id)
-            merged.append(dict(disk_by_id.get(entry_id, entry)))
-        for entry in disk:
-            if entry.get("id") not in seen:
-                merged.append(dict(entry))
-
+        merged = [dict(entry) for entry in (disk if persisted else base_entries)]
         by_id = {e.get("id"): e for e in merged}
+        base_by_id = {e.get("id"): e for e in base_entries}
         for entry_id, patch in patches.items():
             target = by_id.get(entry_id)
-            if target is not None:
-                target.update(patch)
+            if target is None:
+                base = base_by_id.get(entry_id)
+                if base is None:
+                    continue
+                target = dict(base)
+                merged.append(target)
+                by_id[entry_id] = target
+            target.update(patch)
 
         save_queue(root, merged)
     return merged

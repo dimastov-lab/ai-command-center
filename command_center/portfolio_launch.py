@@ -1244,8 +1244,7 @@ def launch_portfolio_task(
         synthetic_task = _synthetic_task(task, plan, worktree_path=worktree_path, prompt=prompt)
         synthetic_tasks_by_id = {synthetic_task["id"]: synthetic_task}
 
-        entries = execution_queue.load_queue(root)
-        entries = execution_queue.enqueue(entries, synthetic_task, synthetic_tasks_by_id)
+        entries = execution_queue.enqueue_and_persist(root, synthetic_task, synthetic_tasks_by_id)
         new_entry = next(
             (e for e in entries if e.get("task_id") == task.task_id and e.get("state") in execution_queue.OPEN_STATES),
             None,
@@ -1257,21 +1256,24 @@ def launch_portfolio_task(
             return PortfolioLaunchResult(
                 task_id=task.task_id, launched=False, message="не удалось создать запись очереди запуска", plan=plan
             )
-        execution_queue.save_queue(root, entries)
-
-        updated_entries, results = execution_queue.launch_ready(
+        _, results = execution_queue.launch_ready(
             root,
             entries,
             [synthetic_task],
             synthetic_tasks_by_id,
-            {task.project: {}},
+            {
+                task.project: {
+                    "repository_path": str(repo_root),
+                    "base_branch": plan.base_branch,
+                }
+            },
             execution_center_api,
             entry_ids=[new_entry["id"]],
         )
         result = next((r for r in results if r.entry_id == new_entry["id"]), None)
 
         if result is None or not result.launched:
-            execution_queue.save_queue(root, execution_queue.dequeue(updated_entries, new_entry["id"]))
+            execution_queue.dequeue_and_persist(root, new_entry["id"])
             _rollback_worktree(
                 repo_root, worktree_path, worktree_created=worktree_created, branch=plan.branch, branch_created=branch_created
             )

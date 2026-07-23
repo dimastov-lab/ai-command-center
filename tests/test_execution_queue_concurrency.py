@@ -375,7 +375,7 @@ def test_launch_ready_commit_merges_onto_a_concurrent_write(tmp_path, git_repo, 
 
     api = runtime_api.ExecutionCenterAPI(db_path=git_repo.parent / "runtime.db")
     updated, results = execution_queue.launch_ready(
-        tmp_path, entries, [task], tasks_by_id, {"AIOS": {}}, api
+        tmp_path, entries, [task], tasks_by_id, {"AIOS": {"repository_path": str(git_repo)}}, api
     )
 
     assert results[0].launched is True
@@ -387,3 +387,43 @@ def test_launch_ready_commit_merges_onto_a_concurrent_write(tmp_path, git_repo, 
     assert stored["LAUNCH"]["run_id"] == results[0].run_id
 
     api.request_cancel(results[0].run_id, confirmed=True)
+
+
+def test_launch_commit_preserves_concurrent_deletion_of_unrelated_entry(tmp_path):
+    launch_task = _task("LAUNCH")
+    unrelated_task = _task("DELETE-ME")
+    tasks = {"LAUNCH": launch_task, "DELETE-ME": unrelated_task}
+    base = execution_queue.enqueue([], launch_task, tasks)
+    base = execution_queue.enqueue(base, unrelated_task, tasks)
+    execution_queue.save_queue(tmp_path, base)
+
+    unrelated = next(e for e in base if e["task_id"] == "DELETE-ME")
+    execution_queue.dequeue_and_persist(tmp_path, unrelated["id"])
+    launched = next(e for e in base if e["task_id"] == "LAUNCH")
+
+    merged = execution_queue._commit_launch_results(
+        tmp_path,
+        base,
+        {launched["id"]: {"state": execution_queue.STATE_LAUNCHED, "run_id": "run-1"}},
+    )
+
+    assert [e["task_id"] for e in merged] == ["LAUNCH"]
+    assert merged[0]["state"] == execution_queue.STATE_LAUNCHED
+
+
+def test_launch_commit_restores_only_a_concurrently_deleted_launched_entry(tmp_path):
+    task = _task("LAUNCH")
+    base = execution_queue.enqueue([], task, {"LAUNCH": task})
+    execution_queue.save_queue(tmp_path, base)
+    entry = base[0]
+    execution_queue.dequeue_and_persist(tmp_path, entry["id"])
+
+    merged = execution_queue._commit_launch_results(
+        tmp_path,
+        base,
+        {entry["id"]: {"state": execution_queue.STATE_LAUNCHED, "run_id": "run-1"}},
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["id"] == entry["id"]
+    assert merged[0]["state"] == execution_queue.STATE_LAUNCHED

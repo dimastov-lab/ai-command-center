@@ -116,7 +116,7 @@ def render_recommendations_panel(
                     width="stretch",
                 ):
                     task = tasks_by_id.get(view["task_id"])
-                    working_entries = execution_queue.enqueue(queue_entries, task, tasks_by_id)
+                    working_entries = execution_queue.enqueue_and_persist(root, task, tasks_by_id)
                     new_entry = next(
                         e
                         for e in working_entries

@@ -1424,28 +1424,28 @@ def test_recommendations_enqueue_button_adds_task_to_execution_queue():
     assert any(c.value == "В очереди · готово" for c in at.caption)
 
 
-def test_recommendations_launch_now_still_persists_and_is_unchanged(monkeypatch):
-    """The separate «Запустить» (launch-now) workflow already persists safely
-    through `launch_ready`'s lock-guarded commit — this remediation must not
-    touch it. Guard: launching from a recommendation still routes through
-    `execution_queue.launch_ready` (never the enqueue-only path) and reports a
-    per-entry result."""
+def test_recommendations_launch_now_uses_locked_enqueue_then_launch_ready(monkeypatch):
+    """Launch-now atomically finds-or-creates its queue entry before routing
+    that exact entry through `launch_ready`."""
     import app
 
     _seed_task(id="seeded-task-1", workspace_path=None)
 
     launch_ready_calls: list[tuple] = []
     real_launch_ready = execution_queue.launch_ready
+    enqueue_calls: list[tuple] = []
+    real_enqueue = execution_queue.enqueue_and_persist
 
     def spy_launch_ready(root, entries, *args, **kwargs):
         launch_ready_calls.append((root, entries, args, kwargs))
         return real_launch_ready(root, entries, *args, **kwargs)
 
-    def fail_locked_enqueue(*args, **kwargs):
-        raise AssertionError("launch-now must not use the enqueue-only persistence helper")
+    def spy_locked_enqueue(root, task, tasks_by_id):
+        enqueue_calls.append((root, task, tasks_by_id))
+        return real_enqueue(root, task, tasks_by_id)
 
     monkeypatch.setattr(execution_queue, "launch_ready", spy_launch_ready)
-    monkeypatch.setattr(execution_queue, "enqueue_and_persist", fail_locked_enqueue)
+    monkeypatch.setattr(execution_queue, "enqueue_and_persist", spy_locked_enqueue)
 
     at = _at_on_page("kanban")
     assert not at.exception
@@ -1454,6 +1454,9 @@ def test_recommendations_launch_now_still_persists_and_is_unchanged(monkeypatch)
     assert not at.exception
 
     assert len(launch_ready_calls) == 1, "launch-now must route through launch_ready exactly once"
+    assert len(enqueue_calls) == 1
+    assert enqueue_calls[0][0] == app.ROOT
+    assert enqueue_calls[0][1]["id"] == "seeded-task-1"
     root, entries, _, kwargs = launch_ready_calls[0]
     assert root == app.ROOT
     entry_ids = kwargs.get("entry_ids")

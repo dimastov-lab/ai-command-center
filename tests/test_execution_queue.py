@@ -172,7 +172,7 @@ def test_launch_ready_skips_entry_needing_warning_acknowledgement(tmp_path, git_
     api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
 
     updated, results = execution_queue.launch_ready(
-        tmp_path, entries, [task], tasks_by_id, {"AIOS": {}}, api
+        tmp_path, entries, [task], tasks_by_id, {"AIOS": {"repository_path": str(git_repo)}}, api
     )
     assert results[0].launched is False
     assert "подтверждения" in results[0].message
@@ -221,7 +221,7 @@ def test_launch_ready_launches_clean_ready_entry(tmp_path, git_repo, fake_claude
     api = runtime_api.ExecutionCenterAPI(db_path=git_repo.parent / "runtime.db")
 
     updated, results = execution_queue.launch_ready(
-        tmp_path, entries, [task], tasks_by_id, {"AIOS": {}}, api
+        tmp_path, entries, [task], tasks_by_id, {"AIOS": {"repository_path": str(git_repo)}}, api
     )
 
     assert results[0].launched is True
@@ -244,7 +244,13 @@ def test_launch_ready_with_entry_ids_launches_only_that_entry(tmp_path, git_repo
 
     entry_a = next(e for e in entries if e["task_id"] == "a")
     updated, results = execution_queue.launch_ready(
-        tmp_path, entries, [task_a, task_b], tasks_by_id, {"AIOS": {}}, api, entry_ids=[entry_a["id"]]
+        tmp_path,
+        entries,
+        [task_a, task_b],
+        tasks_by_id,
+        {"AIOS": {"repository_path": str(git_repo)}},
+        api,
+        entry_ids=[entry_a["id"]],
     )
 
     assert len(results) == 1
@@ -259,7 +265,7 @@ def test_launch_ready_with_entry_ids_launches_only_that_entry(tmp_path, git_repo
 
 def test_launch_ready_one_bad_entry_does_not_abort_the_batch(tmp_path, git_repo, fake_claude):
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
-    broken = _task(id="broken")  # no workspace_path anywhere -> resolve_workspace_path fails
+    broken = _task(id="broken", project="MISSING")  # no workspace or project fallback
     healthy = _task(id="healthy", workspace_path=str(git_repo))
     tasks_by_id = {"broken": broken, "healthy": healthy}
     entries = execution_queue.enqueue([], broken, tasks_by_id)
@@ -267,7 +273,12 @@ def test_launch_ready_one_bad_entry_does_not_abort_the_batch(tmp_path, git_repo,
     api = runtime_api.ExecutionCenterAPI(db_path=git_repo.parent / "runtime.db")
 
     updated, results = execution_queue.launch_ready(
-        tmp_path, entries, [broken, healthy], tasks_by_id, {"AIOS": {}}, api
+        tmp_path,
+        entries,
+        [broken, healthy],
+        tasks_by_id,
+        {"AIOS": {"repository_path": str(git_repo)}},
+        api,
     )
 
     by_task = {r.task_id: r for r in results}
