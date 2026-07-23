@@ -255,7 +255,7 @@ class Supervisor:
         db.migrate(self.db_path)
         self._active: dict[str, _ActiveRun] = {}
         # Run ids this instance has committed to launching (persisted as
-        # QUEUED) but has not yet `Popen`'d — the gap `self._active` alone
+        # PREPARED/QUEUED) but has not yet `Popen`'d — the gap `self._active` alone
         # cannot cover, because `_active` is only populated once a process
         # actually exists (see `_launch_process`). Guarded by the same
         # `_active_lock`. See `reconcile()` for why this must be included in
@@ -462,42 +462,39 @@ class Supervisor:
             _assert_no_forbidden_flags(command)
 
         try:
-            run = db.create_run(
-                self.db_path,
-                session_id=session_id,
-                task_id=task_id,
-                project=project,
-                task_type=task_type,
-                repository_path=str(repo_path),
-                prompt=prompt if executor_id == providers.CLAUDE_ID else "[redacted: prompt transported via stdin]",
-                is_resume=is_resume,
-                timeout_seconds=timeout_seconds,
-                command=command,
-                expected_branch=expected_branch,
-                launch_source=launch_source,
-                prompt_version=prompt_version,
-                provider_id=executor_id,
-                provider_metadata_json=providers.audit_json(spec.audit_metadata),
-                enforce_workspace_lock=True,
-            )
+            # Keep creation and in-memory ownership registration atomic with
+            # `reconcile()`'s active-id snapshot plus active-row query. Without
+            # this shared lock, a dashboard refresh can observe the committed
+            # PREPARED row in the few instructions before `_launching.add()`
+            # and incorrectly transition this live launch to INTERRUPTED.
+            # The lock covers one short SQLite transaction only; it is released
+            # before git inspection or subprocess creation.
+            with self._active_lock:
+                run = db.create_run(
+                    self.db_path,
+                    session_id=session_id,
+                    task_id=task_id,
+                    project=project,
+                    task_type=task_type,
+                    repository_path=str(repo_path),
+                    prompt=(
+                        prompt
+                        if executor_id == providers.CLAUDE_ID
+                        else "[redacted: prompt transported via stdin]"
+                    ),
+                    is_resume=is_resume,
+                    timeout_seconds=timeout_seconds,
+                    command=command,
+                    expected_branch=expected_branch,
+                    launch_source=launch_source,
+                    prompt_version=prompt_version,
+                    provider_id=executor_id,
+                    provider_metadata_json=providers.audit_json(spec.audit_metadata),
+                    enforce_workspace_lock=True,
+                )
+                self._launching.add(run["id"])
         except db.WorkspaceLockedError as exc:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
-
-        # From here on this run is committed to being launched by *this*
-        # instance — recorded the instant the row exists (still PREPARED),
-        # not after the QUEUED transition below, so a concurrent
-        # `reconcile()` call in this same process (e.g. another browser
-        # tab's dashboard refresh) — which now scans PREPARED rows too,
-        # since that's exactly what this hardening added — can never
-        # observe this row before it's guarded here. Registering it any
-        # later would reopen the same gap this set exists to close: a
-        # pid-less PREPARED/QUEUED row with no entry in `self._launching`
-        # is indistinguishable from one abandoned by a crashed predecessor.
-        # See `reconcile()`'s skip-guard and `_launch_process`'s `finally`,
-        # which removes this once the row has a real process (or has
-        # failed) recorded instead.
-        with self._active_lock:
-            self._launching.add(run["id"])
 
         try:
             run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
@@ -1215,9 +1212,16 @@ class Supervisor:
           and must not attempt to signal/cancel it.
         """
         outcomes = []
+        # The row query belongs to the same critical section as the in-memory
+        # snapshot. `start_raw()` uses this lock around create_run()+registration,
+        # so reconciliation can see either no new row or a row already present
+        # in one of the ownership sets, never the unguarded state between them.
         with self._active_lock:
             actively_supervised_ids = set(self._active.keys()) | set(self._launching)
-        for run in db.list_runs(self.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES):
+            active_rows = db.list_runs(
+                self.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES
+            )
+        for run in active_rows:
             run_id = run["id"]
             if run_id in actively_supervised_ids:
                 continue
