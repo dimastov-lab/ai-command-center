@@ -93,6 +93,7 @@ REASON_AGENT_AT_CAPACITY = "agent_at_capacity"
 REASON_AGENT_UNAVAILABLE = "agent_unavailable"
 # BLOCKED (structural — re-planning alone will not help)
 REASON_MALFORMED = "malformed"
+REASON_INVALID_ATTEMPT_STATE = "invalid_attempt_state"
 REASON_NO_CAPABLE_AGENT = "no_capable_agent"
 REASON_TERMINAL_FAILURE = "terminal_failure"
 REASON_RETRY_EXHAUSTED = "retry_exhausted"
@@ -314,11 +315,12 @@ class WorkItem:
 @dataclass(frozen=True)
 class LoadSnapshot:
     """The execution load already in flight, against which capacity and
-    workspace-exclusivity are checked. Immutable; build one per planning tick
-    (see `build_load_snapshot` for the read-only DB projection)."""
+    task/workspace exclusivity are checked. Immutable; build one per planning
+    tick (see `build_load_snapshot` for the read-only DB projection)."""
 
     running_by_agent: Mapping[str, int] = field(default_factory=dict)
     busy_workspaces: frozenset[str] = frozenset()
+    active_task_ids: frozenset[str] = frozenset()
     global_running: int = 0
 
 
@@ -535,7 +537,7 @@ def plan(
         a.agent_id: max(0, load.running_by_agent.get(a.agent_id, 0)) for a in registry.all()
     }
     consumed_workspaces: set[str] = {_normalize_workspace(w) for w in load.busy_workspaces}
-    scheduled_tasks: set[str] = set()
+    scheduled_tasks: set[str] = set(load.active_task_ids)
 
     decisions: list[SchedulingDecision] = []
 
@@ -568,23 +570,19 @@ def plan(
             )
             continue
 
-        # 0b) Duplicate task_id — at most one ASSIGN per task_id per plan
-        #     (finding F2). `scheduled_tasks` holds only task_ids that were
-        #     actually ASSIGNED earlier in this same, canonically-ordered pass,
-        #     so the earliest-ordered eligible item wins deterministically and
-        #     every later item for that task is DEFERRED (never a second
-        #     concurrent attempt). An earlier item that merely DEFERRED/BLOCKED
-        #     (never assigned) does not consume its task_id, so a valid twin is
-        #     not blocked incorrectly. Placed before the retry/capacity gates
-        #     so the duplicate reason is reported regardless of those.
+        # 0b) Duplicate task_id — at most one active or newly-assigned attempt
+        #     per task. `scheduled_tasks` begins with the task IDs in the live
+        #     load snapshot, then gains only task IDs actually ASSIGNED in this
+        #     canonically-ordered pass. An earlier candidate that merely
+        #     DEFERRED/BLOCKED does not consume its task ID.
         if item.task_id in scheduled_tasks:
             decisions.append(
                 SchedulingDecision(
                     action=ACTION_DEFER,
                     reason_code=REASON_DUPLICATE_TASK,
                     explanation=(
-                        f"task_id {item.task_id!r} was already assigned earlier in this plan; "
-                        "at most one attempt per task_id is scheduled per tick"
+                        f"task_id {item.task_id!r} already has an active or newly-assigned attempt; "
+                        "at most one concurrent attempt per task_id is allowed"
                     ),
                     **base,
                 )
@@ -593,7 +591,27 @@ def plan(
 
         workspace = _normalize_workspace(item.workspace)
 
-        # 1) Dependencies not satisfied — transient, will clear.
+        # 1) A completed-attempt count without a recognized prior state is
+        #    corrupt/incomplete history. Never treat it as a fresh launch:
+        #    doing so bypasses retry budget and can create an unbounded attempt.
+        if item.attempts_made > 0 and item.last_state not in {
+            "COMPLETED",
+            *_RETRY_GATED_STATES,
+        }:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_BLOCKED,
+                    reason_code=REASON_INVALID_ATTEMPT_STATE,
+                    explanation=(
+                        f"task reports {item.attempts_made} completed attempt(s) but has "
+                        f"unrecognized prior state {item.last_state!r}; refusing to bypass retry policy"
+                    ),
+                    **base,
+                )
+            )
+            continue
+
+        # 2) Dependencies not satisfied — transient, will clear.
         if not item.dependencies_met:
             decisions.append(
                 SchedulingDecision(
@@ -605,7 +623,7 @@ def plan(
             )
             continue
 
-        # 2) Retry gating — STATE-driven, never failure_reason-driven (finding
+        # 3) Retry gating — STATE-driven, never failure_reason-driven (finding
         #    F1). Any prior non-success terminal state with a completed attempt
         #    (FAILED / INTERRUPTED / UNKNOWN / CANCELLED, incl. reconcile output
         #    that carries no failure_reason) enters the retry policy.
@@ -686,7 +704,7 @@ def plan(
             # else: backoff already elapsed — fall through to normal assignment
             # as a fresh attempt (attempt number attempts_made + 1).
 
-        # 3) Capability match — structural. No capable agent is BLOCKED.
+        # 4) Capability match — structural. No capable agent is BLOCKED.
         if item.preferred_agent is not None:
             preferred = registry.get(item.preferred_agent)
             if preferred is None or not preferred.can_run(item.required_capabilities):
@@ -719,7 +737,7 @@ def plan(
             )
             continue
 
-        # 4) Availability — transient. Capable agents exist but are all down.
+        # 5) Availability — transient. Capable agents exist but are all down.
         available = [a for a in capable if a.available]
         if not available:
             decisions.append(
@@ -732,7 +750,7 @@ def plan(
             )
             continue
 
-        # 5) Workspace exclusivity — transient. Mirrors the DB workspace lock
+        # 6) Workspace exclusivity — transient. Mirrors the DB workspace lock
         #    (`create_run(enforce_workspace_lock=True)`) *and* guards against
         #    two items in this same plan claiming one workspace.
         if workspace in consumed_workspaces:
@@ -746,7 +764,7 @@ def plan(
             )
             continue
 
-        # 6) Global capacity — transient.
+        # 7) Global capacity — transient.
         if global_used >= config.max_global_concurrency:
             decisions.append(
                 SchedulingDecision(
@@ -761,7 +779,7 @@ def plan(
             )
             continue
 
-        # 7) Per-agent capacity + workload distribution — pick the available,
+        # 8) Per-agent capacity + workload distribution — pick the available,
         #    capable agent with the most spare capacity (spreads load), tie
         #    broken by weight desc then agent_id asc (both already the order
         #    `registry.all()` yields, so `max` on a stable-sorted list is
@@ -781,9 +799,9 @@ def plan(
             )
             continue
 
-        chosen = max(with_capacity, key=lambda a: (_spare(a), a.weight, a.agent_id))
+        chosen = min(with_capacity, key=lambda a: (-_spare(a), -a.weight, a.agent_id))
 
-        # 8) ASSIGN — draw down every ledger so later items see it.
+        # 9) ASSIGN — draw down every ledger so later items see it.
         global_used += 1
         agent_used[chosen.agent_id] = agent_used.get(chosen.agent_id, 0) + 1
         consumed_workspaces.add(workspace)
@@ -827,14 +845,19 @@ def build_load_snapshot(db_path, *, agent_of_run=None) -> LoadSnapshot:
     rows = db.list_runs(db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
     running_by_agent: dict[str, int] = {}
     busy: set[str] = set()
+    active_task_ids: set[str] = set()
     for run in rows:
         agent_id = agent_of_run(run)
         running_by_agent[agent_id] = running_by_agent.get(agent_id, 0) + 1
         workspace = run.get("repository_path")
         if workspace:
             busy.add(_normalize_workspace(workspace))
+        task_id = run.get("task_id")
+        if task_id:
+            active_task_ids.add(task_id)
     return LoadSnapshot(
         running_by_agent=running_by_agent,
         busy_workspaces=frozenset(busy),
+        active_task_ids=frozenset(active_task_ids),
         global_running=len(rows),
     )

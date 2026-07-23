@@ -256,6 +256,22 @@ def test_workload_distribution_prefers_agent_with_most_spare_capacity():
     assert result.assignments()[0].agent_id == "idle"
 
 
+def test_equal_capacity_and_weight_choose_lexicographically_first_agent():
+    reg = scheduler.AgentRegistry(
+        [
+            scheduler.AgentSpec("b", "claude_code", frozenset({scheduler.CAP_ANY}), 3, weight=2),
+            scheduler.AgentSpec("a", "claude_code", frozenset({scheduler.CAP_ANY}), 3, weight=2),
+        ]
+    )
+    result = scheduler.plan(
+        [_item("t1", "/repo/a")],
+        registry=reg,
+        config=scheduler.SchedulerConfig(max_global_concurrency=10),
+        now=NOW,
+    )
+    assert result.assignments()[0].agent_id == "a"
+
+
 # --------------------------------------------------------------------------
 # Duplicate prevention (workspace exclusivity)
 # --------------------------------------------------------------------------
@@ -446,6 +462,15 @@ def test_malformed_enqueued_timestamp_does_not_crash():
     assert d.queued_seconds is None
 
 
+@pytest.mark.parametrize("last_state", [None, "", "CORRUPT", "RUNNING"])
+def test_completed_attempt_count_with_invalid_prior_state_is_blocked(last_state):
+    reg = _registry(max_concurrency=10)
+    item = _item("t1", "/repo/a", attempts_made=999, last_state=last_state)
+    decision = scheduler.plan([item], registry=reg, now=NOW).decisions[0]
+    assert decision.action == scheduler.ACTION_BLOCKED
+    assert decision.reason_code == scheduler.REASON_INVALID_ATTEMPT_STATE
+
+
 # --------------------------------------------------------------------------
 # Determinism
 # --------------------------------------------------------------------------
@@ -488,7 +513,26 @@ def test_build_load_snapshot_reflects_active_runs(tmp_path):
     snap = scheduler.build_load_snapshot(db_path)
     assert snap.global_running == 2
     assert snap.busy_workspaces == frozenset({"/repo/a", "/repo/b"})
+    assert len(snap.active_task_ids) == 2
     assert snap.running_by_agent == {"claude_code": 2}
+
+
+def test_active_task_cannot_be_assigned_again_in_a_different_workspace(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    active = _make_running_row(db_path, repository_path="/repo/a")
+    snap = scheduler.build_load_snapshot(db_path)
+
+    plan = scheduler.plan(
+        [_item(active["task_id"], "/repo/b")],
+        registry=_registry(max_concurrency=10),
+        config=scheduler.SchedulerConfig(max_global_concurrency=10),
+        load=snap,
+        now=NOW,
+    )
+
+    assert plan.assignments() == []
+    assert plan.deferrals()[0].reason_code == scheduler.REASON_DUPLICATE_TASK
 
 
 def test_snapshot_after_reconciliation_frees_workspace_for_scheduling(tmp_path):
@@ -508,6 +552,7 @@ def test_snapshot_after_reconciliation_frees_workspace_for_scheduling(tmp_path):
     snap = scheduler.build_load_snapshot(db_path)
     assert snap.global_running == 0
     assert snap.busy_workspaces == frozenset()
+    assert snap.active_task_ids == frozenset()
 
     reg = _registry()
     result = scheduler.plan([_item("t-new", "/repo/a")], registry=reg, load=snap, now=NOW)
