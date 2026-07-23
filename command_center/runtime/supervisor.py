@@ -433,16 +433,6 @@ class Supervisor:
         except db.WorkspaceLockedError as exc:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
 
-        if verification_evidence is not None:
-            db.append_run_event(
-                self.db_path,
-                run["id"],
-                "lifecycle",
-                stream_parser.lifecycle_event(
-                    "workspace_verified", **verification_evidence.as_payload()
-                )["payload"],
-            )
-
         # From here on this run is committed to being launched by *this*
         # instance — recorded the instant the row exists (still PREPARED),
         # not after the QUEUED transition below, so a concurrent
@@ -460,6 +450,15 @@ class Supervisor:
             self._launching.add(run["id"])
 
         try:
+            if verification_evidence is not None:
+                db.append_run_event(
+                    self.db_path,
+                    run["id"],
+                    "lifecycle",
+                    stream_parser.lifecycle_event(
+                        "workspace_verified", **verification_evidence.as_payload()
+                    )["payload"],
+                )
             run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
             pre_run_status = agent_runner.git_snapshot(repo_path).get("status_summary")
             run = db.update_run_fields(

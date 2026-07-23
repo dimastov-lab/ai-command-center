@@ -312,7 +312,7 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
                 ),
                 expected_workspace=spec.workspace_path,
                 expected_branch=spec.expected_branch,
-                detail=f"cannot attach an already-checked-out branch to a second worktree",
+                detail="cannot attach an already-checked-out branch to a second worktree",
             )
         _worktree_add(repo, workspace, [str(workspace_target), spec.expected_branch], spec)
         return "attached"

@@ -134,6 +134,50 @@ def test_start_raw_verified_worktree_runs_claude_in_that_worktree(
     assert git_info.get_status(repo)["status_lines"] == []
 
 
+def test_verified_run_is_guarded_before_workspace_event_is_persisted(
+    tmp_path, configure_project_repo, fake_claude, monkeypatch
+):
+    """A concurrent reconcile must not interrupt the PREPARED run while its
+    verification evidence is being persisted."""
+    repo = _make_repo(tmp_path / "repo")
+    worktree = _add_worktree(repo, tmp_path / "wt" / "audit", "audit/execution-queue")
+    configure_project_repo("AIOS", repo)
+    sup = supervisor_module.Supervisor(db_path=tmp_path / "runs.db")
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(worktree),
+        expected_branch="audit/execution-queue",
+        base_branch="main",
+        repository_path=str(repo),
+    )
+
+    original_append = supervisor_module.db.append_run_event
+    observed: dict[str, object] = {}
+
+    def append_with_reconcile(db_path, run_id, event_type, payload):
+        if payload.get("lifecycle") == "workspace_verified":
+            observed["guarded"] = run_id in sup._launching
+            observed["reconciled"] = sup.reconcile()
+            observed["state"] = runtime_db.get_run(sup.db_path, run_id)["state"]
+        return original_append(db_path, run_id, event_type, payload)
+
+    monkeypatch.setattr(supervisor_module.db, "append_run_event", append_with_reconcile)
+
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(worktree),
+        task_type="implementation",
+        prompt="do the audit",
+        confirmed=True,
+        repository_already_validated=True,
+        expected_branch="audit/execution-queue",
+        workspace_verification=spec,
+    )
+
+    assert observed == {"guarded": True, "reconciled": [], "state": "PREPARED"}
+    assert run["state"] == "RUNNING"
+    sup.wait_for_run(run["id"], timeout=10)
+
+
 # --------------------------------------------------------------------------
 # launch_service.execute_agent_launch_v2 — orchestration layer
 # --------------------------------------------------------------------------
