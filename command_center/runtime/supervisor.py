@@ -40,14 +40,16 @@ project without having gone through `context_service` first.
 from __future__ import annotations
 
 import os
+import json
 import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from command_center import agent_runner
 from command_center.models import iso_now
-from command_center.runtime import context_service, db, identity, outcome, reports, stream_parser
+from command_center.runtime import context_service, db, identity, outcome, providers, reports, stream_parser
 
 # `AICC_CLAUDE_BINARY` lets a test point a genuinely separate OS process
 # (e.g. `scripts/execution_center_debug.py`, invoked as a real subprocess, not
@@ -89,6 +91,10 @@ class WorkspaceLockedError(SupervisorError):
             f"({conflicting_run['id']!r}, state={conflicting_run['state']!r}). Wait for it to "
             "finish or cancel it before launching again."
         )
+
+
+class ProviderUnavailableError(SupervisorError):
+    """The selected provider cannot be used safely on this machine."""
 
 
 def build_claude_command(
@@ -152,9 +158,10 @@ def _assert_no_forbidden_flags(command: list[str]) -> None:
 
 
 class _ActiveRun:
-    def __init__(self, *, process: subprocess.Popen, run_id: str) -> None:
+    def __init__(self, *, process: subprocess.Popen, run_id: str, provider: providers.ExecutionProvider) -> None:
         self.process = process
         self.run_id = run_id
+        self.provider = provider
         self.done_event = threading.Event()
         # Set by `_timeout_watchdog` (never by `cancel()`) so `_supervise` can
         # tell a timeout-triggered termination apart from an explicit,
@@ -170,6 +177,28 @@ class _ActiveRun:
         # milestone exactly once.
         self.handshake_recorded = threading.Event()
         self.handshake_lock = threading.Lock()
+
+
+def _capture_stable_process_identity(
+    process: subprocess.Popen, *, attempts: int = 10, interval_seconds: float = 0.01
+) -> identity.ProcessIdentity | None:
+    """Wait briefly for shebang/interpreter exec transitions to settle.
+
+    Persisting an identity from the transient `/usr/bin/env` phase makes the
+    same live child look like PID reuse milliseconds later. Two consecutive
+    identical captures retain full start-time+command protection while
+    avoiding that false mismatch.
+    """
+    previous = None
+    for _ in range(attempts):
+        if process.poll() is not None:
+            return previous
+        current = identity.capture_identity(process.pid)
+        if current is not None and previous is not None and current.as_string() == previous.as_string():
+            return current
+        previous = current
+        time.sleep(interval_seconds)
+    return previous
 
 
 class Supervisor:
@@ -266,6 +295,8 @@ class Supervisor:
         launch_source: str | None = None,
         prompt_version: int | None = None,
         repository_already_validated: bool = False,
+        executor_id: str = providers.CLAUDE_ID,
+        canonical_repository_path: str | None = None,
     ) -> dict:
         """Prepare and launch a run from an already-final `prompt` string.
 
@@ -315,7 +346,12 @@ class Supervisor:
         an unconfigured/mismatched repository path, or an invalid resume
         request (no such session).
         """
-        context_service.require_launch_confirmation(confirmed, what="Launching a Claude Code run")
+        provider = providers.get_provider(executor_id)
+        context_service.require_launch_confirmation(confirmed, what=f"Launching a {provider.label} run")
+
+        availability = provider.availability()
+        if executor_id != providers.CLAUDE_ID and not availability.available:
+            raise ProviderUnavailableError(f"{provider.label} unavailable ({availability.code}): {availability.message}")
 
         if repository_already_validated:
             repo_path = Path(repository_path).expanduser().resolve()
@@ -324,16 +360,24 @@ class Supervisor:
         else:
             repo_path = agent_runner.validate_repository(project, repository_path)
 
+        if provider.requires_dedicated_worktree:
+            self._validate_dedicated_worktree(
+                repo_path,
+                canonical_repository_path=canonical_repository_path,
+                expected_branch=expected_branch,
+            )
+
+        safe_default_title = "Codex CLI run" if executor_id == providers.CODEX_ID else prompt[:120]
         if task_id is None:
             task = db.create_task(
-                self.db_path, project=project, title=title or prompt[:120], task_type=task_type
+                self.db_path, project=project, title=title or safe_default_title, task_type=task_type
             )
             task_id = task["id"]
         elif db.get_task(self.db_path, task_id) is None:
             db.create_task(
                 self.db_path,
                 project=project,
-                title=title or prompt[:120],
+                title=title or safe_default_title,
                 task_type=task_type,
                 task_id=task_id,
             )
@@ -354,10 +398,20 @@ class Supervisor:
             )
             session_id = session["id"]
 
-        command = build_claude_command(
-            session_id=session_id, prompt=prompt, task_type=task_type, is_resume=is_resume, model=model
-        )
-        _assert_no_forbidden_flags(command)
+        try:
+            spec = provider.build_launch(
+                repository_path=repo_path,
+                session_id=session_id,
+                prompt=prompt,
+                task_type=task_type,
+                is_resume=is_resume,
+                model=model,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise ProviderUnavailableError(str(exc)) from exc
+        command = list(spec.argv)
+        if executor_id == providers.CLAUDE_ID:
+            _assert_no_forbidden_flags(command)
 
         try:
             run = db.create_run(
@@ -367,13 +421,15 @@ class Supervisor:
                 project=project,
                 task_type=task_type,
                 repository_path=str(repo_path),
-                prompt=prompt,
+                prompt=prompt if executor_id == providers.CLAUDE_ID else "[redacted: prompt transported via stdin]",
                 is_resume=is_resume,
                 timeout_seconds=timeout_seconds,
                 command=command,
                 expected_branch=expected_branch,
                 launch_source=launch_source,
                 prompt_version=prompt_version,
+                provider_id=executor_id,
+                provider_metadata_json=providers.audit_json(spec.audit_metadata),
                 enforce_workspace_lock=True,
             )
         except db.WorkspaceLockedError as exc:
@@ -413,12 +469,42 @@ class Supervisor:
                 self._launching.discard(run["id"])
             raise
 
-        return self._launch_process(run, command, repo_path)
+        return self._launch_process(run, spec, repo_path, provider)
 
-    def _launch_process(self, run: dict, command: list[str], repo_path: Path) -> dict:
+    @staticmethod
+    def _validate_dedicated_worktree(
+        repo_path: Path, *, canonical_repository_path: str | None, expected_branch: str | None
+    ) -> None:
+        """Fail closed unless Codex targets the intended registered feature worktree."""
+        from command_center import worktree_launcher
+
+        if not canonical_repository_path:
+            raise SupervisorError("Codex launch requires the project's canonical repository path.")
+        canonical = Path(canonical_repository_path).expanduser().resolve()
+        if repo_path == canonical:
+            raise SupervisorError("Unsafe Codex target: the canonical checkout cannot be used for execution.")
+        if not expected_branch:
+            raise SupervisorError("Codex launch requires the intended task branch.")
+        validation = worktree_launcher.validate_worktree(
+            repository_root=canonical,
+            worktree_path=repo_path,
+            expected_branch=expected_branch,
+            require_clean=False,
+        )
+        if not validation.can_launch:
+            detail = "; ".join(validation.errors) or "worktree validation failed"
+            raise SupervisorError(f"Unsafe Codex target worktree: {detail}")
+
+    def _launch_process(
+        self,
+        run: dict,
+        spec: providers.LaunchSpec,
+        repo_path: Path,
+        provider: providers.ExecutionProvider,
+    ) -> dict:
         run_id = run["id"]
         try:
-            return self._launch_process_unguarded(run, command, repo_path)
+            return self._launch_process_unguarded(run, spec, repo_path, provider)
         finally:
             # Whatever happened above — a successful launch (`self._active`
             # now has `run_id`) or a failed `Popen` (state already FAILED) —
@@ -430,38 +516,48 @@ class Supervisor:
             with self._active_lock:
                 self._launching.discard(run_id)
 
-    def _launch_process_unguarded(self, run: dict, command: list[str], repo_path: Path) -> dict:
+    def _launch_process_unguarded(
+        self,
+        run: dict,
+        spec: providers.LaunchSpec,
+        repo_path: Path,
+        provider: providers.ExecutionProvider,
+    ) -> dict:
         run_id = run["id"]
         try:
             process = subprocess.Popen(
-                command,
+                list(spec.argv),
                 cwd=repo_path,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if spec.stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=spec.environment,
                 text=True,
                 bufsize=1,
                 shell=False,
                 start_new_session=True,
             )
         except OSError as exc:
+            failure_reason = "executable_missing" if isinstance(exc, FileNotFoundError) else "provider_launch_failed"
             run = db.update_run_state(
                 self.db_path,
                 run_id,
                 expected_version=run["version"],
                 new_state="FAILED",
-                fields={"completed_at": iso_now()},
+                fields={"completed_at": iso_now(), "failure_reason": failure_reason},
             )
             db.append_run_event(
                 self.db_path,
                 run_id,
                 "lifecycle",
-                stream_parser.lifecycle_event("launch_failed", error=str(exc))["payload"],
+                stream_parser.lifecycle_event(
+                    "launch_failed", error_type=type(exc).__name__, failure_reason=failure_reason
+                )["payload"],
             )
             return run
 
         pid = process.pid
-        proc_identity = identity.capture_identity(pid)
+        proc_identity = _capture_stable_process_identity(process)
         run = db.update_run_fields(
             self.db_path,
             run_id,
@@ -482,12 +578,20 @@ class Supervisor:
             self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("process_started", pid=pid)["payload"]
         )
 
-        active = _ActiveRun(process=process, run_id=run_id)
+        active = _ActiveRun(process=process, run_id=run_id, provider=provider)
         with self._active_lock:
             self._active[run_id] = active
 
         waiter = threading.Thread(target=self._supervise, args=(run_id, active, repo_path), daemon=True)
         waiter.start()
+
+        if spec.stdin_text is not None:
+            stdin_writer = threading.Thread(
+                target=self._write_stdin,
+                args=(run_id, active, spec.stdin_text),
+                daemon=True,
+            )
+            stdin_writer.start()
 
         timeout_seconds = run.get("timeout_seconds")
         if timeout_seconds is not None:
@@ -497,6 +601,24 @@ class Supervisor:
             watchdog.start()
 
         return db.get_run(self.db_path, run_id)
+
+    def _write_stdin(self, run_id: str, active: _ActiveRun, prompt: str) -> None:
+        try:
+            active.process.stdin.write(prompt)
+            active.process.stdin.close()
+            db.append_run_event(
+                self.db_path,
+                run_id,
+                "lifecycle",
+                stream_parser.lifecycle_event("prompt_delivered", transport="stdin")["payload"],
+            )
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            db.append_run_event(
+                self.db_path,
+                run_id,
+                "lifecycle",
+                stream_parser.lifecycle_event("prompt_delivery_failed", error=type(exc).__name__)["payload"],
+            )
 
     # ------------------------------------------------------------------
     # Streaming consumption (runs in background reader threads)
@@ -565,7 +687,7 @@ class Supervisor:
         try:
             for line in process.stdout:
                 self._record_handshake(run_id, active)
-                event = stream_parser.parse_stream_line(line)
+                event = active.provider.parse_stdout_line(line)
                 if event is None:
                     continue
                 db.append_run_event(self.db_path, run_id, event["event_type"], event["payload"])
@@ -580,7 +702,7 @@ class Supervisor:
         try:
             for line in process.stderr:
                 self._record_handshake(run_id, active)
-                event = stream_parser.stderr_event(line)
+                event = stream_parser.stderr_event(active.provider.sanitize_stderr(line))
                 db.append_run_event(self.db_path, run_id, event["event_type"], event["payload"])
         finally:
             try:
@@ -629,6 +751,13 @@ class Supervisor:
             failure_reason = "timeout"
         elif exit_code != 0:
             new_state = "FAILED"
+            diagnostic_events = db.list_run_events(
+                self.db_path, run_id, after_seq=0, limit=1_000_000
+            )
+            diagnostic_lines = [json.dumps(event["payload"], ensure_ascii=False) for event in diagnostic_events]
+            failure_reason = active.provider.classify_failure(
+                exit_code=exit_code, diagnostic_lines=diagnostic_lines
+            )
         else:
             # exit_code == 0 only proves the `claude` process itself did not
             # crash — it does not prove the requested work actually happened
@@ -735,52 +864,83 @@ class Supervisor:
             raise KeyError(f"No such run: {run_id!r}")
         if run["state"] != "RUNNING":
             raise SupervisorError(f"Run {run_id!r} is not RUNNING (state={run['state']!r}); nothing to cancel.")
-
-        try:
-            run = db.update_run_fields(
-                self.db_path,
-                run_id,
-                expected_version=run["version"],
-                fields={"cancel_requested": 1, "cancel_requested_at": iso_now()},
-            )
-        except db.LostUpdateError:
-            current = db.get_run(self.db_path, run_id)
+        if active.process.poll() is not None or (
+            active.provider.id == providers.CODEX_ID
+            and not identity.identity_matches(active.process.pid, run.get("process_start_identity"))
+        ):
             raise SupervisorError(
-                f"Run {run_id!r} changed state before cancellation could be recorded "
-                f"(now state={current['state']!r})."
-            ) from None
+                f"Run {run_id!r} process identity cannot be verified; "
+                "refusing to signal a possibly reused PID."
+            )
+
+        for _ in range(5):
+            try:
+                run = db.update_run_fields(
+                    self.db_path,
+                    run_id,
+                    expected_version=run["version"],
+                    fields={"cancel_requested": 1, "cancel_requested_at": iso_now()},
+                )
+                break
+            except db.LostUpdateError:
+                run = db.get_run(self.db_path, run_id)
+                if run is None or run["state"] != "RUNNING":
+                    raise SupervisorError(
+                        f"Run {run_id!r} changed state before cancellation could be recorded "
+                        f"(now state={None if run is None else run['state']!r})."
+                    ) from None
+        else:
+            raise SupervisorError(
+                f"Run {run_id!r} was changing too quickly to record cancellation safely; retry."
+            )
 
         db.append_run_event(
             self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("cancel_requested")["payload"]
         )
 
         pid = active.process.pid
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        sigterm_sent = self._signal_verified_process_group(active, run, signal.SIGTERM)
         db.append_run_event(
             self.db_path,
             run_id,
             "lifecycle",
-            stream_parser.lifecycle_event("cancel_sigterm_sent", pid=pid)["payload"],
+            stream_parser.lifecycle_event(
+                "cancel_sigterm_sent" if sigterm_sent else "cancel_signal_refused_identity_mismatch", pid=pid
+            )["payload"],
         )
 
         exited_in_time = active.done_event.wait(timeout=grace_seconds)
         if not exited_in_time:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            sigkill_sent = self._signal_verified_process_group(active, run, signal.SIGKILL)
             db.append_run_event(
                 self.db_path,
                 run_id,
                 "lifecycle",
-                stream_parser.lifecycle_event("cancel_sigkill_sent", pid=pid)["payload"],
+                stream_parser.lifecycle_event(
+                    "cancel_sigkill_sent" if sigkill_sent else "cancel_signal_refused_identity_mismatch", pid=pid
+                )["payload"],
             )
             active.done_event.wait(timeout=grace_seconds)
 
         return db.get_run(self.db_path, run_id)
+
+    @staticmethod
+    def _signal_verified_process_group(active: _ActiveRun, run: dict, sig: signal.Signals) -> bool:
+        """Signal only while the child still matches its launch identity."""
+        pid = active.process.pid
+        if active.process.poll() is not None:
+            return False
+        if active.provider.id == providers.CODEX_ID and not identity.identity_matches(
+            pid, run.get("process_start_identity")
+        ):
+            return False
+        try:
+            # start_new_session=True makes pgid equal the launch PID. Avoid
+            # resolving a potentially reused PID to an unrelated new pgid.
+            os.killpg(pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
 
     # ------------------------------------------------------------------
     # Timeout watchdog — same SIGTERM -> grace -> SIGKILL mechanism as
@@ -816,28 +976,27 @@ class Supervisor:
         )
 
         pid = active.process.pid
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        run = db.get_run(self.db_path, run_id)
+        sigterm_sent = self._signal_verified_process_group(active, run, signal.SIGTERM)
         db.append_run_event(
             self.db_path,
             run_id,
             "lifecycle",
-            stream_parser.lifecycle_event("timeout_sigterm_sent", pid=pid)["payload"],
+            stream_parser.lifecycle_event(
+                "timeout_sigterm_sent" if sigterm_sent else "timeout_signal_refused_identity_mismatch", pid=pid
+            )["payload"],
         )
 
         exited_in_time = active.done_event.wait(timeout=grace_seconds)
         if not exited_in_time:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            sigkill_sent = self._signal_verified_process_group(active, run, signal.SIGKILL)
             db.append_run_event(
                 self.db_path,
                 run_id,
                 "lifecycle",
-                stream_parser.lifecycle_event("timeout_sigkill_sent", pid=pid)["payload"],
+                stream_parser.lifecycle_event(
+                    "timeout_sigkill_sent" if sigkill_sent else "timeout_signal_refused_identity_mismatch", pid=pid
+                )["payload"],
             )
 
     # ------------------------------------------------------------------

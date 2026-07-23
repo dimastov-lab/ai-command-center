@@ -238,6 +238,7 @@ def guard_real_project_files():
 # --------------------------------------------------------------------------
 
 FAKE_CLAUDE_SCRIPT = Path(__file__).parent / "fixtures" / "fake_claude.py"
+FAKE_CODEX_SCRIPT = Path(__file__).parent / "fixtures" / "fake_codex.py"
 
 
 @pytest.fixture
@@ -317,6 +318,17 @@ def fake_claude(monkeypatch):
     monkeypatch.setattr(supervisor_module.subprocess, "Popen", popen_with_env)
 
     return env_overrides
+
+
+@pytest.fixture
+def fake_codex(monkeypatch, tmp_path):
+    """Install an isolated executable Codex double and route every probe/run to it."""
+    executable = tmp_path / "codex"
+    shutil.copyfile(FAKE_CODEX_SCRIPT, executable)
+    executable.chmod(0o700)
+    monkeypatch.setenv("AICC_CODEX_BINARY", str(executable))
+    monkeypatch.setenv("FAKE_CODEX_TOUCH_FILE", "fake_codex_default_touch.txt")
+    return executable
 
 
 FAKE_CLAUDE_TREE_SCRIPT = Path(__file__).parent / "fixtures" / "fake_claude_tree.py"

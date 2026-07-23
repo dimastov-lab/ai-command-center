@@ -89,6 +89,13 @@ def test_execution_center_page_renders_and_nav_entry_exists():
     assert any("Live Execution Center" in option for option in nav_options)
 
 
+def test_execution_center_provider_selector_exposes_claude_and_codex():
+    at = _at_on_page("execution_center")
+    selector = at.selectbox(key="exec_center_launch_executor")
+    assert selector.options == ["Claude Code", "Codex CLI"]
+    assert selector.value == "claude_code"
+
+
 def _assert_execution_center_page_rendered(at: AppTest) -> None:
     assert not at.exception
     assert at.subheader[0].value == "Live Execution Center"

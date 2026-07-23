@@ -27,13 +27,13 @@ def _run(db_path):
 
 
 def test_schema_version_is_5(db_path):
-    assert runtime_db.current_schema_version(db_path) == 5
-    assert runtime_db.SCHEMA_VERSION == 5
+    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
+    assert runtime_db.SCHEMA_VERSION >= 5
 
 
 def test_migrate_is_idempotent(db_path):
     runtime_db.migrate(db_path)  # second run must not error
-    assert runtime_db.current_schema_version(db_path) == 5
+    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
 
 
 def test_create_and_get_completion(db_path):

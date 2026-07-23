@@ -116,7 +116,7 @@ CONTEXT_FILES: dict[str, str] = {
 
 GLOBAL_CONTEXT_FILES: list[str] = ["CURRENT_STATE.md", "DECISIONS.md"]
 
-DEFAULT_ALLOWED_AGENTS: list[str] = ["claude_code"]
+DEFAULT_ALLOWED_AGENTS: list[str] = ["claude_code", "codex"]
 
 
 def default_project_config(project_id: str) -> dict:

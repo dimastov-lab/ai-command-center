@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 from command_center.runtime import context_service, db, supervisor
+from command_center import project_config
 
 DEFAULT_TIMEOUT_SECONDS = 900
 
@@ -61,6 +62,7 @@ class ExecutionCenterAPI:
         launch_source: str | None = None,
         prompt_version: int | None = None,
         repository_already_validated: bool = False,
+        executor_id: str = "claude_code",
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -91,7 +93,7 @@ class ExecutionCenterAPI:
             prompt=prompt,
             confirmed=confirmed,
             task_id=task_id,
-            title=title or instruction[:120],
+            title=title or ("Codex CLI run" if executor_id == "codex" else instruction[:120]),
             session_id=session_id,
             is_resume=is_resume,
             model=model,
@@ -100,6 +102,8 @@ class ExecutionCenterAPI:
             launch_source=launch_source,
             prompt_version=prompt_version,
             repository_already_validated=repository_already_validated,
+            executor_id=executor_id,
+            canonical_repository_path=project_config.get_project_config(project).get("repository_path"),
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)

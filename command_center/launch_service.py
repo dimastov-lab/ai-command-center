@@ -226,7 +226,7 @@ def execute_agent_launch_v2(
         if on_task_state_changed is not None:
             on_task_state_changed()
 
-    title = (task or {}).get("title") or prompt[:120]
+    title = (task or {}).get("title") or ("Codex CLI run" if executor_id == "codex" else prompt[:120])
 
     run = execution_center_api.start_run(
         project=project,
@@ -256,6 +256,7 @@ def execute_agent_launch_v2(
         # when `not validation.can_launch`, but this must hold regardless of
         # caller discipline).
         repository_already_validated=bool(validation is not None and validation.can_launch),
+        executor_id=executor_id,
     )
 
     if task is not None:

@@ -674,6 +674,28 @@ def render_agent_launcher(
             format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
             key=f"{key_prefix}_task_type",
         )
+        executor_options = ["claude_code", "codex"]
+        configured_executor = (
+            (task_for_launch or {}).get("executor") or cfg.get("default_executor") or "claude_code"
+        )
+        if configured_executor not in executor_options:
+            configured_executor = "claude_code"
+        executor_id = st.selectbox(
+            "Execution provider",
+            executor_options,
+            index=executor_options.index(configured_executor),
+            format_func=lambda value: executors.get_executor(value).label,
+            key=f"{key_prefix}_executor",
+        )
+        selected_executor = executors.get_executor(executor_id)
+        provider_availability = selected_executor.availability
+        if provider_availability is not None:
+            availability_text = (
+                f"Доступен: {provider_availability.version or provider_availability.executable or 'да'}"
+                if provider_availability.available
+                else f"Недоступен ({provider_availability.code}): {provider_availability.message}"
+            )
+            (st.caption if provider_availability.available else st.error)(availability_text)
         prompt = st.text_area(
             "Промпт для агента", value=default_prompt, height=220, key=f"{key_prefix}_prompt"
         )
@@ -708,7 +730,7 @@ def render_agent_launcher(
         st.write(f"- Источник workspace: {launch.WORKSPACE_SOURCE_LABELS.get(selection.source, selection.source)}")
         st.write(f"- Ожидаемая ветка: `{expected_branch or '—'}`")
         st.write(f"- Текущая ветка: `{actual_branch or '—'}`")
-        st.write("- Агент: `claude_code` (Claude Code CLI)")
+        st.write(f"- Агент: `{executor_id}` ({selected_executor.label})")
         st.write(f"- Тип задачи: `{task_type}`")
 
         for error in validation.errors:
@@ -747,7 +769,12 @@ def render_agent_launcher(
                 "Подтвердить и запустить",
                 type="primary",
                 key=f"{key_prefix}_launch_btn",
-                disabled=not confirmed or not validation.can_launch or not warnings_ack,
+                disabled=(
+                    not confirmed
+                    or not validation.can_launch
+                    or not warnings_ack
+                    or not bool(provider_availability and provider_availability.available)
+                ),
                 icon=":material/play_arrow:",
             )
         with action_cols[1]:
@@ -789,7 +816,7 @@ def render_agent_launcher(
                 execution_center_api=get_execution_center_api(),
                 confirmed=True,
                 task=task_for_launch,
-                executor_id="claude_code",
+                executor_id=executor_id,
                 validation=validation,
                 expected_branch=expected_branch,
                 on_task_state_changed=(
@@ -1204,6 +1231,25 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
     launch_project = st.selectbox("Проект", models.PROJECT_IDS, key="exec_center_launch_project")
     cfg = project_config.get_project_config(launch_project)
     repo_path = cfg.get("repository_path")
+    executor_id = st.selectbox(
+        "Execution provider",
+        ["claude_code", "codex"],
+        format_func=lambda value: executors.get_executor(value).label,
+        key="exec_center_launch_executor",
+    )
+    selected_executor = executors.get_executor(executor_id)
+    provider_availability = selected_executor.availability
+    if provider_availability is not None:
+        if provider_availability.available:
+            st.caption(
+                f"Provider: {selected_executor.label} · available"
+                + (f" · {provider_availability.version}" if provider_availability.version else "")
+            )
+        else:
+            st.error(
+                f"{selected_executor.label} unavailable ({provider_availability.code}): "
+                f"{provider_availability.message}"
+            )
 
     task_type = st.selectbox(
         "Тип задачи",
@@ -1233,7 +1279,7 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
     st.caption(f"Репозиторий: `{repo_path}`")
 
     confirmed = st.checkbox(
-        "Я подтверждаю запуск Claude Code с указанными параметрами.",
+        f"Я подтверждаю запуск {selected_executor.label} с указанными параметрами.",
         key="exec_center_launch_confirm",
     )
     sensitivity_ack = True
@@ -1248,7 +1294,19 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
             key="exec_center_launch_sensitivity_ack",
         )
 
-    ready = confirmed and sensitivity_ack and bool(instruction.strip())
+    codex_target_unsafe = executor_id == "codex"
+    if codex_target_unsafe:
+        st.error(
+            "Codex CLI requires a dedicated task worktree and intended task branch; "
+            "the ad-hoc form targets the canonical project checkout. Launch Codex from a task instead."
+        )
+    ready = (
+        confirmed
+        and sensitivity_ack
+        and bool(instruction.strip())
+        and bool(provider_availability and provider_availability.available)
+        and not codex_target_unsafe
+    )
     launch_clicked = st.button(
         "Запустить",
         type="primary",
@@ -1284,6 +1342,7 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
             instruction=instruction,
             confirmed=confirmed,
             timeout_seconds=int(timeout_seconds),
+            executor_id=executor_id,
         )
     except (
         runtime_context_service.ConfirmationRequiredError,

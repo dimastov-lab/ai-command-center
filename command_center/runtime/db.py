@@ -207,7 +207,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -360,6 +360,16 @@ def _migration_4_add_first_output_at(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE run ADD COLUMN first_output_at TEXT")
 
 
+def _migration_6_add_execution_provider_fields(conn: sqlite3.Connection) -> None:
+    """Persist the selected provider and its redacted, deterministic launch metadata."""
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "provider_id" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'claude_code'")
+        if "provider_metadata_json" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_metadata_json TEXT")
+
+
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
 # run drives a *separate* state machine — the post-execution "is the engineering
 # task actually merged into the target branch" lifecycle — distinct from and
@@ -450,6 +460,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (3, _migration_3_add_live_execution_center_v2_fields),
     (4, _migration_4_add_first_output_at),
     (5, _SCHEMA_V5),
+    (6, _migration_6_add_execution_provider_fields),
 ]
 
 
@@ -755,6 +766,8 @@ def create_run(
     expected_branch: str | None = None,
     launch_source: str | None = None,
     prompt_version: int | None = None,
+    provider_id: str = "claude_code",
+    provider_metadata_json: str | None = None,
     enforce_workspace_lock: bool = False,
 ) -> dict:
     """`expected_branch`/`launch_source`/`prompt_version` are write-once, like
@@ -819,6 +832,8 @@ def create_run(
                 "expected_branch": expected_branch,
                 "launch_source": launch_source,
                 "prompt_version": prompt_version,
+                "provider_id": provider_id,
+                "provider_metadata_json": provider_metadata_json,
                 "commit_hash": None,
                 "pull_request_url": None,
                 "version": 0,
@@ -832,14 +847,16 @@ def create_run(
                     process_start_identity, pre_run_git_status, post_run_git_status,
                     working_tree_changed, exit_code, cancel_requested, cancel_requested_at,
                     started_at, completed_at, expected_branch, launch_source, prompt_version,
-                    commit_hash, pull_request_url, version, created_at, updated_at
+                    commit_hash, pull_request_url, provider_id, provider_metadata_json,
+                    version, created_at, updated_at
                 ) VALUES (
                     :id, :session_id, :task_id, :sequence, :is_resume, :state, :project, :task_type,
                     :repository_path, :prompt, :command_json, :timeout_seconds, :pid,
                     :process_start_identity, :pre_run_git_status, :post_run_git_status,
                     :working_tree_changed, :exit_code, :cancel_requested, :cancel_requested_at,
                     :started_at, :completed_at, :expected_branch, :launch_source, :prompt_version,
-                    :commit_hash, :pull_request_url, :version, :created_at, :updated_at
+                    :commit_hash, :pull_request_url, :provider_id, :provider_metadata_json,
+                    :version, :created_at, :updated_at
                 )""",
                 record,
             )
