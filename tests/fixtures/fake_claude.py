@@ -22,6 +22,11 @@ without needing a new script per scenario:
   nothing, so a test can exercise the grace-period -> SIGKILL escalation.
 - `FAKE_CLAUDE_EXTRA_SLEEP`: extra seconds to sleep after emitting all lines,
   before exiting (default 0) — gives a test time to cancel mid-flight.
+- `FAKE_CLAUDE_HOLD_FILE`: if set, a file whose continued existence keeps the
+  fake process alive after it emits its output. This lets UI tests synchronize
+  cancellation deterministically instead of racing a short fixed sleep. The
+  wait has a 300-second safety ceiling so a broken test cannot leave the fake
+  process alive indefinitely.
 - `FAKE_CLAUDE_TOUCH_FILE`: if set, a file path (relative to cwd) to write to
   right after emitting all lines — simulates the working tree changing during
   a run, for cancellation "working tree changed" tests.
@@ -69,6 +74,12 @@ def main() -> int:
     if touch_file:
         with open(touch_file, "a") as handle:
             handle.write("modified by fake_claude\n")
+
+    hold_file = os.environ.get("FAKE_CLAUDE_HOLD_FILE")
+    if hold_file:
+        deadline = time.monotonic() + 300
+        while os.path.exists(hold_file) and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     extra_sleep = float(os.environ.get("FAKE_CLAUDE_EXTRA_SLEEP", "0"))
     if extra_sleep:

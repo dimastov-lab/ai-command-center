@@ -232,7 +232,9 @@ def test_launch_is_nonblocking_and_running_status_is_displayed(git_repo, configu
 
 
 def test_cancel_requires_confirmation_before_calling_api(monkeypatch, git_repo, configure_project_repo, fake_claude):
-    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    hold_file = git_repo.parent / "fake-claude.hold"
+    hold_file.touch()
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold_file)
     configure_project_repo("AIOS", git_repo)
 
     cancel_calls: list[tuple] = []
@@ -244,19 +246,26 @@ def test_cancel_requires_confirmation_before_calling_api(monkeypatch, git_repo, 
 
     monkeypatch.setattr(runtime_api.ExecutionCenterAPI, "request_cancel", spy_cancel)
 
-    at = _at_on_page("execution_center")
-    at = _launch_via_ui(at)
-    run_id = _most_recent_run_id(runtime_db.resolve_db_path())
-    cancel_btn_key = f"exec_card_cancel_btn_{run_id}"
+    run_id = None
+    db_path = runtime_db.resolve_db_path()
+    try:
+        at = _at_on_page("execution_center")
+        at = _launch_via_ui(at)
+        run_id = _most_recent_run_id(db_path)
+        cancel_btn_key = f"exec_card_cancel_btn_{run_id}"
 
-    at = at.button(key=cancel_btn_key).click().run()
-    assert not cancel_calls, "request_cancel must not be called before the cancel checkbox is confirmed"
+        at = at.button(key=cancel_btn_key).click().run()
+        assert not cancel_calls, "request_cancel must not be called before the cancel checkbox is confirmed"
 
-    at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
-    at = at.button(key=cancel_btn_key).click().run()
-    assert cancel_calls == [(run_id, {"confirmed": True})]
-
-    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+        at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
+        at = at.button(key=cancel_btn_key).click().run()
+        assert cancel_calls == [(run_id, {"confirmed": True})]
+    finally:
+        # On an assertion failure, releasing the hold lets the fake process
+        # exit naturally instead of leaking a background Supervisor thread.
+        hold_file.unlink(missing_ok=True)
+        if run_id is not None:
+            _wait_for_report(db_path, run_id)
 
 
 @pytest.mark.parametrize("state", ["PREPARED", "QUEUED"])
