@@ -11,6 +11,9 @@ without needing a new script per scenario:
   already a JSON string (so a test can also ask for a deliberately malformed
   line by including plain non-JSON text here). Defaults to a small realistic
   stream-json sequence.
+- `FAKE_CLAUDE_LINES_FILE`: path to a UTF-8 JSON file containing that same
+  list. Takes precedence over `FAKE_CLAUDE_LINES` and lets tests provide large
+  payloads without exceeding Linux's per-environment-string exec limit.
 - `FAKE_CLAUDE_INITIAL_DELAY`: seconds to sleep *before* emitting the first
   line (default 0) — simulates a spawned, alive process that produces no early
   stdout (a late handshake). Distinct from `FAKE_CLAUDE_DELAY` (between lines)
@@ -22,6 +25,11 @@ without needing a new script per scenario:
   nothing, so a test can exercise the grace-period -> SIGKILL escalation.
 - `FAKE_CLAUDE_EXTRA_SLEEP`: extra seconds to sleep after emitting all lines,
   before exiting (default 0) — gives a test time to cancel mid-flight.
+- `FAKE_CLAUDE_HOLD_FILE`: if set, a file whose continued existence keeps the
+  fake process alive after it emits its output. This lets UI tests synchronize
+  cancellation deterministically instead of racing a short fixed sleep. The
+  wait has a 300-second safety ceiling so a broken test cannot leave the fake
+  process alive indefinitely.
 - `FAKE_CLAUDE_TOUCH_FILE`: if set, a file path (relative to cwd) to write to
   right after emitting all lines — simulates the working tree changing during
   a run, for cancellation "working tree changed" tests.
@@ -47,8 +55,13 @@ def main() -> int:
     if os.environ.get("FAKE_CLAUDE_IGNORE_SIGTERM") == "1":
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
 
+    lines_file = os.environ.get("FAKE_CLAUDE_LINES_FILE")
     lines_env = os.environ.get("FAKE_CLAUDE_LINES")
-    lines = json.loads(lines_env) if lines_env else DEFAULT_LINES
+    if lines_file:
+        with open(lines_file, encoding="utf-8") as handle:
+            lines = json.load(handle)
+    else:
+        lines = json.loads(lines_env) if lines_env else DEFAULT_LINES
     delay = float(os.environ.get("FAKE_CLAUDE_DELAY", "0.05"))
 
     initial_delay = float(os.environ.get("FAKE_CLAUDE_INITIAL_DELAY", "0"))
@@ -69,6 +82,12 @@ def main() -> int:
     if touch_file:
         with open(touch_file, "a") as handle:
             handle.write("modified by fake_claude\n")
+
+    hold_file = os.environ.get("FAKE_CLAUDE_HOLD_FILE")
+    if hold_file:
+        deadline = time.monotonic() + 300
+        while os.path.exists(hold_file) and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     extra_sleep = float(os.environ.get("FAKE_CLAUDE_EXTRA_SLEEP", "0"))
     if extra_sleep:

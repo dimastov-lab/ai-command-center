@@ -271,7 +271,9 @@ def test_report_never_truncates_large_assistant_output(git_repo, configure_proje
         json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": huge_text}]}}),
         json.dumps({"type": "result", "result": "done"}),
     ]
-    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(lines)
+    lines_file = git_repo.parent / "large-fake-claude-lines.json"
+    lines_file.write_text(json.dumps(lines), encoding="utf-8")
+    fake_claude["FAKE_CLAUDE_LINES_FILE"] = str(lines_file)
     configure_project_repo("AIOS", git_repo)
 
     sup = supervisor.Supervisor()
@@ -402,6 +404,110 @@ def test_cancel_graceful_sigterm_exit_within_grace_period(git_repo, configure_pr
     assert "cancel_requested" in lifecycles
     assert "cancel_sigterm_sent" in lifecycles
     assert "cancel_sigkill_sent" not in lifecycles, "a process that dies from SIGTERM must not also receive SIGKILL"
+
+
+def test_cancel_survives_benign_concurrent_version_bump(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """Regression (CI flake): a benign concurrent write that bumps the run
+    row's version while it stays RUNNING — in production the once-per-run
+    best-effort ``first_output_at`` handshake write (see ``_record_handshake``)
+    — must not make ``cancel()`` fail with a spurious "changed state before
+    cancellation could be recorded (now state='RUNNING')" error.
+
+    Before the fix, ``cancel()``'s single compare-and-set treated *any*
+    ``LostUpdateError`` as fatal, even when the re-read showed the run still
+    RUNNING and perfectly cancellable. On a slow/contended CI runner the
+    handshake write regularly landed inside cancel()'s read-then-CAS window,
+    surfacing as an intermittent failure of the launch/cancel tests.
+    """
+    fake_claude["FAKE_CLAUDE_INITIAL_DELAY"] = "5"  # stays alive, emits no early output -> no real handshake yet
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+    )
+
+    real_update = db.update_run_fields
+    injected = {"done": False}
+
+    def update_with_one_injected_race(db_path, run_id, *, expected_version, fields):
+        # The first time cancel() records the cancel flag, land a benign
+        # competing write first (bumps version, leaves state RUNNING) so
+        # cancel()'s compare-and-set sees a now-stale version and raises
+        # LostUpdateError — deterministically reproducing the handshake race.
+        if not injected["done"] and "cancel_requested" in fields:
+            injected["done"] = True
+            real_update(
+                db_path, run_id, expected_version=expected_version,
+                fields={"first_output_at": "2026-01-01T00:00:00Z"},
+            )
+        return real_update(db_path, run_id, expected_version=expected_version, fields=fields)
+
+    monkeypatch.setattr(supervisor.db, "update_run_fields", update_with_one_injected_race)
+
+    # Must not raise SupervisorError("...changed state...") — the run never left RUNNING.
+    result = sup.cancel(run["id"], confirmed=True, grace_seconds=5)
+    assert injected["done"], "the test must have actually exercised the race window"
+    assert result["cancel_requested"] == 1
+    assert result["state"] == "CANCELLED"
+
+
+def test_cancel_surfaces_concurrent_terminal_state_without_retrying(monkeypatch):
+    """A genuine terminal transition is still a conflict, not a successful cancel."""
+    sup = supervisor.Supervisor()
+    run_id = "terminal-race"
+    with sup._active_lock:
+        sup._active[run_id] = object()
+
+    reads = iter(
+        [
+            {"state": "RUNNING", "version": 3},
+            {"state": "FAILED", "version": 4},
+        ]
+    )
+    attempts = {"count": 0}
+
+    monkeypatch.setattr(supervisor.db, "get_run", lambda db_path, requested_id: next(reads))
+
+    def always_lose_update(db_path, requested_id, *, expected_version, fields):
+        attempts["count"] += 1
+        raise db.LostUpdateError("injected terminal transition")
+
+    monkeypatch.setattr(supervisor.db, "update_run_fields", always_lose_update)
+
+    with pytest.raises(supervisor.SupervisorError, match="now state='FAILED'"):
+        sup.cancel(run_id, confirmed=True)
+    assert attempts["count"] == 1
+
+
+def test_cancel_concurrent_write_retries_are_bounded(monkeypatch):
+    """Continuous benign version churn cannot make cancellation spin forever."""
+    sup = supervisor.Supervisor()
+    run_id = "continuous-version-churn"
+    with sup._active_lock:
+        sup._active[run_id] = object()
+
+    version = {"value": 0}
+    attempts = {"count": 0}
+
+    def running_run(db_path, requested_id):
+        version["value"] += 1
+        return {"state": "RUNNING", "version": version["value"]}
+
+    def always_lose_update(db_path, requested_id, *, expected_version, fields):
+        attempts["count"] += 1
+        raise db.LostUpdateError("injected continuous version churn")
+
+    monkeypatch.setattr(supervisor.db, "get_run", running_run)
+    monkeypatch.setattr(supervisor.db, "update_run_fields", always_lose_update)
+
+    with pytest.raises(
+        supervisor.SupervisorError,
+        match=rf"after {supervisor._CANCEL_CAS_MAX_ATTEMPTS} attempts",
+    ):
+        sup.cancel(run_id, confirmed=True)
+    assert attempts["count"] == supervisor._CANCEL_CAS_MAX_ATTEMPTS
 
 
 def test_cancel_escalates_to_sigkill_after_grace_period_when_sigterm_ignored(

@@ -1,2 +1,8 @@
 -r requirements.txt
-pytest>=8.0,<9.0
+# Test runner. Pinned to the 9.x line the suite is actually developed and
+# validated against (was >=8.0,<9.0, which excluded the real pytest 9.x it runs
+# on). Major-band cap matches the house style of requirements.txt.
+pytest>=9.0,<10.0
+# Linter enforced by CI (`ruff check .`). 0.x minor releases can change the rule
+# set, so the band is held to the validated 0.15 line for deterministic gates.
+ruff>=0.15,<0.16

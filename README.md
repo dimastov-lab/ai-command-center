@@ -27,8 +27,10 @@ readiness; they do not launch queued work.
 
 Create an environment and install the declared runtime and test dependencies:
 
+Supported Python: **3.14** (the version CI runs and the app is validated against).
+
 ```bash
-python3 -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
@@ -212,17 +214,22 @@ tools.
 
 ## Validation
 
-The repository's supported local gates are:
+The test suite redirects local data through `AICC_DATA_DIR` and uses temporary report paths.
+Tests mock scenarios that would otherwise invoke the real Claude CLI, so validation does not
+launch real agent jobs or write to the normal runtime stores.
+
+The same mandatory gates run locally and in CI:
 
 ```bash
-python -m compileall -q command_center app.py
+git diff --check
 ruff check .
+python -m compileall -q command_center scripts tests app.py
 pytest -q
 ```
 
-`requirements-dev.txt` declares pytest but does not declare Ruff. There is currently no MyPy
-configuration or declared MyPy dependency, and no checked-in mandatory CI workflow. Run validation
-in an environment satisfying the ranges in `requirements.txt` and `requirements-dev.txt`.
+`.github/workflows/ci.yml` runs these gates for pull requests into `main`, pushes to `main`, and
+manual dispatches on Python 3.14. The workflow uses a read-only token, pins actions to commit SHAs,
+and cancels superseded runs for the same ref.
 
 ## Current limitations and risks
 
@@ -231,9 +238,7 @@ in an environment satisfying the ranges in `requirements.txt` and `requirements-
 - Legacy synchronous/JSONL and current asynchronous/SQLite execution paths coexist.
 - Supervisor ownership is process-local; a server restart loses pipes and live `Popen` handles.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
-- Toolchain declarations are incomplete: Ruff is used but undeclared, and no type checker is
-  configured.
-- There is no checked-in mandatory CI gate.
+- There is no configured static type checker.
 - Whole-file execution queue mutations are not protected by a cross-process lock.
 - Streamlit may be reachable beyond localhost unless explicitly bound; the application has no
   authentication.

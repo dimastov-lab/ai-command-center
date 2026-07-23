@@ -64,6 +64,17 @@ CLAUDE_BINARY = os.environ.get("AICC_CLAUDE_BINARY") or "claude"
 # executor.
 DEFAULT_CANCEL_GRACE_SECONDS = 10.0
 
+# `cancel()` records the cancel flag with a compare-and-set on the run row's
+# version. A concurrent *benign* field write that leaves the run RUNNING — in
+# practice the once-per-run best-effort `first_output_at` handshake write from
+# a reader thread (see `_record_handshake`) — bumps the version without
+# changing state, and must not defeat a legitimate cancel. `cancel()` re-reads
+# and retries the CAS while the run is still RUNNING; this bounds those retries
+# so a pathological, unending stream of concurrent writes can never spin
+# forever. Only one benign write can actually race a cancel today, so this is a
+# generous ceiling, not a tuning knob.
+_CANCEL_CAS_MAX_ATTEMPTS = 5
+
 # Defense in depth: `build_claude_command` never constructs these, but every
 # command is checked against this set before it is ever handed to `Popen`.
 _FORBIDDEN_FLAGS = frozenset({"--continue", "-c", "--background", "--bg"})
@@ -736,19 +747,38 @@ class Supervisor:
         if run["state"] != "RUNNING":
             raise SupervisorError(f"Run {run_id!r} is not RUNNING (state={run['state']!r}); nothing to cancel.")
 
-        try:
-            run = db.update_run_fields(
-                self.db_path,
-                run_id,
-                expected_version=run["version"],
-                fields={"cancel_requested": 1, "cancel_requested_at": iso_now()},
-            )
-        except db.LostUpdateError:
-            current = db.get_run(self.db_path, run_id)
+        # Record the cancel request with a compare-and-set on the run's
+        # version. A LostUpdateError here does not necessarily mean the run
+        # left RUNNING: a benign concurrent write (the once-per-run
+        # `first_output_at` handshake — see `_record_handshake`, and the
+        # `_CANCEL_CAS_MAX_ATTEMPTS` note) bumps the version while the state
+        # stays RUNNING. Re-read and retry while the run is still cancellable;
+        # only surface "nothing to cancel" if it has actually reached a
+        # non-RUNNING state.
+        for _ in range(_CANCEL_CAS_MAX_ATTEMPTS):
+            try:
+                run = db.update_run_fields(
+                    self.db_path,
+                    run_id,
+                    expected_version=run["version"],
+                    fields={"cancel_requested": 1, "cancel_requested_at": iso_now()},
+                )
+                break
+            except db.LostUpdateError:
+                current = db.get_run(self.db_path, run_id)
+                if current is None:
+                    raise KeyError(f"No such run: {run_id!r}") from None
+                if current["state"] != "RUNNING":
+                    raise SupervisorError(
+                        f"Run {run_id!r} changed state before cancellation could be recorded "
+                        f"(now state={current['state']!r})."
+                    ) from None
+                run = current  # still RUNNING, just a newer version — retry the CAS
+        else:
             raise SupervisorError(
-                f"Run {run_id!r} changed state before cancellation could be recorded "
-                f"(now state={current['state']!r})."
-            ) from None
+                f"Run {run_id!r} could not be marked for cancellation after "
+                f"{_CANCEL_CAS_MAX_ATTEMPTS} attempts against concurrent writes."
+            )
 
         db.append_run_event(
             self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("cancel_requested")["payload"]
