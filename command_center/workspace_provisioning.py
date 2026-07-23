@@ -54,6 +54,7 @@ STATUS_POLICY_CLEAN = "clean"                  # block on any modified/untracked
 STATUS_POLICIES = frozenset(
     {STATUS_POLICY_ALLOW_DIRTY, STATUS_POLICY_NO_UNTRACKED, STATUS_POLICY_CLEAN}
 )
+PROVISION_OUTCOMES = frozenset({"skipped", "reused", "attached", "created"})
 
 _DETACHED_HEAD = "(detached HEAD)"
 
@@ -79,6 +80,7 @@ class WorkspaceSpec:
     task_type: str | None = None
     status_policy: str = STATUS_POLICY_ALLOW_DIRTY
     allow_provision: bool = True
+    provision_outcome: str = "skipped"
 
 
 class WorkspaceVerificationError(Exception):
@@ -221,6 +223,36 @@ def _conflicting_worktree(repo: Path, branch: str, workspace_resolved: Path) -> 
     return None
 
 
+def _remote_branch_ref(repo: Path, branch: str) -> str | None:
+    """Return the unique local remote-tracking ref for ``branch``.
+
+    Provisioning is intentionally offline: it uses already-fetched refs and
+    never performs an implicit network fetch. Ambiguous matches across multiple
+    remotes fail closed instead of guessing which history to launch.
+    """
+    result = git_info.run_git_command(
+        repo,
+        ["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+    )
+    if result is None or result.returncode != 0:
+        return None
+    suffix = f"/{branch}"
+    matches = sorted(
+        ref.strip()
+        for ref in result.stdout.splitlines()
+        if ref.strip().endswith(suffix) and not ref.strip().endswith("/HEAD")
+    )
+    if len(matches) > 1:
+        raise WorkspaceVerificationError(
+            failed_step="remote_branch_unambiguous",
+            remediation=f"Create a local {branch!r} branch from the intended remote explicitly.",
+            expected_workspace=None,
+            expected_branch=branch,
+            detail=f"multiple remote-tracking branches match: {matches}",
+        )
+    return matches[0] if matches else None
+
+
 def is_feature_task(
     expected_branch: str | None, base_branch: str | None, task_type: str | None = None
 ) -> bool:
@@ -317,6 +349,16 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
         _worktree_add(repo, workspace, [str(workspace_target), spec.expected_branch], spec)
         return "attached"
 
+    remote_branch = _remote_branch_ref(repo, spec.expected_branch)
+    if remote_branch is not None:
+        _worktree_add(
+            repo,
+            workspace,
+            ["--track", "-b", spec.expected_branch, str(workspace_target), remote_branch],
+            spec,
+        )
+        return "attached"
+
     verify = git_info.run_git_command(repo, ["rev-parse", "--verify", f"{spec.base_branch}^{{commit}}"])
     if verify is None or verify.returncode != 0:
         # Base branch missing — let `verify_workspace` report it as the
@@ -362,6 +404,9 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
 
     if spec.status_policy not in STATUS_POLICIES:
         raise ValueError(f"Unknown status_policy: {spec.status_policy!r}")
+    if spec.provision_outcome not in PROVISION_OUTCOMES:
+        raise ValueError(f"Unknown provision_outcome: {spec.provision_outcome!r}")
+    evidence.provision_outcome = spec.provision_outcome
 
     # 1. Workspace exists.
     if not Path(workspace_input).expanduser().exists() or not workspace_resolved.is_dir():

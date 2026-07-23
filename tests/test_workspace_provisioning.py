@@ -85,6 +85,39 @@ def test_branch_is_created_from_base_branch(tmp_path):
     assert "feature/x" in git_info.get_branches(repo)
 
 
+def test_remote_only_branch_is_attached_without_recreating_from_base(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    _git(repo, "checkout", "-q", "-b", "remote-source")
+    (repo / "remote.txt").write_text("remote history\n")
+    _git(repo, "add", "remote.txt")
+    _git(repo, "commit", "-q", "-m", "remote history")
+    remote_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "branch", "-D", "remote-source")
+    _git(repo, "remote", "add", "origin", str(repo))
+    _git(repo, "update-ref", "refs/remotes/origin/feature/remote", remote_commit)
+
+    workspace = tmp_path / "wt" / "remote"
+    evidence = wp.provision_and_verify(
+        wp.WorkspaceSpec(
+            workspace_path=str(workspace),
+            expected_branch="feature/remote",
+            base_branch="main",
+            repository_path=str(repo),
+        )
+    )
+
+    assert evidence.provision_outcome == "attached"
+    assert _current_branch(workspace) == "feature/remote"
+    assert (workspace / "remote.txt").read_text() == "remote history\n"
+
+
 def test_existing_correct_worktree_is_reused_untouched(tmp_path):
     repo = _make_repo(tmp_path / "repo")
     workspace = tmp_path / "wt" / "reuse"

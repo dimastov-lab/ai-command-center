@@ -18,7 +18,7 @@ import pytest
 from command_center import git_info, launch, launch_service, models
 from command_center import workspace_provisioning as wp
 from command_center.runtime import api as runtime_api
-from command_center.runtime import db as runtime_db
+from command_center.runtime import context_service, db as runtime_db
 from command_center.runtime import supervisor as supervisor_module
 
 
@@ -84,6 +84,32 @@ def test_start_raw_fails_closed_on_branch_mismatch_and_starts_no_process(tmp_pat
     assert runtime_db.list_runs(sup.db_path) == []
     # The main repository was not touched — no stray files.
     assert git_info.get_status(repo)["status_lines"] == []
+
+
+def test_start_raw_rejects_verification_for_a_different_launch_directory(tmp_path):
+    verified_repo = _make_repo(tmp_path / "verified")
+    actual_repo = _make_repo(tmp_path / "actual")
+    sup = supervisor_module.Supervisor(db_path=tmp_path / "runs.db")
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(verified_repo),
+        expected_branch="main",
+        base_branch="main",
+        repository_path=str(verified_repo),
+    )
+
+    with pytest.raises(supervisor_module.WorkspaceVerificationFailed) as exc_info:
+        sup.start_raw(
+            project="AIOS",
+            repository_path=str(actual_repo),
+            task_type="implementation",
+            prompt="must not run",
+            confirmed=True,
+            repository_already_validated=True,
+            workspace_verification=spec,
+        )
+
+    assert exc_info.value.failed_step == "workspace_matches_launch_path"
+    assert runtime_db.list_runs(sup.db_path) == []
 
 
 def test_start_raw_verified_worktree_runs_claude_in_that_worktree(
@@ -260,3 +286,33 @@ def test_v2_auto_provisions_missing_worktree_and_launches_there(
 
     done = api.supervisor.wait_for_run(run["id"], timeout=10)
     assert done["state"] == "COMPLETED"
+    events = runtime_db.list_run_events(api.db_path, run["id"])
+    verified = [e for e in events if e["payload"].get("lifecycle") == "workspace_verified"]
+    assert verified[0]["payload"]["provision_outcome"] == "created"
+
+
+def test_unconfirmed_launch_does_not_provision_branch_or_worktree(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    worktree = tmp_path / "wt" / "audit"
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runs.db")
+    task = {"id": "T-AUDIT", "project": "AIOS", "branch": "audit/execution-queue"}
+    models.normalize_task_execution(task)
+
+    with pytest.raises(context_service.ConfirmationRequiredError):
+        launch_service.execute_agent_launch_v2(
+            project="AIOS",
+            task_type="implementation",
+            prompt="do not mutate",
+            timeout_seconds=30,
+            repository_path=worktree,
+            execution_center_api=api,
+            confirmed=False,
+            task=task,
+            expected_branch="audit/execution-queue",
+            base_branch="main",
+            source_repository_path=str(repo),
+        )
+
+    assert not worktree.exists()
+    assert "audit/execution-queue" not in git_info.get_branches(repo)
+    assert runtime_db.list_runs(api.db_path) == []

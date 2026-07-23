@@ -3,7 +3,9 @@ import inspect
 import json
 import subprocess
 
-from command_center import agent_runner, launch, launch_service, models
+import pytest
+
+from command_center import agent_runner, launch, launch_service, models, workspace_provisioning
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
 
@@ -184,7 +186,7 @@ def test_execute_agent_launch_v2_returns_immediately(git_repo, fake_claude):
     run = launch_service.execute_agent_launch_v2(
         project="AIOS", task_type="implementation", prompt="do the thing", timeout_seconds=30,
         repository_path=git_repo, task=task, validation=validation, confirmed=True,
-        execution_center_api=api,
+        execution_center_api=api, source_repository_path=str(git_repo),
     )
     elapsed = time.monotonic() - started
 
@@ -254,17 +256,11 @@ def test_execute_agent_launch_v2_without_task_is_execution_center_adhoc(git_repo
     assert final["prompt_version"] is None
 
 
-def test_execute_agent_launch_v2_does_not_reject_task_workspace_different_from_project_repository(
-    tmp_path, fake_claude
+def test_execute_agent_launch_v2_rejects_task_workspace_without_source_repository(
+    tmp_path,
 ):
-    """The regression this bridge exists to fix: a task's own worktree,
-    already validated via `launch.validate_launch`, must be launchable even
-    though it is not the project's configured `repository_path` — the v2
-    Supervisor's `agent_runner.validate_repository` project-equality check
-    would otherwise reject it (see `repository_already_validated` on
-    `Supervisor.start_raw`)."""
-    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps([json.dumps({"type": "result", "result": "done"})])
-
+    """A task workspace cannot authorize itself when repository ownership is
+    unknown, even if it is otherwise a valid Git repository."""
     task_workspace = tmp_path / "task-workspace"
     task_workspace.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=task_workspace, check=True)
@@ -280,16 +276,14 @@ def test_execute_agent_launch_v2_does_not_reject_task_workspace_different_from_p
     validation = launch.validate_launch(workspace_path=str(task_workspace))
     api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
 
-    # No project repository_path is configured at all here — proving this
-    # launch never depends on it matching, unlike the old v2 ad-hoc form.
-    run = launch_service.execute_agent_launch_v2(
-        project="AIOS", task_type="implementation", prompt="p", timeout_seconds=30,
-        repository_path=task_workspace, task=task, validation=validation, confirmed=True,
-        execution_center_api=api,
-    )
-    final = _wait_for_run_terminal(api.db_path, run["id"])
-    assert final["state"] == "COMPLETED"
-    assert final["repository_path"] == str(task_workspace.resolve())
+    with pytest.raises(workspace_provisioning.WorkspaceVerificationError) as exc_info:
+        launch_service.execute_agent_launch_v2(
+            project="AIOS", task_type="implementation", prompt="p", timeout_seconds=30,
+            repository_path=task_workspace, task=task, validation=validation, confirmed=True,
+            execution_center_api=api,
+        )
+    assert exc_info.value.failed_step == "source_repository_required"
+    assert runtime_db.list_runs(api.db_path) == []
 
 
 # --------------------------------------------------------------------------
@@ -308,7 +302,7 @@ def test_execute_agent_launch_v2_refuses_second_launch_against_same_task(git_rep
     first_run = launch_service.execute_agent_launch_v2(
         project="AIOS", task_type="implementation", prompt="first", timeout_seconds=30,
         repository_path=git_repo, task=task, validation=validation, confirmed=True,
-        execution_center_api=api,
+        execution_center_api=api, source_repository_path=str(git_repo),
     )
     assert first_run["state"] == "RUNNING"
     prompt_history_before = list(task.get("prompt_history") or [])
@@ -317,7 +311,7 @@ def test_execute_agent_launch_v2_refuses_second_launch_against_same_task(git_rep
         launch_service.execute_agent_launch_v2(
             project="AIOS", task_type="implementation", prompt="second", timeout_seconds=30,
             repository_path=git_repo, task=task, validation=validation, confirmed=True,
-            execution_center_api=api,
+            execution_center_api=api, source_repository_path=str(git_repo),
         )
         raise AssertionError("expected DuplicateActiveLaunchError")
     except launch_service.DuplicateActiveLaunchError as exc:
@@ -348,14 +342,14 @@ def test_execute_agent_launch_v2_refuses_second_launch_against_same_workspace_di
     first_run = launch_service.execute_agent_launch_v2(
         project="AIOS", task_type="implementation", prompt="first", timeout_seconds=30,
         repository_path=git_repo, task=task_a, validation=validation, confirmed=True,
-        execution_center_api=api,
+        execution_center_api=api, source_repository_path=str(git_repo),
     )
 
     try:
         launch_service.execute_agent_launch_v2(
             project="AIOS", task_type="implementation", prompt="second", timeout_seconds=30,
             repository_path=git_repo, task=task_b, validation=validation, confirmed=True,
-            execution_center_api=api,
+            execution_center_api=api, source_repository_path=str(git_repo),
         )
         raise AssertionError("expected DuplicateActiveLaunchError")
     except launch_service.DuplicateActiveLaunchError:
@@ -377,14 +371,14 @@ def test_execute_agent_launch_v2_allows_relaunch_once_prior_run_is_terminal(git_
     first_run = launch_service.execute_agent_launch_v2(
         project="AIOS", task_type="implementation", prompt="first", timeout_seconds=30,
         repository_path=git_repo, task=task, validation=validation, confirmed=True,
-        execution_center_api=api,
+        execution_center_api=api, source_repository_path=str(git_repo),
     )
     _wait_for_run_terminal(api.db_path, first_run["id"])
 
     second_run = launch_service.execute_agent_launch_v2(
         project="AIOS", task_type="implementation", prompt="second", timeout_seconds=30,
         repository_path=git_repo, task=task, validation=validation, confirmed=True,
-        execution_center_api=api,
+        execution_center_api=api, source_repository_path=str(git_repo),
     )
     assert second_run["id"] != first_run["id"]
     _wait_for_run_terminal(api.db_path, second_run["id"])

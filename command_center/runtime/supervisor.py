@@ -373,6 +373,17 @@ class Supervisor:
         # Verified" (recorded below, once the run row exists to attach it to).
         verification_evidence = None
         if workspace_verification is not None:
+            verified_path = Path(workspace_verification.workspace_path).expanduser().resolve()
+            if verified_path != repo_path:
+                mismatch = workspace_provisioning.WorkspaceVerificationError(
+                    failed_step="workspace_matches_launch_path",
+                    remediation="Use the verified workspace as repository_path; never authorize a different cwd.",
+                    expected_workspace=str(verified_path),
+                    actual_workspace=str(repo_path),
+                    expected_branch=workspace_verification.expected_branch,
+                    detail="workspace verification spec does not match the process launch directory",
+                )
+                raise WorkspaceVerificationFailed(mismatch)
             try:
                 verification_evidence = workspace_provisioning.verify_workspace(workspace_verification)
             except workspace_provisioning.WorkspaceVerificationError as exc:

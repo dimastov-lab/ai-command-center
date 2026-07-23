@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from command_center import (
@@ -34,7 +34,7 @@ from command_center import (
     workflow,
     workspace_provisioning,
 )
-from command_center.runtime import db as runtime_db
+from command_center.runtime import context_service, db as runtime_db
 
 
 @dataclass
@@ -394,6 +394,10 @@ def execute_agent_launch_v2(
     this is a pure addition, not a replacement, so anything not yet bridged
     onto v2 keeps working exactly as before.
     """
+    # Confirmation must precede every mutation, including provisioning a new
+    # branch/worktree. Supervisor enforces it again immediately before launch.
+    context_service.require_launch_confirmation(confirmed, what="Launching an agent run")
+
     task_id = (task or {}).get("id")
     resolved_workspace = str(Path(repository_path).expanduser().resolve())
     conflict = find_active_run_conflict(
@@ -418,6 +422,15 @@ def execute_agent_launch_v2(
     # failed check; neither is caught here, so a failed launch never proceeds.
     workspace_verification: workspace_provisioning.WorkspaceSpec | None = None
     if provision_workspace:
+        if task is not None and not source_repository_path:
+            raise workspace_provisioning.WorkspaceVerificationError(
+                failed_step="source_repository_required",
+                remediation="Configure the task project's repository_path before launching.",
+                expected_workspace=str(repository_path),
+                actual_workspace=str(repository_path),
+                expected_branch=expected_branch,
+                detail="task workspace ownership cannot be verified without a source repository",
+            )
         workspace_verification = workspace_provisioning.WorkspaceSpec(
             workspace_path=str(repository_path),
             expected_branch=expected_branch,
@@ -426,7 +439,11 @@ def execute_agent_launch_v2(
             task_type=task_type,
             status_policy=status_policy,
         )
-        workspace_provisioning.provision_and_verify(workspace_verification)
+        verification_evidence = workspace_provisioning.provision_and_verify(workspace_verification)
+        workspace_verification = replace(
+            workspace_verification,
+            provision_outcome=verification_evidence.provision_outcome,
+        )
         # Post-provision validation: if the caller handed us a validation that
         # was only failing because the workspace did not exist yet (the
         # provisionable path — see `prepare_task_launch`), it is now stale. The
