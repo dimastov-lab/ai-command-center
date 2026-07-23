@@ -25,7 +25,7 @@ flowchart LR
 
     Services --> Planning["data/tasks.json<br/>planning and Kanban"]
     Services --> Queue["data/execution_queue.json<br/>execution queue"]
-    Services --> Runtime["data/runtime.db<br/>runtime and completion"]
+    Services --> Runtime["data/runtime.db<br/>runtime, completion, and autonomy proposals"]
     Services --> AppStores["chats.json and activity.jsonl<br/>active application stores"]
     Services --> Legacy["runs.jsonl<br/>legacy run journal"]
     Services --> Portfolio["Portfolio cards and<br/>Portfolio registries"]
@@ -78,8 +78,10 @@ Important service groups are:
   mutations, atomic JSON, and JSONL primitives;
 - `project_config.py`: project registry, repository paths, sensitivity, and completion policies;
 - `launch.py` and `launch_service.py`: workspace selection, read-only preflight, confirmation
-  state, and legacy/current launch bridges;
-- `execution_queue.py`: persisted queue entries and readiness;
+  state, provisionable/blocked classification, and legacy/current launch bridges;
+- `workspace_provisioning.py`: offline worktree provisioning and fail-closed source-repository,
+  branch, isolation, and status verification for normal task-v2 launch paths;
+- `execution_queue.py`: persisted queue entries, readiness, and same-host locked mutation helpers;
 - `portfolio_models.py`, `portfolio_config.py`, `portfolio_launch.py`, and
   `portfolio_intelligence.py`: Portfolio parsing, repository mapping, execution planning,
   worktree orchestration, registry coordination, and read-only intelligence;
@@ -88,6 +90,10 @@ Important service groups are:
 - `runtime/db.py`: SQLite schema, transactions, state guards, compare-and-swap updates, and
   workspace locks;
 - `runtime/supervisor.py`: live subprocess ownership and lifecycle;
+- `runtime/scheduler.py`: deterministic, read-only `ASSIGN`/`DEFER`/`BLOCKED` decisions; it does
+  not claim or launch work;
+- `runtime/autonomy.py` and `runtime/autonomy_service.py`: persisted, evidence-backed proposal,
+  approval, and dispatch-boundary contracts; they have no UI, background driver, or executor;
 - `runtime/task_sync.py`: runtime/completion projection into planning tasks;
 - `runtime/completion.py` and `runtime/completion_service.py`: completion state machine and
   side-effect orchestrator;
@@ -113,8 +119,8 @@ There is no single system-wide transactional store. Several authorities coexist:
 | Source | Authoritative for | Mutation model |
 |---|---|---|
 | `data/tasks.json` | Planning and Kanban tasks | Whole-file JSON; atomic replacement; thread/cross-process lock through `data/tasks.lock` |
-| `data/runtime.db` | Runtime tasks, sessions, runs, run events, reports, and completion state | SQLite schema version 5; WAL, busy timeout, foreign keys, guarded transitions, CAS versions, workspace locks |
-| `data/execution_queue.json` | Separate execution planning queue | Whole-file JSON; atomic replacement; no cross-process locked mutation |
+| `data/runtime.db` | Runtime tasks, sessions, runs, events, reports, completion, and autonomy proposals/evidence/events | SQLite schema version 7; WAL, busy timeout, foreign keys, guarded transitions, CAS versions, transactional exact-workspace exclusion |
+| `data/execution_queue.json` | Separate execution planning queue | Whole-file JSON with atomic replacement; application-owned RMW cycles use the same-host cooperative OS advisory lock in `data/execution_queue.lock`; raw primitives remain uncoordinated |
 | `data/runs.jsonl` | Legacy synchronous run journal | Append-only JSONL; latest record per run is folded on read |
 | `data/chats.json` | Active project chat conversations | Whole-file JSON |
 | `data/activity.jsonl` | Active application activity journal | Append-only JSONL |
@@ -126,8 +132,12 @@ There is no single system-wide transactional store. Several authorities coexist:
 | `generated/<PROJECT>/` | Legacy generated task files | Per-file artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative for
-execution and completion state. SQLite does not replace the active chat and activity stores, the
-legacy `runs.jsonl` journal, the execution queue, Portfolio registries, or artifact directories.
+execution, completion, and the autonomy-proposal lifecycle. Schema 7 contains the application
+tables `task`, `session`, `run`, `run_event`, and `report`; `completion`,
+`completion_validation`, and `completion_event`; and `proposal`, `proposal_evidence`, and
+`proposal_event`; `schema_version` tracks migrations. It contains no execution-queue or
+scheduler-claim table. SQLite does not replace the active chat and activity stores, the legacy
+`runs.jsonl` journal, the execution queue, Portfolio registries, or artifact directories.
 
 `data/runs.jsonl` and `data/activity.jsonl` use append-only JSON Lines rather than JSON arrays.
 Each record is appended, flushed, and synced to disk without rewriting earlier records. This
@@ -163,22 +173,44 @@ refresh must repair.
 The current Streamlit launch bridge is asynchronous:
 
 1. A user explicitly selects or enters work and requests launch.
-2. `launch.py` resolves the workspace using task, project default, then repository fallback
-   precedence. It resolves the expected branch and performs read-only Git validation.
-3. Errors block launch. Dirty-tree, detached-HEAD, and branch-mismatch warnings require explicit
-   acknowledgement.
-4. The confirmation surface shows the exact project, repository/worktree, branch, task type,
-   prompt, and timeout.
-5. `launch_service.execute_agent_launch_v2` rejects another active run for the same task or
-   resolved workspace before mutating the task.
-6. `ExecutionCenterAPI.start_run` persists the runtime task/session/run and asks the Supervisor to
-   spawn it.
-7. The UI returns immediately to the live Execution Center and polls persisted state.
+2. For normal task launches, `launch_service.prepare_task_launch` resolves the selected workspace,
+   source repository, expected branch, and base branch, performs read-only validation, and returns
+   ready, warning-acknowledgement, provisionable, or blocked.
+3. The confirmation surface shows the exact project, repository/worktree, branch, task type,
+   prompt, and timeout. Confirmation is checked before any branch/worktree provisioning or runtime
+   mutation.
+4. `launch_service.execute_agent_launch_v2` may provision a missing task worktree offline through
+   `git worktree add`; it never silently falls back to the source repository.
+5. The normal task-v2 path must pass `WorkspaceSpec` verification before task mutation and again at
+   `Supervisor.start_raw`. Wrong repository ownership, detached or wrong branch, and a primary
+   worktree used for feature work fail closed. Dirty/untracked checks follow the selected status
+   policy.
+6. A read-only preflight rejects an observed active run for the same task or resolved workspace.
+   This task-id check is not a durable claim and can race. The run insert independently enforces
+   exact-workspace exclusivity inside the same SQLite transaction.
+7. `ExecutionCenterAPI.start_run` persists the runtime task/session/run and asks the Supervisor to
+   spawn it. Passed workspace evidence is recorded with the run.
+8. The UI returns immediately to the live Execution Center and polls persisted state.
 
-All normal launch surfaces require an explicit button action. There is no general autonomous task
-scheduler on `main`.
+All normal launch surfaces require an explicit button action. Low-level/ad-hoc `start_run` callers
+may omit `WorkspaceSpec`; the fail-closed isolation guarantee is scoped to normal task-v2 paths
+that supply it.
 
-### 4.2 Supervisor lifecycle
+### 4.2 Scheduling decision layer
+
+`runtime.scheduler` and `ExecutionCenterAPI.plan_schedule` form a deterministic read-only planning
+layer. Given work items, an agent registry, retry/capacity policy, and a point-in-time load snapshot,
+the planner returns explainable `ASSIGN`, `DEFER`, or `BLOCKED` decisions. Full determinism requires
+the caller to pass `now`; omitting it uses the current local time.
+
+An `ASSIGN` decision is advisory. Planning writes no queue or run row, reserves no agent or task,
+creates no lease or durable claim, and launches no process. Task-id, capacity, and workspace checks
+are consistent only within the supplied snapshot and one plan, so state can change before the
+caller separately enters the explicit confirmed launch path. At launch time, the SQLite run insert
+transactionally enforces only exact-workspace exclusion. There is no scheduler UI, background
+poller, automatic dispatcher, or persisted scheduling audit log.
+
+### 4.3 Supervisor lifecycle
 
 The Supervisor:
 
@@ -202,14 +234,14 @@ does not reattach output streams or seamlessly resume supervision.
 
 This is process-local durability, not distributed execution or remote-worker ownership.
 
-### 4.3 Cancellation and timeouts
+### 4.4 Cancellation and timeouts
 
 User cancellation is an explicit confirmed action. The Supervisor targets the spawned process
 group, sends a graceful termination signal, waits a bounded interval, and escalates to kill if
 needed. Timeout uses the same ownership and classification machinery. State-transition guards and
 compare-and-swap updates prevent late worker threads from overwriting a newer terminal decision.
 
-### 4.4 Legacy execution
+### 4.5 Legacy execution
 
 `execute_agent_launch` and `agent_runner.py` retain the synchronous Claude CLI path and
 `data/runs.jsonl` persistence; generated-task scripts also remain legacy. The active
@@ -226,8 +258,12 @@ Readiness is recalculated when queue checkpoints or UI refreshes occur. A ready 
 recommendation to the operator, not scheduled work. Launch still requires an explicit action and
 the same repository validation and confirmation as other launches.
 
-Queue writes use atomic whole-file replacement, but the read-modify-write cycle is not protected
-by the cross-process lock used for `tasks.json`. Simultaneous writers can overwrite one another.
+Queue writes use atomic whole-file replacement. Application-owned persisted read-modify-write
+cycles (`enqueue_and_persist`, `dequeue_and_persist`, `reevaluate_and_persist`, and launch-result
+commit) hold `data/execution_queue.lock` across the complete load-transform-save operation.
+Portfolio queue insertion and pre-launch rollback use the same helpers. This is a same-host
+cooperative OS advisory lock, not a distributed lock. Raw `load_queue`/`save_queue` remain
+uncoordinated primitives, and reads remain lock-free.
 
 ## 6. Run-to-task reconciliation
 
@@ -302,8 +338,8 @@ For a ready Portfolio card:
 4. Explicit user confirmation claims the task under a Portfolio lock.
 5. `worktree_launcher.py` validates an existing worktree or creates a task branch/worktree from
    the selected base.
-6. The orchestration registers the Portfolio launch, adds/links queue state, and calls the same
-   asynchronous runtime API.
+6. The orchestration registers the Portfolio launch, adds/links queue state through the locked
+   persisted helpers, and calls the same asynchronous runtime API.
 7. If failure occurs before process ownership transfers, rollback removes only the branch,
    worktree, registry, or queue resources that this transaction created.
 
@@ -319,7 +355,10 @@ Git access is not globally read-only. Capabilities are separated:
 | Git Center, repository status, launch preflight | Read-only inspection | Fixed read-only commands |
 | Claude review/final-gate/architecture-review task | Read/search only | Claude tool allowlist excludes Bash and edit tools |
 | Claude implementation/remediation task | File editing and validation | Git-write commands denied in Claude tool configuration |
+| Normal task-v2 workspace provisioning | Create or attach a worktree through `git worktree add` | Explicit confirmation precedes mutation; source repository, branch, isolation, and status are verified fail closed |
 | Portfolio worktree launcher | Create/attach branch and worktree | Exact repository validation, collision checks, explicit launch, bounded rollback |
+| Scheduling planner | Read-only planning | Snapshot-based advisory decisions; no claim, persistence, or launch |
+| Autonomy proposal service | Persist proposal decisions and return a dispatch plan | Closed default policy, evidence/action checks, approval gate; no UI, driver, or execution |
 | Completion Git adapter | Push or recreate branch | Fixed argv, no force-push, policy and state-machine gates |
 | Completion GitHub adapter | Discover/create/optionally merge PR | Local authenticated `gh`, fixed argv, explicit project policy, manual merge default |
 | Validation adapter | Run configured checks | Executable allowlist, `shell=False`, timeout, captured bounded output |
@@ -357,11 +396,12 @@ application still launches tools with the local user's filesystem and credential
 
 ## 12. Validation and quality gates
 
-The supported local gates are:
+The supported local gates, also run automatically by checked-in CI, are:
 
 ```bash
-python -m compileall -q command_center app.py
+git diff --check
 ruff check .
+python -m compileall -q command_center scripts tests app.py
 pytest -q
 ```
 
@@ -370,9 +410,14 @@ real fake-process supervision, process-tree cancellation and timeout, restart re
 completion scenarios and races, Git/GitHub adapters, queue behavior, worktree creation and
 rollback, Portfolio parsing/launch/intelligence, read-model redaction, and Streamlit rendering.
 
-`requirements-dev.txt` declares pytest but not Ruff. No MyPy or other type checker is configured.
-There is no checked-in mandatory CI workflow, so local gates are conventions rather than enforced
-repository checks.
+`requirements-dev.txt` declares both pytest and Ruff. No MyPy or other type checker is configured.
+`.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
+compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
+Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
+ref.
+
+The workflow does not configure GitHub branch protection. Whether its result is a required merge
+gate remains a repository-setting concern outside this codebase.
 
 ## 13. Current risks and boundaries
 
@@ -381,8 +426,18 @@ repository checks.
   active chat and activity stores remain separate from both.
 - Live Supervisor ownership is confined to one Python process.
 - `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
-- Toolchain declarations are incomplete and no mandatory CI is checked in.
-- Execution queue read-modify-write operations are not cross-process locked.
+- No static type checker is configured.
+- CI runs automatically, but required-check/branch-protection enforcement is not configured by
+  repository code and cannot be inferred from the workflow alone.
+- The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
+  it, and there is no distributed coordination.
+- Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
+  within-plan workspace decisions can race before explicit launch; only exact workspace exclusion
+  is enforced transactionally by the runtime launch path.
+- The autonomy proposal layer has no UI, automated evidence collectors, per-project policy
+  resolver, background driver, or executor.
+- Fail-closed workspace verification is scoped to normal task-v2 paths that supply a
+  `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
 - Streamlit can be exposed to the network unless it is explicitly bound to localhost.
 - There is no production-readiness guarantee, distributed execution, durable remote-worker
   ownership, or seamless process resumption.
@@ -407,5 +462,6 @@ that directory must not be read as current capability.
 - [`docs/adr/0002-project-config-as-canonical-engineering-defaults.md`](docs/adr/0002-project-config-as-canonical-engineering-defaults.md)
 - [`docs/adr/0003-live-execution-center-v2-and-kanban-launch-bridge.md`](docs/adr/0003-live-execution-center-v2-and-kanban-launch-bridge.md)
 - [`docs/adr/0004-autonomous-task-completion-pipeline.md`](docs/adr/0004-autonomous-task-completion-pipeline.md)
+- [`docs/adr/0005-autonomy-proposal-foundation.md`](docs/adr/0005-autonomy-proposal-foundation.md)
 - [`docs/completion-pipeline.md`](docs/completion-pipeline.md)
 - [`CURRENT_STATE.md`](CURRENT_STATE.md)

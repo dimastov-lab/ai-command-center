@@ -9,20 +9,38 @@ Status: Active, local Streamlit implementation
 Current position:
 - `app.py` hosts the implemented 19-destination Streamlit control application.
 - `data/tasks.json` remains the planning and Kanban store.
-- `data/runtime.db` is authoritative for asynchronous execution and completion state.
+- `data/runtime.db` schema 7 is authoritative for asynchronous execution, completion and the
+  persisted autonomy-proposal lifecycle.
 - Execution Center provides process supervision, streaming events, cancellation, timeouts and
   restart reconciliation; live process handles remain owned by the hosting Python process.
+- Normal task-v2 launches require explicit confirmation before any provisioning, may create an
+  isolated worktree offline, and fail closed unless source repository, expected branch, worktree
+  isolation and configured status policy verify before process launch.
+- Application-owned execution-queue mutations hold a same-host cooperative OS advisory lock across
+  the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
+- `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
+  decisions. It creates no durable claim, queue entry or run and has no background driver.
+- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state,
+  but has no Streamlit UI, automated evidence collectors, project policy resolver, background
+  driver or executor.
 - Portfolio Execution and Portfolio Overview provide guarded worktree launch plus read-only
   dependency, health, capacity and recommendation views.
 - The persisted completion pipeline supports validation, push, pull-request and merge workflows;
   completion autopilot and automatic merge policies are opt-in and disabled by conservative
   defaults.
+- Checked-in CI validates committed-diff whitespace, Ruff, byte compilation and pytest on Python
+  3.14.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
 
 Current boundaries:
-- Normal task launches require explicit user action; no general autonomous task scheduler is
-  implemented.
+- Normal task launches require explicit user action. Scheduler `ASSIGN` results are point-in-time
+  advice, not persisted claims; task-id/capacity decisions may race before the separate launch, and
+  only exact-workspace exclusion is enforced transactionally by the runtime launch path.
+- Fail-closed workspace verification is scoped to normal task-v2 callers that supply
+  `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
+- The current private-repository plan does not expose branch protection/rulesets, so CI is
+  automatic but required-check enforcement remains an operator merge discipline.
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
 - The native PySide6 desktop client remains documentation and design work only.

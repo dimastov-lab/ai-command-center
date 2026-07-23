@@ -14,14 +14,16 @@ single-host control plane whose durable state is local to the machine running St
 
 | Classification | Capabilities |
 |---|---|
-| Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; current JSON/JSONL project-chat and activity stores; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; execution queue; Portfolio parsing, intelligence, and guarded worktree launch; completion-state seeding and read-only completion status |
+| Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; current JSON/JSONL project-chat and activity stores; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; fail-closed task-workspace provisioning and verification; a persisted execution queue whose application-owned mutations are locked; Portfolio parsing, intelligence, and guarded worktree launch; completion-state seeding and read-only completion status |
+| Implemented service/API foundations, not autonomously driven | Deterministic read-only scheduling decisions through `ExecutionCenterAPI.plan_schedule`; persisted, evidence-backed autonomy proposals through the runtime API/domain layer. Neither capability has a Streamlit UI, background task driver, durable scheduling claim/lease, or automatic dispatcher |
 | Implemented but opt-in | Completion autopilot through `AICC_COMPLETION_AUTOPILOT`; OpenAI project-chat provider when its package and environment variables are supplied; project-specific completion policies that permit automatic merge or recovery |
 | Legacy but still present | Synchronous Claude execution; `runs.jsonl` run journal; generated-task shell workflow |
 | Designed or planned, not implemented | Native PySide6 desktop client and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
 
-Normal task launches always require an explicit user action and confirmation. There is no general
-autonomous task scheduler on `main`. Periodic Streamlit fragments refresh views and recompute
-readiness; they do not launch queued work.
+Normal task launches require an explicit user action and confirmation. The scheduling API can
+return advisory `ASSIGN`, `DEFER`, or `BLOCKED` decisions from a point-in-time snapshot, but it
+does not persist a claim or launch anything. Periodic Streamlit fragments refresh views and
+recompute readiness; no background task scheduler or automatic dispatcher is implemented.
 
 ## Getting started
 
@@ -69,10 +71,11 @@ There is no application authentication layer.
   state, owns navigation, renders top-level pages, caches the process-local execution API, and
   delegates domain work to `command_center/`.
 - [`command_center/`](command_center/) contains storage, models, read models, launch services,
-  Portfolio orchestration, runtime supervision, completion services, Git/GitHub adapters, and
-  Streamlit UI components.
+  fail-closed workspace provisioning, execution-queue and Portfolio orchestration, runtime
+  supervision, completion services, Git/GitHub adapters, and Streamlit UI components.
 - [`command_center/runtime/`](command_center/runtime/) contains the SQLite runtime API,
-  Supervisor, process reconciliation, task projection, and completion state machine.
+  Supervisor, process reconciliation, task projection, completion state machine, read-only
+  scheduling planner, and autonomy proposal domain/service.
 - [`command_center/ui/`](command_center/ui/) contains extracted Streamlit panels and renderers.
   Much of the application routing and presentation still remains concentrated in `app.py`.
 - [`scripts/start-task.sh`](scripts/start-task.sh) is the legacy generated-task launcher. It
@@ -92,8 +95,8 @@ AI Command Center deliberately has more than one persistence authority:
 | Store | Role |
 |---|---|
 | `data/tasks.json` | Planning and Kanban task store |
-| `data/runtime.db` | Authoritative SQLite state for runtime tasks, sessions, runs, run events, reports, and completion |
-| `data/execution_queue.json` | Separate persisted planning/execution queue |
+| `data/runtime.db` | Authoritative SQLite schema 7 state for runtime tasks, sessions, runs, run events, reports, completion, and autonomy proposals/evidence/events |
+| `data/execution_queue.json`, `data/execution_queue.lock` | Separate persisted planning/execution queue plus its same-host cooperative OS advisory lock |
 | `data/runs.jsonl` | Legacy append-only synchronous run journal |
 | `data/chats.json`, `data/activity.jsonl` | Currently used project-chat and activity stores, separate from SQLite |
 | `data/project_config.json` | Local project repository and completion-policy overrides |
@@ -103,12 +106,15 @@ AI Command Center deliberately has more than one persistence authority:
 | `generated/<PROJECT>/` | Generated legacy task artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative
-for execution and completion state. The legacy `runs.jsonl` journal and the current JSON/JSONL
-project-chat and activity stores coexist with SQLite, while `execution_queue.json` and Portfolio
-registries, reports, and generated artifacts are additional persisted boundaries. Reconciliation
-is therefore required: Execution Center refreshes project SQLite run/completion state back to
-Kanban tasks, and queue readiness is recomputed from the planning store. These are projections, not
-a single transactional database.
+for execution, completion, and the autonomy-proposal lifecycle. Schema 7 contains the application
+tables `task`, `session`, `run`, `run_event`, and `report`; the three completion tables; and
+`proposal`, `proposal_evidence`, and `proposal_event`; `schema_version` tracks migrations. It does
+not contain the execution queue or scheduler claims. The legacy `runs.jsonl` journal and the
+current JSON/JSONL project-chat and activity stores coexist with SQLite, while
+`execution_queue.json` and Portfolio registries, reports, and generated artifacts are additional
+persisted boundaries. Reconciliation is therefore required: Execution Center refreshes project
+SQLite run/completion state back to Kanban tasks, and queue readiness is recomputed from the
+planning store. These are projections, not a single transactional database.
 
 Most local artifacts are excluded by the checked-in [`.gitignore`](.gitignore). `runtime.db` is
 local state and must remain untracked; the current checkout excludes it through repository-local
@@ -120,25 +126,36 @@ before running the application. Tests redirect data through `AICC_DATA_DIR`.
 The primary launch path is asynchronous:
 
 1. The user selects a task or ad-hoc instruction, repository, task type, and timeout.
-2. Read-only preflight resolves the exact workspace and expected branch, validates repository
-   state, and surfaces warnings.
-3. The UI requires explicit confirmation before calling the runtime API.
-4. The API persists task, session, and run records in `data/runtime.db`.
-5. The Supervisor starts the Claude CLI with `Popen(shell=False, start_new_session=True)`,
-   records PID identity, streams bounded stdout/stderr events, and returns control to Streamlit.
-6. Reader and watchdog threads handle output, timeout, completion, and report persistence.
-7. Cancellation signals the process group, escalating from termination to kill when needed.
-8. Run-to-task reconciliation updates the Kanban projection and seeds or advances completion
-   state.
+2. For a normal task launch, `prepare_task_launch` resolves the selected workspace, source
+   repository, expected branch, and base branch, then classifies the request as ready, requiring
+   warning acknowledgement, provisionable, or blocked.
+3. The UI requires explicit confirmation before any branch/worktree provisioning or runtime
+   mutation.
+4. The normal task-v2 path may provision a missing worktree offline with `git worktree add`, never
+   falling back to the source repository, and must pass fail-closed `WorkspaceSpec` verification.
+   Wrong repository ownership, detached or wrong branch, and a primary worktree used for feature
+   work are hard failures; the selected status policy controls dirty/untracked checks.
+5. A read-only preflight rejects an already-active task or workspace when observed. At run
+   insertion, SQLite transactionally enforces exact-workspace exclusivity; task-id preflight is not
+   a durable claim and can race with another launcher.
+6. The API persists task, session, and run records in `data/runtime.db`.
+7. The Supervisor starts the Claude CLI with `Popen(shell=False, start_new_session=True)`,
+   records PID identity and workspace-verification evidence, streams bounded stdout/stderr events,
+   and returns control to Streamlit.
+8. Reader and watchdog threads handle output, timeout, completion, and report persistence.
+9. Cancellation signals the process group, escalating from termination to kill when needed.
+10. Run-to-task reconciliation updates the Kanban projection and seeds or advances completion
+    state.
 
-Duplicate active runs for the same task or resolved workspace are rejected. The Supervisor owns
-live `Popen` handles, pipes, and reader threads only inside the hosting Python process. SQLite
-state survives restart, but stdout/stderr pipes and live process handles cannot be restored.
-Startup reconciliation can inspect a persisted PID and its recorded identity to classify a run;
-it cannot seamlessly resume supervision or reattach to the original child process.
+The Supervisor owns live `Popen` handles, pipes, and reader threads only inside the hosting Python
+process. SQLite state survives restart, but stdout/stderr pipes and live process handles cannot be
+restored. Startup reconciliation can inspect a persisted PID and its recorded identity to classify
+a run; it cannot seamlessly resume supervision or reattach to the original child process.
 
 The legacy synchronous `execute_agent_launch` and JSONL journal remain for compatibility and
-tests. The Streamlit task-launch bridge uses the asynchronous runtime path.
+tests. The Streamlit task-launch bridge uses the asynchronous runtime path. Low-level/ad-hoc
+`start_run` calls may omit `WorkspaceSpec`; the fail-closed isolation guarantee above is scoped to
+the normal task-v2 launch paths that supply it.
 
 ## Execution queue
 
@@ -147,9 +164,11 @@ status, dependencies, readiness, and launch linkage. Readiness is recalculated w
 checkpoints run. The queue never launches a task by itself: the user must click the launch control
 and pass the normal confirmation and preflight boundaries.
 
-Queue loads and saves are atomic at the file-replacement level, but the queue does not currently
-have the cross-process locked mutation primitive used by `data/tasks.json`. Concurrent
-read-modify-write operations can therefore lose another writer's update.
+Queue writes use atomic file replacement. Application-owned persisted read-modify-write cycles
+(`enqueue_and_persist`, `dequeue_and_persist`, `reevaluate_and_persist`, and launch-result commit)
+hold `data/execution_queue.lock` across the complete load-transform-save operation. This is a
+same-host cooperative OS advisory lock, not a distributed lock. Raw `load_queue`/`save_queue`
+remain available as uncoordinated primitives, and reads stay lock-free.
 
 ## Portfolio intelligence and execution
 
@@ -166,7 +185,8 @@ Portfolio Execution:
 3. checks dependencies, conflicts, launch registry, branch, worktree, and collision constraints;
 4. previews the launch plan;
 5. after explicit user action, creates or attaches the task branch and Git worktree;
-6. persists the Portfolio launch registry and queue link;
+6. persists the Portfolio launch registry and uses the locked queue helpers for queue insertion or
+   rollback;
 7. launches through the same asynchronous Execution Center API.
 
 Worktree creation and rollback are intentionally bounded. Existing worktrees are validated before
@@ -200,6 +220,9 @@ runtime API.
 Read-only Git views and preflight checks do not mutate repositories. Other narrowly scoped
 components do have write capabilities:
 
+- Normal task-v2 workspace provisioning may run `git worktree add` only after explicit
+  confirmation; the resulting path must pass source-repository, branch, isolation, and status
+  verification before process launch.
 - Portfolio orchestration may create a branch/worktree and may remove only resources it created
   while rolling back a failed pre-launch transaction.
 - Completion Git operations may push or recreate a branch; force-push is rejected.
@@ -221,7 +244,7 @@ The test suite redirects local data through `AICC_DATA_DIR` and uses temporary r
 Tests mock scenarios that would otherwise invoke the real Claude CLI, so validation does not
 launch real agent jobs or write to the normal runtime stores.
 
-The same mandatory gates run locally and in CI:
+The same validation gates run locally and automatically in CI:
 
 ```bash
 git diff --check
@@ -230,9 +253,11 @@ python -m compileall -q command_center scripts tests app.py
 pytest -q
 ```
 
-`.github/workflows/ci.yml` runs these gates for pull requests into `main`, pushes to `main`, and
-manual dispatches on Python 3.14. The workflow uses a read-only token, pins actions to commit SHAs,
-and cancels superseded runs for the same ref.
+`.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
+compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
+Python 3.14. The workflow uses a read-only token, pins actions to commit SHAs, and cancels
+superseded runs for the same ref. The workflow does not itself configure branch protection;
+repository settings must separately require the check if merges are to be blocked on it.
 
 ## Current limitations and risks
 
@@ -242,7 +267,18 @@ and cancels superseded runs for the same ref.
 - Supervisor ownership is process-local; a server restart loses pipes and live `Popen` handles.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - There is no configured static type checker.
-- Whole-file execution queue mutations are not protected by a cross-process lock.
+- The checked-in CI workflow is automatic but does not itself enforce branch protection; the
+  repository's current plan/settings must be checked before treating it as a required merge gate.
+- The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
+  it, and there is no distributed coordination.
+- Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
+  within-plan workspace decisions can change before the separate explicit launch; only exact
+  workspace exclusion is enforced transactionally by the runtime launch path.
+- The autonomy proposal layer has no Streamlit UI, automated evidence collectors, per-project
+  policy resolver, background driver, or executor; dispatch records and returns a plan but does not
+  perform it.
+- Fail-closed workspace verification is scoped to normal task-v2 paths that supply a
+  `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
 - Streamlit may be reachable beyond localhost unless explicitly bound; the application has no
   authentication.
 - The system does not provide distributed execution, remote-worker durability, or seamless

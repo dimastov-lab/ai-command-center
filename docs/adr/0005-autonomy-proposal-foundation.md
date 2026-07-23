@@ -45,9 +45,11 @@ deliberately *more restrained*: **the autonomy layer never executes anything.**
 | `run` / `completion` | `runtime.db` / `runtime.completion` | Execution and post-execution. Unchanged. |
 
 A proposal records *why it exists* (`rationale`, required and non-empty at the
-persistence boundary), *what it is based on* (immutable evidence rows), *how
-dangerous it is* (`risk_level`), *whether it is allowed* (the stored eligibility
-verdict), *who decided* (`decided_by`), and *what it eventually authorised*
+persistence boundary), *what it is based on* (evidence rows frozen at
+assessment), *how dangerous it is* (`risk_level`), *whether it is allowed* (the
+stored eligibility verdict), *who decided* (`decided_by`), the canonical action
+arguments it authorises (`parameters_json` plus an `action_digest` in the plan),
+and the matching result eventually confirmed
 (`dispatched_run_id`/`dispatched_task_id`).
 
 ### 2. Proposal state machine
@@ -62,12 +64,12 @@ DRAFT ─▶ PROPOSED ─▶ ELIGIBLE ─▶ AWAITING_APPROVAL ─▶ APPROVED �
 ```
 
 Terminal states are `EXECUTED`, `REJECTED`, `WITHDRAWN`. The allowed edges are
-explicit *data* (`autonomy.PROPOSAL_TRANSITIONS`), and
-`is_valid_proposal_transition` is consulted by `db.update_proposal` before any
-compare-and-set write — a backward jump or a move out of a terminal state is
-refused at the persistence layer, independent of orchestration control flow
-(exactly as `update_completion` guards `completion_state`). Same-state updates
-(evidence enrichment / metadata) are always allowed.
+explicit *data* (`autonomy.PROPOSAL_TRANSITIONS`). Persistence checks the
+expected row version first, then applies a lifecycle-scoped field allowlist and
+`is_valid_proposal_transition`. A stale writer therefore always loses as a
+stale writer, while a current writer still cannot jump backward, leave a
+terminal state, or rewrite authority-bearing fields after assessment. A
+same-state compare-and-set does not grant arbitrary mutation authority.
 
 `DISPATCHED` deliberately cannot be withdrawn: once the execution boundary is
 crossed it is confirmed (`EXECUTED`) or failed back (`BLOCKED`), never silently
@@ -78,10 +80,11 @@ abandoned.
 An `Evidence` item carries a `kind`, a **mandatory `source`** (an observation
 with no source is a claim, not evidence, and is rejected in `__post_init__`), a
 `summary`, an `observed_at` timestamp, structured `data`, and an `is_blocker`
-flag. Evidence rows are **append-only and never updated** — the observations a
-decision rests on stay frozen, so the decision remains reproducible from them. A
-content-addressed `evidence_digest` (order-independent SHA-256) is stored so a
-reviewer can confirm the evidence has not silently changed.
+flag. Evidence rows are append-only while a proposal is being prepared and are
+fully frozen once assessment begins. The observations a decision rests on
+therefore remain reproducible. A content-addressed `evidence_digest`
+(order-independent SHA-256) is stored so a reviewer can confirm the evidence
+has not silently changed.
 
 The domain module never *invents* evidence; it only classifies and evaluates
 what a caller collected. This is the "no fabricated evidence" rule made
@@ -108,8 +111,8 @@ denial:
 7. risk ≤ `auto_approve_max_risk` and policy enabled → `APPROVED` (auto);
 8. otherwise → `AWAITING_APPROVAL` (human).
 
-Every path that is not an explicit, in-policy auto-approval requires a human —
-risky actions default to blocked.
+Hard denials become `BLOCKED`; eligible actions outside the explicit
+auto-approval ceiling enter `AWAITING_APPROVAL` and require a human.
 
 ### 5. Autonomy policy — conservative by construction
 
@@ -119,35 +122,54 @@ A brand-new install proposes nothing and auto-executes nothing. `CRITICAL` risk
 is never auto-approvable even if a policy names it (it is clamped to `HIGH`, and
 `may_auto_approve` refuses CRITICAL outright).
 
+Policy parsing is strict at this authority boundary. Boolean-looking strings,
+unknown proposal kinds or risk values, unexpected keys, and non-integer
+staleness windows do not get coerced; any malformed policy resolves to the
+fully closed default.
+
 ### 6. The execution boundary — recorded, never performed
 
 This is the load-bearing safety property. `autonomy_service.dispatch`:
 
 * refuses unless the proposal is `APPROVED`;
-* refuses unless `policy.allow_execution_dispatch` is explicitly on — a refusal
-  leaves the proposal untouched and is itself written to the audit trail;
+* rechecks that the effective policy is enabled, permits the proposal kind, and
+  explicitly permits dispatch;
+* rebuilds the plan from frozen `parameters_json` and refuses an incomplete
+  payload or a mismatch with the persisted action digest;
+* verifies the frozen evidence digest and re-runs eligibility at the current
+  time, so stale or newly inconsistent evidence cannot cross the boundary;
+* records every refusal while leaving the proposal `APPROVED`;
 * on success moves `APPROVED → DISPATCHED` and **returns the dry-run
   `ExecutionPlan`** — it does not launch a run, create a task, or merge.
 
-The caller then performs exactly the planned action through the existing,
-already-guarded route (`ExecutionCenterAPI.start_run`, which itself demands
-`confirmed=True` and honours the agent `--disallowedTools` git sandbox), and
-reports the resulting id back via `confirm_execution` (`DISPATCHED → EXECUTED`).
-The autonomy layer *governs and records* the boundary; the existing execution
-machinery *is* the boundary. Agents still cannot commit/push/merge; only the
-completion orchestrator can, unchanged.
+The caller then performs the returned action through the existing,
+already-guarded route (`ExecutionCenterAPI.start_run` itself demands
+`confirmed=True` and honours the agent `--disallowedTools` git sandbox).
+`confirm_execution` accepts only a real persisted task or run whose identity
+and core action fields match the authorised payload; an empty, foreign, or
+mismatched result is audited and refused. The autonomy layer *governs and
+records* the boundary; the existing execution machinery *is* the boundary.
+Agents still cannot commit/push/merge; only the completion orchestrator can,
+unchanged.
 
-### 7. Persistence — schema 6, restart-safe, audited
+### 7. Persistence — schema 7, restart-safe, audited
 
 Three tables added via migration 6 (`SCHEMA_VERSION` 5 → 6), following the
-completion-row idioms exactly:
+completion-row idioms:
 
 * `proposal` — one mutable current-state row, `version`-guarded compare-and-set,
-  transition-guarded; identity columns write-once, mutable columns on an
-  allowlist (`_UPDATABLE_PROPOSAL_FIELDS`).
-* `proposal_evidence` — append-only, immutable, per-proposal `seq`.
+  transition-guarded; identity columns write-once and mutable columns governed
+  by a lifecycle-scoped allowlist.
+* `proposal_evidence` — append-only before assessment and frozen afterward,
+  per-proposal `seq`.
 * `proposal_event` — append-only audit trail (from/to state, actor, reason code,
   message, metadata), per-proposal `seq`.
+
+Migration 7 (`SCHEMA_VERSION` 6 → 7) adds
+`proposal.parameters_json TEXT NOT NULL DEFAULT '{}'`. Writes validate that it
+is a JSON object and store canonical key ordering. Existing schema-6 rows
+migrate without losing proposal, evidence, event, completion, run, or task
+data.
 
 Every lifecycle move writes an event, so the full decision history — including
 *why* (the `CREATED` event carries the rationale) and *who* — is reconstructable,
@@ -208,6 +230,25 @@ Two Founder-Gate findings were closed without changing the architecture above:
   is exactly one CREATED and one ASSESSED event per committed operation, with a
   monotonic audit sequence. Future-dated evidence is treated as stale.
 
+### Addendum (INTEGRATION-REMEDIATION-002) — frozen action authority
+
+The integration audit closed the remaining execution-boundary gaps:
+
+* **Strict policy parsing.** Malformed values close the entire policy; Python
+  truthiness and integer coercions cannot turn strings into authority.
+* **Lifecycle-scoped authority.** Expected-version CAS is checked first.
+  Policy, action parameters, evidence digest, verdict, risk, and plan can change
+  only before assessment. Evidence append is rejected after assessment.
+* **Canonical action binding.** Every kind has a bounded parameter vocabulary
+  and required fields. Plans expose completeness and a SHA-256 action digest.
+  Unknown arguments are rejected, and incomplete plans cannot dispatch.
+* **Dispatch-time validation.** Policy, kind, dispatch permission, action
+  digest, evidence digest, blockers, and current staleness are rechecked at the
+  boundary.
+* **Result binding.** TASK_CREATION and TASK_EXECUTION confirmations must link
+  an existing task/run matching the approved core payload. Foreign or empty
+  confirmations leave the proposal `DISPATCHED` and append a refusal event.
+
 ## Known limitations
 
 * No automated evidence collectors yet (repository analysis, gap detection); the
@@ -217,20 +258,27 @@ Two Founder-Gate findings were closed without changing the architecture above:
 * No per-project persisted `AutonomyPolicy` resolution layer yet; a policy is
   passed in or stored per-proposal. Project/task-level policy resolution
   (as `CompletionPolicy.resolve` does) is a natural follow-up.
+* PRIORITY_CHANGE, DEPENDENCY_LINK, and MERGE remain advisory and cannot
+  dispatch until durable execution-and-result adapters exist. Only
+  TASK_CREATION and TASK_EXECUTION currently produce dispatchable plans.
+* There is no autonomy UI, evidence collector, background driver, or implicit
+  workspace isolation. Dispatch returns a plan; it does not execute that plan.
 * Evidence staleness uses the project-wide naive-local timestamp convention
   (`models.iso_now`); cross-machine clock skew is out of scope, as elsewhere.
 
 ## Verification
 
-`ruff check .`, `python -m compileall`, and `pytest` all clean. New coverage:
+`ruff check .`, `python -m compileall`, and `pytest` are the validation gates.
+Coverage includes:
 `tests/test_autonomy_domain.py` (policy defaults, risk classification, the state
 machine, evidence model, and every eligibility branch including denials and
-malformed input), `tests/test_autonomy_db.py` (migration 6, CRUD, compare-and-set,
-the transition guard preceding the version check, the field allowlist, immutable
-evidence, ordered audit events), `tests/test_autonomy_service.py` (the full
+malformed input), `tests/test_autonomy_db.py` (migrations 6 and 7, data
+preservation, CRUD, CAS-first behavior, lifecycle field authority, frozen
+evidence, and ordered audit events), `tests/test_autonomy_service.py` (the full
 lifecycle: blocked path, human-gate path, auto-approval, dispatch refusal,
-dispatch + confirm, reject/withdraw/override, critical-never-auto,
-reproducibility, and the complete audit trail), and `tests/test_autonomy_api.py`
+dispatch-time evidence checks, bound confirm, reject/withdraw/override,
+critical-never-auto, reproducibility, and the complete audit trail), and
+`tests/test_autonomy_api.py`
 (the `ExecutionCenterAPI` facade). `scripts/demo_autonomy_proposals.py` runs the
 four scenarios end to end against a throwaway store without launching a run or
 touching a repository.
