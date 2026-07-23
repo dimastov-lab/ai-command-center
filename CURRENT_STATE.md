@@ -17,7 +17,8 @@ Current position:
 - The persisted completion pipeline supports validation, push, pull-request and merge workflows;
   completion autopilot and automatic merge policies are opt-in and disabled by conservative
   defaults.
-- Legacy synchronous and JSON/JSONL paths remain present alongside SQLite.
+- `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
+  legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
 
 Current boundaries:
 - Normal task launches require explicit user action; no general autonomous task scheduler is
