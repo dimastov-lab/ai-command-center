@@ -1327,21 +1327,29 @@ def update_completion(db_path: Path, run_id: str, *, expected_version: int, fiel
             ).fetchone()
             if row is None:
                 raise KeyError(f"No such completion: {run_id!r}")
-            # Structural transition guard (mirrors `update_run_state`): reject an
-            # illegal completion-state move *before* the CAS check, so a backward
-            # jump or a move out of a terminal state is refused regardless of the
-            # caller's `expected_version`. A same-state / metadata-only update
-            # (no `completion_state` in `fields`) is always allowed.
+            # Compare-and-set FIRST: a caller whose `expected_version` no longer
+            # matches has read a stale row, so it must lose with `LostUpdateError`
+            # *before* we judge its intended transition against a state it never
+            # saw. Evaluating the transition guard first would let a stale loser
+            # be reported as an `InvalidCompletionTransitionError` (its stale
+            # target measured against the winner's newer state) — misclassifying
+            # benign concurrency as a hard state-machine violation. See
+            # AICC-AUTONOMY-002.
+            if row["version"] != expected_version:
+                raise LostUpdateError(
+                    f"Completion {run_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
+                )
+            # Structural transition guard (mirrors `update_run_state`): once the
+            # caller is confirmed to be operating on the current row version,
+            # reject an illegal completion-state move (a backward jump or a move
+            # out of a terminal state). A same-state / metadata-only update (no
+            # `completion_state` in `fields`) is always allowed.
             new_state = fields.get("completion_state")
             if new_state is not None and not completion_domain.is_valid_completion_transition(
                 row["completion_state"], new_state
             ):
                 raise InvalidCompletionTransitionError(
                     f"Completion {run_id!r} cannot transition {row['completion_state']!r} -> {new_state!r}"
-                )
-            if row["version"] != expected_version:
-                raise LostUpdateError(
-                    f"Completion {run_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
                 )
             fields["updated_at"] = iso_now()
             set_clause = ", ".join(f"{key} = :{key}" for key in fields)

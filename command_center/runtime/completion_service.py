@@ -221,6 +221,21 @@ class CompletionOrchestrator:
                 # without bumping any retry/recovery counter; the row (if still
                 # non-terminal) is simply picked up on the next due poll.
                 continue
+            except runtime_db.InvalidCompletionTransitionError as exc:
+                # Defense in depth. With CAS-before-guard ordering in
+                # `db.update_completion`, a stale advancer now loses with
+                # `LostUpdateError`, so reaching here means the transition was
+                # illegal at the *current* row version. Re-read to separate a
+                # benign race (another worker already terminalized or removed the
+                # row — its result stands) from a genuine state-machine error,
+                # and never abort the batch either way.
+                fresh = runtime_db.get_completion(self.db_path, row["run_id"])
+                if fresh is None or fresh["completion_state"] in _TERMINAL:
+                    continue
+                self._mark_attention(
+                    fresh, now=now, reason_code=ReasonCode.RETRY_LIMIT_REACHED,
+                    recommended=f"Illegal completion transition: {exc}",
+                )
             except (GitHubError, git_ops.GitOpsError) as exc:
                 # Transient infrastructure failure (GitHub/network/git remote):
                 # schedule a backoff retry rather than giving up. Repeated
@@ -679,11 +694,9 @@ class CompletionOrchestrator:
         if waiting:
             retry_count += 1
             next_retry = _compute_next_retry(now, retry_count)
-        if assessment.status == CompletionState.REQUIRES_ATTENTION:
-            runtime_db.append_completion_event(
-                self.db_path, row["run_id"], EV_REQUIRES_ATTENTION, reason_code=assessment.reason_code,
-                message=assessment.recommended_action,
-            )
+        # Persist first, then log. If a concurrent winner advanced the row the
+        # CAS in `_transition` raises before we append, so a benign loser never
+        # records a misleading REQUIRES_ATTENTION audit event (AICC-AUTONOMY-002).
         self._transition(
             row,
             state=assessment.status,
@@ -700,19 +713,45 @@ class CompletionOrchestrator:
             next_retry_at=next_retry,
             progressed=False,
         )
+        if assessment.status == CompletionState.REQUIRES_ATTENTION:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_REQUIRES_ATTENTION, reason_code=assessment.reason_code,
+                message=assessment.recommended_action,
+            )
 
     def _mark_attention(self, row: dict, *, now: datetime, reason_code: str, recommended: str) -> None:
+        """Escalate a row to REQUIRES_ATTENTION — idempotent and race-safe.
+
+        A concurrency loser must never overwrite or terminalize the winner, so
+        this re-reads the row and refuses to act when another worker has already
+        moved on: a missing row (deleted/cascaded), an already-terminal row, or
+        a row whose CAS is lost between re-read and write are all left untouched
+        — no state change, no `requires_human`/retry mutation, and no audit
+        event. The REQUIRES_ATTENTION audit event is appended only *after* the
+        transition commits, so the log never claims a change that did not happen
+        (AICC-AUTONOMY-002)."""
+        fresh = runtime_db.get_completion(self.db_path, row["run_id"])
+        if fresh is None or fresh["completion_state"] in _TERMINAL:
+            # Row was deleted, or another worker already reached a terminal
+            # state (possibly a legitimate winner). Nothing to escalate.
+            return
+        try:
+            self._transition(
+                fresh,
+                state=CompletionState.REQUIRES_ATTENTION,
+                reason_code=reason_code,
+                recommended=recommended,
+                requires_human=True,
+                now=now,
+                progressed=False,
+            )
+        except (runtime_db.LostUpdateError, runtime_db.InvalidCompletionTransitionError):
+            # Another worker advanced or terminalized the row between our
+            # re-read and the compare-and-set. Its progress is authoritative;
+            # do not clobber it and do not raise (which would abort the batch).
+            return
         runtime_db.append_completion_event(
             self.db_path, row["run_id"], EV_REQUIRES_ATTENTION, reason_code=reason_code, message=recommended
-        )
-        self._transition(
-            row,
-            state=CompletionState.REQUIRES_ATTENTION,
-            reason_code=reason_code,
-            recommended=recommended,
-            requires_human=True,
-            now=now,
-            progressed=False,
         )
 
     def _transition(

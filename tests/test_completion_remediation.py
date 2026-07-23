@@ -380,24 +380,38 @@ def test_update_completion_allows_metadata_only_update(db_path):
     assert updated["completion_state"] == CompletionState.AWAITING_MERGE
 
 
-def test_transition_checked_before_cas(db_path):
-    """An illegal transition is rejected even with a stale version (transition
-    guard runs first); a legal transition with a stale version still enforces
-    CAS."""
+def test_cas_checked_before_transition_guard(db_path):
+    """AICC-AUTONOMY-002: the compare-and-set version check runs *before* the
+    structural transition guard. A stale caller always loses with
+    `LostUpdateError` — regardless of whether its intended target would be legal
+    or illegal against the newer row it never saw — so benign concurrency is
+    never misreported as a hard state-machine violation. Legality is still
+    enforced for a caller operating on the current version."""
+    # Stale version + a target that is illegal against the winner's state
+    # (COMPLETED is terminal) -> LostUpdateError, NOT InvalidCompletionTransition.
     run = _make_run(db_path)
     _seed_state(db_path, run, CompletionState.COMPLETED)
-    # Illegal transition + wrong version -> transition error (checked first).
-    with pytest.raises(runtime_db.InvalidCompletionTransitionError):
+    with pytest.raises(runtime_db.LostUpdateError):
         runtime_db.update_completion(
             db_path, run["id"], expected_version=999,
             fields={"completion_state": CompletionState.MERGED},
         )
 
+    # Stale version + an otherwise-legal target -> LostUpdateError (unchanged).
     run2 = _make_run(db_path)
     _seed_state(db_path, run2, CompletionState.EXECUTION_FINISHED)
-    # Legal transition + wrong version -> CAS still enforced.
     with pytest.raises(runtime_db.LostUpdateError):
         runtime_db.update_completion(
             db_path, run2["id"], expected_version=999,
             fields={"completion_state": CompletionState.RESULT_VALID},
+        )
+
+    # Current version + illegal target -> the guard STILL fires for a non-stale
+    # caller; legality rules remain enforced.
+    run3 = _make_run(db_path)
+    _seed_state(db_path, run3, CompletionState.COMPLETED)  # version 0
+    with pytest.raises(runtime_db.InvalidCompletionTransitionError):
+        runtime_db.update_completion(
+            db_path, run3["id"], expected_version=0,
+            fields={"completion_state": CompletionState.MERGED},
         )
