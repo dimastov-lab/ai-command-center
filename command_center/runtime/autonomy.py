@@ -223,6 +223,8 @@ class ReasonCode:
     RISK_EXCEEDS_POLICY = "RISK_EXCEEDS_POLICY"
     RISK_CRITICAL_NO_AUTO = "RISK_CRITICAL_NO_AUTO"
     DISPATCH_DISABLED = "DISPATCH_DISABLED"
+    ACTION_PAYLOAD_INVALID = "ACTION_PAYLOAD_INVALID"
+    EVIDENCE_MISMATCH = "EVIDENCE_MISMATCH"
     # Eligibility — allowed
     AUTO_APPROVED = "AUTO_APPROVED"
     HUMAN_APPROVAL_REQUIRED = "HUMAN_APPROVAL_REQUIRED"
@@ -232,6 +234,7 @@ class ReasonCode:
     OVERRIDDEN_BY_HUMAN = "OVERRIDDEN_BY_HUMAN"
     DISPATCHED = "DISPATCHED"
     EXECUTION_CONFIRMED = "EXECUTION_CONFIRMED"
+    EXECUTION_MISMATCH = "EXECUTION_MISMATCH"
     DISPATCH_FAILED = "DISPATCH_FAILED"
     WITHDRAWN = "WITHDRAWN"
 
@@ -367,14 +370,38 @@ class AutonomyPolicy:
     max_evidence_age_seconds: int = 3600
 
     def __post_init__(self) -> None:
-        self.allowed_kinds = frozenset(self.allowed_kinds)
-        if self.auto_approve_max_risk not in RISK_ORDER:
+        # Configuration is an authority boundary, so it must not use Python's
+        # permissive coercions (for example bool("false") is True).  If any
+        # field has the wrong type or vocabulary, close the *whole* policy
+        # rather than trying to salvage a partially permissive configuration.
+        allowed_container = isinstance(self.allowed_kinds, (set, frozenset, list, tuple))
+        allowed_values = (
+            list(self.allowed_kinds)
+            if allowed_container
+            else []
+        )
+        valid = (
+            type(self.enabled) is bool
+            and allowed_container
+            and all(type(kind) is str and kind in ALL_KINDS for kind in allowed_values)
+            and type(self.auto_approve_max_risk) is str
+            and self.auto_approve_max_risk in RISK_ORDER
+            and type(self.allow_execution_dispatch) is bool
+            and type(self.max_evidence_age_seconds) is int
+            and self.max_evidence_age_seconds >= 0
+        )
+        if not valid:
+            self.enabled = False
+            self.allowed_kinds = frozenset()
             self.auto_approve_max_risk = RiskLevel.NONE
+            self.allow_execution_dispatch = False
+            self.max_evidence_age_seconds = 3600
+            return
+
+        self.allowed_kinds = frozenset(allowed_values)
         # CRITICAL is never auto-approvable; clamp a policy that tries.
         if self.auto_approve_max_risk == RiskLevel.CRITICAL:
             self.auto_approve_max_risk = RiskLevel.HIGH
-        if self.max_evidence_age_seconds < 0:
-            self.max_evidence_age_seconds = 0
 
     def allows_kind(self, kind: str) -> bool:
         return kind in self.allowed_kinds
@@ -431,13 +458,23 @@ class AutonomyPolicy:
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "AutonomyPolicy":
-        data = data or {}
+        if type(data) is not dict:
+            return cls()
+        known_fields = {
+            "enabled",
+            "allowed_kinds",
+            "auto_approve_max_risk",
+            "allow_execution_dispatch",
+            "max_evidence_age_seconds",
+        }
+        if set(data) - known_fields:
+            return cls()
         return cls(
-            enabled=bool(data.get("enabled", False)),
-            allowed_kinds=frozenset(data.get("allowed_kinds") or ()),
-            auto_approve_max_risk=str(data.get("auto_approve_max_risk", RiskLevel.NONE)),
-            allow_execution_dispatch=bool(data.get("allow_execution_dispatch", False)),
-            max_evidence_age_seconds=int(data.get("max_evidence_age_seconds", 3600)),
+            enabled=data.get("enabled", False),
+            allowed_kinds=data.get("allowed_kinds", frozenset()),
+            auto_approve_max_risk=data.get("auto_approve_max_risk", RiskLevel.NONE),
+            allow_execution_dispatch=data.get("allow_execution_dispatch", False),
+            max_evidence_age_seconds=data.get("max_evidence_age_seconds", 3600),
         )
 
     @classmethod
@@ -638,6 +675,123 @@ def evaluate_eligibility(
 # --------------------------------------------------------------------------
 
 
+# The exact, bounded action vocabulary for each proposal kind.  Proposal
+# metadata (title/rationale/evidence) explains the decision; only these fields
+# authorise an eventual side effect.  Unknown fields are rejected at proposal
+# creation so a caller cannot hide an unreviewed action argument beside the
+# reviewed payload.
+ACTION_PARAMETER_KEYS: dict[str, frozenset[str]] = {
+    ProposalKind.TASK_CREATION: frozenset({"project", "title", "task_type"}),
+    ProposalKind.TASK_EXECUTION: frozenset(
+        {
+            "task_id",
+            "project",
+            "repository_path",
+            "expected_branch",
+            "task_type",
+            "instruction",
+        }
+    ),
+    ProposalKind.PRIORITY_CHANGE: frozenset({"task_id", "priority"}),
+    ProposalKind.DEPENDENCY_LINK: frozenset({"task_id", "dependency_task_id"}),
+    ProposalKind.MERGE: frozenset(
+        {"project", "repository_path", "head_branch", "base_branch"}
+    ),
+}
+
+ACTION_REQUIRED_PARAMETERS: dict[str, frozenset[str]] = {
+    kind: keys for kind, keys in ACTION_PARAMETER_KEYS.items()
+}
+
+
+def canonical_action_parameters(
+    *,
+    kind: str,
+    project: str,
+    title: str,
+    task_id: str | None = None,
+    parameters: dict | None = None,
+) -> dict:
+    """Return the canonical, JSON-safe action payload for a proposal.
+
+    The proposal's top-level identity fields are authoritative: a duplicated
+    ``project``, ``title`` or ``task_id`` inside ``parameters`` must agree with
+    them.  TASK_CREATION retains the existing safe default
+    ``task_type="implementation"``; other absent required values remain absent
+    and therefore make the dry-run plan non-dispatchable.
+    """
+    if kind not in ACTION_PARAMETER_KEYS:
+        raise ValueError(f"Unknown proposal kind: {kind!r}")
+    if parameters is None:
+        raw: dict = {}
+    elif type(parameters) is dict:
+        raw = dict(parameters)
+    else:
+        raise ValueError("proposal parameters must be a JSON object")
+
+    unknown = set(raw) - ACTION_PARAMETER_KEYS[kind]
+    if unknown:
+        raise ValueError(
+            f"Unknown action parameters for {kind}: {sorted(unknown)!r}"
+        )
+
+    canonical = dict(raw)
+
+    def bind_authoritative(key: str, value: str | None) -> None:
+        if key in canonical and canonical[key] != value:
+            raise ValueError(
+                f"Action parameter {key!r} conflicts with the proposal identity"
+            )
+        if value is not None:
+            canonical[key] = value
+
+    if kind in {
+        ProposalKind.TASK_CREATION,
+        ProposalKind.TASK_EXECUTION,
+        ProposalKind.MERGE,
+    }:
+        bind_authoritative("project", project)
+    if kind == ProposalKind.TASK_CREATION:
+        bind_authoritative("title", title)
+        canonical.setdefault("task_type", "implementation")
+    if kind in {
+        ProposalKind.TASK_EXECUTION,
+        ProposalKind.PRIORITY_CHANGE,
+        ProposalKind.DEPENDENCY_LINK,
+    }:
+        bind_authoritative("task_id", task_id)
+
+    # Every accepted action value is a non-blank string.  The intentionally
+    # small vocabulary makes both the digest and later confirmation exact and
+    # avoids bool/int/string coercion surprises at an authority boundary.
+    for key, value in canonical.items():
+        if type(value) is not str or not value.strip():
+            raise ValueError(
+                f"Action parameter {key!r} must be a non-empty string"
+            )
+        canonical[key] = value.strip()
+
+    # Round-trip through canonical JSON both to reject non-JSON values and to
+    # detach the stored payload from any caller-owned mutable object.
+    try:
+        return json.loads(
+            json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("proposal parameters must be JSON serializable") from exc
+
+
+def action_digest(*, kind: str, dispatch_route: str, parameters: dict) -> str:
+    """SHA-256 of the exact action identity returned to the executor."""
+    payload = {
+        "kind": kind,
+        "dispatch_route": dispatch_route,
+        "parameters": parameters,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class ExecutionPlan:
     """A description of the action a proposal would take if executed — the
@@ -656,6 +810,9 @@ class ExecutionPlan:
     steps: list[str]
     parameters: dict
     requires_confirmation: bool = True
+    executable: bool = False
+    missing_parameters: tuple[str, ...] = ()
+    action_digest: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -665,6 +822,9 @@ class ExecutionPlan:
             "steps": list(self.steps),
             "parameters": dict(self.parameters),
             "requires_confirmation": self.requires_confirmation,
+            "executable": self.executable,
+            "missing_parameters": list(self.missing_parameters),
+            "action_digest": self.action_digest,
         }
 
 
@@ -674,10 +834,14 @@ class ExecutionPlan:
 _DISPATCH_ROUTES: dict[str, str] = {
     ProposalKind.TASK_CREATION: "db.create_task",
     ProposalKind.TASK_EXECUTION: "ExecutionCenterAPI.start_run",
-    ProposalKind.PRIORITY_CHANGE: "db.update_task_fields",
-    ProposalKind.DEPENDENCY_LINK: "db.update_task_fields",
+    ProposalKind.PRIORITY_CHANGE: "unsupported (planning-store adapter required)",
+    ProposalKind.DEPENDENCY_LINK: "unsupported (planning-store adapter required)",
     ProposalKind.MERGE: "completion_service.merge (manual gate)",
 }
+
+_EXECUTABLE_KINDS: frozenset[str] = frozenset(
+    {ProposalKind.TASK_CREATION, ProposalKind.TASK_EXECUTION}
+)
 
 
 def build_execution_plan(
@@ -690,6 +854,14 @@ def build_execution_plan(
     """Produce the dry-run plan for a proposal. Pure and side-effect-free."""
     params = dict(parameters or {})
     route = _DISPATCH_ROUTES.get(kind, "unsupported")
+    missing = tuple(
+        sorted(
+            key
+            for key in ACTION_REQUIRED_PARAMETERS.get(kind, frozenset())
+            if type(params.get(key)) is not str or not params[key].strip()
+        )
+    )
+    executable = kind in _EXECUTABLE_KINDS and not missing
     if kind == ProposalKind.TASK_CREATION:
         steps = [
             f"Record a new task: {title!r}",
@@ -707,6 +879,11 @@ def build_execution_plan(
             "Merging is never performed by autonomy; this plan is advisory only",
             "A human must perform or explicitly authorise the merge",
         ]
+    elif kind in {ProposalKind.PRIORITY_CHANGE, ProposalKind.DEPENDENCY_LINK}:
+        steps = [
+            f"{kind} is advisory until a durable planning-store result adapter exists",
+            "The proposal cannot cross the dispatch boundary in this implementation",
+        ]
     else:
         steps = [f"Apply {kind} via {route} (metadata change only)"]
     return ExecutionPlan(
@@ -716,4 +893,7 @@ def build_execution_plan(
         steps=steps,
         parameters=params,
         requires_confirmation=True,
+        executable=executable,
+        missing_parameters=missing,
+        action_digest=action_digest(kind=kind, dispatch_route=route, parameters=params),
     )

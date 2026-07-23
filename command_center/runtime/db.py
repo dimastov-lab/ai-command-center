@@ -128,9 +128,18 @@ class InvalidCompletionTransitionError(Exception):
 class InvalidProposalTransitionError(Exception):
     """Raised when an `update_proposal` call would move `state` along an illegal
     edge (a backward jump, or any move out of a terminal state) — see
-    `runtime.autonomy.PROPOSAL_TRANSITIONS`. Same-state updates (evidence
-    enrichment / metadata) are always permitted. This is the autonomy-proposal
+    `runtime.autonomy.PROPOSAL_TRANSITIONS`. This is the autonomy-proposal
     analogue of `InvalidCompletionTransitionError`."""
+
+
+class ProposalFieldFrozenError(Exception):
+    """Raised when proposal fields are mutated outside the lifecycle states in
+    which they are authoritative. In particular, the action, policy, evidence
+    digest, eligibility verdict, and execution plan are frozen after assessment."""
+
+
+class ProposalEvidenceFrozenError(Exception):
+    """Raised when evidence is appended after proposal assessment has begun."""
 
 
 class LostUpdateError(Exception):
@@ -216,7 +225,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -527,6 +536,24 @@ CREATE INDEX IF NOT EXISTS idx_proposal_event_proposal_id ON proposal_event(prop
 """
 
 
+def _migration_7_add_proposal_parameters_json(conn: sqlite3.Connection) -> None:
+    """Add the immutable, canonical action payload approved by a proposal.
+
+    Existing schema-6 databases contain proposals without a structured action
+    payload. Backfill those rows with the empty-object sentinel rather than
+    NULL so every caller can safely parse `parameters_json` after migration.
+    The check-and-add runs under the same write lock used by earlier callable
+    migrations, making concurrent and repeated migration attempts safe.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(proposal)").fetchall()}
+        if "parameters_json" not in existing:
+            conn.execute(
+                "ALTER TABLE proposal "
+                "ADD COLUMN parameters_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -537,6 +564,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (4, _migration_4_add_first_output_at),
     (5, _SCHEMA_V5),
     (6, _SCHEMA_V6),
+    (7, _migration_7_add_proposal_parameters_json),
 ]
 
 
@@ -1556,14 +1584,15 @@ def list_validation_results(db_path: Path, run_id: str, *, attempt: int | None =
 
 
 # --------------------------------------------------------------------------
-# Autonomy proposals (schema 6) — the pre-execution decision layer.
+# Autonomy proposals (schema 7) — the pre-execution decision layer.
 #
 # Mirrors the completion-row idioms: a `create_proposal` write-once insert, a
-# compare-and-set `update_proposal` guarded by both a field allowlist and the
-# `autonomy.is_valid_proposal_transition` structural guard, an immutable
-# `append_proposal_evidence`, and an append-only `append_proposal_event` audit
-# trail. Identity columns (id/kind/project/created_at) are write-once and
-# deliberately absent from the updatable allowlist below.
+# compare-and-set `update_proposal` guarded by both a lifecycle-scoped field
+# allowlist and the `autonomy.is_valid_proposal_transition` structural guard,
+# evidence that is append-only until assessment and frozen afterward, and an
+# append-only `append_proposal_event` audit trail. Identity columns
+# (id/kind/project/created_at) are write-once and deliberately absent from the
+# updatable allowlist below.
 # --------------------------------------------------------------------------
 
 _UPDATABLE_PROPOSAL_FIELDS: frozenset[str] = frozenset(
@@ -1576,6 +1605,7 @@ _UPDATABLE_PROPOSAL_FIELDS: frozenset[str] = frozenset(
         "policy_json",
         "eligibility_json",
         "plan_json",
+        "parameters_json",
         "evidence_digest",
         "requires_human",
         "last_reason_code",
@@ -1587,10 +1617,101 @@ _UPDATABLE_PROPOSAL_FIELDS: frozenset[str] = frozenset(
 )
 
 
+_PROPOSAL_AUTHORITY_FIELDS: frozenset[str] = frozenset(
+    {
+        "task_id",
+        "title",
+        "rationale",
+        "risk_level",
+        "policy_json",
+        "eligibility_json",
+        "plan_json",
+        "parameters_json",
+        "evidence_digest",
+    }
+)
+
+_PROPOSAL_DECISION_FIELDS: frozenset[str] = frozenset(
+    {
+        "state",
+        "requires_human",
+        "last_reason_code",
+        "decided_by",
+        "decision_reason",
+    }
+)
+
+_PROPOSAL_FIELDS_BY_STATE: dict[str, frozenset[str]] = {
+    # Assessment may start from either DRAFT or PROPOSED. These are the only
+    # states in which authority-bearing fields may be written.
+    autonomy_domain.ProposalState.DRAFT: _PROPOSAL_AUTHORITY_FIELDS | _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.PROPOSED: _PROPOSAL_AUTHORITY_FIELDS | _PROPOSAL_DECISION_FIELDS,
+    # From this point onward, policy, evidence digest, action parameters,
+    # eligibility, risk, and plan are immutable. Lifecycle decisions may still
+    # advance the row and record the responsible actor/reason.
+    autonomy_domain.ProposalState.ELIGIBLE: _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.BLOCKED: _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.AWAITING_APPROVAL: _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.APPROVED: _PROPOSAL_DECISION_FIELDS,
+    # Result links are legal only while confirming a dispatched action.
+    autonomy_domain.ProposalState.DISPATCHED: frozenset(
+        {"state", "last_reason_code", "dispatched_run_id", "dispatched_task_id"}
+    ),
+    # Terminal rows permit only an idempotent same-state CAS; their authority
+    # and decision attribution cannot be rewritten.
+    autonomy_domain.ProposalState.REJECTED: frozenset({"state"}),
+    autonomy_domain.ProposalState.EXECUTED: frozenset({"state"}),
+    autonomy_domain.ProposalState.WITHDRAWN: frozenset({"state"}),
+}
+
+
 def _validate_updatable_proposal_fields(fields: dict) -> None:
     unknown = set(fields) - _UPDATABLE_PROPOSAL_FIELDS
     if unknown:
         raise UnknownRunFieldError(f"Not an updatable proposal field: {sorted(unknown)}")
+
+
+def _validate_proposal_fields_for_state(
+    state: str,
+    fields: dict,
+    *,
+    assessment_persisted: bool,
+) -> None:
+    allowed = _PROPOSAL_FIELDS_BY_STATE.get(state, frozenset())
+    # Assessment is normally persisted and routed onward in one transaction,
+    # so callers never observe a DRAFT/PROPOSED row with a verdict. Keep the DB
+    # boundary safe even if a lower-level caller writes the verdict without its
+    # transitions: once the marker exists, authority is frozen immediately.
+    if (
+        assessment_persisted
+        and state
+        in {
+            autonomy_domain.ProposalState.DRAFT,
+            autonomy_domain.ProposalState.PROPOSED,
+        }
+    ):
+        allowed = _PROPOSAL_DECISION_FIELDS
+    forbidden = set(fields) - allowed
+    if forbidden:
+        raise ProposalFieldFrozenError(
+            f"Proposal fields {sorted(forbidden)} cannot be updated in state {state!r}"
+        )
+
+
+def _canonical_proposal_parameters_json(raw: str) -> str:
+    """Validate and canonicalize the structured action payload.
+
+    A proposal approves a named parameter object, never an arbitrary JSON
+    scalar/list. Canonical serialization makes the persisted authority stable
+    for hashing, comparison, and later execution binding.
+    """
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("proposal.parameters_json must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("proposal.parameters_json must encode a JSON object")
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 _PROPOSAL_INSERT_COLUMNS: tuple[str, ...] = (
@@ -1605,6 +1726,7 @@ _PROPOSAL_INSERT_COLUMNS: tuple[str, ...] = (
     "policy_json",
     "eligibility_json",
     "plan_json",
+    "parameters_json",
     "evidence_digest",
     "requires_human",
     "last_reason_code",
@@ -1630,6 +1752,7 @@ def create_proposal(
     proposal_id: str | None = None,
     task_id: str | None = None,
     policy_json: str | None = None,
+    parameters_json: str = "{}",
     requires_human: bool = True,
 ) -> dict:
     """Create one `proposal` row in its initial state.
@@ -1639,6 +1762,7 @@ def create_proposal(
     they were created" rule at the persistence boundary."""
     if not rationale or not str(rationale).strip():
         raise ValueError("proposal.rationale must be non-empty — every proposal must explain itself")
+    parameters_json = _canonical_proposal_parameters_json(parameters_json)
     now = iso_now()
     record = {name: None for name in _PROPOSAL_INSERT_COLUMNS}
     record.update(
@@ -1652,6 +1776,7 @@ def create_proposal(
             "state": state,
             "risk_level": risk_level,
             "policy_json": policy_json,
+            "parameters_json": parameters_json,
             "requires_human": 1 if requires_human else 0,
             "version": 0,
             "created_at": now,
@@ -1805,26 +1930,42 @@ def _proposal_update(
 ) -> tuple[int, str]:
     """CAS + transition-guarded UPDATE inside an open transaction. Returns
     (new_version, resulting_state). Validates `fields` against the allowlist,
-    refuses an illegal `state` transition (via `is_valid_proposal_transition`)
-    *before* the CAS check, bumps `version`, sets `updated_at`. Raises
-    `KeyError`/`InvalidProposalTransitionError`/`LostUpdateError` as appropriate."""
+    checks the caller's version before interpreting its requested mutation,
+    enforces the lifecycle-scoped field allowlist, then refuses an illegal
+    `state` transition (via `is_valid_proposal_transition`). Bumps `version`
+    and sets `updated_at`. Raises `KeyError`/`LostUpdateError`/
+    `ProposalFieldFrozenError`/`InvalidProposalTransitionError` as appropriate."""
     fields = dict(fields)
     fields.pop("version", None)
     fields.pop("created_at", None)
     _validate_updatable_proposal_fields(fields)
-    if "requires_human" in fields and isinstance(fields["requires_human"], bool):
-        fields["requires_human"] = 1 if fields["requires_human"] else 0
-    row = conn.execute("SELECT state, version FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+    row = conn.execute(
+        "SELECT state, version, eligibility_json FROM proposal WHERE id = ?",
+        (proposal_id,),
+    ).fetchone()
     if row is None:
         raise KeyError(f"No such proposal: {proposal_id!r}")
+    # CAS is deliberately checked before the state-aware mutation/transition
+    # guards. A stale writer must always lose as a stale writer; otherwise a
+    # winner's newer state could make the loser's old request look like a hard
+    # policy/transition violation and misclassify benign concurrency.
+    if row["version"] != expected_version:
+        raise LostUpdateError(
+            f"Proposal {proposal_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
+        )
+    _validate_proposal_fields_for_state(
+        row["state"],
+        fields,
+        assessment_persisted=row["eligibility_json"] is not None,
+    )
+    if "requires_human" in fields and isinstance(fields["requires_human"], bool):
+        fields["requires_human"] = 1 if fields["requires_human"] else 0
+    if "parameters_json" in fields:
+        fields["parameters_json"] = _canonical_proposal_parameters_json(fields["parameters_json"])
     new_state = fields.get("state")
     if new_state is not None and not autonomy_domain.is_valid_proposal_transition(row["state"], new_state):
         raise InvalidProposalTransitionError(
             f"Proposal {proposal_id!r} cannot transition {row['state']!r} -> {new_state!r}"
-        )
-    if row["version"] != expected_version:
-        raise LostUpdateError(
-            f"Proposal {proposal_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
         )
     fields["updated_at"] = now
     set_clause = ", ".join(f"{key} = :{key}" for key in fields)
@@ -1843,11 +1984,11 @@ def _proposal_update(
 
 def update_proposal(db_path: Path, proposal_id: str, *, expected_version: int, fields: dict) -> dict:
     """Compare-and-set update of a `proposal` row, mirroring `update_completion`:
-    validates `fields` against `_UPDATABLE_PROPOSAL_FIELDS`, refuses an illegal
-    `state` transition (via `autonomy.is_valid_proposal_transition`) *before* the
-    CAS check, bumps `version`, sets `updated_at`, and raises `LostUpdateError`
-    on a version mismatch. `requires_human` is coerced to 0/1 if supplied as a
-    bool."""
+    validates the global field vocabulary, checks CAS first, enforces the
+    lifecycle-scoped allowlist, then validates any state transition. Authority
+    fields (policy/evidence digest/action parameters/verdict/plan) are mutable
+    only before assessment. `requires_human` is coerced to 0/1 if supplied as
+    a bool."""
     now = iso_now()
     with connect(db_path) as conn:
         with transaction(conn):
@@ -1868,11 +2009,28 @@ def append_proposal_evidence(
     data: dict | None = None,
 ) -> int:
     """Append one immutable evidence row and return its per-proposal `seq`.
-    Evidence is never updated or deleted — the observations a decision rests on
-    stay fixed, so the decision remains reproducible from them."""
+    Evidence may be enriched only before assessment (DRAFT/PROPOSED with no
+    persisted verdict). Once assessment has begun, the set is frozen so the
+    stored digest and verdict remain reproducible."""
     now = iso_now()
     with connect(db_path) as conn:
         with transaction(conn):
+            row = conn.execute(
+                "SELECT state, eligibility_json FROM proposal WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No such proposal: {proposal_id!r}")
+            if (
+                row["state"] not in {
+                    autonomy_domain.ProposalState.DRAFT,
+                    autonomy_domain.ProposalState.PROPOSED,
+                }
+                or row["eligibility_json"] is not None
+            ):
+                raise ProposalEvidenceFrozenError(
+                    f"Proposal {proposal_id!r} evidence is frozen in state {row['state']!r}"
+                )
             return _proposal_evidence_insert(
                 conn, proposal_id, kind=kind, source=source, summary=summary,
                 observed_at=observed_at, is_blocker=is_blocker, data=data, now=now,
@@ -1958,6 +2116,7 @@ def create_proposal_atomic(
     proposal_id: str | None = None,
     task_id: str | None = None,
     policy_json: str | None = None,
+    parameters_json: str = "{}",
     requires_human: bool = True,
     evidence_digest: str | None = None,
     evidence: list[dict] | None = None,
@@ -1974,6 +2133,7 @@ def create_proposal_atomic(
     duplicate; a retry after a rolled-back attempt succeeds cleanly."""
     if not rationale or not str(rationale).strip():
         raise ValueError("proposal.rationale must be non-empty — every proposal must explain itself")
+    parameters_json = _canonical_proposal_parameters_json(parameters_json)
     now = iso_now()
     pid = proposal_id or new_id()
     record = {name: None for name in _PROPOSAL_INSERT_COLUMNS}
@@ -1988,6 +2148,7 @@ def create_proposal_atomic(
             "state": state,
             "risk_level": risk_level,
             "policy_json": policy_json,
+            "parameters_json": parameters_json,
             "evidence_digest": evidence_digest,
             "requires_human": 1 if requires_human else 0,
             "version": 0,

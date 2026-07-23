@@ -94,6 +94,38 @@ def test_policy_unknown_risk_ceiling_falls_back_to_none():
     assert p.auto_approve_max_risk == RiskLevel.NONE
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"enabled": "false", "allowed_kinds": [ProposalKind.TASK_CREATION]},
+        {
+            "enabled": True,
+            "allowed_kinds": [ProposalKind.TASK_CREATION],
+            "allow_execution_dispatch": "false",
+        },
+        {"enabled": True, "allowed_kinds": "TASK_CREATION"},
+        {"enabled": True, "allowed_kinds": ["NOT_A_KIND"]},
+        {
+            "enabled": True,
+            "allowed_kinds": [ProposalKind.TASK_CREATION],
+            "max_evidence_age_seconds": "3600",
+        },
+        {"enabled": True, "allowed_kinds": [], "unexpected_authority": True},
+    ],
+)
+def test_policy_malformed_values_fail_fully_closed(payload):
+    assert AutonomyPolicy.from_dict(payload).to_dict() == AutonomyPolicy().to_dict()
+
+
+def test_direct_policy_construction_with_string_boolean_fails_closed():
+    policy = AutonomyPolicy(
+        enabled=True,
+        allowed_kinds={ProposalKind.TASK_CREATION},
+        allow_execution_dispatch="false",  # type: ignore[arg-type]
+    )
+    assert policy.to_dict() == AutonomyPolicy().to_dict()
+
+
 # --------------------------------------------------------------------------
 # Risk classification — deterministic from kind + evidence
 # --------------------------------------------------------------------------
@@ -301,9 +333,60 @@ def test_plan_for_task_execution_routes_through_start_run():
                                   rationale="ready", parameters={"task_id": "t1"})
     assert plan.dispatch_route == "ExecutionCenterAPI.start_run"
     assert plan.requires_confirmation is True
+    assert plan.executable is False
+    assert "repository_path" in plan.missing_parameters
     assert any("start_run" in step for step in plan.steps)
 
 
 def test_plan_for_merge_is_advisory_only():
     plan = A.build_execution_plan(kind=ProposalKind.MERGE, title="merge", rationale="done")
     assert "never performed by autonomy" in " ".join(plan.steps).lower()
+    assert plan.executable is False
+
+
+def test_metadata_change_plan_stays_advisory_even_with_complete_parameters():
+    plan = A.build_execution_plan(
+        kind=ProposalKind.PRIORITY_CHANGE,
+        title="raise priority",
+        rationale="critical path",
+        parameters={"task_id": "task-1", "priority": "High"},
+    )
+    assert plan.missing_parameters == ()
+    assert plan.executable is False
+    assert "advisory" in " ".join(plan.steps).lower()
+
+
+def test_canonical_action_payload_is_bounded_and_digest_is_content_sensitive():
+    params = A.canonical_action_parameters(
+        kind=ProposalKind.TASK_CREATION,
+        project="AICC",
+        title="Add tests",
+        parameters={"task_type": "implementation"},
+    )
+    assert params == {
+        "project": "AICC",
+        "task_type": "implementation",
+        "title": "Add tests",
+    }
+    first = A.build_execution_plan(
+        kind=ProposalKind.TASK_CREATION,
+        title="Add tests",
+        rationale="gap",
+        parameters=params,
+    )
+    changed = A.build_execution_plan(
+        kind=ProposalKind.TASK_CREATION,
+        title="Add tests",
+        rationale="gap",
+        parameters={**params, "task_type": "documentation"},
+    )
+    assert first.executable is True
+    assert first.action_digest != changed.action_digest
+
+    with pytest.raises(ValueError, match="Unknown action parameters"):
+        A.canonical_action_parameters(
+            kind=ProposalKind.TASK_CREATION,
+            project="AICC",
+            title="Add tests",
+            parameters={"shell_command": "rm -rf /tmp/example"},
+        )

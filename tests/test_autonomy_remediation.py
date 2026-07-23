@@ -6,6 +6,8 @@ F2 — proposal creation and assessment are atomic: either the whole multi-row
      sequence commits or none of it does, and there is exactly one CREATED /
      ASSESSED event per committed operation. Includes deterministic
      failure-injection (real transactions, no sleeps) and CAS concurrency.
+F3 — action parameters, policy, verdict, plan, and evidence are mutable only
+     before assessment; afterward the persisted authority is frozen.
 
 The primary F1 test (`test_F1_stored_forbids_caller_permits_is_refused`) fails on
 da1de1c — there, a caller-supplied permissive policy overrode the stored gate and
@@ -79,15 +81,27 @@ def _fail_on(orig, n):
 
 
 def test_F1_intersect_unit_semantics():
-    a = AutonomyPolicy(enabled=True, allowed_kinds=frozenset({"A", "B"}),
-                       auto_approve_max_risk=RiskLevel.LOW, allow_execution_dispatch=False,
-                       max_evidence_age_seconds=1000)
-    b = AutonomyPolicy(enabled=True, allowed_kinds=frozenset({"B", "C"}),
-                       auto_approve_max_risk=RiskLevel.HIGH, allow_execution_dispatch=True,
-                       max_evidence_age_seconds=500)
+    a = AutonomyPolicy(
+        enabled=True,
+        allowed_kinds=frozenset(
+            {ProposalKind.TASK_CREATION, ProposalKind.TASK_EXECUTION}
+        ),
+        auto_approve_max_risk=RiskLevel.LOW,
+        allow_execution_dispatch=False,
+        max_evidence_age_seconds=1000,
+    )
+    b = AutonomyPolicy(
+        enabled=True,
+        allowed_kinds=frozenset(
+            {ProposalKind.TASK_EXECUTION, ProposalKind.MERGE}
+        ),
+        auto_approve_max_risk=RiskLevel.HIGH,
+        allow_execution_dispatch=True,
+        max_evidence_age_seconds=500,
+    )
     eff = a.intersect(b)
     assert eff.enabled is True
-    assert eff.allowed_kinds == frozenset({"B"})               # intersection
+    assert eff.allowed_kinds == frozenset({ProposalKind.TASK_EXECUTION})  # intersection
     assert eff.auto_approve_max_risk == RiskLevel.LOW          # lower ceiling
     assert eff.allow_execution_dispatch is False               # AND
     assert eff.max_evidence_age_seconds == 500                 # stricter window
@@ -365,6 +379,123 @@ def test_F2_concurrent_transition_one_wins(db_path):
     transitions = [e for e in runtime_db.list_proposal_events(db_path, p["id"])
                    if e["event_type"] == "transition"]
     assert len(transitions) == 1
+
+
+# ==========================================================================
+# F3 — authority and evidence freeze after assessment
+# ==========================================================================
+
+
+def test_F3_action_authority_and_evidence_are_mutable_before_assessment(engine):
+    p = engine.create_proposal(
+        kind=ProposalKind.TASK_CREATION,
+        project="AICC",
+        title="t",
+        rationale="r",
+        policy=_stored_no_dispatch(),
+        evidence=_ev(),
+    )
+    p = runtime_db.update_proposal(
+        engine.db_path,
+        p["id"],
+        expected_version=p["version"],
+        fields={"parameters_json": '{"task_type":"implementation"}'},
+    )
+    runtime_db.append_proposal_evidence(
+        engine.db_path,
+        p["id"],
+        kind="repository",
+        source="test",
+        summary="clean",
+        observed_at="2026-07-23T12:00:00",
+    )
+    assert p["parameters_json"] == '{"task_type":"implementation"}'
+    assert len(engine.evidence(p["id"])) == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_id", "different-task"),
+        ("title", "rewritten title"),
+        ("rationale", "rewritten rationale"),
+        ("risk_level", RiskLevel.HIGH),
+        ("policy_json", AutonomyPolicy().to_json()),
+        ("eligibility_json", '{"decision":"BLOCKED"}'),
+        ("plan_json", '{"dispatch_route":"different"}'),
+        ("parameters_json", '{"task_type":"different"}'),
+        ("evidence_digest", "rewritten-digest"),
+    ],
+)
+def test_F3_authority_fields_are_frozen_after_assessment(engine, field, value):
+    p = engine.create_proposal(
+        kind=ProposalKind.TASK_CREATION,
+        project="AICC",
+        title="t",
+        rationale="r",
+        policy=_stored_no_dispatch(),
+        evidence=_ev(),
+    )
+    p = engine.assess(p["id"])
+    before = dict(p)
+
+    with pytest.raises(runtime_db.ProposalFieldFrozenError):
+        runtime_db.update_proposal(
+            engine.db_path,
+            p["id"],
+            expected_version=p["version"],
+            fields={field: value},
+        )
+
+    after = engine.get(p["id"])
+    assert after["version"] == before["version"]
+    assert after[field] == before[field]
+
+
+def test_F3_evidence_is_frozen_after_assessment(engine):
+    p = engine.create_proposal(
+        kind=ProposalKind.TASK_CREATION,
+        project="AICC",
+        title="t",
+        rationale="r",
+        policy=_stored_no_dispatch(),
+        evidence=_ev(),
+    )
+    p = engine.assess(p["id"])
+    before = engine.evidence(p["id"])
+
+    with pytest.raises(runtime_db.ProposalEvidenceFrozenError):
+        runtime_db.append_proposal_evidence(
+            engine.db_path,
+            p["id"],
+            kind="late",
+            source="test",
+            summary="must not alter assessed evidence",
+            observed_at="2026-07-23T12:00:00",
+        )
+
+    assert engine.evidence(p["id"]) == before
+
+
+def test_F3_stale_authority_writer_loses_cas_before_freeze_guard(engine):
+    p = engine.create_proposal(
+        kind=ProposalKind.TASK_CREATION,
+        project="AICC",
+        title="t",
+        rationale="r",
+        policy=_stored_no_dispatch(),
+        evidence=_ev(),
+    )
+    stale_version = p["version"]
+    engine.assess(p["id"])
+
+    with pytest.raises(runtime_db.LostUpdateError):
+        runtime_db.update_proposal(
+            engine.db_path,
+            p["id"],
+            expected_version=stale_version,
+            fields={"policy_json": AutonomyPolicy().to_json()},
+        )
 
 
 # ==========================================================================

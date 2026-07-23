@@ -35,6 +35,11 @@ def test_api_end_to_end_proposal_flow(api):
 
     plan = api.plan_proposal(p["id"])
     assert plan["dispatch_route"] == "db.create_task"
+    assert plan["parameters"] == {
+        "project": "AICC",
+        "task_type": "implementation",
+        "title": "Add tests",
+    }
 
     p = api.approve_proposal(p["id"], actor="dima@me.com", reason="ok")
     assert p["state"] == ProposalState.APPROVED

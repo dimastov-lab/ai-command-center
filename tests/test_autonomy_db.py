@@ -1,8 +1,8 @@
-"""Persistence-layer tests for the autonomy proposal tables (migration 6).
+"""Persistence-layer tests for autonomy proposals (migrations 6 and 7).
 
 Covers create/get/list, compare-and-set updates, the structural transition
-guard, the field allowlist, immutable evidence rows, and append-only event
-ordering — plus malformed input."""
+guard, lifecycle-scoped field freezing, immutable action parameters/evidence,
+and append-only event ordering — plus real upgrade/preservation paths."""
 
 from __future__ import annotations
 
@@ -32,18 +32,140 @@ def _proposal(db_path, **overrides):
     return runtime_db.create_proposal(db_path, **kwargs)
 
 
+def _migrations_through(version):
+    return [item for item in runtime_db.MIGRATIONS if item[0] <= version]
+
+
 # --------------------------------------------------------------------------
 # Migration
 # --------------------------------------------------------------------------
 
 
-def test_schema_migrated_to_6(db_path):
-    assert runtime_db.current_schema_version(db_path) == 6
+def test_schema_migrated_to_7(db_path):
+    assert runtime_db.current_schema_version(db_path) == 7
 
 
 def test_migrate_is_idempotent(db_path):
     runtime_db.migrate(db_path)
+    assert runtime_db.current_schema_version(db_path) == 7
+
+
+def test_v5_to_v6_migration_preserves_runtime_and_completion_rows(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime-v5.db"
+    all_migrations = list(runtime_db.MIGRATIONS)
+    monkeypatch.setattr(runtime_db, "MIGRATIONS", _migrations_through(5))
+    runtime_db.migrate(db_path)
+    assert runtime_db.current_schema_version(db_path) == 5
+
+    task = runtime_db.create_task(
+        db_path, project="AICC", title="preserve", task_type="implementation"
+    )
+    session = runtime_db.create_session(
+        db_path,
+        task_id=task["id"],
+        project="AICC",
+        repository_path="/tmp/preserve",
+    )
+    run = runtime_db.create_run(
+        db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AICC",
+        task_type="implementation",
+        repository_path="/tmp/preserve",
+        prompt="preserve me",
+        is_resume=False,
+    )
+    completion = runtime_db.create_completion(
+        db_path,
+        run_id=run["id"],
+        task_id=task["id"],
+        session_id=session["id"],
+        project="AICC",
+        repository_path="/tmp/preserve",
+        completion_state="EXECUTION_FINISHED",
+    )
+
+    monkeypatch.setattr(
+        runtime_db,
+        "MIGRATIONS",
+        [item for item in all_migrations if item[0] <= 6],
+    )
+    runtime_db.migrate(db_path)
+
     assert runtime_db.current_schema_version(db_path) == 6
+    assert runtime_db.get_task(db_path, task["id"])["title"] == "preserve"
+    assert runtime_db.get_session(db_path, session["id"])["repository_path"] == "/tmp/preserve"
+    assert runtime_db.get_run(db_path, run["id"])["prompt"] == "preserve me"
+    assert runtime_db.get_completion(db_path, completion["run_id"])["completion_state"] == (
+        "EXECUTION_FINISHED"
+    )
+    assert runtime_db.list_proposals(db_path) == []
+
+
+def test_v6_to_v7_migration_backfills_parameters_and_preserves_proposal_children(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "runtime-v6.db"
+    all_migrations = list(runtime_db.MIGRATIONS)
+    monkeypatch.setattr(runtime_db, "MIGRATIONS", _migrations_through(6))
+    runtime_db.migrate(db_path)
+    assert runtime_db.current_schema_version(db_path) == 6
+
+    task = runtime_db.create_task(
+        db_path, project="AICC", title="legacy proposal task", task_type="implementation"
+    )
+    now = "2026-07-23T12:00:00"
+    with runtime_db.connect(db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                """INSERT INTO proposal
+                       (id, kind, project, task_id, title, rationale, state,
+                        risk_level, requires_human, version, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "proposal-v6",
+                    A.ProposalKind.TASK_CREATION,
+                    "AICC",
+                    task["id"],
+                    "legacy",
+                    "created before parameters_json",
+                    A.ProposalState.DRAFT,
+                    A.RiskLevel.LOW,
+                    1,
+                    0,
+                    now,
+                    now,
+                ),
+            )
+    runtime_db.append_proposal_evidence(
+        db_path,
+        "proposal-v6",
+        kind="gap",
+        source="migration-test",
+        summary="preserve evidence",
+        observed_at=now,
+    )
+    runtime_db.append_proposal_event(
+        db_path,
+        "proposal-v6",
+        A.EventType.CREATED,
+        to_state=A.ProposalState.DRAFT,
+    )
+
+    monkeypatch.setattr(runtime_db, "MIGRATIONS", all_migrations)
+    runtime_db.migrate(db_path)
+
+    assert runtime_db.current_schema_version(db_path) == 7
+    proposal = runtime_db.get_proposal(db_path, "proposal-v6")
+    assert proposal["parameters_json"] == "{}"
+    assert proposal["task_id"] == task["id"]
+    assert len(runtime_db.list_proposal_evidence(db_path, proposal["id"])) == 1
+    assert len(runtime_db.list_proposal_events(db_path, proposal["id"])) == 1
+    with runtime_db.connect(db_path) as conn:
+        columns = {row["name"]: row for row in conn.execute("PRAGMA table_info(proposal)")}
+    assert columns["parameters_json"]["notnull"] == 1
+    assert columns["parameters_json"]["dflt_value"] == "'{}'"
 
 
 # --------------------------------------------------------------------------
@@ -52,13 +174,25 @@ def test_migrate_is_idempotent(db_path):
 
 
 def test_create_and_get_proposal(db_path):
-    row = _proposal(db_path)
+    row = _proposal(
+        db_path,
+        parameters_json='{"task_type": "implementation", "repository_path": "/tmp/r"}',
+    )
     assert row["version"] == 0
     assert row["requires_human"] == 1
+    assert row["parameters_json"] == (
+        '{"repository_path":"/tmp/r","task_type":"implementation"}'
+    )
     fetched = runtime_db.get_proposal(db_path, row["id"])
     assert fetched["state"] == A.ProposalState.DRAFT
     assert fetched["rationale"] == "Coverage gap detected"
     assert fetched["risk_level"] == A.RiskLevel.LOW
+
+
+@pytest.mark.parametrize("parameters_json", ["[]", '"scalar"', "not-json"])
+def test_create_proposal_rejects_non_object_parameters(db_path, parameters_json):
+    with pytest.raises(ValueError):
+        _proposal(db_path, parameters_json=parameters_json)
 
 
 def test_create_proposal_rejects_blank_rationale(db_path):
@@ -123,13 +257,27 @@ def test_update_proposal_illegal_transition_rejected(db_path):
                                    fields={"state": A.ProposalState.EXECUTED})
 
 
-def test_update_proposal_transition_guard_precedes_version_check(db_path):
-    # An illegal transition is rejected even with a stale expected_version — the
-    # structural guard runs before the CAS check (mirrors update_completion).
+def test_update_proposal_cas_precedes_transition_guard(db_path):
     row = _proposal(db_path)
-    with pytest.raises(runtime_db.InvalidProposalTransitionError):
+    runtime_db.update_proposal(
+        db_path,
+        row["id"],
+        expected_version=0,
+        fields={"state": A.ProposalState.PROPOSED},
+    )
+    # A stale caller always loses as stale, even when its target is illegal
+    # against the winner's newer state.
+    with pytest.raises(runtime_db.LostUpdateError):
         runtime_db.update_proposal(db_path, row["id"], expected_version=999,
                                    fields={"state": A.ProposalState.EXECUTED})
+    # A current caller still gets the structural state-machine error.
+    with pytest.raises(runtime_db.InvalidProposalTransitionError):
+        runtime_db.update_proposal(
+            db_path,
+            row["id"],
+            expected_version=1,
+            fields={"state": A.ProposalState.EXECUTED},
+        )
 
 
 def test_update_proposal_unknown_field_rejected(db_path):
@@ -137,6 +285,24 @@ def test_update_proposal_unknown_field_rejected(db_path):
     with pytest.raises(runtime_db.UnknownRunFieldError):
         runtime_db.update_proposal(db_path, row["id"], expected_version=0,
                                    fields={"kind": "hacked"})
+
+
+def test_persisted_assessment_marker_freezes_authority_before_state_routing(db_path):
+    row = _proposal(db_path)
+    assessed = runtime_db.update_proposal(
+        db_path,
+        row["id"],
+        expected_version=0,
+        fields={"eligibility_json": '{"decision":"ELIGIBLE"}'},
+    )
+
+    with pytest.raises(runtime_db.ProposalFieldFrozenError):
+        runtime_db.update_proposal(
+            db_path,
+            row["id"],
+            expected_version=assessed["version"],
+            fields={"parameters_json": '{"task_type":"different"}'},
+        )
 
 
 def test_update_missing_proposal_raises_keyerror(db_path):
@@ -193,11 +359,38 @@ def test_events_are_appended_and_ordered(db_path):
     assert events[0]["metadata"] is None
 
 
-def test_evidence_and_events_cascade_delete_with_task(db_path):
-    # A proposal referencing a task keeps working after the task row is gone
-    # (ON DELETE SET NULL), and its own children remain queryable.
+def test_task_delete_sets_null_and_proposal_delete_cascades_children(db_path):
     task = runtime_db.create_task(db_path, project="AICC", title="t", task_type="implementation")
     row = _proposal(db_path, task_id=task["id"])
+    runtime_db.append_proposal_evidence(
+        db_path,
+        row["id"],
+        kind="gap",
+        source="test",
+        summary="preserve until proposal deletion",
+        observed_at="2026-07-23T12:00:00",
+    )
     runtime_db.append_proposal_event(db_path, row["id"], A.EventType.CREATED)
+    with runtime_db.connect(db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute("DELETE FROM task WHERE id = ?", (task["id"],))
+
     fetched = runtime_db.get_proposal(db_path, row["id"])
-    assert fetched["task_id"] == task["id"]
+    assert fetched["task_id"] is None
+    assert len(runtime_db.list_proposal_evidence(db_path, row["id"])) == 1
+    assert len(runtime_db.list_proposal_events(db_path, row["id"])) == 1
+
+    with runtime_db.connect(db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute("DELETE FROM proposal WHERE id = ?", (row["id"],))
+        evidence_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM proposal_evidence WHERE proposal_id = ?",
+            (row["id"],),
+        ).fetchone()["n"]
+        event_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM proposal_event WHERE proposal_id = ?",
+            (row["id"],),
+        ).fetchone()["n"]
+    assert runtime_db.get_proposal(db_path, row["id"]) is None
+    assert evidence_count == 0
+    assert event_count == 0

@@ -192,6 +192,7 @@ class ExecutionCenterAPI:
         evidence: list | None = None,
         task_id: str | None = None,
         policy: "autonomy.AutonomyPolicy | None" = None,
+        parameters: dict | None = None,
     ) -> dict:
         return self.autonomy.create_proposal(
             kind=kind,
@@ -201,6 +202,7 @@ class ExecutionCenterAPI:
             evidence=evidence,
             task_id=task_id,
             policy=policy,
+            parameters=parameters,
         )
 
     def assess_proposal(self, proposal_id: str, *, policy=None, now=None) -> dict:

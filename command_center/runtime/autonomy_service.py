@@ -34,6 +34,7 @@ Safety invariants enforced here:
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from command_center.models import iso_now
@@ -105,6 +106,45 @@ class AutonomyEngine:
             for r in rows
         ]
 
+    def _action_parameters(self, row: dict) -> dict:
+        """Load and re-bind the immutable action payload to proposal identity.
+
+        A malformed JSON blob, a deleted FK that changed ``task_id`` to NULL,
+        or a duplicated identity value that no longer agrees all fail closed.
+        """
+        raw = row.get("parameters_json") or "{}"
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ProposalError("Proposal action parameters are not valid JSON") from exc
+        try:
+            return autonomy.canonical_action_parameters(
+                kind=row["kind"],
+                project=row["project"],
+                title=row["title"],
+                task_id=row.get("task_id"),
+                parameters=parsed,
+            )
+        except ValueError as exc:
+            raise ProposalError(f"Proposal action parameters are invalid: {exc}") from exc
+
+    def _build_plan(self, row: dict) -> autonomy.ExecutionPlan:
+        return autonomy.build_execution_plan(
+            kind=row["kind"],
+            title=row["title"],
+            rationale=row["rationale"],
+            parameters=self._action_parameters(row),
+        )
+
+    @staticmethod
+    def _result_created_after_dispatch(row: dict, result: dict) -> bool:
+        try:
+            return datetime.fromisoformat(result["created_at"]) >= datetime.fromisoformat(
+                row["updated_at"]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
     def _transition(
         self,
         row: dict,
@@ -161,6 +201,7 @@ class AutonomyEngine:
         evidence: list[autonomy.Evidence] | None = None,
         task_id: str | None = None,
         policy: autonomy.AutonomyPolicy | None = None,
+        parameters: dict | None = None,
     ) -> dict:
         """Create a proposal in DRAFT with its evidence attached.
 
@@ -173,6 +214,19 @@ class AutonomyEngine:
         evidence = list(evidence or [])
         risk = autonomy.classify_risk(kind, evidence)
         digest = autonomy.evidence_digest(evidence)
+        action_parameters = autonomy.canonical_action_parameters(
+            kind=kind,
+            project=project,
+            title=title,
+            task_id=task_id,
+            parameters=parameters,
+        )
+        initial_plan = autonomy.build_execution_plan(
+            kind=kind,
+            title=title,
+            rationale=rationale,
+            parameters=action_parameters,
+        )
         # One atomic unit (F2): the proposal row, its immutable evidence, its
         # digest, and the CREATED audit event all commit together or not at all.
         return db.create_proposal_atomic(
@@ -185,6 +239,12 @@ class AutonomyEngine:
             risk_level=risk,
             task_id=task_id,
             policy_json=policy.to_json() if policy is not None else None,
+            parameters_json=json.dumps(
+                action_parameters,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
             requires_human=True,
             evidence_digest=digest,
             evidence=[e.to_dict() for e in evidence],
@@ -192,7 +252,13 @@ class AutonomyEngine:
                 "event_type": autonomy.EventType.CREATED,
                 "to_state": autonomy.ProposalState.DRAFT,
                 "message": rationale,
-                "metadata": {"kind": kind, "risk_level": risk, "evidence_count": len(evidence)},
+                "metadata": {
+                    "kind": kind,
+                    "risk_level": risk,
+                    "evidence_count": len(evidence),
+                    "action_digest": initial_plan.action_digest,
+                    "action_executable": initial_plan.executable,
+                },
             },
         )
 
@@ -227,12 +293,7 @@ class AutonomyEngine:
         verdict = autonomy.evaluate_eligibility(
             kind=row["kind"], evidence=evidence, policy=resolved_policy, now=assessed_at
         )
-        plan = autonomy.build_execution_plan(
-            kind=row["kind"],
-            title=row["title"],
-            rationale=row["rationale"],
-            parameters={"task_id": row.get("task_id"), "project": row["project"]},
-        )
+        plan = self._build_plan(row)
         digest = autonomy.evidence_digest(evidence)
 
         # The verdict, its ASSESSED event, and every state transition below are
@@ -348,12 +409,7 @@ class AutonomyEngine:
         row = self._require(proposal_id)
         if row.get("plan_json"):
             return json.loads(row["plan_json"])
-        return autonomy.build_execution_plan(
-            kind=row["kind"],
-            title=row["title"],
-            rationale=row["rationale"],
-            parameters={"task_id": row.get("task_id"), "project": row["project"]},
-        ).to_dict()
+        return self._build_plan(row).to_dict()
 
     # ------------------------------------------------------------------
     # Human decision gates
@@ -476,7 +532,65 @@ class AutonomyEngine:
             "runtime_policy_fingerprint": autonomy.policy_fingerprint(policy),
             "effective_policy_fingerprint": autonomy.policy_fingerprint(resolved_policy),
         }
-        if not resolved_policy.allow_execution_dispatch:
+        refusal_reason: str | None = None
+        refusal_message: str | None = None
+        if not resolved_policy.enabled:
+            refusal_reason = autonomy.ReasonCode.POLICY_DISABLED
+            refusal_message = "dispatch refused: effective policy is disabled"
+        elif not resolved_policy.allows_kind(row["kind"]):
+            refusal_reason = autonomy.ReasonCode.KIND_NOT_ALLOWED
+            refusal_message = "dispatch refused: proposal kind is not allowed by effective policy"
+        elif not resolved_policy.allow_execution_dispatch:
+            refusal_reason = autonomy.ReasonCode.DISPATCH_DISABLED
+            refusal_message = (
+                "dispatch refused: effective policy.allow_execution_dispatch is False"
+            )
+
+        try:
+            rebuilt_plan = self._build_plan(row).to_dict()
+        except ProposalError as exc:
+            refusal_reason = autonomy.ReasonCode.ACTION_PAYLOAD_INVALID
+            refusal_message = f"dispatch refused: {exc}"
+            rebuilt_plan = None
+
+        if refusal_reason is None and rebuilt_plan is not None:
+            try:
+                stored_plan = json.loads(row.get("plan_json") or "")
+            except (TypeError, ValueError):
+                stored_plan = None
+            if (
+                type(stored_plan) is not dict
+                or stored_plan.get("action_digest") != rebuilt_plan["action_digest"]
+                or stored_plan.get("parameters") != rebuilt_plan["parameters"]
+                or not rebuilt_plan["executable"]
+            ):
+                refusal_reason = autonomy.ReasonCode.ACTION_PAYLOAD_INVALID
+                refusal_message = (
+                    "dispatch refused: assessed action payload is missing, incomplete, "
+                    "or does not match its persisted digest"
+                )
+
+        evidence = self._load_evidence(proposal_id)
+        if refusal_reason is None:
+            current_digest = autonomy.evidence_digest(evidence)
+            if current_digest != row.get("evidence_digest"):
+                refusal_reason = autonomy.ReasonCode.EVIDENCE_MISMATCH
+                refusal_message = "dispatch refused: frozen evidence no longer matches its digest"
+            else:
+                current_verdict = autonomy.evaluate_eligibility(
+                    kind=row["kind"],
+                    evidence=evidence,
+                    policy=resolved_policy,
+                    now=iso_now(),
+                )
+                if current_verdict.decision == autonomy.DECISION_BLOCKED:
+                    refusal_reason = current_verdict.primary_reason
+                    refusal_message = (
+                        "dispatch refused: current evidence/policy eligibility is "
+                        f"blocked ({current_verdict.primary_reason})"
+                    )
+
+        if refusal_reason is not None:
             # The proposal stays APPROVED; nothing crosses the boundary. Record
             # the refusal (with the fingerprints and result) in the audit trail
             # without a state change.
@@ -487,15 +601,12 @@ class AutonomyEngine:
                 from_state=row["state"],
                 to_state=row["state"],
                 actor=actor,
-                reason_code=autonomy.ReasonCode.DISPATCH_DISABLED,
-                message="dispatch refused: effective policy.allow_execution_dispatch is False",
+                reason_code=refusal_reason,
+                message=refusal_message,
                 metadata={**policy_prints, "dispatch_allowed": False},
             )
-            raise DispatchNotPermittedError(
-                "Effective policy does not allow execution dispatch "
-                "(persisted ∩ runtime allow_execution_dispatch is False)"
-            )
-        plan = self.plan(proposal_id)
+            raise DispatchNotPermittedError(refusal_message or "Execution dispatch is not permitted")
+        plan = rebuilt_plan
         updated = self._transition(
             row,
             autonomy.ProposalState.DISPATCHED,
@@ -520,7 +631,93 @@ class AutonomyEngine:
         proposal points at the real work it authorised."""
         if not actor or not str(actor).strip():
             raise ValueError("confirm_execution requires a non-empty actor")
+        if run_id is None and task_id is None:
+            raise ValueError("confirm_execution requires a resulting run_id or task_id")
         row = self._require(proposal_id)
+        if row["state"] != autonomy.ProposalState.DISPATCHED:
+            raise IllegalProposalActionError(
+                f"Only a DISPATCHED proposal may be confirmed; state is {row['state']!r}"
+            )
+        try:
+            plan = self._build_plan(row).to_dict()
+        except ProposalError as exc:
+            raise IllegalProposalActionError(str(exc)) from exc
+        params = plan["parameters"]
+        kind = row["kind"]
+
+        mismatch: str | None = None
+        if kind == autonomy.ProposalKind.TASK_CREATION:
+            if run_id is not None or task_id is None:
+                mismatch = "TASK_CREATION confirmation requires only task_id"
+            else:
+                task = db.get_task(self.db_path, task_id)
+                if task is None:
+                    mismatch = f"confirmed task {task_id!r} does not exist"
+                elif any(
+                    task.get(key) != params.get(key)
+                    for key in ("project", "title", "task_type")
+                ) or task.get("legacy_task_id") is not None:
+                    mismatch = "confirmed task does not match the authorised action payload"
+                elif not self._result_created_after_dispatch(row, task):
+                    mismatch = "confirmed task predates the proposal dispatch"
+        elif kind == autonomy.ProposalKind.TASK_EXECUTION:
+            if task_id is not None or run_id is None:
+                mismatch = "TASK_EXECUTION confirmation requires only run_id"
+            else:
+                run = db.get_run(self.db_path, run_id)
+                if run is None:
+                    mismatch = f"confirmed run {run_id!r} does not exist"
+                else:
+                    expected_path = str(Path(params["repository_path"]).expanduser().resolve())
+                    actual_path = str(Path(run["repository_path"]).expanduser().resolve())
+                    instruction = params["instruction"].strip()
+                    prompt = (run.get("prompt") or "").strip()
+                    if (
+                        run.get("task_id") != params.get("task_id")
+                        or run.get("project") != params.get("project")
+                        or run.get("task_type") != params.get("task_type")
+                        or run.get("expected_branch") != params.get("expected_branch")
+                        or actual_path != expected_path
+                        or prompt != instruction
+                    ):
+                        mismatch = "confirmed run does not match the authorised action payload"
+                    elif not self._result_created_after_dispatch(row, run):
+                        mismatch = "confirmed run predates the proposal dispatch"
+        elif kind in {
+            autonomy.ProposalKind.PRIORITY_CHANGE,
+            autonomy.ProposalKind.DEPENDENCY_LINK,
+        }:
+            if run_id is not None or task_id is None or task_id != params.get("task_id"):
+                mismatch = f"{kind} confirmation requires its authorised task_id"
+            elif db.get_task(self.db_path, task_id) is None:
+                mismatch = f"confirmed task {task_id!r} does not exist"
+            elif (
+                kind == autonomy.ProposalKind.DEPENDENCY_LINK
+                and db.get_task(self.db_path, params["dependency_task_id"]) is None
+            ):
+                mismatch = "authorised dependency task does not exist"
+        elif kind == autonomy.ProposalKind.MERGE:
+            mismatch = (
+                "MERGE confirmation is unavailable until a durable merge-result "
+                "evidence route is implemented"
+            )
+        else:
+            mismatch = f"unsupported proposal kind {kind!r}"
+
+        if mismatch is not None:
+            db.append_proposal_event(
+                self.db_path,
+                proposal_id,
+                autonomy.EventType.EXECUTION,
+                from_state=row["state"],
+                to_state=row["state"],
+                actor=actor,
+                reason_code=autonomy.ReasonCode.EXECUTION_MISMATCH,
+                message=mismatch,
+                metadata={"run_id": run_id, "task_id": task_id},
+            )
+            raise IllegalProposalActionError(mismatch)
+
         extra: dict = {}
         if run_id is not None:
             extra["dispatched_run_id"] = run_id
