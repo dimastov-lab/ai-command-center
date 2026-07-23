@@ -36,6 +36,7 @@ from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
     content_area,
+    portfolio_overview_panel,
     portfolio_panel,
     project_intelligence_panel,
     project_selector,
@@ -186,6 +187,7 @@ NAV: dict[str, tuple[str, str]] = {
     "workspace": ("Workspace Launcher", ":material/rocket_launch:"),
     "focus": ("Focus Mode", ":material/center_focus_strong:"),
     "portfolio": ("Portfolio Execution", ":material/inventory_2:"),
+    "portfolio_overview": ("Portfolio Overview", ":material/hub:"),
 }
 
 
@@ -3547,3 +3549,7 @@ elif page_key == "portfolio":
         root=ROOT,
         execution_center_api=get_execution_center_api(),
     )
+
+elif page_key == "portfolio_overview":
+    st.subheader("Portfolio Overview")
+    portfolio_overview_panel.render_portfolio_overview_panel(root=ROOT)
