@@ -750,6 +750,12 @@ class CompletionOrchestrator:
             # re-read and the compare-and-set. Its progress is authoritative;
             # do not clobber it and do not raise (which would abort the batch).
             return
+        except KeyError:
+            # The row was deleted (run/task cascade) between the fresh read above
+            # and the CAS write inside `_transition` (`update_completion` raises
+            # KeyError for a missing row). That is benign concurrent cleanup —
+            # nothing left to escalate — and must not abort the batch either.
+            return
         runtime_db.append_completion_event(
             self.db_path, row["run_id"], EV_REQUIRES_ATTENTION, reason_code=reason_code, message=recommended
         )

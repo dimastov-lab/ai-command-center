@@ -66,6 +66,13 @@ def _orch(db_path):
     return CompletionOrchestrator(db_path, github=FakeGitHubClient())
 
 
+def _delete_completion(db_path, run_id):
+    """Simulate a concurrent run/task cascade removing the completion row."""
+    with runtime_db.connect(db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute("DELETE FROM completion WHERE run_id = ?", (run_id,))
+
+
 def _events(db_path, run_id):
     return [e["event_type"] for e in runtime_db.list_completion_events(db_path, run_id)]
 
@@ -318,3 +325,121 @@ def test_advance_pending_concurrent_invalid_transition_is_benign(db_path, monkey
     assert after["completion_state"] == CompletionState.COMPLETED  # winner preserved
     assert after["requires_human"] == 0
     assert EV_REQUIRES_ATTENTION not in _events(db_path, run["id"])
+
+
+# ---------------------------------------------------------------------------
+# M-1 — a row deleted *during* _mark_attention is a benign no-op (KeyError)
+# ---------------------------------------------------------------------------
+def test_mark_attention_row_deleted_between_read_and_cas_is_noop(db_path, monkeypatch):
+    """`_mark_attention` re-reads the row, then writes via CAS. If the row is
+    deleted in that window (run/task cascade), `update_completion` raises
+    KeyError. That must be swallowed as benign concurrent cleanup — no raise,
+    no resurrection of the row — not propagated (which would abort the batch).
+
+    Fails on b8ae697 (KeyError escapes `_mark_attention`); passes after the fix."""
+    orch = _orch(db_path)
+    run = _make_run(db_path)
+    row = _seed(db_path, run, CompletionState.AWAITING_MERGE)
+
+    real_get = runtime_db.get_completion
+
+    def deleting_get(db_path_, run_id):
+        # `_mark_attention`'s single fresh read returns the live row, but the row
+        # vanishes immediately afterwards — before `_transition`'s CAS write.
+        fetched = real_get(db_path_, run_id)
+        if fetched is not None:
+            _delete_completion(db_path_, run_id)
+        return fetched
+
+    monkeypatch.setattr(runtime_db, "get_completion", deleting_get)
+    orch._mark_attention(row, now=NOW, reason_code="X", recommended="deleted mid-escalation")
+    monkeypatch.undo()
+
+    # Row stayed deleted (never re-created as REQUIRES_ATTENTION), no exception.
+    assert runtime_db.get_completion(db_path, run["id"]) is None
+
+
+def test_advance_pending_row_deleted_mid_attention_does_not_abort_batch(db_path, monkeypatch):
+    """End-to-end M-1: row A's advance fails, and A is deleted in the window
+    inside `_mark_attention` (after its fresh read, before its CAS). The batch
+    must not abort — the unrelated healthy row B is still processed and is never
+    falsely escalated.
+
+    Fails on b8ae697 (KeyError aborts `advance_pending`); passes after the fix."""
+    orch = _orch(db_path)
+    run_a = _make_run(db_path)
+    _seed(db_path, run_a, CompletionState.AWAITING_MERGE)
+    run_b = _make_run(db_path)
+    _seed(db_path, run_b, CompletionState.EXECUTION_FINISHED)
+
+    def fake_advance(run_id, *, now=None):
+        if run_id == run_a["id"]:
+            raise RuntimeError("advance blew up for A")
+        return AdvanceResult(run_id, "EXECUTION_FINISHED", "EXECUTION_FINISHED", None, changed=False)
+
+    monkeypatch.setattr(orch, "advance", fake_advance)
+
+    real_get = runtime_db.get_completion
+    a_reads = {"n": 0}
+
+    def deleting_get(db_path_, run_id):
+        fetched = real_get(db_path_, run_id)
+        if run_id == run_a["id"] and fetched is not None:
+            a_reads["n"] += 1
+            # 1st read = the generic handler's `fresh`; 2nd read = inside
+            # `_mark_attention`. Delete right after that second read, before CAS.
+            if a_reads["n"] == 2:
+                _delete_completion(db_path_, run_id)
+        return fetched
+
+    monkeypatch.setattr(runtime_db, "get_completion", deleting_get)
+    results = orch.advance_pending(now=NOW)  # must NOT raise
+    monkeypatch.undo()
+
+    assert any(r.run_id == run_b["id"] for r in results)  # batch continued to B
+    assert runtime_db.get_completion(db_path, run_a["id"]) is None  # A deleted, not resurrected
+    b = runtime_db.get_completion(db_path, run_b["id"])
+    assert b["completion_state"] == CompletionState.EXECUTION_FINISHED  # B untouched
+    assert b["requires_human"] == 0  # no false attention on the unrelated row
+
+
+# ---------------------------------------------------------------------------
+# N-1 — a genuine (same-version) illegal transition still escalates, once
+# ---------------------------------------------------------------------------
+def test_advance_pending_genuine_invalid_transition_escalates_once(db_path, monkeypatch):
+    """The `InvalidCompletionTransitionError` branch of `advance_pending` when
+    the re-read row is still non-terminal: a genuine state-machine error (not a
+    stale race, so the row is not concurrently advanced) is surfaced by escalating
+    the row to REQUIRES_ATTENTION exactly once — audit event only after the CAS
+    commits — while unrelated rows keep advancing. Genuine errors are not
+    silently ignored."""
+    orch = _orch(db_path)
+    run_a = _make_run(db_path)
+    _seed(db_path, run_a, CompletionState.AWAITING_MERGE)
+    run_b = _make_run(db_path)
+    _seed(db_path, run_b, CompletionState.EXECUTION_FINISHED)
+
+    def fake_advance(run_id, *, now=None):
+        if run_id == run_a["id"]:
+            # No concurrent modification -> version still matches -> this is a
+            # genuine illegal transition at the current version, not a race.
+            raise runtime_db.InvalidCompletionTransitionError("genuine illegal move")
+        return AdvanceResult(run_id, "EXECUTION_FINISHED", "EXECUTION_FINISHED", None, changed=False)
+
+    monkeypatch.setattr(orch, "advance", fake_advance)
+    results = orch.advance_pending(now=NOW)
+
+    a = runtime_db.get_completion(db_path, run_a["id"])
+    assert a["completion_state"] == CompletionState.REQUIRES_ATTENTION  # escalated, not ignored
+    assert a["requires_human"] == 1
+    events_a = _events(db_path, run_a["id"])
+    assert events_a.count(EV_REQUIRES_ATTENTION) == 1  # exactly once
+    assert EV_STATE_CHANGED in events_a  # persisted transition recorded
+    # STATE_CHANGED (emitted inside _transition after the CAS commits) precedes
+    # the REQUIRES_ATTENTION event, confirming the event follows persistence.
+    assert events_a.index(EV_STATE_CHANGED) < events_a.index(EV_REQUIRES_ATTENTION)
+
+    assert any(r.run_id == run_b["id"] for r in results)  # batch continued
+    b = runtime_db.get_completion(db_path, run_b["id"])
+    assert b["completion_state"] == CompletionState.EXECUTION_FINISHED  # unrelated row untouched
+    assert b["requires_human"] == 0
