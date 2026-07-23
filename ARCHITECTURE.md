@@ -1,363 +1,400 @@
 # AI Command Center — Architecture
 
-This document describes how the application is built as of **v1.2**. It reflects the code in
-`app.py` and `command_center/`, not aspirations — if this file and the code disagree, the code is
-authoritative. §§1–10 describe the v1.1 baseline (still accurate); §11 describes what v1.2 added.
+This document describes the architecture implemented on `main`. Current code, tests, accepted
+ADRs, and runtime operator documentation are authoritative if another document conflicts with this
+description.
 
-A future native desktop application will reuse `command_center/` and `command_center/runtime/`
-unchanged, adding new `command_center.desktop`/`command_center.application`/
-`command_center.platform` packages alongside this Streamlit application rather than replacing
-any of it — see `docs/desktop/ARCHITECTURE.md` for that target architecture (status: D0,
-documentation only, no desktop code yet).
+The current product is a Streamlit application. The native PySide6 design under
+[`docs/desktop/`](docs/desktop/README.md) is a planned architecture only: no PySide6 client,
+desktop package, or native installer is implemented.
 
-## 1. Shape of the system
+## 1. System context
 
-AI Command Center is a **single-process, single-file, local-only Streamlit application**. There
-is no backend service, no database, and no network dependency beyond what `pip install streamlit`
-pulls in.
+AI Command Center is a local engineering control plane. A browser connects to a Streamlit server
+running `app.py`; that Python process reads local planning and Portfolio files, persists execution
+state in SQLite, starts local Claude CLI subprocesses, inspects and mutates explicitly selected Git
+worktrees through bounded services, and can use the local `gh` CLI for completion workflows.
 
-```
-Browser (Streamlit client)
-        │  HTTP / WebSocket, localhost only
-        ▼
-Streamlit server  ──  app.py  (re-executed top-to-bottom on every interaction)
-        │                                   │
-        ├── reads/writes ──────────────────►│ data/tasks.json          (Kanban task store)
-        ├── reads ──────────────────────────►│ projects/*.md            (project status)
-        ├── reads ──────────────────────────►│ context/*_CONTEXT.md     (project context)
-        ├── reads ──────────────────────────►│ generated/<PROJECT>/*.md (AI task files)
-        ├── reads ──────────────────────────►│ reports/<PROJECT>/*.md   (AI report files)
-        ├── reads ──────────────────────────►│ CURRENT_STATE.md, DECISIONS.md, INBOX.md
-        ├── subprocess ─────────────────────►│ scripts/start-task.sh    (fixed args, timeout)
-        ├── subprocess ─────────────────────►│ git <read-only subcommand>
-        │
-        ├── calls ──────────────────────────►│ command_center/ (v1.2, see §11)
-        │                                        ├── writes/reads data/runs.jsonl, chats.json,
-        │                                        │   activity.jsonl, project_config.json
-        │                                        ├── subprocess ──► claude CLI (-p, fixed args,
-        │                                        │   timeout, restricted tool permissions)
-        │                                        └── writes reports/<PROJECT>/*.md (full reports)
-        └── subprocess (optional) ──────────►│ OpenAI SDK (Responses API), only if
-                                                 OPENAI_API_KEY + OPENAI_MODEL are set
+It is not a distributed scheduler or a durable remote-worker platform.
+
+```mermaid
+flowchart LR
+    Operator["Engineer in browser"] --> Streamlit["Streamlit server<br/>app.py"]
+    Streamlit --> UI["command_center/ui"]
+    Streamlit --> Services["command_center services"]
+
+    Services --> Planning["data/tasks.json<br/>planning and Kanban"]
+    Services --> Queue["data/execution_queue.json<br/>execution queue"]
+    Services --> Runtime["data/runtime.db<br/>runtime and completion"]
+    Services --> Legacy["JSON and JSONL<br/>legacy state"]
+    Services --> Portfolio["Portfolio cards and<br/>Portfolio registries"]
+    Services --> Artifacts["reports and generated files"]
+
+    Services --> Supervisor["Runtime Supervisor"]
+    Supervisor --> Claude["Local Claude CLI<br/>process group"]
+    Services --> Git["Local Git repositories<br/>branches and worktrees"]
+    Services --> GitHub["GitHub through gh CLI"]
+
+    Streamlit -. "planned, not implemented" .-> Desktop["Native PySide6 client"]
 ```
 
-Everything the app knows comes from the filesystem under the repository root, plus
-`data/tasks.json` and (v1.2) `data/runs.jsonl`, `data/chats.json`, `data/activity.jsonl`,
-`data/project_config.json`. There is no hidden state anywhere else, and no database.
+Streamlit itself serves HTTP and WebSocket traffic. The repository does not configure
+`server.address`, and `scripts/start-ui.sh` does not add a bind address. Operators must explicitly
+bind Streamlit to localhost when network exposure is not intended. The application has no
+authentication layer.
 
-## 2. Execution model
+## 2. UI and service boundaries
 
-Streamlit re-runs `app.py` from top to bottom on every user interaction (widget change, button
-click, `st.rerun()`). `app.py` is intentionally kept as a **direct script**, not wrapped in a
-`main()` function, per the project's Streamlit conventions — this is idiomatic for Streamlit and
-keeps the top-to-bottom re-run model visible in the code itself.
+### 2.1 Streamlit host
 
-A single run does, in order:
+`app.py` is a direct Streamlit script and is re-executed top to bottom on interactions. It:
 
-1. Resolve any staged cross-page navigation (`pending_*` session-state keys — see §5).
-2. `st.set_page_config(...)`, with the sidebar defaulting to collapsed only when Focus Mode
-   (`nav_page == "focus"`) is the active page.
-3. Render the title/caption and the sidebar (command-palette trigger button + page navigation
-   radio + footer captions).
-4. `tasks = load_tasks()` — read and normalize `data/tasks.json` for this run.
-5. Render the command palette dialog if it has been opened.
-6. Dispatch to exactly one page section via an `if page_key == "...": ... elif ...` chain.
+- configures the page and sidebar;
+- applies staged cross-page navigation;
+- loads planning tasks;
+- caches one `ExecutionCenterAPI` and process-local Supervisor per Streamlit server process;
+- performs startup runtime reconciliation once for that cached resource;
+- renders top-level pages through a flat `if/elif` route;
+- uses timed Streamlit fragments to poll execution and completion views.
 
-There is no routing framework and no multi-page-app folder (`app_pages/`) — a single flat
-`if/elif` chain keyed by `page_key` (the sidebar radio's value) implements all 13 pages. This was
-a deliberate choice to preserve the original single-entry-point architecture rather than introduce
-Streamlit's `st.navigation`/`st.Page` machinery.
+The 19 current navigation destinations are Dashboard, Workspace Home, Executive, Create Task,
+Project Chat, Kanban, AI Agents, Live Execution Center, Run Journal, Timeline, Projects,
+Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode, Portfolio
+Execution, and Portfolio Overview.
 
-## 3. Module layout (inside `app.py`)
+`app.py` remains a large presentation and orchestration surface. Extracted panels live in
+`command_center/ui/`, including execution queue, Execution Center, completion, workspace home,
+Portfolio execution, and Portfolio overview UI. `command_center/ui/` may import Streamlit;
+domain, storage, and runtime services remain plain Python.
 
-The file is organized into clearly delimited sections, in this order:
+### 2.2 Application and domain services
 
-| Section | Contents |
-|---|---|
-| Constants | `ROOT` and derived paths, `PROJECTS`, `CONTEXT_FILES`, `TASK_TYPES` (+ Russian labels), `AGENT_ROLES`, `KANBAN_COLUMNS`, `PRIORITIES` (+ colors), `GLOBAL_FILES`, `NAV` |
-| File and text helpers | `read_text`, `format_mtime`, `format_estimate`, `list_markdown_files`, `project_from_path`, `infer_task_type_from_filename`, `gather_activity`, `parse_project_statuses` |
-| Task persistence | `normalize_task`, `load_tasks`, `save_tasks`, `new_task_record`, `update_task_status`, `delete_task`, `task_label`, `unmet_dependencies`, `is_blocked` |
-| Task generation | `run_start_task_script` |
-| Git (read-only) | `run_git_command`, `get_git_status`, `get_git_log`, `get_git_diff_stat`, `get_git_branches`, `get_git_remotes`, `get_git_worktrees` |
-| Timeline | `build_timeline_events` |
-| Page setup | pending-navigation resolution, `st.set_page_config`, sidebar, command palette |
-| 13 page sections | one `if`/`elif` block per `NAV` entry (below) |
+Important service groups are:
 
-There is exactly one Python *script*: `app.py` is still the single Streamlit entry point and still
-owns every page's rendering, session-state, and navigation logic — no `pages/`/`app_pages/`
-directory, no `st.navigation`/`st.Page`. As of v1.2, `app.py` imports a small package,
-`command_center/`, for everything that isn't Streamlit rendering: storage, project configuration,
-the Claude Code runner, report parsing, chat providers, next-task suggestion, and the activity log.
-See §11 for that package's module layout. The split follows one rule: if a function calls `st.*`,
-it stays in `app.py`; if it doesn't, it lives in `command_center/`.
+- `models.py`, `tasks_repository.py`, and `storage.py`: planning model normalization, locked task
+  mutations, atomic JSON, and JSONL primitives;
+- `project_config.py`: project registry, repository paths, sensitivity, and completion policies;
+- `launch.py` and `launch_service.py`: workspace selection, read-only preflight, confirmation
+  state, and legacy/current launch bridges;
+- `execution_queue.py`: persisted queue entries and readiness;
+- `portfolio_models.py`, `portfolio_config.py`, `portfolio_launch.py`, and
+  `portfolio_intelligence.py`: Portfolio parsing, repository mapping, execution planning,
+  worktree orchestration, registry coordination, and read-only intelligence;
+- `worktree_launcher.py`: validated branch/worktree creation and attachment;
+- `runtime/api.py`: UI-facing execution facade;
+- `runtime/db.py`: SQLite schema, transactions, state guards, compare-and-swap updates, and
+  workspace locks;
+- `runtime/supervisor.py`: live subprocess ownership and lifecycle;
+- `runtime/task_sync.py`: runtime/completion projection into planning tasks;
+- `runtime/completion.py` and `runtime/completion_service.py`: completion state machine and
+  side-effect orchestrator;
+- `runtime/validation.py`, `runtime/git_ops.py`, `runtime/repo_state.py`, and
+  `runtime/github.py`: bounded validation, Git writes, Git inspection, and GitHub operations.
 
-## 4. Pages
+### 2.3 External process adapters
 
-Each `NAV` entry is `key -> (label, material_icon)`; the sidebar `st.radio(key="nav_page")`
-drives a flat dispatch:
+Subprocess-facing code uses fixed argument arrays and `shell=False`. The main adapters are:
 
-| Key | Page | Purpose |
+- Claude CLI execution;
+- read-only Git inspection;
+- worktree/branch orchestration;
+- completion Git push and branch recovery;
+- GitHub pull-request operations through `gh`;
+- legacy `scripts/start-task.sh`;
+- configured validation commands selected from an executable allowlist.
+
+## 3. Persistence architecture
+
+There is no single system-wide transactional store. Several authorities coexist:
+
+| Source | Authoritative for | Mutation model |
 |---|---|---|
-| `dashboard` | Обзор | Operational KPIs, active tasks by project, recent activity |
-| `executive` | Исполнительная панель | Cross-project rollup, blocked tasks, priority/owner breakdowns, v1.2 run metrics |
-| `create` | Создать задачу | Task-creation form → `scripts/start-task.sh` → Kanban record |
-| `chat` | Чат по проекту | v1.2: per-project conversations, provider abstraction, save-to-report / to-task |
-| `kanban` | Kanban | 5-column board with priority/owner/estimate badges, dependency blocking, and (v1.2) an agent launcher per task |
-| `agents` | AI-агенты | Catalog of the 5 task types, their rules, usage stats, and (v1.2) a direct launcher |
-| `runs` | Журнал запусков | v1.2: every Claude Code run, filterable, with parsed fields and Create Next Task |
-| `timeline` | Таймлайн | Day-grouped feed of task events, file activity, runs, and activity-log events |
-| `projects` | Проекты | Per-project status/generated/reports/context browser + (v1.2) repository-path settings |
-| `generated` | Сгенерированные задачи | Global, recursive, project-filterable browser of `generated/`, with a launcher |
-| `reports` | Отчёты | Global, recursive, project-filterable browser of `reports/`, with parsed run data when linked |
-| `context` | Глобальный контекст | `CURRENT_STATE.md`, `DECISIONS.md`, `INBOX.md` |
-| `git_center` | Git Center | Read-only branch/status/log/diff/branches/remotes |
-| `workspace` | Workspace Launcher | `git worktree list` + per-project quick-jump cards |
-| `focus` | Focus Mode | Single-task, minimal-chrome working view |
+| `data/tasks.json` | Planning and Kanban tasks | Whole-file JSON; atomic replacement; thread/cross-process lock through `data/tasks.lock` |
+| `data/runtime.db` | Runtime tasks, sessions, runs, run events, reports, and completion state | SQLite schema version 5; WAL, busy timeout, foreign keys, guarded transitions, CAS versions, workspace locks |
+| `data/execution_queue.json` | Separate execution planning queue | Whole-file JSON; atomic replacement; no cross-process locked mutation |
+| `data/runs.jsonl` | Legacy synchronous run journal | Append-only JSONL; latest record per run is folded on read |
+| `data/chats.json` | Project chat conversations | Whole-file JSON |
+| `data/activity.jsonl` | Activity journal | Append-only JSONL |
+| `data/project_config.json` | Local repository and policy overrides | Whole-file JSON |
+| `data/portfolio_config.json` | Portfolio project-to-repository mapping | Whole-file JSON |
+| `data/portfolio_launches.json` | Portfolio launch-to-runtime registry | Whole-file JSON plus Portfolio lock files |
+| Portfolio task cards | Portfolio lanes, task metadata, dependencies, conflicts, and launch hints | Parsed from the separate Portfolio checkout; intelligence views are read-only |
+| `reports/<PROJECT>/` | Full Markdown reports and saved chat content | Per-file artifacts |
+| `generated/<PROJECT>/` | Legacy generated task files | Per-file artifacts |
 
-## 5. State management
+`data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative for
+execution and completion state. SQLite does not replace the legacy JSON/JSONL stores, the execution
+queue, Portfolio registries, or artifact directories.
 
-Two kinds of state exist:
+Most runtime files are covered by the checked-in `.gitignore`. `runtime.db` must remain local and
+untracked, but the current checkout's exclusion is repository-local Git metadata rather than a
+portable checked-in ignore rule. `AICC_DATA_DIR` redirects data storage for tests.
 
-- **Persistent state**: `data/tasks.json`, written atomically (`tempfile.mkstemp` in the same
-  directory + `os.replace`) so a crash mid-write cannot corrupt the file. Every task record is
-  passed through `normalize_task` on load, so records written by an older version of the app
-  (missing `priority`/`owner`/`estimate_hours`/`depends_on`) are backfilled with defaults rather
-  than breaking newer code.
-- **Session state** (`st.session_state`), in-memory per browser session, used for:
-  - Widget values (`nav_page`, all the `*_select`/`*_filter` keys, form fields).
-  - `show_command_palette` — whether the command-palette dialog is open.
-  - `pending_nav`, `pending_create_project`, `pending_create_type`, `pending_project_browser`,
-    `pending_chat_conv` (v1.2) — a deferred-write pattern (see below).
+### 3.1 Reconciliation boundaries
 
-**Why the `pending_*` pattern exists:** Streamlit raises `StreamlitAPIException` if code tries to
-write `st.session_state[key]` for a key that already belongs to a widget instantiated earlier in
-the *same* script run. The sidebar's `nav_page` radio is instantiated near the top of every run;
-any code further down the same run (the command palette, an AI Agents "create task of this type"
-button, a Workspace Launcher shortcut, Focus Mode's exit button, v1.2's "new conversation created"
-handler) that wants to change the active page or another already-instantiated widget cannot write
-`st.session_state.<key>` directly. Instead, these call sites write a `pending_nav` (and, where
-relevant, `pending_create_project` / `pending_create_type` / `pending_project_browser` /
-`pending_chat_conv`) key and call `st.rerun()`. At the very top of the *next* run — before
-`st.set_page_config` and before any widget is created — a small loop applies each pending value to
-its real widget key and removes the pending key. This is the only cross-page navigation mechanism
-in the app; there is no separate router.
+Because planning, execution, queue, and completion do not share one transaction:
 
-## 6. External process boundary
+- the runtime service projects terminal run state into the linked `tasks.json` task;
+- terminal successful runs seed completion records;
+- completion state projects launch status, workflow stage, PR state, and final progress into the
+  planning task;
+- queue readiness is recomputed against current planning dependencies;
+- Portfolio registry entries link Portfolio task IDs to runtime run IDs;
+- legacy data remains independently readable and is not automatically converted into the SQLite
+  source of truth during every startup.
 
-`subprocess.run` is called from exactly two categories of call sites, both with a fixed argument
-list (never `shell=True`), `capture_output=True`, `text=True`, and an explicit timeout:
+Projection is idempotent and task mutations are locked, but reconciliation is still an explicit
+application responsibility. A crash between stores can leave a stale projection that a later
+refresh must repair.
 
-1. **`run_start_task_script`** → `scripts/start-task.sh <PROJECT> <TASK_TYPE> <OBJECTIVE>`
-   (30s timeout). This is the only place the app can create a new AI task file. `stdout`/`stderr`
-   are always captured and surfaced in the UI; a non-zero exit code is treated as failure and the
-   Kanban record is not created.
-2. **`run_git_command`** → `git <args...>` (5–10s timeout depending on call site), used only for
-   read-only subcommands: `rev-parse`, `branch --show-current`, `branch --list`, `status
-   --porcelain`, `log`, `diff --stat`, `remote -v`, `worktree list --porcelain`. No git subcommand
-   that mutates repository or working-tree state (`commit`, `push`, `pull`, `merge`, `reset`,
-   `rebase`, `checkout`, `add`, `stash`) is ever invoked.
+## 4. Runtime execution lifecycle
 
-Workspace Launcher intentionally does **not** spawn a file manager or editor (e.g. `open`,
-`code`) — that would fall outside these two categories. Instead it navigates within the app and
-prints copyable absolute paths for the user's own terminal/editor.
+### 4.1 Launch
 
-## 7. Data model
+The current Streamlit launch bridge is asynchronous:
 
-A Kanban task (one JSON object in the `data/tasks.json` array) has this shape:
+1. A user explicitly selects or enters work and requests launch.
+2. `launch.py` resolves the workspace using task, project default, then repository fallback
+   precedence. It resolves the expected branch and performs read-only Git validation.
+3. Errors block launch. Dirty-tree, detached-HEAD, and branch-mismatch warnings require explicit
+   acknowledgement.
+4. The confirmation surface shows the exact project, repository/worktree, branch, task type,
+   prompt, and timeout.
+5. `launch_service.execute_agent_launch_v2` rejects another active run for the same task or
+   resolved workspace before mutating the task.
+6. `ExecutionCenterAPI.start_run` persists the runtime task/session/run and asks the Supervisor to
+   spawn it.
+7. The UI returns immediately to the live Execution Center and polls persisted state.
 
-```json
-{
-  "id": "uuid4 hex string",
-  "project": "AIOS | AICOS | BANK | LEGAL | BUSINESS | PERSONAL",
-  "title": "the task objective, as entered",
-  "task_type": "implementation | review | remediation | final_gate | architecture_review",
-  "status": "Backlog | Next | In Progress | Review | Done",
-  "priority": "Low | Medium | High | Critical",
-  "owner": "free-text string, may be empty",
-  "estimate_hours": 0.0,
-  "depends_on": ["other task id", "..."],
-  "created_at": "ISO 8601, second precision",
-  "updated_at": "ISO 8601, second precision",
+All normal launch surfaces require an explicit button action. There is no general autonomous task
+scheduler on `main`.
 
-  "_comment": "v1.2 workflow fields — all optional, backfilled by normalize_task via command_center.models.normalize_task_workflow for records written before v1.2:",
-  "parent_task_id": "prior task id this one was created from, or null",
-  "prior_run_id": "run id this task was created from, or null",
-  "current_run_id": "most recent run id launched for this task, or null",
-  "workflow_stage": "Draft | Ready | Running | Remediation | Final Review | Approved | Commit Pending | Push Pending | PR Pending | Done",
-  "latest_verdict": "last parsed verdict for this task, or null — parallel to, does not replace, `status`",
-  "report_path": "repo-relative path to the latest full report, or null",
-  "repository_path": "absolute path used for the latest run, or null",
-  "branch": "branch observed after the latest run, or null",
-  "agent": "e.g. \"claude_code\", or null",
-  "last_run_at": "ISO 8601 timestamp of the latest run, or null"
-}
+### 4.2 Supervisor lifecycle
+
+The Supervisor:
+
+- constructs a fixed Claude CLI argument list and launches with
+  `Popen(shell=False, start_new_session=True)`;
+- records PID and process-identity evidence in SQLite;
+- retains the live `Popen`, pipes, reader threads, watchdog, and cancellation state in memory;
+- streams bounded stdout/stderr chunks into run events;
+- detects first output and process startup failures;
+- enforces timeout;
+- cancels the process group with terminate-then-kill escalation;
+- classifies exit, cancellation, timeout, spawn, and supervision failures;
+- persists final run/session state and report metadata;
+- triggers task and completion reconciliation.
+
+The Supervisor owns live subprocess handles only within the hosting Python process. Persisted state
+survives a Streamlit/Python restart, but pipes, reader threads, waitable child ownership, and live
+`Popen` handles cannot be restored. Startup reconciliation checks PID liveness and recorded process
+identity to avoid confusing PID reuse with the original process, then updates persisted state. It
+does not reattach output streams or seamlessly resume supervision.
+
+This is process-local durability, not distributed execution or remote-worker ownership.
+
+### 4.3 Cancellation and timeouts
+
+User cancellation is an explicit confirmed action. The Supervisor targets the spawned process
+group, sends a graceful termination signal, waits a bounded interval, and escalates to kill if
+needed. Timeout uses the same ownership and classification machinery. State-transition guards and
+compare-and-swap updates prevent late worker threads from overwriting a newer terminal decision.
+
+### 4.4 Legacy execution
+
+`execute_agent_launch` and `agent_runner.py` retain the synchronous Claude CLI path and
+`data/runs.jsonl` persistence. Legacy chat/activity JSON/JSONL and generated-task scripts also
+remain. They coexist with, rather than replace, the asynchronous SQLite runtime. New Streamlit task
+launches use the v2 asynchronous bridge.
+
+## 5. Execution queue
+
+`execution_queue.py` persists a separate queue in `data/execution_queue.json`. Entries carry task
+links, dependency state, readiness, launch state, and runtime run references.
+
+Readiness is recalculated when queue checkpoints or UI refreshes occur. A ready entry is a
+recommendation to the operator, not scheduled work. Launch still requires an explicit action and
+the same repository validation and confirmation as other launches.
+
+Queue writes use atomic whole-file replacement, but the read-modify-write cycle is not protected
+by the cross-process lock used for `tasks.json`. Simultaneous writers can overwrite one another.
+
+## 6. Run-to-task reconciliation
+
+`runtime/task_sync.py` is the bridge from SQLite execution/completion state to the Kanban model.
+It:
+
+- locates the planning task linked to a runtime run;
+- applies terminal launch state, report path, timestamps, verdict, and workflow metadata;
+- seeds completion only for eligible successful terminal runs;
+- projects completion progress and pull-request state;
+- marks the planning task completed only after completion evidence reaches the terminal completed
+  state.
+
+The implementation uses `tasks_repository.mutate_tasks`, which serializes task-file mutation and
+writes atomically. SQLite remains authoritative if the task projection is temporarily stale.
+
+## 7. Completion lifecycle
+
+The completion domain separates "execution finished" from "change integrated." Its persisted
+states cover:
+
+1. execution finished;
+2. validation pending/running/passed or failed;
+3. result evidence valid or requiring attention;
+4. pull request preparation/opening;
+5. awaiting checks, reviews, or manual merge;
+6. optional policy-controlled merge;
+7. target-branch verification;
+8. completed, retryable, intervention, or recovery states.
+
+`CompletionOrchestrator` resolves task/project policy, runs allowlisted validation commands,
+inspects repository state, pushes without force, discovers or creates a PR through `gh`, observes
+checks/reviews/mergeability, optionally merges, recovers a closed-unmerged PR only when enabled,
+and verifies that the result is reachable from the configured target branch. SQLite events and
+attempt counters provide an audit trail; versioned compare-and-swap updates and bounded backoff
+support idempotent retry.
+
+Conservative defaults require validation and a pull request, use squash as the merge method, keep
+merge manual, and disable PR recovery. Completion autopilot is implemented but opt-in:
+`AICC_COMPLETION_AUTOPILOT` is disabled by default. When enabled, the hosting process runs a
+background loop that calls `advance_pending`; this is a completion-state worker, not a general
+task scheduler.
+
+## 8. Portfolio intelligence and launch flow
+
+### 8.1 Portfolio model and intelligence
+
+`portfolio_models.py` parses flat frontmatter task cards from Portfolio lanes. Card fields include
+task/project IDs, status, dependencies, conflicts, branch/worktree overrides, launch and permission
+profiles, and planning metadata.
+
+`portfolio_intelligence.py` builds read-only derived views:
+
+- per-project health and counts;
+- dependency graph, execution waves, cycles, and critical path;
+- ready, blocked, running, and completed classifications;
+- capacity and workload summaries;
+- deterministic recommendations and parse-quality warnings.
+
+The intelligence layer does not edit cards or schedule launches. The Portfolio Overview panel
+renders its snapshot.
+
+### 8.2 Launch orchestration
+
+For a ready Portfolio card:
+
+1. `portfolio_config.py` resolves an explicitly configured local repository mapping.
+2. `portfolio_launch.py` validates identity, lane, dependency/conflict state, repository,
+   requested/default branch, worktree, launch profile, permission profile, registry state, and
+   collisions.
+3. The UI displays a dry-run plan.
+4. Explicit user confirmation claims the task under a Portfolio lock.
+5. `worktree_launcher.py` validates an existing worktree or creates a task branch/worktree from
+   the selected base.
+6. The orchestration registers the Portfolio launch, adds/links queue state, and calls the same
+   asynchronous runtime API.
+7. If failure occurs before process ownership transfers, rollback removes only the branch,
+   worktree, registry, or queue resources that this transaction created.
+
+Batch launch is also explicit, bounded by a concurrency cap, and preflights task/worktree
+collisions. It is orchestration, not autonomous scheduling.
+
+## 9. Git and GitHub privileged boundaries
+
+Git access is not globally read-only. Capabilities are separated:
+
+| Boundary | Capability | Safeguard |
+|---|---|---|
+| Git Center, repository status, launch preflight | Read-only inspection | Fixed read-only commands |
+| Claude review/final-gate/architecture-review task | Read/search only | Claude tool allowlist excludes Bash and edit tools |
+| Claude implementation/remediation task | File editing and validation | Git-write commands denied in Claude tool configuration |
+| Portfolio worktree launcher | Create/attach branch and worktree | Exact repository validation, collision checks, explicit launch, bounded rollback |
+| Completion Git adapter | Push or recreate branch | Fixed argv, no force-push, policy and state-machine gates |
+| Completion GitHub adapter | Discover/create/optionally merge PR | Local authenticated `gh`, fixed argv, explicit project policy, manual merge default |
+| Validation adapter | Run configured checks | Executable allowlist, `shell=False`, timeout, captured bounded output |
+
+Worktree creation, push, pull-request creation, and merge are privileged write capabilities. Their
+availability does not imply blanket authorization. User-triggered launch controls and conservative
+completion policies are the safety boundary; enabling an opt-in automatic policy must be treated
+as an explicit operational decision.
+
+## 10. Streamlit execution characteristics
+
+Streamlit reruns `app.py` on interaction. `st.cache_resource` preserves the runtime API and its
+Supervisor while the server process remains alive; session state preserves browser-session UI
+choices. Timed fragments poll SQLite and render live state without making the queue a scheduler.
+
+This arrangement has two implications:
+
+- the UI and service layer share one Python host instead of communicating with an independent
+  daemon;
+- server restart recreates services from persisted state but loses process-local handles.
+
+The application is local-first, but "local" describes deployment intent, not an enforced network
+bind.
+
+## 11. Security and sensitivity
+
+Project configuration marks sensitive projects such as BANK and LEGAL. UI flows warn before
+launch or chat, avoid automatic context attachment, and sanitize cross-project Workspace Home
+snapshots before rendering.
+
+Prompts and reports can contain sensitive content. Runtime databases, JSON/JSONL stores, reports,
+Portfolio mappings, and generated artifacts are machine-local operational data and must not be
+committed. Subprocess adapters avoid shell interpolation and bound execution time, but the
+application still launches tools with the local user's filesystem and credential context.
+
+## 12. Validation and quality gates
+
+The supported local gates are:
+
+```bash
+python -m compileall -q command_center app.py
+ruff check .
+pytest -q
 ```
 
-`depends_on` holds other tasks' `id`s. A task is **blocked** (`is_blocked`) if any dependency
-either doesn't exist in the current task list or is not in `Done` status; `unmet_dependencies`
-returns the list of such ids for display. Dependency resolution is done in memory each run
-(`tasks_by_id = {t["id"]: t for t in tasks}`) — there is no foreign-key enforcement or cascade
-delete, so deleting a task that others depend on leaves a dangling id, which the UI renders as
-"(удалена) <id>" rather than failing.
+The test suite covers storage isolation, SQLite migrations and concurrency, API/state transitions,
+real fake-process supervision, process-tree cancellation and timeout, restart reconciliation,
+completion scenarios and races, Git/GitHub adapters, queue behavior, worktree creation and
+rollback, Portfolio parsing/launch/intelligence, read-model redaction, and Streamlit rendering.
 
-`workflow_stage` is a v1.2 addition that sits *alongside* the existing Kanban `status` — it is never
-a replacement. `status` still drives the Kanban board's five columns; `workflow_stage` tracks
-progress through the agent run → verdict → remediation/final-review → commit/push/PR pipeline (see
-§11). A task can be `status: "In Progress"` and `workflow_stage: "Remediation"` at the same time.
+`requirements-dev.txt` declares pytest but not Ruff. No MyPy or other type checker is configured.
+There is no checked-in mandatory CI workflow, so local gates are conventions rather than enforced
+repository checks.
 
-See `command_center/models.py` for the run record, chat conversation/message, and activity event
-shapes (`new_run_record`, `new_conversation`, `new_message`, `new_activity_event`) and
-`command_center/report_parser.py`'s `empty_parsed_result()` for the parsed-report shape stored in a
-run's `parsed` field.
+## 13. Current risks and boundaries
 
-Every timestamp in this app (v1.1's task `created_at`/`updated_at` and every v1.2 run/chat/activity
-timestamp) is `datetime.now().isoformat(timespec="seconds")` — **naive local time, no timezone
-offset**, deliberately kept identical to the pre-existing v1.1 convention rather than migrated to a
-timezone-aware format, to avoid a mixed-format hazard against existing `data/tasks.json` records.
-Read every timestamp in this app as "local time on the machine that wrote it."
+- Multiple persistence authorities require reconciliation and cannot commit atomically together.
+- Legacy synchronous/JSONL and current asynchronous/SQLite paths coexist.
+- Live Supervisor ownership is confined to one Python process.
+- `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
+- Toolchain declarations are incomplete and no mandatory CI is checked in.
+- Execution queue read-modify-write operations are not cross-process locked.
+- Streamlit can be exposed to the network unless it is explicitly bound to localhost.
+- There is no production-readiness guarantee, distributed execution, durable remote-worker
+  ownership, or seamless process resumption.
 
-## 8. Directory contract
+## 14. Planned desktop architecture
 
-The app treats these repository paths as its contract with the rest of the project; it never
-writes outside `data/` and (v1.2) `reports/`:
+The accepted desktop documents propose a PySide6/Qt Widgets client that reuses plain-Python domain
+and runtime services through application adapters. That target is deliberately outside the current
+runtime:
 
-| Path | Read | Written by app | Written by `scripts/start-task.sh` |
-|---|---|---|---|
-| `projects/<FILE>.md` | ✓ | — | — |
-| `context/<FILE>_CONTEXT.md` | ✓ | — | — |
-| `generated/<PROJECT>/*.md` | ✓ | — | ✓ |
-| `reports/<PROJECT>/*.md` | ✓ | ✓ (v1.2, `agent_runner.save_report`) | ✓ (report skeleton path) |
-| `CURRENT_STATE.md`, `DECISIONS.md`, `INBOX.md` | ✓ | — | — |
-| `data/tasks.json` | ✓ | ✓ | — |
-| `data/runs.jsonl`, `data/activity.jsonl` | ✓ | ✓ (append-only) | — |
-| `data/chats.json`, `data/project_config.json` | ✓ | ✓ | — |
+- no `command_center.desktop` package exists;
+- PySide6 is not a runtime dependency;
+- no desktop executable or installer is built;
+- no native packaging or update channel is implemented.
 
-## 9. Extension points
+See [`docs/desktop/README.md`](docs/desktop/README.md) for the design status. Roadmap statements in
+that directory must not be read as current capability.
 
-- **New page**: add one `NAV` entry and one `elif page_key == "...":` block. No other file needs
-  to change.
-- **New task field**: extend `new_task_record`, add a default in `normalize_task`, and render it
-  wherever tasks are displayed (Kanban card, Focus Mode, Executive Dashboard).
-- **New read-only git view**: add a `get_git_*` helper following the existing pattern (call
-  `run_git_command`, parse `stdout`, return a plain Python structure) and render it in Git Center.
-- **New cross-page shortcut**: stage a `pending_*` key and call `st.rerun()`, then add that key to
-  `_PENDING_KEY_MAP` at the top of the Page setup section.
+## 15. Related decisions and operator documentation
 
-## 10. Explicitly out of scope
-
-- No authentication, multi-user support, or network exposure beyond `localhost`.
-- No database — `data/*.json`/`*.jsonl` files are the entire persistence layer.
-- No mutating git operations from the UI or from this app's own code, ever (the Claude Code
-  subprocess it launches is itself blocked from git-write subcommands — see §11.3).
-- No subprocess calls outside `scripts/start-task.sh`, read-only `git` subcommands, and (v1.2) the
-  `claude` CLI (in particular, no spawning of external editors/file managers/browsers).
-- No JavaScript/HTML component code — the UI is built entirely from native Streamlit elements
-  (`st.button(shortcut=...)` provides the keyboard-shortcut behavior for the command palette
-  without any custom component).
-- No FastAPI, React, Docker, PostgreSQL, Redis, or Celery — v1.2 deliberately did not introduce any
-  of these; the local single-process Streamlit model from §1 is unchanged.
-- No Anthropic cloud SDK — the local Claude Code CLI is sufficient and is what v1.2 uses.
-
-## 11. v1.2: Agent workflow architecture
-
-### 11.1 `command_center/` module layout
-
-| Module | Responsibility |
-|---|---|
-| `models.py` | Shared constants (`PROJECT_IDS`, `WORKFLOW_STAGES`, `RUN_STATUSES`, verdict constants, `SEVERITIES`) and plain-dict record factories (`new_run_record`, `new_conversation`, `new_message`, `new_activity_event`, `default_task_workflow_fields`) — the same "dict + `new_*`/`normalize_*` factory" convention `app.py` already used for tasks, not dataclasses/an ORM. |
-| `storage.py` | Generic atomic-JSON and append-only-JSONL primitives (`atomic_write_json`, `read_json`, `append_jsonl`, `read_jsonl`, `fold_latest_by_id`, `ensure_seeded[_jsonl]`, `resolve_data_dir`). Every other module's persistence is built on these. |
-| `project_config.py` | Project configuration: display name, sensitivity, allowed agents, context file paths, `reports_dir`/`generated_dir`, and the one locally-editable field, `repository_path` (stored in gitignored `data/project_config.json`). `discover_candidate_repository_path` only ever returns a path it has verified exists and is a git repo. |
-| `agent_runner.py` | Everything about launching and recording a Claude Code run: repository-path validation, git snapshotting, `subprocess` execution, run persistence (`runs.jsonl`), and full-report file generation. The security-sensitive core — see §11.3. |
-| `report_parser.py` | Deterministic, regex/heading-based extraction of verdict/findings/files/commit/branch/PR/validation/git-status/next-action from a report's text. Never invents a field; every unmatched field stays `None`/empty. Supports a manual-correction overlay that never discards the original extraction. |
-| `chat_service.py` | Project Chat conversation storage (`chats.json`) plus the `ChatProvider` interface and its three implementations (`LocalProvider`, `ClaudeCodeChatProvider`, `OpenAIChatProvider`). |
-| `workflow.py` | `suggest_next_task`: pure function, verdict → task-type/workflow-stage/objective-draft suggestion. Never creates or executes anything itself — `app.py`'s "Создать следующую задачу" button does that, after the user reviews the draft. |
-| `activity_log.py` | Append-only event log (`activity.jsonl`). |
-
-`app.py` is the only module that calls `st.*`; every `command_center` module is plain Python,
-independently unit-testable, and imports nothing from `app.py` (the dependency direction is always
-`app.py → command_center`, never the reverse).
-
-### 11.2 Runtime storage: JSON vs. JSON Lines
-
-`data/tasks.json` and `data/chats.json` stay whole-file JSON (read-modify-write documents, matching
-the v1.1 `tasks.json` pattern: atomic temp-file + `os.replace` on every write). `data/runs.jsonl`
-and `data/activity.jsonl` are **JSON Lines** instead: both are write-heavy logs where a run record
-can carry a large `stdout` blob and gets appended to at queued/running/completed. Rewriting an
-entire multi-run JSON array on every status transition would be slower and would put the *whole*
-history at risk during that rewrite; JSONL reduces that window to a single `open(..., "a")` + one
-line + `fsync`. "Current state" of a run is the last line seen for its id — `storage.fold_latest_by_id`
-performs that fold on load. See `command_center/storage.py`'s module docstring for the same
-reasoning in code.
-
-Every `data/*.json(l)` runtime file is **gitignored** and starts genuinely empty on a fresh
-checkout — `storage.ensure_seeded`/`ensure_seeded_jsonl` deliberately never read the tracked
-`data/*.example.*` sibling file to seed the real one; those `.example` files hold illustrative
-sample content for documentation only. (An earlier draft of this feature did seed from the example
-files — caught during manual testing before release, because it silently presented a fabricated
-AIOS repository path and a fake chat conversation as if they were real local data.)
-
-`AICC_DATA_DIR` (env var, read by `storage.resolve_data_dir`) redirects every module's data
-directory at once. It exists for the test suite, which sets it once in `tests/conftest.py` before
-any module is imported, so tests never touch a developer's real `data/`.
-
-### 11.3 Security boundaries (Claude Code runner)
-
-- `agent_runner.run_claude_code` calls `subprocess.run` exactly like `run_start_task_script`/
-  `run_git_command` already did: a fixed argument list, `shell=True` never used, `capture_output=True`,
-  `text=True`, an explicit timeout. The prompt is one argv element passed straight to the `claude`
-  binary — never interpreted by a shell — so prompt content cannot inject shell commands.
-- `agent_runner.validate_repository` refuses to run unless the requested `repository_path` resolves
-  (symlinks/`..` included) to *exactly* the path configured for that project in
-  `project_config.load_project_configs()`. A task can never be launched against a repository path
-  that isn't in the project configuration, and an unconfigured project refuses outright.
-- **This application's own code** — the Python running under Streamlit — never calls
-  `git commit`/`push`/`merge`/`reset`/`rebase`/`clean`/`add`/`apply`/`checkout`/`restore`/`switch`/
-  `stash`, automatically or otherwise. The only git subprocess calls `agent_runner` itself makes are
-  the read-only pre/post-run snapshot (`rev-parse`, `branch --show-current`, `status --porcelain`).
-  This guarantee is unconditional — it does not depend on what a spawned `claude` process does, and
-  it is the only prohibition in this section that is absolute for every task type.
-- **Read-only task types** (`review`, `final_gate`, `architecture_review`) get genuine technical
-  enforcement that they cannot modify the repository: `agent_runner.build_command` passes `--tools
-  Read,Grep,Glob` (`READ_ONLY_ALLOWED_TOOLS`). Per `claude --help`, `--tools` replaces the *entire*
-  available tool set for that run rather than layering a permission rule on top of it — `Bash`,
-  `Edit`, `Write`, `NotebookEdit`, and `MultiEdit` are simply not in the list the model is given, so
-  none of them can be invoked, by any means, for that run. This is what actually justifies "cannot
-  modify any file" for these three task types: not a prompt instruction, and not a Bash pattern
-  denylist (an earlier version of this module tried exactly that — denying specific
-  `Bash(git ...)` patterns while leaving the general-purpose `Bash` tool itself available — and an
-  independent review correctly found that left `git apply`/`checkout`/`stash`, plain shell
-  redirection, and everything else reachable through Bash completely unrestricted; that approach was
-  replaced with the `--tools` allowlist described here).
-- **Implementation/remediation task types** keep the `Bash` tool — they need it to run tests,
-  linters, and other validation per the `AGENT_ROLES` prompt rules in `scripts/start-task.sh` — but
-  `--disallowedTools` is set to `GIT_WRITE_DISALLOWED_TOOLS`, a pattern-based denylist covering every
-  git-write operation those task types' own prompts already forbid (`add`, `apply`, `checkout`,
-  `restore`, `switch`, `stash`, `commit`, `push`, `merge`, `reset`, `rebase`, `clean`, branch
-  deletion). Unlike the read-only case, this is **not** a tool-removal guarantee: these task types
-  are expected to edit files (that's the job), and a denylist cannot enumerate every way a shell
-  could mutate a repository outside of git — the boundary actually enforced here is specifically "no
-  git-write operations," not "no file changes" and not "no shell access."
-- The UI always shows the exact repository, branch, agent, and prompt, and requires an explicit
-  confirmation checkbox before `run_claude_code` is ever called (`app.py`'s `render_agent_launcher`);
-  this confirmation is re-required on every launch (there is no "remember this" state), and nothing
-  in the app triggers a launch from a page load or an unrelated rerun.
-- BANK/LEGAL are `sensitive` in `project_config`; the launcher and Project Chat show an explicit
-  warning for them and never auto-attach context files — context is always pasted in by hand.
-- No automated test invokes the real `claude` CLI or spends API credits: `tests/test_agent_runner.py`
-  and `tests/test_app_streamlit.py` monkeypatch `subprocess.run` (delegating non-`claude` calls,
-  i.e. the git snapshot, to the real `subprocess.run` against a throwaway `tmp_path` repo). The one
-  real invocation of `claude` in this project's history was a manual, disposable, few-cents smoke
-  test in a scratch git repo during development — never part of the automated suite.
-
-### 11.4 Recovering from a failed/stuck run
-
-Because the runner is synchronous (§ "v1.2 — Agent Workflow" in README.md), a run can only be
-"stuck" for as long as its configured timeout — after that, `subprocess.run(..., timeout=...)`
-raises `TimeoutExpired` and the run is recorded as `timed_out` with whatever partial stdout/stderr
-were captured. If the Streamlit page itself seems frozen while a run is in flight: it is — the
-script run is blocked on the subprocess by design (see §11.3). Reloading the browser tab does not
-stop the underlying `claude` process (Streamlit's rerun model has no handle to cancel a subprocess
-started by a *previous* run); if you need to stop it, find and terminate the `claude` process
-directly (e.g. `pkill -f "claude -p"`) from a terminal. The run record will then be missing its
-terminal state — this app does not fabricate one — so re-launch a fresh run for that task afterward
-rather than trusting a run that never reached `completed`/`failed`/`timed_out` in `data/runs.jsonl`.
+- [`docs/adr/0001-engineering-control-center-v2-increment-1.md`](docs/adr/0001-engineering-control-center-v2-increment-1.md)
+- [`docs/adr/0002-project-config-as-canonical-engineering-defaults.md`](docs/adr/0002-project-config-as-canonical-engineering-defaults.md)
+- [`docs/adr/0003-live-execution-center-v2-and-kanban-launch-bridge.md`](docs/adr/0003-live-execution-center-v2-and-kanban-launch-bridge.md)
+- [`docs/adr/0004-autonomous-task-completion-pipeline.md`](docs/adr/0004-autonomous-task-completion-pipeline.md)
+- [`docs/completion-pipeline.md`](docs/completion-pipeline.md)
+- [`CURRENT_STATE.md`](CURRENT_STATE.md)

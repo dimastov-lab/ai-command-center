@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow strict semantic versioning tags in Git; versions below refer to
 functional application milestones of `app.py`.
 
+## [Unreleased] — Portfolio Execution and Intelligence
+
+### Added
+- **Portfolio Execution**: parses ready task cards from a separate Portfolio checkout, validates
+  dependencies/conflicts and repository mappings, previews a launch plan, creates or attaches an
+  isolated branch/worktree after explicit confirmation, and launches through the asynchronous
+  Execution Center. A persisted launch registry and lock files prevent duplicate claims; bounded
+  rollback removes only resources created by a failed launch attempt.
+- **Portfolio Overview**: read-only project health, dependency waves, cycles, critical path,
+  capacity, readiness and deterministic recommendations from Portfolio task cards and current
+  launch state.
+- **Portfolio batch launch**: an explicit, concurrency-capped orchestration flow with collision
+  preflight. It does not introduce autonomous scheduling.
+
 ## [Unreleased] — Autonomous Task Completion Pipeline (AICC-AUTONOMY-001)
 
 Closes the gap between "Claude process finished" and "the engineering task is completed and

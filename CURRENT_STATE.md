@@ -1,6 +1,31 @@
 # AI Command Center — Current State
 
-Updated: 2026-07-15
+Updated: 2026-07-23
+
+## 0. AI Command Center platform
+
+Status: Active, local Streamlit implementation
+
+Current position:
+- `app.py` hosts the implemented 19-destination Streamlit control application.
+- `data/tasks.json` remains the planning and Kanban store.
+- `data/runtime.db` is authoritative for asynchronous execution and completion state.
+- Execution Center provides process supervision, streaming events, cancellation, timeouts and
+  restart reconciliation; live process handles remain owned by the hosting Python process.
+- Portfolio Execution and Portfolio Overview provide guarded worktree launch plus read-only
+  dependency, health, capacity and recommendation views.
+- The persisted completion pipeline supports validation, push, pull-request and merge workflows;
+  completion autopilot and automatic merge policies are opt-in and disabled by conservative
+  defaults.
+- Legacy synchronous and JSON/JSONL paths remain present alongside SQLite.
+
+Current boundaries:
+- Normal task launches require explicit user action; no general autonomous task scheduler is
+  implemented.
+- Git worktree creation, push, pull-request creation and merge are privileged capabilities with
+  confirmation or policy safeguards.
+- The native PySide6 desktop client remains documentation and design work only.
+- The runtime is local and process-hosted, not a distributed or production-ready worker platform.
 
 ## 1. AIOS
 
@@ -81,7 +106,7 @@ Use for:
 1. One project must not be mixed with another project.
 2. One agent = one task = one branch = one worktree.
 3. Every technical implementation requires independent review.
-4. No push or merge without explicit approval.
+4. No commit, push, pull-request creation or merge without explicit authorization.
 5. Every task must have a measurable Definition of Done.
 6. Closed architectural decisions must not be reconsidered without new evidence.
 7. Current-state files are the primary source of project context.
