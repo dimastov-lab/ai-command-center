@@ -80,6 +80,13 @@ REASON_ASSIGNED = "assigned"
 # DEFER (transient — re-plan later, condition is expected to clear)
 REASON_WAITING_DEPENDENCY = "waiting_dependency"
 REASON_BACKOFF = "backoff"
+# A recoverable prior failure whose completion time is unknown/unparseable —
+# the backoff deadline cannot be computed, so we fail safe (DEFER) rather than
+# assign immediately or fabricate a next_eligible_at (finding F4).
+REASON_RETRY_TIMING_UNKNOWN = "retry_timing_unknown"
+# A second eligible item whose task_id was already ASSIGNED earlier in this same
+# plan — enforces "at most one ASSIGN per task_id per plan" (finding F2).
+REASON_DUPLICATE_TASK = "duplicate_task_assignment"
 REASON_WORKSPACE_BUSY = "workspace_busy"
 REASON_GLOBAL_AT_CAPACITY = "global_at_capacity"
 REASON_AGENT_AT_CAPACITY = "agent_at_capacity"
@@ -107,6 +114,18 @@ TERMINAL = "terminal"
 # recoverable — a fresh attempt may well succeed.
 _TERMINAL_STATES: frozenset[str] = frozenset({"CANCELLED"})
 _TERMINAL_REASON_PREFIXES: tuple[str, ...] = ("blocked:",)
+
+# Prior run states that mean "an attempt was made and did NOT succeed", so the
+# retry policy (budget + backoff + terminal classification) must apply whenever
+# `attempts_made > 0`. This gate is deliberately **state-driven, never
+# failure_reason-driven**: the runtime legitimately records FAILED (nonzero
+# exit), INTERRUPTED and UNKNOWN (both produced by `Supervisor.reconcile()`)
+# with `failure_reason=None`, and every one of those must still be gated
+# (finding F1). COMPLETED is excluded — a success is not a retry. `classify_
+# failure` (which *does* read `failure_reason`) only refines the outcome into
+# RECOVERABLE vs TERMINAL once we are already inside the gate; it never decides
+# whether the gate applies.
+_RETRY_GATED_STATES: frozenset[str] = frozenset({"FAILED", "INTERRUPTED", "UNKNOWN", "CANCELLED"})
 
 
 def classify_failure(*, state: str | None, failure_reason: str | None) -> str:
@@ -326,6 +345,13 @@ def _priority_rank(priority: str | None) -> int:
     return _PRIORITY_RANK.get(priority or "", 0)
 
 
+def _priority_recognized(priority: str | None) -> bool:
+    """Whether `priority` is a known `models.TASK_PRIORITIES` value (vs. having
+    been normalized to the lowest rank by `_priority_rank`) — surfaced per
+    decision so the normalization is auditable, not silent (finding F6)."""
+    return priority in _PRIORITY_RANK
+
+
 def _normalize_workspace(path: str) -> str:
     return os.path.normpath(os.path.expanduser(path))
 
@@ -351,6 +377,10 @@ class SchedulingDecision:
     priority: str
     priority_rank: int
     decided_at: str
+    # False when `priority` was not one of `models.TASK_PRIORITIES` and was
+    # normalized to the lowest rank — surfaces the silent normalization in the
+    # audit trail rather than hiding it (finding F6).
+    priority_recognized: bool = True
     required_capabilities: frozenset[str] = frozenset()
     agent_id: str | None = None
     executor_id: str | None = None
@@ -370,6 +400,7 @@ class SchedulingDecision:
             "explanation": self.explanation,
             "priority": self.priority,
             "priority_rank": self.priority_rank,
+            "priority_recognized": self.priority_recognized,
             "decided_at": self.decided_at,
             "required_capabilities": sorted(self.required_capabilities),
             "agent_id": self.agent_id,
@@ -414,13 +445,23 @@ class SchedulingPlan:
 def _order_key(item: WorkItem, now_epoch: float | None) -> tuple:
     """Deterministic scheduling order: highest priority first; within a
     priority, an SLA-breached item jumps ahead; then FIFO by `enqueued_at`;
-    final tiebreak `task_id` (total order, so the sort is stable and
-    reproducible even for items identical in every other field)."""
+    then `task_id`; final tiebreak the normalized `workspace`.
+
+    The trailing `(task_id, workspace)` pair makes this a **total** order even
+    for two items that share a `task_id` (the F2 duplicate case): they differ
+    by workspace, so the canonical winner is fixed regardless of input order —
+    reversing the input list yields the identical plan (byte-for-byte)."""
     breached = _sla_breached(item, now_epoch)
     enqueued = _to_epoch(item.enqueued_at)
     # `None` timestamps sort last within their group (treated as +inf).
     enqueued_key = enqueued if enqueued is not None else float("inf")
-    return (-_priority_rank(item.priority), 0 if breached else 1, enqueued_key, item.task_id)
+    return (
+        -_priority_rank(item.priority),
+        0 if breached else 1,
+        enqueued_key,
+        item.task_id,
+        _normalize_workspace(item.workspace or ""),
+    )
 
 
 def _queued_seconds(item: WorkItem, now_epoch: float | None) -> float | None:
@@ -465,9 +506,13 @@ def plan(
     now: str | None = None,
 ) -> SchedulingPlan:
     """Produce a deterministic, explainable `SchedulingPlan` from immutable
-    inputs. Never launches, never mutates anything, never reads the wall clock
-    (pass `now`; defaults to `models.iso_now()` only as a convenience for
-    callers that genuinely want "as of this instant").
+    inputs. Never launches and never mutates anything.
+
+    For a fully deterministic result the caller **must pass `now`** (an ISO
+    timestamp): when `now` is omitted this falls back to `models.iso_now()`
+    (the wall clock) purely as a convenience for callers that genuinely want
+    "as of this instant" — that fallback is the only wall-clock read in this
+    module, and supplying `now` avoids it entirely (finding F5).
 
     Capacity is consumed greedily in the deterministic order defined by
     `_order_key`, so a higher-priority item always claims scarce global/agent
@@ -482,9 +527,13 @@ def plan(
 
     # Mutable, plan-local capacity ledgers — start from the live snapshot and
     # are drawn down as ASSIGN decisions are made, so later (lower-priority)
-    # items see the capacity earlier items have already claimed.
-    global_used = load.global_running
-    agent_used: dict[str, int] = {a.agent_id: load.running_by_agent.get(a.agent_id, 0) for a in registry.all()}
+    # items see the capacity earlier items have already claimed. Snapshot
+    # counts are clamped to >= 0 (finding F3): a corrupted/negative count must
+    # never *increase* available capacity below.
+    global_used = max(0, load.global_running)
+    agent_used: dict[str, int] = {
+        a.agent_id: max(0, load.running_by_agent.get(a.agent_id, 0)) for a in registry.all()
+    }
     consumed_workspaces: set[str] = {_normalize_workspace(w) for w in load.busy_workspaces}
     scheduled_tasks: set[str] = set()
 
@@ -495,6 +544,7 @@ def plan(
             "task_id": item.task_id,
             "priority": item.priority,
             "priority_rank": _priority_rank(item.priority),
+            "priority_recognized": _priority_recognized(item.priority),
             "decided_at": now,
             "required_capabilities": item.required_capabilities,
             "queued_seconds": _queued_seconds(item, now_epoch),
@@ -518,6 +568,29 @@ def plan(
             )
             continue
 
+        # 0b) Duplicate task_id — at most one ASSIGN per task_id per plan
+        #     (finding F2). `scheduled_tasks` holds only task_ids that were
+        #     actually ASSIGNED earlier in this same, canonically-ordered pass,
+        #     so the earliest-ordered eligible item wins deterministically and
+        #     every later item for that task is DEFERRED (never a second
+        #     concurrent attempt). An earlier item that merely DEFERRED/BLOCKED
+        #     (never assigned) does not consume its task_id, so a valid twin is
+        #     not blocked incorrectly. Placed before the retry/capacity gates
+        #     so the duplicate reason is reported regardless of those.
+        if item.task_id in scheduled_tasks:
+            decisions.append(
+                SchedulingDecision(
+                    action=ACTION_DEFER,
+                    reason_code=REASON_DUPLICATE_TASK,
+                    explanation=(
+                        f"task_id {item.task_id!r} was already assigned earlier in this plan; "
+                        "at most one attempt per task_id is scheduled per tick"
+                    ),
+                    **base,
+                )
+            )
+            continue
+
         workspace = _normalize_workspace(item.workspace)
 
         # 1) Dependencies not satisfied — transient, will clear.
@@ -532,11 +605,17 @@ def plan(
             )
             continue
 
-        # 2) Retry gating on the previous attempt's terminal outcome.
-        if item.attempts_made > 0 and (item.last_failure_reason or item.last_state in _TERMINAL_STATES):
+        # 2) Retry gating — STATE-driven, never failure_reason-driven (finding
+        #    F1). Any prior non-success terminal state with a completed attempt
+        #    (FAILED / INTERRUPTED / UNKNOWN / CANCELLED, incl. reconcile output
+        #    that carries no failure_reason) enters the retry policy.
+        #    `classify_failure` — which *does* read failure_reason — only
+        #    refines the gated outcome into TERMINAL vs RECOVERABLE; it never
+        #    decides whether the gate applies. COMPLETED is not in
+        #    `_RETRY_GATED_STATES`, so a successful prior attempt is never
+        #    gated (it falls through to normal assignment, e.g. a resume).
+        if item.attempts_made > 0 and item.last_state in _RETRY_GATED_STATES:
             classification = classify_failure(state=item.last_state, failure_reason=item.last_failure_reason)
-            if item.last_state in ("COMPLETED",):
-                classification = None  # a completed prior attempt is not a failure to gate on
             if classification == TERMINAL:
                 decisions.append(
                     SchedulingDecision(
@@ -552,41 +631,60 @@ def plan(
                     )
                 )
                 continue
-            if classification == RECOVERABLE:
-                if item.attempts_made >= policy.max_attempts:
-                    decisions.append(
-                        SchedulingDecision(
-                            action=ACTION_BLOCKED,
-                            reason_code=REASON_RETRY_EXHAUSTED,
-                            explanation=(
-                                f"recoverable failure but retry budget exhausted "
-                                f"({item.attempts_made}/{policy.max_attempts} attempts made)"
-                            ),
-                            failure_classification=RECOVERABLE,
-                            **base,
-                        )
+            # RECOVERABLE from here — budget first, then backoff timing.
+            if item.attempts_made >= policy.max_attempts:
+                decisions.append(
+                    SchedulingDecision(
+                        action=ACTION_BLOCKED,
+                        reason_code=REASON_RETRY_EXHAUSTED,
+                        explanation=(
+                            f"recoverable failure but retry budget exhausted "
+                            f"({item.attempts_made}/{policy.max_attempts} attempts made)"
+                        ),
+                        failure_classification=RECOVERABLE,
+                        **base,
                     )
-                    continue
-                backoff = policy.backoff_seconds(item.attempts_made)
-                next_eligible = _iso_add(item.last_completed_at, backoff)
-                last_epoch = _to_epoch(item.last_completed_at)
-                if last_epoch is not None and now_epoch is not None and now_epoch < last_epoch + backoff:
-                    decisions.append(
-                        SchedulingDecision(
-                            action=ACTION_DEFER,
-                            reason_code=REASON_BACKOFF,
-                            explanation=(
-                                f"recoverable failure; backing off {backoff:.0f}s after attempt "
-                                f"{item.attempts_made} before the next attempt"
-                            ),
-                            failure_classification=RECOVERABLE,
-                            next_eligible_at=next_eligible,
-                            **base,
-                        )
+                )
+                continue
+            backoff = policy.backoff_seconds(item.attempts_made)
+            last_epoch = _to_epoch(item.last_completed_at)
+            if last_epoch is None or now_epoch is None:
+                # F4: recoverable, but the backoff deadline cannot be computed
+                # (missing/unparseable last_completed_at, or unparseable now).
+                # Fail safe — DEFER; never assign immediately, never fabricate
+                # a next_eligible_at.
+                decisions.append(
+                    SchedulingDecision(
+                        action=ACTION_DEFER,
+                        reason_code=REASON_RETRY_TIMING_UNKNOWN,
+                        explanation=(
+                            f"recoverable failure after attempt {item.attempts_made}, but the completion "
+                            "time is unknown so the backoff deadline cannot be computed; deferring rather "
+                            "than retrying immediately"
+                        ),
+                        failure_classification=RECOVERABLE,
+                        next_eligible_at=None,
+                        **base,
                     )
-                    continue
-                # else: backoff already elapsed (or no timestamp to gate on) —
-                # fall through to normal assignment as a fresh attempt.
+                )
+                continue
+            if now_epoch < last_epoch + backoff:
+                decisions.append(
+                    SchedulingDecision(
+                        action=ACTION_DEFER,
+                        reason_code=REASON_BACKOFF,
+                        explanation=(
+                            f"recoverable failure; backing off {backoff:.0f}s after attempt "
+                            f"{item.attempts_made} before the next attempt"
+                        ),
+                        failure_classification=RECOVERABLE,
+                        next_eligible_at=_iso_add(item.last_completed_at, backoff),
+                        **base,
+                    )
+                )
+                continue
+            # else: backoff already elapsed — fall through to normal assignment
+            # as a fresh attempt (attempt number attempts_made + 1).
 
         # 3) Capability match — structural. No capable agent is BLOCKED.
         if item.preferred_agent is not None:

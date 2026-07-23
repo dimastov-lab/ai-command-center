@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+import pytest
+
 from command_center.runtime import db, scheduler, supervisor
 
 NOW = "2026-07-23T12:00:00"
@@ -510,3 +512,222 @@ def test_snapshot_after_reconciliation_frees_workspace_for_scheduling(tmp_path):
     reg = _registry()
     result = scheduler.plan([_item("t-new", "/repo/a")], registry=reg, load=snap, now=NOW)
     assert result.assignments()[0].task_id == "t-new"
+
+
+# ==========================================================================
+# Founder Gate remediation — F1 (state-driven retry gating), F2 (task_id
+# dedup), F3 (snapshot clamp), F4 (missing retry timestamp), F6 (priority
+# normalization surfaced). Regression coverage for the exact defects the
+# independent review reproduced.
+# ==========================================================================
+
+# --- F1: retry gating is STATE-driven, not failure_reason-driven ----------
+
+
+@pytest.mark.parametrize("state", ["FAILED", "INTERRUPTED", "UNKNOWN"])
+def test_f1_non_success_terminal_with_no_failure_reason_below_budget_defers_backoff(state):
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=3, base_backoff_seconds=30)
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state=state, last_failure_reason=None,
+        last_completed_at=NOW,  # just completed -> inside the 30s backoff window
+    )
+    d = scheduler.plan([item], registry=reg, policy=policy, now=NOW).decisions[0]
+    assert d.action == scheduler.ACTION_DEFER
+    assert d.reason_code == scheduler.REASON_BACKOFF
+    assert d.failure_classification == scheduler.RECOVERABLE
+    assert d.next_eligible_at == _iso(NOW, seconds=30)
+
+
+@pytest.mark.parametrize("state", ["FAILED", "INTERRUPTED", "UNKNOWN"])
+def test_f1_non_success_terminal_with_no_failure_reason_exhausted_budget_blocks(state):
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=3)
+    item = _item(
+        "t1", "/repo/a", attempts_made=3, last_state=state, last_failure_reason=None,
+        last_completed_at=_iso(NOW, seconds=-100000),  # long past any backoff
+    )
+    d = scheduler.plan([item], registry=reg, policy=policy, now=NOW).decisions[0]
+    assert d.action == scheduler.ACTION_BLOCKED
+    assert d.reason_code == scheduler.REASON_RETRY_EXHAUSTED
+    assert d.failure_classification == scheduler.RECOVERABLE
+
+
+@pytest.mark.parametrize("state", ["FAILED", "INTERRUPTED", "UNKNOWN"])
+def test_f1_recently_completed_recoverable_never_assigns_immediately(state):
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=5, base_backoff_seconds=30)
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state=state, last_failure_reason=None,
+        last_completed_at=_iso(NOW, seconds=-5),  # 5s ago, backoff is 30s
+    )
+    d = scheduler.plan([item], registry=reg, policy=policy, now=NOW).decisions[0]
+    assert d.action != scheduler.ACTION_ASSIGN
+    assert d.reason_code == scheduler.REASON_BACKOFF
+
+
+@pytest.mark.parametrize("state", ["FAILED", "INTERRUPTED", "UNKNOWN"])
+def test_f1_recoverable_after_backoff_assigns_attempt_made_plus_one(state):
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=5, base_backoff_seconds=30)
+    item = _item(
+        "t1", "/repo/a", attempts_made=2, last_state=state, last_failure_reason=None,
+        last_completed_at=_iso(NOW, seconds=-1000),  # backoff long elapsed
+    )
+    d = scheduler.plan([item], registry=reg, policy=policy, now=NOW).assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+    assert d.attempt == 3  # attempts_made + 1
+
+
+def test_f1_cancelled_prior_remains_terminal_never_retries():
+    reg = _registry()
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="CANCELLED", last_failure_reason=None,
+        last_completed_at=_iso(NOW, seconds=-100000),
+    )
+    d = scheduler.plan([item], registry=reg, now=NOW).decisions[0]
+    assert d.action == scheduler.ACTION_BLOCKED
+    assert d.reason_code == scheduler.REASON_TERMINAL_FAILURE
+    assert d.failure_classification == scheduler.TERMINAL
+
+
+def test_f1_blocked_reason_remains_terminal_never_retries():
+    reg = _registry()
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED", last_failure_reason="blocked:permission",
+        last_completed_at=_iso(NOW, seconds=-100000),
+    )
+    d = scheduler.plan([item], registry=reg, now=NOW).decisions[0]
+    assert d.action == scheduler.ACTION_BLOCKED
+    assert d.reason_code == scheduler.REASON_TERMINAL_FAILURE
+
+
+def test_f1_completed_prior_attempt_is_not_gated_and_assigns():
+    """A successful prior attempt (a resume) must NOT enter retry gating."""
+    reg = _registry()
+    item = _item("t1", "/repo/a", attempts_made=1, last_state="COMPLETED", last_completed_at=NOW)
+    d = scheduler.plan([item], registry=reg, now=NOW).assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+    assert d.attempt == 2
+
+
+def test_f1_budget_can_never_be_exceeded_for_any_gated_state():
+    """Property: for every gated state, attempts_made >= max_attempts never assigns."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=2)
+    for state in ("FAILED", "INTERRUPTED", "UNKNOWN", "CANCELLED"):
+        for attempts in (2, 3, 9):
+            item = _item(
+                "t", "/repo/a", attempts_made=attempts, last_state=state, last_failure_reason=None,
+                last_completed_at=_iso(NOW, seconds=-100000),
+            )
+            d = scheduler.plan([item], registry=reg, policy=policy, now=NOW).decisions[0]
+            assert d.action != scheduler.ACTION_ASSIGN, (state, attempts, d.action, d.reason_code)
+
+
+# --- F2: at most one ASSIGN per task_id per plan --------------------------
+
+
+def test_f2_duplicate_task_id_different_workspaces_yields_exactly_one_assign():
+    reg = _registry(max_concurrency=10)
+    cfg = scheduler.SchedulerConfig(max_global_concurrency=10)
+    items = [_item("SAME", "/repo/a"), _item("SAME", "/repo/b")]
+    plan = scheduler.plan(items, registry=reg, config=cfg, now=NOW)
+    assert len(plan.assignments()) == 1
+    dups = [d for d in plan.deferrals() if d.reason_code == scheduler.REASON_DUPLICATE_TASK]
+    assert len(dups) == 1
+
+
+def test_f2_duplicate_winner_is_deterministic_under_input_reversal():
+    reg = _registry(max_concurrency=10)
+    cfg = scheduler.SchedulerConfig(max_global_concurrency=10)
+    items = [_item("SAME", "/repo/a"), _item("SAME", "/repo/b")]
+    fwd = scheduler.plan(items, registry=reg, config=cfg, now=NOW)
+    rev = scheduler.plan(list(reversed(items)), registry=reg, config=cfg, now=NOW)
+    assert fwd.audit_records() == rev.audit_records()
+    # Canonical winner is the lexicographically-smaller normalized workspace.
+    assert fwd.assignments()[0].task_id == "SAME"
+
+
+def test_f2_deferred_first_item_does_not_consume_task_id():
+    """If the earliest same-task item is only DEFERRED (workspace busy), a later
+    twin on a free workspace may still be assigned — dedup keys on ASSIGNED
+    task_ids, not merely seen ones."""
+    reg = _registry(max_concurrency=10)
+    cfg = scheduler.SchedulerConfig(max_global_concurrency=10)
+    # /repo/a is already busy in the live snapshot -> the /repo/a twin defers.
+    load = scheduler.LoadSnapshot(global_running=1, busy_workspaces=frozenset({"/repo/a"}))
+    items = [_item("SAME", "/repo/a"), _item("SAME", "/repo/b")]
+    plan = scheduler.plan(items, registry=reg, config=cfg, load=load, now=NOW)
+    assert len(plan.assignments()) == 1
+    assert plan.assignments()[0].task_id == "SAME"
+    reasons = {d.reason_code for d in plan.deferrals()}
+    assert scheduler.REASON_WORKSPACE_BUSY in reasons
+    assert scheduler.REASON_DUPLICATE_TASK not in reasons
+
+
+def test_f2_malformed_twin_does_not_block_valid_canonical_item():
+    reg = _registry(max_concurrency=10)
+    cfg = scheduler.SchedulerConfig(max_global_concurrency=10)
+    items = [scheduler.WorkItem(task_id="SAME", workspace=""), _item("SAME", "/repo/b")]
+    plan = scheduler.plan(items, registry=reg, config=cfg, now=NOW)
+    assert len(plan.assignments()) == 1
+    assert plan.assignments()[0].task_id == "SAME"
+    assert {d.reason_code for d in plan.blocked()} == {scheduler.REASON_MALFORMED}
+
+
+# --- F3: clamp corrupted snapshot counts ----------------------------------
+
+
+def test_f3_negative_global_running_is_clamped():
+    reg = _registry(max_concurrency=10)
+    cfg = scheduler.SchedulerConfig(max_global_concurrency=1)
+    load = scheduler.LoadSnapshot(global_running=-5)
+    items = [_item(f"t{i}", f"/repo/{i}") for i in range(4)]
+    plan = scheduler.plan(items, registry=reg, config=cfg, load=load, now=NOW)
+    # Clamp to 0 -> exactly max_global_concurrency assignments, never more.
+    assert len(plan.assignments()) == 1
+
+
+def test_f3_negative_per_agent_running_is_clamped():
+    reg = scheduler.AgentRegistry([scheduler.AgentSpec("c", "claude_code", frozenset({scheduler.CAP_ANY}), 1)])
+    cfg = scheduler.SchedulerConfig(max_global_concurrency=10)
+    load = scheduler.LoadSnapshot(running_by_agent={"c": -4})
+    items = [_item(f"t{i}", f"/repo/{i}") for i in range(4)]
+    plan = scheduler.plan(items, registry=reg, config=cfg, load=load, now=NOW)
+    # Agent capacity is 1; negative running must not inflate it.
+    assert len(plan.assignments()) == 1
+
+
+# --- F4: missing/unparseable retry timestamp fails safe -------------------
+
+
+@pytest.mark.parametrize("bad_ts", [None, "not-a-timestamp"])
+def test_f4_missing_last_completed_at_defers_not_assigns(bad_ts):
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=5)
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED", last_failure_reason="timeout",
+        last_completed_at=bad_ts,
+    )
+    d = scheduler.plan([item], registry=reg, policy=policy, now=NOW).decisions[0]
+    assert d.action == scheduler.ACTION_DEFER
+    assert d.reason_code == scheduler.REASON_RETRY_TIMING_UNKNOWN
+    assert d.next_eligible_at is None  # never fabricated
+
+
+# --- F6: unknown priority normalization surfaced --------------------------
+
+
+def test_f6_unknown_priority_is_surfaced_in_audit():
+    reg = _registry()
+    d = scheduler.plan([_item("t1", "/repo/a", priority="URGENT!!")], registry=reg, now=NOW).decisions[0]
+    assert d.priority_recognized is False
+    assert d.priority_rank == 0
+    assert d.as_dict()["priority_recognized"] is False
+
+
+def test_f6_known_priority_marked_recognized():
+    reg = _registry()
+    d = scheduler.plan([_item("t1", "/repo/a", priority="Critical")], registry=reg, now=NOW).decisions[0]
+    assert d.priority_recognized is True
