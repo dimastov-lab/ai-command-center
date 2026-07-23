@@ -14,8 +14,10 @@ documentation (status: D0, documentation only, no desktop code yet).
 
 ### 1. Create a virtual environment
 
+Supported Python: **3.14** (the version CI runs and the app is validated against).
+
 ```bash
-python3 -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 ```
 
@@ -248,6 +250,25 @@ pytest
 
 The suite (`tests/`) isolates itself from your real local data via the `AICC_DATA_DIR`
 environment variable (set once in `tests/conftest.py`, before any app/`command_center`
-module is imported) — it never reads or writes your real `data/*.json(l)` files. It
-mocks `subprocess.run` for every scenario that would otherwise invoke the real `claude`
-CLI or spend API credits; no automated test launches a real agent job.
+module is imported) — it never reads or writes your real `data/*.json(l)` files, and a
+monkeypatched `REPORTS_ROOT` keeps `reports/` untouched. It mocks `subprocess.run` for
+every scenario that would otherwise invoke the real `claude` CLI or spend API credits; no
+automated test launches a real agent job. All writes go to per-test temp directories, so
+the suite is safe to run in a disposable CI environment.
+
+## Continuous integration
+
+`requirements-dev.txt` installs the tools CI needs (`pytest`, `ruff`). The same four
+gates run locally and in CI — run them before pushing:
+
+```bash
+git diff --check                                            # no whitespace errors / conflict markers
+ruff check .                                                # lint
+python -m compileall -q command_center scripts tests app.py # byte-compile validation
+pytest -q                                                   # full suite
+```
+
+`.github/workflows/ci.yml` runs these gates on every pull request into `main`, every push
+to `main`, and on-demand (`workflow_dispatch`), on Python 3.14. The workflow uses a
+read-only token, references no secrets, pins each action to a commit SHA, and cancels
+superseded runs for the same ref.
