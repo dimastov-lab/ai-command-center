@@ -111,7 +111,8 @@ the design is implemented, not just approved.
 
 ### Added
 - **`command_center/` package**: `models`, `storage`, `project_config`, `agent_runner`,
-  `report_parser`, `chat_service`, `workflow`, `activity_log` — see ARCHITECTURE.md §11.
+  `report_parser`, `chat_service`, `workflow`, `activity_log` — see
+  [Application and domain services](ARCHITECTURE.md#22-application-and-domain-services).
 - **Project Chat** (`chat` page): per-project conversations with a provider abstraction (local
   manual mode, Claude Code CLI, optional OpenAI Responses API gated on `OPENAI_API_KEY` +
   `OPENAI_MODEL`); save any message into `reports/`, or convert it into a task.
@@ -144,7 +145,8 @@ the design is implemented, not just approved.
 
 ### Changed
 - `data/runs.jsonl` and `data/activity.jsonl` use JSON Lines instead of a single JSON array — see
-  ARCHITECTURE.md §11.2 for why. `reports/` is now gitignored (may contain BANK/LEGAL content).
+  [Persistence architecture](ARCHITECTURE.md#3-persistence-architecture) for why. `reports/` is now
+  gitignored (may contain BANK/LEGAL content).
 
 ### Security
 - The Claude Code runner never calls git-write subcommands itself, and refuses to run against any
@@ -152,8 +154,9 @@ the design is implemented, not just approved.
 - Read-only task types (`review`/`final_gate`/`architecture_review`) run with the model's tool set
   restricted to `Read,Grep,Glob` via `--tools` — `Bash` and every file-edit tool are entirely absent
   from that run, not merely pattern-denied. Implementation/remediation task types keep `Bash` but
-  have the specific git-write subcommands denied via `--disallowedTools` — see ARCHITECTURE.md §11.3
-  for exactly what each task-type class does and does not enforce.
+  have the specific git-write subcommands denied via `--disallowedTools` — see
+  [Git and GitHub privileged boundaries](ARCHITECTURE.md#9-git-and-github-privileged-boundaries)
+  for what each task-type class enforces.
 - Fixed during independent review (F-01/F-02): an earlier version of this control denied specific
   `Bash(git ...)` patterns for read-only task types while leaving the general-purpose `Bash` tool
   available, which left `git apply`/`checkout`/`stash` and plain shell writes unrestricted for task

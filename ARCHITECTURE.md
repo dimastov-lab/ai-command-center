@@ -26,7 +26,8 @@ flowchart LR
     Services --> Planning["data/tasks.json<br/>planning and Kanban"]
     Services --> Queue["data/execution_queue.json<br/>execution queue"]
     Services --> Runtime["data/runtime.db<br/>runtime and completion"]
-    Services --> Legacy["JSON and JSONL<br/>legacy state"]
+    Services --> AppStores["chats.json and activity.jsonl<br/>active application stores"]
+    Services --> Legacy["runs.jsonl<br/>legacy run journal"]
     Services --> Portfolio["Portfolio cards and<br/>Portfolio registries"]
     Services --> Artifacts["reports and generated files"]
 
@@ -62,10 +63,12 @@ Project Chat, Kanban, AI Agents, Live Execution Center, Run Journal, Timeline, P
 Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode, Portfolio
 Execution, and Portfolio Overview.
 
-`app.py` remains a large presentation and orchestration surface. Extracted panels live in
-`command_center/ui/`, including execution queue, Execution Center, completion, workspace home,
-Portfolio execution, and Portfolio overview UI. `command_center/ui/` may import Streamlit;
-domain, storage, and runtime services remain plain Python.
+`app.py` remains a large presentation and orchestration surface. `command_center/ui/` contains
+selected extracted panels and components, including the execution queue, recommendations, project
+selection and intelligence, Portfolio execution and overview, and shared shell elements. The
+primary Live Execution Center, completion-status, and Workspace Home renderers remain in `app.py`.
+`command_center/ui/` may import Streamlit; domain, storage, and runtime services remain plain
+Python.
 
 ### 2.2 Application and domain services
 
@@ -113,8 +116,8 @@ There is no single system-wide transactional store. Several authorities coexist:
 | `data/runtime.db` | Runtime tasks, sessions, runs, run events, reports, and completion state | SQLite schema version 5; WAL, busy timeout, foreign keys, guarded transitions, CAS versions, workspace locks |
 | `data/execution_queue.json` | Separate execution planning queue | Whole-file JSON; atomic replacement; no cross-process locked mutation |
 | `data/runs.jsonl` | Legacy synchronous run journal | Append-only JSONL; latest record per run is folded on read |
-| `data/chats.json` | Project chat conversations | Whole-file JSON |
-| `data/activity.jsonl` | Activity journal | Append-only JSONL |
+| `data/chats.json` | Active project chat conversations | Whole-file JSON |
+| `data/activity.jsonl` | Active application activity journal | Append-only JSONL |
 | `data/project_config.json` | Local repository and policy overrides | Whole-file JSON |
 | `data/portfolio_config.json` | Portfolio project-to-repository mapping | Whole-file JSON |
 | `data/portfolio_launches.json` | Portfolio launch-to-runtime registry | Whole-file JSON plus Portfolio lock files |
@@ -123,8 +126,14 @@ There is no single system-wide transactional store. Several authorities coexist:
 | `generated/<PROJECT>/` | Legacy generated task files | Per-file artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative for
-execution and completion state. SQLite does not replace the legacy JSON/JSONL stores, the execution
-queue, Portfolio registries, or artifact directories.
+execution and completion state. SQLite does not replace the active chat and activity stores, the
+legacy `runs.jsonl` journal, the execution queue, Portfolio registries, or artifact directories.
+
+`data/runs.jsonl` and `data/activity.jsonl` use append-only JSON Lines rather than JSON arrays.
+Each record is appended, flushed, and synced to disk without rewriting earlier records. This
+supports incremental persistence, avoids whole-file rewrites for write-heavy journals, and
+confines an interrupted or malformed write to one line. Readers skip malformed lines, and the
+legacy run journal folds later snapshots by run ID to recover each run's current record.
 
 Most runtime files are covered by the checked-in `.gitignore`. `runtime.db` must remain local and
 untracked, but the current checkout's exclusion is repository-local Git metadata rather than a
@@ -140,8 +149,8 @@ Because planning, execution, queue, and completion do not share one transaction:
   planning task;
 - queue readiness is recomputed against current planning dependencies;
 - Portfolio registry entries link Portfolio task IDs to runtime run IDs;
-- legacy data remains independently readable and is not automatically converted into the SQLite
-  source of truth during every startup.
+- legacy run data remains independently readable and is not automatically converted into the
+  SQLite source of truth during every startup.
 
 Projection is idempotent and task mutations are locked, but reconciliation is still an explicit
 application responsibility. A crash between stores can leave a stale projection that a later
@@ -203,8 +212,9 @@ compare-and-swap updates prevent late worker threads from overwriting a newer te
 ### 4.4 Legacy execution
 
 `execute_agent_launch` and `agent_runner.py` retain the synchronous Claude CLI path and
-`data/runs.jsonl` persistence. Legacy chat/activity JSON/JSONL and generated-task scripts also
-remain. They coexist with, rather than replace, the asynchronous SQLite runtime. New Streamlit task
+`data/runs.jsonl` persistence; generated-task scripts also remain legacy. The active
+`data/chats.json` and `data/activity.jsonl` application stores remain separate from SQLite. These
+stores coexist with, rather than replace, the asynchronous SQLite runtime. New Streamlit task
 launches use the v2 asynchronous bridge.
 
 ## 5. Execution queue
@@ -367,7 +377,8 @@ repository checks.
 ## 13. Current risks and boundaries
 
 - Multiple persistence authorities require reconciliation and cannot commit atomically together.
-- Legacy synchronous/JSONL and current asynchronous/SQLite paths coexist.
+- The legacy synchronous `runs.jsonl` path and current asynchronous SQLite execution path coexist;
+  active chat and activity stores remain separate from both.
 - Live Supervisor ownership is confined to one Python process.
 - `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
 - Toolchain declarations are incomplete and no mandatory CI is checked in.
