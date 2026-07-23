@@ -87,12 +87,54 @@ def resolve_expected_branch(*, task: dict | None, project_config: dict | None) -
     return (project_config or {}).get("default_branch") or None
 
 
+def resolve_base_branch(*, task: dict | None, project_config: dict | None) -> str | None:
+    """The branch a not-yet-existing feature/audit worktree should be created
+    *from*. Precedence: `task["base_branch"]` → `project_config["default_branch"]`
+    → `None`. Consumed by `command_center.workspace_provisioning` to run
+    `git worktree add -b <expected_branch> <path> <base_branch>` when the
+    workspace is absent — it is never the branch the agent runs on (that is
+    `resolve_expected_branch`), only the point it forks from."""
+    task_base = (task or {}).get("base_branch")
+    if task_base:
+        return task_base
+    return (project_config or {}).get("default_branch") or None
+
+
+# Stable, translation-independent classification codes for every validation
+# issue. Callers (`launch_service.prepare_task_launch`, the Kanban launcher,
+# the execution queue) branch on these — never on the human-facing, localized
+# message text — so a distinct, *recoverable* pre-launch condition (a
+# configured workspace that does not yet exist but can be provisioned) can be
+# told apart from a genuinely fatal one without string-matching display text.
+ISSUE_WORKSPACE_NOT_CONFIGURED = "workspace_not_configured"
+ISSUE_WORKSPACE_MISSING = "workspace_missing"            # the one provisionable code
+ISSUE_WORKSPACE_NOT_DIRECTORY = "workspace_not_directory"
+ISSUE_WORKSPACE_NOT_GIT_REPO = "workspace_not_git_repo"
+ISSUE_DETACHED_HEAD = "detached_head"
+ISSUE_DIRTY_TREE = "dirty_tree"
+ISSUE_BRANCH_MISMATCH = "branch_mismatch"
+
+SEVERITY_ERROR = "error"
+SEVERITY_WARNING = "warning"
+
+
+@dataclass
+class LaunchIssue:
+    """A single validation finding, carrying a stable `code` for programmatic
+    branching alongside the localized `message` shown to the operator."""
+
+    code: str
+    message: str
+    severity: str = SEVERITY_ERROR
+
+
 @dataclass
 class LaunchValidation:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     git_status: dict[str, object] | None = None
     workspace_path: str | None = None
+    issues: list[LaunchIssue] = field(default_factory=list)
 
     @property
     def can_launch(self) -> bool:
@@ -102,40 +144,71 @@ class LaunchValidation:
     def needs_confirmation(self) -> bool:
         return bool(self.warnings)
 
+    def _add_error(self, code: str, message: str) -> None:
+        self.errors.append(message)
+        self.issues.append(LaunchIssue(code=code, message=message, severity=SEVERITY_ERROR))
+
+    def _add_warning(self, code: str, message: str) -> None:
+        self.warnings.append(message)
+        self.issues.append(LaunchIssue(code=code, message=message, severity=SEVERITY_WARNING))
+
+    @property
+    def error_codes(self) -> list[str]:
+        return [i.code for i in self.issues if i.severity == SEVERITY_ERROR]
+
+    def blocked_only_by(self, code: str) -> bool:
+        """True when validation failed and *every* blocking error is `code` —
+        the precise test for "the only thing wrong is a recoverable condition"
+        (e.g. a missing-but-provisionable workspace), never inferred from
+        message text."""
+        codes = self.error_codes
+        return bool(codes) and all(c == code for c in codes)
+
 
 def validate_launch(*, workspace_path: str | None, expected_branch: str | None = None) -> LaunchValidation:
     """Read-only pre-flight check. Never mutates the repository or filesystem."""
     result = LaunchValidation(workspace_path=workspace_path)
 
     if not workspace_path:
-        result.errors.append("Workspace-путь не настроен для этой задачи.")
+        result._add_error(ISSUE_WORKSPACE_NOT_CONFIGURED, "Workspace-путь не настроен для этой задачи.")
         return result
 
     path = Path(workspace_path)
-    if not path.exists() or not path.is_dir():
-        result.errors.append(f"Workspace не найден на диске: {workspace_path}")
+    if not path.exists():
+        # Recoverable: a configured workspace that does not yet exist can be
+        # provisioned as an isolated worktree (see
+        # `launch_service.prepare_task_launch`). Distinct code from a path
+        # that exists but is a file — that one is genuinely fatal.
+        result._add_error(ISSUE_WORKSPACE_MISSING, f"Workspace не найден на диске: {workspace_path}")
+        return result
+    if not path.is_dir():
+        result._add_error(ISSUE_WORKSPACE_NOT_DIRECTORY, f"Workspace не найден на диске: {workspace_path}")
         return result
 
     status = git_info.get_status(path)
     result.git_status = status
 
     if not status.get("is_repo"):
-        result.errors.append(f"{workspace_path} не является git-репозиторием.")
+        result._add_error(ISSUE_WORKSPACE_NOT_GIT_REPO, f"{workspace_path} не является git-репозиторием.")
         return result
 
     branch = status.get("branch")
     if branch == "(detached HEAD)":
-        result.warnings.append("Репозиторий в состоянии detached HEAD.")
+        result._add_warning(ISSUE_DETACHED_HEAD, "Репозиторий в состоянии detached HEAD.")
 
     if status.get("dirty"):
         modified = status.get("modified_count", 0)
         untracked = status.get("untracked_count", 0)
-        result.warnings.append(
-            f"Рабочее дерево не чистое: {modified} изменённых, {untracked} неотслеживаемых файлов."
+        result._add_warning(
+            ISSUE_DIRTY_TREE,
+            f"Рабочее дерево не чистое: {modified} изменённых, {untracked} неотслеживаемых файлов.",
         )
 
     if expected_branch and branch and branch != "(detached HEAD)" and branch != expected_branch:
-        result.warnings.append(f"Текущая ветка «{branch}» отличается от ожидаемой «{expected_branch}».")
+        result._add_warning(
+            ISSUE_BRANCH_MISMATCH,
+            f"Текущая ветка «{branch}» отличается от ожидаемой «{expected_branch}».",
+        )
 
     return result
 

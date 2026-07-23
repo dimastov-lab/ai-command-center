@@ -45,7 +45,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from command_center import agent_runner
+from command_center import agent_runner, workspace_provisioning
 from command_center.models import iso_now
 from command_center.runtime import context_service, db, identity, outcome, reports, stream_parser
 
@@ -82,6 +82,22 @@ _FORBIDDEN_FLAGS = frozenset({"--continue", "-c", "--background", "--bg"})
 
 class SupervisorError(Exception):
     """Raised for a launch/cancel request that cannot be carried out."""
+
+
+class WorkspaceVerificationFailed(SupervisorError):
+    """Fail-closed launch rejection: the target workspace did not pass
+    `workspace_provisioning.verify_workspace` (wrong branch, not an isolated
+    worktree, belongs to another repository, ...). Subclasses `SupervisorError`
+    so every caller that already catches `SupervisorError` (e.g. `app.py`'s
+    launch handlers, `execution_queue.launch_ready`) refuses the launch with no
+    new except clause, while carrying `.structured` (expected/actual workspace,
+    expected/actual branch, failed step, remediation) for a caller that wants
+    to render the failure in full. The process is never started."""
+
+    def __init__(self, error: workspace_provisioning.WorkspaceVerificationError) -> None:
+        self.structured = error.as_dict()
+        self.failed_step = error.failed_step
+        super().__init__(str(error))
 
 
 class WorkspaceLockedError(SupervisorError):
@@ -277,8 +293,24 @@ class Supervisor:
         launch_source: str | None = None,
         prompt_version: int | None = None,
         repository_already_validated: bool = False,
+        workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
     ) -> dict:
         """Prepare and launch a run from an already-final `prompt` string.
+
+        `workspace_verification`, when given, is the **fail-closed workspace
+        gate** — this is the single chokepoint every v2 task launch funnels
+        through, so verifying here means no launch path (Kanban launcher,
+        execution queue, portfolio, or a future caller of `start_run`) can
+        bypass it. Before any run row is created or any process is spawned,
+        `workspace_provisioning.verify_workspace` must pass; if it does not
+        (wrong branch, not an isolated worktree, workspace belongs to another
+        repository, dirty tree under a strict policy, ...) this raises
+        `WorkspaceVerificationFailed` and the process is never started. The
+        passing `VerificationEvidence` is recorded as a `workspace_verified`
+        lifecycle event, so "Workspace Verified" is only ever emitted after
+        every check has actually passed. `None` (the default) preserves the
+        original behavior for non-task callers (chat, ad-hoc runs, tests) that
+        have no isolated-worktree concept.
 
         `expected_branch`/`launch_source`/`prompt_version` are opaque,
         write-once Live Execution Center v2 metadata (see
@@ -335,6 +367,17 @@ class Supervisor:
         else:
             repo_path = agent_runner.validate_repository(project, repository_path)
 
+        # Fail-closed workspace gate — the single chokepoint no v2 task launch
+        # can bypass. Runs before any run row exists or any process is spawned;
+        # its passing evidence is the *only* authorization to emit "Workspace
+        # Verified" (recorded below, once the run row exists to attach it to).
+        verification_evidence = None
+        if workspace_verification is not None:
+            try:
+                verification_evidence = workspace_provisioning.verify_workspace(workspace_verification)
+            except workspace_provisioning.WorkspaceVerificationError as exc:
+                raise WorkspaceVerificationFailed(exc) from exc
+
         if task_id is None:
             task = db.create_task(
                 self.db_path, project=project, title=title or prompt[:120], task_type=task_type
@@ -389,6 +432,16 @@ class Supervisor:
             )
         except db.WorkspaceLockedError as exc:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
+
+        if verification_evidence is not None:
+            db.append_run_event(
+                self.db_path,
+                run["id"],
+                "lifecycle",
+                stream_parser.lifecycle_event(
+                    "workspace_verified", **verification_evidence.as_payload()
+                )["payload"],
+            )
 
         # From here on this run is committed to being launched by *this*
         # instance — recorded the instant the row exists (still PREPARED),

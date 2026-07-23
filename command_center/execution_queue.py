@@ -42,7 +42,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import agent_runner, launch, launch_service, models, project_config, storage
+from command_center import (
+    agent_runner,
+    launch,
+    launch_service,
+    models,
+    project_config,
+    storage,
+    workspace_provisioning,
+)
+from command_center.runtime import supervisor as runtime_supervisor
 
 QUEUE_FILE_NAME = "execution_queue.json"
 
@@ -250,27 +259,37 @@ def launch_ready(
             continue
 
         # `project_configs` is keyed by canonical id, but a task may store a
-        # display name / alias — resolve to the canonical id (shared helper) so
-        # a display-name task still finds its repository_path/default workspace
-        # instead of silently launching against an empty `{}` config.
-        cfg = project_configs.get(project_config.canonical_project_id(task.get("project")), {})
-        selection = launch.resolve_workspace_path(task=task, project_config=cfg)
-        if not selection.path:
+        # display name / alias. Resolve it before preparing the launch so the
+        # queue receives the correct repository and workspace configuration.
+        canonical_project = project_config.canonical_project_id(task.get("project"))
+        cfg = project_configs.get(canonical_project, {})
+
+        # Shared classification — same service the Kanban launcher uses. A
+        # missing but provisionable workspace is routed through the isolated
+        # worktree provisioning and fail-closed verification path.
+        prep = launch_service.prepare_task_launch(task=task, project_config=cfg)
+        if not prep.selection.path:
             results.append(
                 LaunchAttemptResult(entry["id"], task_id, False, message="workspace не настроен для задачи")
             )
             continue
 
-        expected_branch = launch.resolve_expected_branch(task=task, project_config=cfg)
-        validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
-        if not validation.can_launch:
+        expected_branch = prep.expected_branch
+        base_branch = prep.base_branch
+        source_repository_path = prep.source_repository_path
+        validation = prep.validation
+
+        if prep.decision == launch_service.LAUNCH_DECISION_BLOCKED:
             results.append(
                 LaunchAttemptResult(
-                    entry["id"], task_id, False, message="; ".join(validation.errors) or "запуск заблокирован"
+                    entry["id"],
+                    task_id,
+                    False,
+                    message="; ".join(prep.fatal_messages) or "запуск заблокирован",
                 )
             )
             continue
-        if validation.warnings:
+        if prep.decision == launch_service.LAUNCH_DECISION_NEEDS_CONFIRMATION:
             results.append(
                 LaunchAttemptResult(
                     entry["id"],
@@ -283,7 +302,8 @@ def launch_ready(
             )
             continue
 
-        resolved_workspace = Path(selection.path).expanduser().resolve()
+        # READY or PROVISIONABLE — proceed through the shared launcher.
+        resolved_workspace = Path(prep.resolved_workspace)
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=task.get("project"),
@@ -297,9 +317,34 @@ def launch_ready(
                 executor_id=task.get("executor") or "claude_code",
                 validation=validation,
                 expected_branch=expected_branch,
+                base_branch=base_branch,
+                source_repository_path=source_repository_path,
             )
         except launch_service.DuplicateActiveLaunchError as exc:
             results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))
+            continue
+        except (
+            workspace_provisioning.WorkspaceVerificationError,
+            runtime_supervisor.WorkspaceVerificationFailed,
+        ) as exc:
+            # Provisioning or the fail-closed isolation gate rejected this
+            # workspace — the agent was never started. Record an explicit,
+            # structured Requires-Attention reason; never continue as launched.
+            structured = (
+                exc.structured
+                if isinstance(exc, runtime_supervisor.WorkspaceVerificationFailed)
+                else exc.as_dict()
+            )
+            reason = structured.get("detail") or structured.get("remediation") or "проверка изоляции не пройдена"
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=f"workspace не прошёл проверку изоляции ({structured['failed_step']}): {reason}",
+                    validation_report=structured,
+                )
+            )
             continue
         except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the batch
             results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))

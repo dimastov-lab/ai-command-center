@@ -202,17 +202,25 @@ def test_execute_agent_launch_v2_persists_task_metadata_and_expected_branch(git_
     fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(
         [json.dumps({"type": "result", "result": "Verdict: APPROVED FOR COMMIT"})]
     )
+    # The task runs in its own isolated worktree of `git_repo` on `feature/x`
+    # (the workspace-isolation gate now refuses to launch a `feature/x` task in
+    # a repo checked out on a different branch — that was the production bug).
+    worktree = git_repo.parent / "wt-feature-x"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/x", str(worktree), "HEAD"],
+        cwd=git_repo, check=True, capture_output=True, text=True,
+    )
     task = {"id": "t-v2-2", "branch": "feature/x", "prompt_version": 4}
     models.normalize_task_execution(task)
     task["branch"] = "feature/x"
     task["prompt_version"] = 4
-    validation = launch.validate_launch(workspace_path=str(git_repo))
+    validation = launch.validate_launch(workspace_path=str(worktree), expected_branch="feature/x")
     api = runtime_api.ExecutionCenterAPI(db_path=git_repo.parent / "runtime.db")
 
     run = launch_service.execute_agent_launch_v2(
         project="AIOS", task_type="implementation", prompt="do the thing", timeout_seconds=30,
-        repository_path=git_repo, task=task, validation=validation, confirmed=True,
-        execution_center_api=api, expected_branch="feature/x",
+        repository_path=worktree, task=task, validation=validation, confirmed=True,
+        execution_center_api=api, expected_branch="feature/x", source_repository_path=str(git_repo),
     )
     final = _wait_for_run_terminal(api.db_path, run["id"])
 
@@ -221,7 +229,7 @@ def test_execute_agent_launch_v2_persists_task_metadata_and_expected_branch(git_
     assert final["expected_branch"] == "feature/x"
     assert final["launch_source"] == "kanban_task"
     assert final["prompt_version"] == 4
-    assert final["repository_path"] == str(git_repo.resolve())
+    assert final["repository_path"] == str(worktree.resolve())
 
 
 def test_execute_agent_launch_v2_without_task_is_execution_center_adhoc(git_repo, fake_claude, configure_project_repo):

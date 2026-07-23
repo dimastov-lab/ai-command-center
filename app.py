@@ -27,6 +27,7 @@ from command_center import (
     tasks_repository,
     workflow,
     workspace_home,
+    workspace_provisioning,
 )
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
@@ -699,8 +700,15 @@ def render_agent_launcher(
         if extra_context.strip():
             full_prompt = f"{prompt}\n\n## Дополнительный контекст (предоставлен пользователем)\n\n{extra_context.strip()}"
 
-        expected_branch = launch.resolve_expected_branch(task=task_for_launch, project_config=cfg)
-        validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
+        # Shared, non-mutating classification (same service the execution
+        # queue uses). Distinguishes a fatal validation error from a
+        # missing-but-provisionable workspace so the launch is not permanently
+        # blocked just because the isolated worktree does not exist yet — it
+        # will be created (and fail-closed verified) downstream on click.
+        prep = launch_service.prepare_task_launch(task=task_for_launch, project_config=cfg)
+        expected_branch = prep.expected_branch
+        base_branch = prep.base_branch
+        validation = prep.validation
         actual_branch = (validation.git_status or {}).get("branch") if validation.git_status else None
 
         st.markdown("**Проверьте перед запуском:**")
@@ -713,8 +721,13 @@ def render_agent_launcher(
         st.write("- Агент: `claude_code` (Claude Code CLI)")
         st.write(f"- Тип задачи: `{task_type}`")
 
-        for error in validation.errors:
-            st.error(error)
+        if prep.provisionable:
+            # Recoverable, not fatal: don't render the "not found" error, tell
+            # the operator the isolated worktree will be created automatically.
+            st.info(prep.provision_notice or "Workspace будет создан автоматически как изолированный worktree.")
+        else:
+            for error in validation.errors:
+                st.error(error)
         for warning in validation.warnings:
             st.warning(warning)
 
@@ -749,7 +762,7 @@ def render_agent_launcher(
                 "Подтвердить и запустить",
                 type="primary",
                 key=f"{key_prefix}_launch_btn",
-                disabled=not confirmed or not validation.can_launch or not warnings_ack,
+                disabled=not confirmed or not prep.launchable or not warnings_ack,
                 icon=":material/play_arrow:",
             )
         with action_cols[1]:
@@ -763,7 +776,11 @@ def render_agent_launcher(
         # Defense in depth: `disabled=` on the button above is the primary
         # gate, but a launch this consequential should not depend solely on
         # a widget attribute — re-check server-side before doing anything.
-        if not validation.can_launch:
+        # `prep.launchable` admits both an already-valid workspace and a
+        # missing-but-provisionable one; a fatal validation error is still
+        # refused here, and the fail-closed isolation gate downstream
+        # (`provision_and_verify` -> `Supervisor.start_raw`) is unchanged.
+        if not prep.launchable:
             st.error("Запуск заблокирован ошибками валидации выше — сначала устраните их.")
             return
         if validation.warnings and not warnings_ack:
@@ -794,12 +811,34 @@ def render_agent_launcher(
                 executor_id="claude_code",
                 validation=validation,
                 expected_branch=expected_branch,
+                base_branch=base_branch,
+                source_repository_path=repo_path,
                 on_task_state_changed=(
                     (lambda: tasks_repository.upsert_task(ROOT, task_for_launch))
                     if task_for_launch is not None
                     else None
                 ),
             )
+        except (
+            workspace_provisioning.WorkspaceVerificationError,
+            runtime_supervisor.WorkspaceVerificationFailed,
+        ) as exc:
+            # Fail closed: the workspace did not verify (wrong branch, not an
+            # isolated worktree, belongs to another repo, ...). The agent was
+            # never started; show the structured failure so the operator can
+            # fix it, and never fall back to the main repository.
+            structured = exc.structured if isinstance(exc, runtime_supervisor.WorkspaceVerificationFailed) else exc.as_dict()
+            st.error("Запуск заблокирован: workspace не прошёл обязательную проверку изоляции.")
+            st.markdown(
+                f"- Проваленная проверка: `{structured['failed_step']}`\n"
+                f"- Ожидаемый workspace: `{structured['expected_workspace']}`\n"
+                f"- Фактический workspace: `{structured.get('actual_workspace') or '—'}`\n"
+                f"- Ожидаемая ветка: `{structured.get('expected_branch') or '—'}`\n"
+                f"- Фактическая ветка: `{structured.get('actual_branch') or '—'}`\n"
+                f"- Причина: {structured.get('detail') or '—'}\n"
+                f"- Рекомендация: {structured.get('remediation') or '—'}"
+            )
+            return
         except (
             runtime_context_service.ConfirmationRequiredError,
             agent_runner.RunnerError,
