@@ -44,6 +44,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from command_center import agent_runner, workspace_provisioning
@@ -51,6 +52,12 @@ from command_center.models import iso_now
 from command_center.runtime import context_service, db, identity, outcome, reports, stream_parser
 
 logger = logging.getLogger(__name__)
+
+# Process-group inspection must not inherit test/application monkeypatches of
+# ``subprocess.Popen`` that are intentionally scoped to launching Claude.
+# Keeping the original constructor also prevents a failed Claude-launch setup
+# from making the recovery probe recursively launch another fake Claude.
+_SYSTEM_POPEN = subprocess.Popen
 
 # `AICC_CLAUDE_BINARY` lets a test point a genuinely separate OS process
 # (e.g. `scripts/execution_center_debug.py`, invoked as a real subprocess, not
@@ -66,6 +73,10 @@ CLAUDE_BINARY = os.environ.get("AICC_CLAUDE_BINARY") or "claude"
 # the application layer (`ExecutionCenterAPI.start_run`), not this low-level
 # executor.
 DEFAULT_CANCEL_GRACE_SECONDS = 10.0
+# A leader that exits naturally must not leave inherited-pipe holders behind.
+# Give residual group members a short graceful window, then contain them with
+# SIGKILL before releasing the pinned leader/pgid.
+PROCESS_GROUP_DRAIN_GRACE_SECONDS = 1.0
 
 # `cancel()` records the cancel flag with a compare-and-set on the run row's
 # version. A concurrent *benign* field write that leaves the run RUNNING — in
@@ -193,8 +204,37 @@ class _ActiveRun:
     def __init__(self, *, process: subprocess.Popen, run_id: str) -> None:
         self.process = process
         self.run_id = run_id
+        # `start_new_session=True` makes the spawned process the leader of a
+        # new process group whose id is its launch-time pid. Keep that value;
+        # resolving `getpgid(process.pid)` later, after the child may have
+        # been reaped, opens a PID-reuse window.
+        self.process_group_id = process.pid
+        # Every poll/reap and signal decision is serialized through this
+        # lock. A signal is therefore either sent while the unreaped child
+        # still pins its pid/pgid, or skipped after exit was observed.
+        self.process_control_lock = threading.RLock()
+        # Serializes competing cancellation, timeout and supervision-failure
+        # termination sequences so TERM/KILL escalation happens at most once
+        # at a time.
+        self.termination_lock = threading.Lock()
+        # OS-process exit is distinct from durable terminal-state persistence
+        # and from best-effort report finalization.
+        self.leader_exited_event = threading.Event()
+        self.process_exited_event = threading.Event()
+        self.process_reaped_event = threading.Event()
+        self.terminal_persisted_event = threading.Event()
         self.done_event = threading.Event()
-        # Set by `_timeout_watchdog` (never by `cancel()`) so `_supervise` can
+        self.finalization_retry_lock = threading.Lock()
+        # Set only when the child is confirmed gone but durable terminal
+        # persistence exhausted its bounded retries. `reconcile()` and
+        # `wait_for_run()` may then safely retry without mistaking slow normal
+        # finalization for a failure.
+        self.finalization_failed_event = threading.Event()
+        # A failed post-Popen setup cleanup retains ownership and is retried by
+        # a recovery thread, ``reconcile()``, and ``wait_for_run()``.
+        self.launch_cleanup_failed_event = threading.Event()
+        # Set by `_timeout_watchdog` (never by `cancel()`) only after a signal
+        # was delivered, so `_supervise` can
         # tell a timeout-triggered termination apart from an explicit,
         # human-confirmed cancellation when it decides the final state.
         self.timeout_triggered = threading.Event()
@@ -229,8 +269,9 @@ class Supervisor:
         self._active: dict[str, _ActiveRun] = {}
         # Run ids this instance has committed to launching (persisted as
         # QUEUED) but has not yet `Popen`'d — the gap `self._active` alone
-        # cannot cover, because `_active` is only populated once a process
-        # actually exists (see `_launch_process`). Guarded by the same
+        # cannot cover, because `_active` is populated only after a process
+        # actually exists and its ownership record is constructed (see
+        # `_launch_process`). Guarded by the same
         # `_active_lock`. See `reconcile()` for why this must be included in
         # its "don't touch this, it's mine" guard, not just `self._active`.
         self._launching: set[str] = set()
@@ -370,6 +411,15 @@ class Supervisor:
         request (no such session).
         """
         context_service.require_launch_confirmation(confirmed, what="Launching a Claude Code run")
+        if os.name != "posix" or not all(
+            hasattr(os, name)
+            for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+        ):
+            raise SupervisorError(
+                "Process-group supervision requires a POSIX host with "
+                "waitid(WNOWAIT); this runtime does not provide equivalent "
+                "process-tree ownership."
+            )
 
         if repository_already_validated:
             repo_path = Path(repository_path).expanduser().resolve()
@@ -537,56 +587,52 @@ class Supervisor:
                 new_state="FAILED",
                 fields={"completed_at": iso_now()},
             )
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event("launch_failed", error=str(exc))["payload"],
-            )
+            self._append_lifecycle_event_best_effort("launch_failed", run_id, error=str(exc))
             return run
 
         pid = process.pid
         try:
+            active = _ActiveRun(process=process, run_id=run_id)
+        except Exception as exc:
+            # Even construction of the process-local ownership record is
+            # inside the post-Popen safety boundary.
+            exited = self._terminate_unregistered_process(process, process_group_id=pid)
+            if exited:
+                self._persist_run_failure(
+                    run_id,
+                    exit_code=process.returncode,
+                    failure_reason="launch_setup_failed",
+                    lifecycle="launch_failed",
+                )
+            self._append_lifecycle_event_best_effort("launch_failed", run_id, error=str(exc), pid=pid)
+            raise
+
+        # Ownership starts at Popen, before any fallible identity/SQLite/thread
+        # setup. A concurrent reconcile therefore never sees a live child as
+        # orphaned during this window.
+        with self._active_lock:
+            self._active[run_id] = active
+
+        try:
             proc_identity = identity.capture_identity(pid)
-            run = db.update_run_fields(
-                self.db_path,
-                run_id,
-                expected_version=run["version"],
-                fields={
-                    "pid": pid,
-                    "process_start_identity": proc_identity.as_string() if proc_identity else None,
-                },
-            )
+            if proc_identity is None:
+                raise SupervisorError(f"Could not capture process identity for spawned pid {pid}.")
+            # Persist pid, restart-safe identity and RUNNING atomically. There
+            # is no intermediate QUEUED row carrying only part of the
+            # ownership evidence.
             run = db.update_run_state(
                 self.db_path,
                 run_id,
                 expected_version=run["version"],
                 new_state="RUNNING",
-                fields={"started_at": iso_now()},
+                fields={
+                    "pid": pid,
+                    "process_start_identity": proc_identity.as_string(),
+                    "started_at": iso_now(),
+                },
             )
         except Exception as exc:
-            # Popen succeeded, so this process is ours even if recording its
-            # identity/state fails. Never let an exception in the narrow
-            # Popen -> `_active` registration window leak a live, unsupervised
-            # process group.
-            self._terminate_unregistered_process(process)
-            current = db.get_run(self.db_path, run_id)
-            if current is not None and current["state"] in db.EXECUTION_CENTER_ACTIVE_STATES:
-                try:
-                    db.update_run_state(
-                        self.db_path,
-                        run_id,
-                        expected_version=current["version"],
-                        new_state="FAILED",
-                        fields={
-                            "exit_code": process.returncode,
-                            "completed_at": iso_now(),
-                            "failure_reason": "launch_setup_failed",
-                        },
-                    )
-                except Exception:
-                    logger.exception("Could not mark run %s FAILED after launch setup failed", run_id)
-            self._append_lifecycle_event_best_effort("launch_failed", run_id, error=str(exc), pid=pid)
+            self._abort_launch_after_popen(run_id, active, exc)
             raise
 
         # The PID and RUNNING transition above are lifecycle correctness; this
@@ -594,48 +640,95 @@ class Supervisor:
         # must not kill an otherwise registered, healthy child process.
         self._append_lifecycle_event_best_effort("process_started", run_id, pid=pid)
 
-        active = _ActiveRun(process=process, run_id=run_id)
-        with self._active_lock:
-            self._active[run_id] = active
-
-        waiter = threading.Thread(target=self._supervise, args=(run_id, active, repo_path), daemon=True)
-        waiter.start()
-
-        timeout_seconds = run.get("timeout_seconds")
-        if timeout_seconds is not None:
-            watchdog = threading.Thread(
-                target=self._timeout_watchdog, args=(run_id, active, timeout_seconds), daemon=True
+        try:
+            # This is the only background-thread start that remains in the
+            # synchronous launch path. Watchdog and reader threads are started
+            # inside `_supervise`, whose exception boundary owns terminate /
+            # reap cleanup.
+            self._start_daemon_thread(
+                target=self._supervise,
+                args=(run_id, active, repo_path, run.get("timeout_seconds")),
+                name=f"run-supervisor-{run_id}",
             )
-            watchdog.start()
+        except Exception as exc:
+            self._abort_launch_after_popen(run_id, active, exc)
+            raise
 
         return run
 
     @staticmethod
-    def _signal_process_group(process: subprocess.Popen, sig: signal.Signals) -> None:
-        """Best-effort signal delivery to a Supervisor-owned process group.
+    def _start_daemon_thread(*, target, args: tuple, name: str) -> threading.Thread:
+        thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+        thread.start()
+        return thread
 
-        Signal-delivery failures are logged but never allowed to skip the
-        caller's grace wait or SIGKILL escalation.
-        """
+    @staticmethod
+    def _terminate_unregistered_process(
+        process: subprocess.Popen,
+        *,
+        process_group_id: int,
+    ) -> bool:
+        """Terminate/reap a child before an `_ActiveRun` could be installed."""
         try:
-            os.killpg(os.getpgid(process.pid), sig)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            logger.exception("Could not send %s to process group for pid %s", sig.name, process.pid)
-
-    @classmethod
-    def _terminate_unregistered_process(cls, process: subprocess.Popen) -> None:
-        """Reap a child that was spawned but never installed in `_active`."""
-        cls._signal_process_group(process, signal.SIGTERM)
-        try:
-            process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            cls._signal_process_group(process, signal.SIGKILL)
-            try:
-                process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                logger.error("Spawned process %s did not exit after SIGKILL", process.pid)
+            if process.poll() is None:
+                try:
+                    os.killpg(process_group_id, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    logger.exception(
+                        "Could not send SIGTERM to unregistered process group %s",
+                        process_group_id,
+                    )
+                try:
+                    process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process_group_id, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except OSError:
+                        logger.exception(
+                            "Could not send SIGKILL to unregistered process group %s",
+                            process_group_id,
+                        )
+                    try:
+                        process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        logger.error(
+                            "Spawned process %s did not exit after SIGKILL",
+                            process.pid,
+                        )
+            exited = process.poll() is not None
+            members = Supervisor._live_process_group_members(
+                process_group_id,
+                leader_pid=process.pid,
+            )
+            group_termination_confirmed = members == []
+            if exited and (members is None or members):
+                try:
+                    os.killpg(process_group_id, signal.SIGKILL)
+                    group_termination_confirmed = True
+                except ProcessLookupError:
+                    group_termination_confirmed = True
+                except OSError:
+                    logger.exception(
+                        "Could not kill residual unregistered process group %s",
+                        process_group_id,
+                    )
+                    return False
+                deadline = time.monotonic() + DEFAULT_CANCEL_GRACE_SECONDS
+                while time.monotonic() < deadline:
+                    members = Supervisor._live_process_group_members(
+                        process_group_id,
+                        leader_pid=process.pid,
+                    )
+                    if not members:
+                        break
+                    time.sleep(0.02)
+                if members:
+                    group_termination_confirmed = False
+            return exited and group_termination_confirmed
         finally:
             for pipe in (process.stdout, process.stderr):
                 if pipe is not None:
@@ -643,6 +736,241 @@ class Supervisor:
                         pipe.close()
                     except OSError:
                         pass
+
+    @staticmethod
+    def _live_process_group_members(
+        process_group_id: int,
+        *,
+        leader_pid: int,
+    ) -> list[int] | None:
+        """Return live non-leader members, or ``None`` if inspection failed.
+
+        The unreaped leader pins the launch-time pgid while this probe runs, so
+        a later signal cannot be redirected to an unrelated reused id. Zombie
+        descendants are already non-running and hold no open pipes, so they do
+        not block ownership release.
+        """
+        process = None
+        try:
+            process = _SYSTEM_POPEN(
+                ["ps", "-axo", "pid=,pgid=,state="],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+            )
+            stdout, _stderr = process.communicate(timeout=2)
+            if process.returncode != 0:
+                return None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            return None
+
+        members = []
+        for line in stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            try:
+                pid = int(parts[0])
+                pgid = int(parts[1])
+            except ValueError:
+                continue
+            state = parts[2]
+            if pgid == process_group_id and pid != leader_pid and not state.startswith("Z"):
+                members.append(pid)
+        return members
+
+    @staticmethod
+    def _observe_leader_exit_locked(active: _ActiveRun) -> bool:
+        """Observe direct-child exit without reaping the process-group leader."""
+        if active.leader_exited_event.is_set():
+            return True
+        try:
+            result = os.waitid(
+                os.P_PID,
+                active.process.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError:
+            # A test double or an unexpected external waiter may not expose a
+            # waitable child. Fall back conservatively to Popen's own status.
+            if active.process.poll() is None:
+                return False
+            active.process_reaped_event.set()
+            active.leader_exited_event.set()
+            return True
+        if result is None:
+            return False
+        active.leader_exited_event.set()
+        return True
+
+    def _finish_exited_process_group_locked(
+        self,
+        run_id: str,
+        active: _ActiveRun,
+        *,
+        lifecycle_prefix: str,
+        group_term_sent: bool,
+        grace_deadline: float | None,
+    ) -> tuple[bool, bool]:
+        """Drain descendants, reap the pinned leader, and report signal use.
+
+        Returns ``(fully_terminated, signal_sent)``. The caller holds
+        ``process_control_lock`` throughout, and the leader stays unreaped
+        until every live member is gone, preventing pgid reuse.
+        """
+        if active.process_exited_event.is_set():
+            return True, False
+        if not active.leader_exited_event.is_set():
+            return False, False
+
+        members = self._live_process_group_members(
+            active.process_group_id,
+            leader_pid=active.process.pid,
+        )
+        signal_sent = False
+
+        if members and not group_term_sent:
+            term_sent = self._signal_process_group_locked(active, signal.SIGTERM)
+            signal_sent = signal_sent or term_sent
+            lifecycle = (
+                f"{lifecycle_prefix}_residual_sigterm_sent"
+                if term_sent
+                else f"{lifecycle_prefix}_residual_sigterm_failed"
+            )
+            self._append_lifecycle_event_best_effort(
+                lifecycle,
+                run_id,
+                pid=active.process.pid,
+                descendant_pids=members,
+            )
+            if not term_sent:
+                return False, signal_sent
+            grace_deadline = time.monotonic() + PROCESS_GROUP_DRAIN_GRACE_SECONDS
+
+        if members and grace_deadline is not None:
+            while members and time.monotonic() < grace_deadline:
+                time.sleep(0.02)
+                members = self._live_process_group_members(
+                    active.process_group_id,
+                    leader_pid=active.process.pid,
+                )
+                if members is None:
+                    break
+
+        # Unknown membership is handled fail-closed: SIGKILL the still-pinned
+        # group before reaping the leader. Known live descendants are the
+        # normal escalation case.
+        if members is None or members:
+            kill_sent = self._signal_process_group_locked(active, signal.SIGKILL)
+            signal_sent = signal_sent or kill_sent
+            lifecycle = (
+                f"{lifecycle_prefix}_sigkill_sent"
+                if kill_sent
+                else f"{lifecycle_prefix}_sigkill_failed"
+            )
+            self._append_lifecycle_event_best_effort(
+                lifecycle,
+                run_id,
+                pid=active.process.pid,
+                descendant_pids=members,
+            )
+            if not kill_sent:
+                return False, signal_sent
+
+            verify_deadline = time.monotonic() + DEFAULT_CANCEL_GRACE_SECONDS
+            while time.monotonic() < verify_deadline:
+                members = self._live_process_group_members(
+                    active.process_group_id,
+                    leader_pid=active.process.pid,
+                )
+                if members is None or not members:
+                    break
+                time.sleep(0.02)
+            if members:
+                return False, signal_sent
+
+        if not active.process_reaped_event.is_set():
+            try:
+                active.process.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                return False, signal_sent
+            active.process_reaped_event.set()
+        active.process_exited_event.set()
+        return True, signal_sent
+
+    def _wait_for_process_exit(
+        self,
+        run_id: str,
+        active: _ActiveRun,
+        *,
+        timeout: float | None,
+        lifecycle_prefix: str,
+        group_term_sent: bool = False,
+        grace_deadline: float | None = None,
+    ) -> int:
+        """Wait for and fully contain the Supervisor-owned process group.
+
+        ``waitid(WNOWAIT)`` observes the leader without releasing its pid/pgid.
+        Descendants are drained before the leader is reaped, so reader pipes
+        cannot be held open by an orphan and no late signal can hit a reused
+        process group.
+        """
+        deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
+        while True:
+            with active.process_control_lock:
+                if self._observe_leader_exit_locked(active):
+                    terminated, _signal_sent = self._finish_exited_process_group_locked(
+                        run_id,
+                        active,
+                        lifecycle_prefix=lifecycle_prefix,
+                        group_term_sent=group_term_sent,
+                        grace_deadline=grace_deadline,
+                    )
+                    if not terminated:
+                        raise SupervisorError(
+                            f"Process group {active.process_group_id} for run "
+                            f"{run_id!r} could not be confirmed terminated."
+                        )
+                    return active.process.returncode
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        getattr(active.process, "args", []),
+                        timeout,
+                    )
+                active.process_exited_event.wait(timeout=min(0.02, remaining))
+            else:
+                active.process_exited_event.wait(timeout=0.02)
+
+    @staticmethod
+    def _signal_process_group_locked(active: _ActiveRun, sig: signal.Signals) -> bool:
+        """Send to the captured pgid; return true only after successful killpg."""
+        try:
+            os.killpg(active.process_group_id, sig)
+            return True
+        except ProcessLookupError:
+            # The group disappeared between the locked liveness observation
+            # and delivery. Never claim a signal was sent.
+            return False
+        except OSError:
+            logger.exception(
+                "Could not send %s to process group %s",
+                sig.name,
+                active.process_group_id,
+            )
+            return False
+
+    def _signal_process_group(self, active: _ActiveRun, sig: signal.Signals) -> bool:
+        with active.process_control_lock:
+            if self._observe_leader_exit_locked(active):
+                return False
+            return self._signal_process_group_locked(active, sig)
 
     def _append_lifecycle_event_best_effort(self, lifecycle: str, run_id: str, **payload: object) -> None:
         """Persist audit telemetry without making lifecycle safety depend on it."""
@@ -656,13 +984,19 @@ class Supervisor:
         except Exception:
             logger.exception("Could not persist %s lifecycle event for run %s", lifecycle, run_id)
 
-    def _persist_supervision_failure(self, run_id: str, *, exit_code: int | None) -> bool:
-        """Best-effort bounded fallback after background finalization fails.
+    def _persist_run_failure(
+        self,
+        run_id: str,
+        *,
+        exit_code: int | None,
+        failure_reason: str,
+        lifecycle: str,
+    ) -> bool:
+        """Bounded CAS fallback after a locally owned child is confirmed gone.
 
         Return true only when the run is gone or a terminal state is confirmed.
-        Callers must retain process-local ownership and leave waiters blocked
-        when this returns false: signalling completion for a persisted active
-        row would make ``wait_for_run`` lie and could strand its workspace lock.
+        All exception classes are retried: a transient SQLite failure must not
+        permanently strand an exited run in an active state.
         """
         for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
             try:
@@ -681,11 +1015,11 @@ class Supervisor:
                     fields={
                         "exit_code": exit_code,
                         "completed_at": iso_now(),
-                        "failure_reason": "supervision_failed",
+                        "failure_reason": failure_reason,
                     },
                 )
                 self._append_lifecycle_event_best_effort(
-                    "supervision_failed",
+                    lifecycle,
                     run_id,
                     exit_code=exit_code,
                 )
@@ -693,14 +1027,139 @@ class Supervisor:
             except (db.LostUpdateError, db.InvalidTransitionError):
                 continue
             except Exception:
-                logger.exception("Could not persist supervision failure for run %s", run_id)
-                return False
+                logger.exception("Could not persist %s for run %s", failure_reason, run_id)
+                continue
         logger.error(
-            "Run %s remained active after %s supervision-failure persistence attempts",
+            "Run %s remained active after %s %s persistence attempts",
             run_id,
             _TERMINAL_CAS_MAX_ATTEMPTS,
+            failure_reason,
         )
         return False
+
+    def _persist_supervision_failure(self, run_id: str, *, exit_code: int | None) -> bool:
+        return self._persist_run_failure(
+            run_id,
+            exit_code=exit_code,
+            failure_reason="supervision_failed",
+            lifecycle="supervision_failed",
+        )
+
+    def _release_active(self, run_id: str, active: _ActiveRun) -> None:
+        active.terminal_persisted_event.set()
+        with self._active_lock:
+            if self._active.get(run_id) is active:
+                self._active.pop(run_id, None)
+        active.done_event.set()
+
+    def _retry_failed_finalization(self, run_id: str, active: _ActiveRun) -> bool:
+        with active.finalization_retry_lock:
+            if active.done_event.is_set():
+                return True
+            if not (
+                active.process_exited_event.is_set()
+                and active.finalization_failed_event.is_set()
+            ):
+                return False
+            if not self._persist_supervision_failure(
+                run_id,
+                exit_code=active.process.returncode,
+            ):
+                return False
+            self._release_active(run_id, active)
+            return True
+
+    def _abort_launch_after_popen(
+        self,
+        run_id: str,
+        active: _ActiveRun,
+        error: Exception,
+    ) -> None:
+        """Fail closed for every exception after Popen but before supervision."""
+        exited = self._terminate_active_process(
+            run_id,
+            active,
+            grace_seconds=DEFAULT_CANCEL_GRACE_SECONDS,
+            lifecycle_prefix="launch_setup_failure",
+        )
+        self._append_lifecycle_event_best_effort(
+            "launch_failed",
+            run_id,
+            error=str(error),
+            pid=active.process.pid,
+        )
+        if not exited:
+            active.launch_cleanup_failed_event.set()
+            self._append_lifecycle_event_best_effort(
+                "launch_cleanup_failed",
+                run_id,
+                pid=active.process.pid,
+            )
+            try:
+                recovery = threading.Thread(
+                    target=self._recover_failed_launch,
+                    args=(run_id, active),
+                    name=f"run-launch-recovery-{run_id}",
+                    daemon=True,
+                )
+                recovery.start()
+            except Exception:
+                # The active record and recovery flag remain visible to
+                # reconcile()/wait_for_run() even if a recovery thread cannot
+                # be created.
+                logger.exception(
+                    "Could not start failed-launch recovery for run %s",
+                    run_id,
+                )
+            raise SupervisorError(
+                f"Launch setup failed for run {run_id!r}, and its child process "
+                "could not be confirmed terminated; ownership is retained and "
+                "recovery remains active."
+            ) from error
+
+        terminal_persisted = self._persist_run_failure(
+            run_id,
+            exit_code=active.process.returncode,
+            failure_reason="launch_setup_failed",
+            lifecycle="launch_setup_failed",
+        )
+        if terminal_persisted:
+            self._release_active(run_id, active)
+        else:
+            active.finalization_failed_event.set()
+
+    def _retry_failed_launch_cleanup(self, run_id: str, active: _ActiveRun) -> bool:
+        if active.done_event.is_set():
+            return True
+        exited = self._terminate_active_process(
+            run_id,
+            active,
+            grace_seconds=DEFAULT_CANCEL_GRACE_SECONDS,
+            lifecycle_prefix="launch_recovery",
+        )
+        if not exited:
+            return False
+        active.launch_cleanup_failed_event.clear()
+        terminal_persisted = self._persist_run_failure(
+            run_id,
+            exit_code=active.process.returncode,
+            failure_reason="launch_setup_failed",
+            lifecycle="launch_setup_failed",
+        )
+        if terminal_persisted:
+            self._release_active(run_id, active)
+            return True
+        active.finalization_failed_event.set()
+        return False
+
+    def _recover_failed_launch(self, run_id: str, active: _ActiveRun) -> None:
+        while not active.done_event.is_set():
+            try:
+                if self._retry_failed_launch_cleanup(run_id, active):
+                    return
+            except Exception:
+                logger.exception("Failed-launch recovery attempt failed for run %s", run_id)
+            active.done_event.wait(timeout=1.0)
 
     def _terminate_active_process(
         self,
@@ -709,18 +1168,123 @@ class Supervisor:
         *,
         grace_seconds: float,
         lifecycle_prefix: str,
-    ) -> None:
-        """SIGTERM, grace wait, and SIGKILL escalation with best-effort events."""
+        before_signal=None,
+        on_first_signal_sent=None,
+        on_no_signal=None,
+    ) -> bool:
+        """Serialize TERM/grace/KILL and return only confirmed OS-exit status."""
         pid = active.process.pid
-        self._signal_process_group(active.process, signal.SIGTERM)
-        self._append_lifecycle_event_best_effort(f"{lifecycle_prefix}_sigterm_sent", run_id, pid=pid)
+        with active.termination_lock:
+            first_signal_recorded = False
 
-        if active.done_event.wait(timeout=grace_seconds):
-            return
+            def record_first_signal() -> None:
+                nonlocal first_signal_recorded
+                if first_signal_recorded:
+                    return
+                first_signal_recorded = True
+                if on_first_signal_sent is not None:
+                    on_first_signal_sent()
 
-        self._signal_process_group(active.process, signal.SIGKILL)
-        self._append_lifecycle_event_best_effort(f"{lifecycle_prefix}_sigkill_sent", run_id, pid=pid)
-        active.done_event.wait(timeout=grace_seconds)
+            with active.process_control_lock:
+                if self._observe_leader_exit_locked(active):
+                    try:
+                        self._wait_for_process_exit(
+                            run_id,
+                            active,
+                            timeout=0,
+                            lifecycle_prefix="process_group_cleanup",
+                        )
+                        return True
+                    except (subprocess.TimeoutExpired, SupervisorError):
+                        return False
+
+                if before_signal is not None:
+                    before_signal()
+
+                # The database claim above may take long enough for a natural
+                # exit. WNOWAIT detects that physical exit before any signal;
+                # undo the claim while the same lock still blocks terminal
+                # finalization.
+                if self._observe_leader_exit_locked(active):
+                    if on_no_signal is not None:
+                        on_no_signal()
+                    try:
+                        self._wait_for_process_exit(
+                            run_id,
+                            active,
+                            timeout=0,
+                            lifecycle_prefix="process_group_cleanup",
+                        )
+                        return True
+                    except (subprocess.TimeoutExpired, SupervisorError):
+                        return False
+
+                grace_deadline = time.monotonic() + max(grace_seconds, 0.0)
+                term_sent = self._signal_process_group_locked(active, signal.SIGTERM)
+                if term_sent:
+                    record_first_signal()
+                term_lifecycle = (
+                    f"{lifecycle_prefix}_sigterm_sent"
+                    if term_sent
+                    else f"{lifecycle_prefix}_sigterm_failed"
+                )
+                self._append_lifecycle_event_best_effort(term_lifecycle, run_id, pid=pid)
+
+                if term_sent:
+                    try:
+                        self._wait_for_process_exit(
+                            run_id,
+                            active,
+                            timeout=max(grace_deadline - time.monotonic(), 0.0),
+                            lifecycle_prefix=lifecycle_prefix,
+                            group_term_sent=True,
+                            grace_deadline=grace_deadline,
+                        )
+                        return True
+                    except subprocess.TimeoutExpired:
+                        pass
+                    except SupervisorError:
+                        self._append_lifecycle_event_best_effort(
+                            f"{lifecycle_prefix}_termination_unconfirmed",
+                            run_id,
+                            pid=pid,
+                        )
+                        return False
+
+                # If TERM itself failed, do not wait for a natural exit that
+                # could be retroactively relabelled. Try KILL immediately.
+                kill_sent = self._signal_process_group_locked(active, signal.SIGKILL)
+                if kill_sent:
+                    record_first_signal()
+                kill_lifecycle = (
+                    f"{lifecycle_prefix}_sigkill_sent"
+                    if kill_sent
+                    else f"{lifecycle_prefix}_sigkill_failed"
+                )
+                self._append_lifecycle_event_best_effort(kill_lifecycle, run_id, pid=pid)
+
+                if not first_signal_recorded and on_no_signal is not None:
+                    on_no_signal()
+
+                try:
+                    self._wait_for_process_exit(
+                        run_id,
+                        active,
+                        timeout=grace_seconds,
+                        lifecycle_prefix=lifecycle_prefix,
+                        group_term_sent=term_sent or kill_sent,
+                        grace_deadline=time.monotonic(),
+                    )
+                    return True
+                except (subprocess.TimeoutExpired, SupervisorError):
+                    pass
+
+                self._append_lifecycle_event_best_effort(
+                    f"{lifecycle_prefix}_termination_unconfirmed",
+                    run_id,
+                    pid=pid,
+                )
+                return False
 
     # ------------------------------------------------------------------
     # Streaming consumption (runs in background reader threads)
@@ -824,18 +1388,51 @@ class Supervisor:
             return None
         return result_events[-1]["payload"]
 
-    def _supervise(self, run_id: str, active: _ActiveRun, repo_path: Path) -> None:
+    def _supervise(
+        self,
+        run_id: str,
+        active: _ActiveRun,
+        repo_path: Path,
+        timeout_seconds: float | None,
+    ) -> None:
         terminal_persisted = False
+        reader_threads: list[threading.Thread] = []
         try:
-            process = active.process
-            stdout_thread = threading.Thread(target=self._drain_stdout, args=(run_id, active), daemon=True)
-            stderr_thread = threading.Thread(target=self._drain_stderr, args=(run_id, active), daemon=True)
-            stdout_thread.start()
-            stderr_thread.start()
+            if timeout_seconds is not None:
+                self._start_daemon_thread(
+                    target=self._timeout_watchdog,
+                    args=(run_id, active, timeout_seconds),
+                    name=f"run-timeout-{run_id}",
+                )
 
-            exit_code = process.wait()
-            stdout_thread.join()
-            stderr_thread.join()
+            reader_threads.append(
+                self._start_daemon_thread(
+                    target=self._drain_stdout,
+                    args=(run_id, active),
+                    name=f"run-stdout-{run_id}",
+                )
+            )
+            reader_threads.append(
+                self._start_daemon_thread(
+                    target=self._drain_stderr,
+                    args=(run_id, active),
+                    name=f"run-stderr-{run_id}",
+                )
+            )
+
+            exit_code = self._wait_for_process_exit(
+                run_id,
+                active,
+                timeout=None,
+                lifecycle_prefix="process_group_cleanup",
+            )
+            for thread in reader_threads:
+                thread.join(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+                if thread.is_alive():
+                    raise SupervisorError(
+                        f"Output reader {thread.name!r} did not finish after "
+                        "the owned process group terminated."
+                    )
 
             run = db.get_run(self.db_path, run_id)
             if run is None:
@@ -894,6 +1491,7 @@ class Supervisor:
                         },
                     )
                     terminal_persisted = True
+                    active.terminal_persisted_event.set()
                     break
                 except (db.LostUpdateError, db.InvalidTransitionError):
                     current = db.get_run(self.db_path, run_id)
@@ -905,6 +1503,7 @@ class Supervisor:
                         # or report; this instance still releases ownership in
                         # the outer finally block.
                         terminal_persisted = True
+                        active.terminal_persisted_event.set()
                         return
                     if current["state"] != "RUNNING":
                         raise
@@ -951,15 +1550,37 @@ class Supervisor:
                     )
         except Exception:
             logger.exception("Unexpected supervision failure for run %s", run_id)
-            terminal_persisted = self._persist_supervision_failure(
-                run_id,
-                exit_code=active.process.returncode,
-            )
+            exited = active.process_exited_event.is_set()
+            if not exited:
+                exited = self._terminate_active_process(
+                    run_id,
+                    active,
+                    grace_seconds=DEFAULT_CANCEL_GRACE_SECONDS,
+                    lifecycle_prefix="supervision_failure",
+                )
+            for thread in reader_threads:
+                thread.join(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+            if exited:
+                terminal_persisted = self._persist_supervision_failure(
+                    run_id,
+                    exit_code=active.process.returncode,
+                )
+                if terminal_persisted:
+                    active.terminal_persisted_event.set()
+                else:
+                    active.finalization_failed_event.set()
+            else:
+                # Never free the workspace lock while the child might still
+                # be alive. Ownership remains in `_active`; a later exit can
+                # still be handled by explicit operator/restart recovery.
+                self._append_lifecycle_event_best_effort(
+                    "supervision_termination_unconfirmed",
+                    run_id,
+                    pid=active.process.pid,
+                )
         finally:
             if terminal_persisted:
-                with self._active_lock:
-                    self._active.pop(run_id, None)
-                active.done_event.set()
+                self._release_active(run_id, active)
 
     # ------------------------------------------------------------------
     # Cancellation — requires explicit confirmation from the caller/UI
@@ -985,52 +1606,107 @@ class Supervisor:
                 "(already finished, or supervised by a different process instance)."
             )
 
-        run = db.get_run(self.db_path, run_id)
-        if run is None:
-            raise KeyError(f"No such run: {run_id!r}")
-        if run["state"] != "RUNNING":
-            raise SupervisorError(f"Run {run_id!r} is not RUNNING (state={run['state']!r}); nothing to cancel.")
+        cancel_recorded = False
 
-        # Record the cancel request with a compare-and-set on the run's
-        # version. A LostUpdateError here does not necessarily mean the run
-        # left RUNNING: a benign concurrent write (the once-per-run
-        # `first_output_at` handshake — see `_record_handshake`, and the
-        # `_CANCEL_CAS_MAX_ATTEMPTS` note) bumps the version while the state
-        # stays RUNNING. Re-read and retry while the run is still cancellable;
-        # only surface "nothing to cancel" if it has actually reached a
-        # non-RUNNING state.
-        for _ in range(_CANCEL_CAS_MAX_ATTEMPTS):
-            try:
-                run = db.update_run_fields(
-                    self.db_path,
-                    run_id,
-                    expected_version=run["version"],
-                    fields={"cancel_requested": 1, "cancel_requested_at": iso_now()},
+        def record_cancel_before_signal() -> None:
+            nonlocal cancel_recorded
+            run = db.get_run(self.db_path, run_id)
+            if run is None:
+                raise KeyError(f"No such run: {run_id!r}")
+            if run["state"] != "RUNNING":
+                raise SupervisorError(
+                    f"Run {run_id!r} is not RUNNING (state={run['state']!r}); nothing to cancel."
                 )
-                break
-            except db.LostUpdateError:
-                current = db.get_run(self.db_path, run_id)
-                if current is None:
-                    raise KeyError(f"No such run: {run_id!r}") from None
-                if current["state"] != "RUNNING":
-                    raise SupervisorError(
-                        f"Run {run_id!r} changed state before cancellation could be recorded "
-                        f"(now state={current['state']!r})."
-                    ) from None
-                run = current  # still RUNNING, just a newer version — retry the CAS
-        else:
+
+            # The process-control lock held by `_terminate_active_process`
+            # makes the liveness observation, this CAS, and the first signal
+            # one linearized operation relative to exit/reap.
+            for _ in range(_CANCEL_CAS_MAX_ATTEMPTS):
+                try:
+                    db.update_run_fields(
+                        self.db_path,
+                        run_id,
+                        expected_version=run["version"],
+                        fields={"cancel_requested": 1, "cancel_requested_at": iso_now()},
+                    )
+                    cancel_recorded = True
+                    return
+                except db.LostUpdateError:
+                    current = db.get_run(self.db_path, run_id)
+                    if current is None:
+                        raise KeyError(f"No such run: {run_id!r}") from None
+                    if current["state"] != "RUNNING":
+                        raise SupervisorError(
+                            f"Run {run_id!r} changed state before cancellation could be recorded "
+                            f"(now state={current['state']!r})."
+                        ) from None
+                    run = current
             raise SupervisorError(
                 f"Run {run_id!r} could not be marked for cancellation after "
                 f"{_CANCEL_CAS_MAX_ATTEMPTS} attempts against concurrent writes."
             )
 
-        self._append_lifecycle_event_best_effort("cancel_requested", run_id)
-        self._terminate_active_process(
+        def rollback_unsignalled_cancel() -> None:
+            nonlocal cancel_recorded
+            if not cancel_recorded:
+                return
+            for _ in range(_CANCEL_CAS_MAX_ATTEMPTS):
+                current = db.get_run(self.db_path, run_id)
+                if current is None or current["state"] != "RUNNING":
+                    cancel_recorded = False
+                    return
+                if not current.get("cancel_requested"):
+                    cancel_recorded = False
+                    return
+                try:
+                    db.update_run_fields(
+                        self.db_path,
+                        run_id,
+                        expected_version=current["version"],
+                        fields={"cancel_requested": 0, "cancel_requested_at": None},
+                    )
+                    cancel_recorded = False
+                    return
+                except db.LostUpdateError:
+                    continue
+            raise SupervisorError(
+                f"Run {run_id!r} exited before cancellation could be signalled, "
+                "and its provisional cancellation claim could not be rolled back."
+            )
+
+        def record_cancel_signal() -> None:
+            self._append_lifecycle_event_best_effort("cancel_requested", run_id)
+
+        exited = self._terminate_active_process(
             run_id,
             active,
             grace_seconds=grace_seconds,
             lifecycle_prefix="cancel",
+            before_signal=record_cancel_before_signal,
+            on_first_signal_sent=record_cancel_signal,
+            on_no_signal=rollback_unsignalled_cancel,
         )
+        if not cancel_recorded:
+            raise SupervisorError(
+                f"Run {run_id!r} has already exited and is finalizing; cancellation was not recorded."
+            )
+        if not exited:
+            raise SupervisorError(
+                f"Run {run_id!r} did not exit after cancellation escalation; ownership is retained."
+            )
+        if not active.terminal_persisted_event.wait(timeout=max(grace_seconds, 0.0)):
+            raise SupervisorError(
+                f"Run {run_id!r} exited after cancellation, but its terminal state was not persisted in time."
+            )
+        # Preserve the synchronous cancellation API contract: once it returns,
+        # best-effort event/report finalization has also released `_active`.
+        # This wait never controls TERM/KILL escalation; only the distinct
+        # `process_exited_event` does.
+        if not active.done_event.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS):
+            raise SupervisorError(
+                f"Run {run_id!r} reached a terminal state after cancellation, "
+                "but local finalization did not complete in time."
+            )
 
         return db.get_run(self.db_path, run_id)
 
@@ -1055,26 +1731,81 @@ class Supervisor:
         (which is reserved for an explicit, human-confirmed cancellation).
         Never runs `git restore/reset/clean` — same guarantee as `cancel()`.
         """
-        exited_before_deadline = active.done_event.wait(timeout=timeout_seconds)
+        exited_before_deadline = active.leader_exited_event.wait(timeout=max(timeout_seconds, 0.0))
         if exited_before_deadline:
             return  # finished on its own before the deadline; nothing to do
 
-        active.timeout_triggered.set()
-        self._append_lifecycle_event_best_effort(
-            "timeout_exceeded",
-            run_id,
-            timeout_seconds=timeout_seconds,
-        )
-        self._terminate_active_process(
+        timeout_claimed = False
+
+        def claim_timeout_before_signal() -> None:
+            nonlocal timeout_claimed
+            active.timeout_triggered.set()
+            timeout_claimed = True
+            self._append_lifecycle_event_best_effort(
+                "timeout_exceeded",
+                run_id,
+                timeout_seconds=timeout_seconds,
+            )
+
+        exited = self._terminate_active_process(
             run_id,
             active,
             grace_seconds=grace_seconds,
             lifecycle_prefix="timeout",
+            on_first_signal_sent=claim_timeout_before_signal,
         )
+        if timeout_claimed and not exited:
+            logger.error(
+                "Timed-out run %s did not exit after signal escalation; ownership retained",
+                run_id,
+            )
 
     # ------------------------------------------------------------------
     # Startup reconciliation
     # ------------------------------------------------------------------
+
+    def _persist_reconciliation_state(
+        self,
+        run_id: str,
+        *,
+        classification: str,
+    ) -> dict | None:
+        """Persist one reconciliation decision with bounded CAS retries."""
+        for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
+            current = db.get_run(self.db_path, run_id)
+            if current is None or current["state"] in db.TERMINAL_STATES:
+                return current
+            if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
+                return current
+            if classification == "RUNNING" and current["state"] == "RUNNING":
+                return current
+            try:
+                return db.update_run_state(
+                    self.db_path,
+                    run_id,
+                    expected_version=current["version"],
+                    new_state=classification,
+                    fields=None if classification == "RUNNING" else {"completed_at": iso_now()},
+                )
+            except (db.LostUpdateError, db.InvalidTransitionError):
+                continue
+        raise SupervisorError(
+            f"Run {run_id!r} could not persist reconciliation state "
+            f"{classification!r} after {_TERMINAL_CAS_MAX_ATTEMPTS} attempts."
+        )
+
+    def _has_lifecycle_event(self, run_id: str, lifecycle: str) -> bool:
+        try:
+            events = db.list_run_events(
+                self.db_path,
+                run_id,
+                after_seq=0,
+                limit=1_000_000,
+                event_type="lifecycle",
+            )
+        except Exception:
+            return False
+        return any(event["payload"].get("lifecycle") == lifecycle for event in events)
 
     def reconcile(self) -> list[dict]:
         """Inspect every run currently recorded in an active state
@@ -1099,10 +1830,15 @@ class Supervisor:
         persisting the `RUNNING` transition), in which case it goes through
         the exact same pid/identity classification as a `RUNNING` row.
 
-        Skips any run currently in `self._active` **or** `self._launching` —
-        a run *this* instance is actively supervising, or has committed to
-        launching but not yet `Popen`'d, is never a candidate for
-        reconciliation:
+        Skips any live/finalizing run currently in `self._active`, plus every
+        run in `self._launching`. The one intentional exception is a locally
+        owned child whose OS exit is confirmed and whose terminal persistence
+        already exhausted its bounded retries: reconciliation retries that
+        durable write and releases ownership once it succeeds.
+
+        In all other cases, a run *this* instance is actively supervising, or
+        has committed to launching but not yet `Popen`'d, is never a
+        candidate for reconciliation:
 
         - `self._active`: the opposite of orphaned — its own `_supervise`
           background thread already holds the real waitable-child handle and
@@ -1150,64 +1886,102 @@ class Supervisor:
         """
         outcomes = []
         with self._active_lock:
-            actively_supervised_ids = set(self._active.keys()) | set(self._launching)
+            active_snapshot = dict(self._active)
+            launching_ids = set(self._launching)
+
+        # Self-heal terminal persistence failures without waiting for a
+        # Supervisor restart. Slow normal finalization is not eligible because
+        # `finalization_failed_event` is set only after bounded failure.
+        for run_id, active in active_snapshot.items():
+            try:
+                if active.launch_cleanup_failed_event.is_set():
+                    if self._retry_failed_launch_cleanup(run_id, active):
+                        current = db.get_run(self.db_path, run_id)
+                        outcomes.append(
+                            {
+                                "run_id": run_id,
+                                "classification": current["state"] if current else "MISSING",
+                                "detail": "recovered failed post-launch process cleanup",
+                            }
+                        )
+                    continue
+                if not active.finalization_failed_event.is_set():
+                    continue
+                if self._retry_failed_finalization(run_id, active):
+                    current = db.get_run(self.db_path, run_id)
+                    outcomes.append(
+                        {
+                            "run_id": run_id,
+                            "classification": current["state"] if current else "MISSING",
+                            "detail": "recovered failed terminal persistence for an exited local process",
+                        }
+                    )
+            except Exception:
+                logger.exception("Could not retry failed finalization for run %s", run_id)
+
+        with self._active_lock:
+            actively_supervised_ids = set(self._active.keys()) | launching_ids
         for run in db.list_runs(self.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES):
             run_id = run["id"]
             if run_id in actively_supervised_ids:
                 continue
-            pid = run.get("pid")
-            recorded_identity = run.get("process_start_identity")
+            try:
+                pid = run.get("pid")
+                recorded_identity = run.get("process_start_identity")
 
-            if pid is None:
-                classification = "INTERRUPTED"
-                detail = "no pid recorded for this run"
-            else:
-                current = identity.capture_identity(pid)
-                if current is None:
+                if pid is None:
                     classification = "INTERRUPTED"
-                    detail = "pid no longer exists"
-                elif not recorded_identity:
-                    classification = "UNKNOWN"
-                    detail = "pid exists but no identity was recorded at launch time"
-                elif current.as_string() == recorded_identity:
-                    classification = "RUNNING"
-                    detail = "pid exists and identity matches; orphaned from this supervisor instance"
+                    detail = "no pid recorded for this run"
                 else:
-                    classification = "INTERRUPTED"
-                    detail = "pid exists but identity does not match recorded identity (pid reuse)"
+                    current_identity = identity.capture_identity(pid)
+                    if current_identity is None:
+                        classification = "INTERRUPTED"
+                        detail = "pid no longer exists"
+                    elif not recorded_identity:
+                        classification = "UNKNOWN"
+                        detail = "pid exists but no identity was recorded at launch time"
+                    elif current_identity.as_string() == recorded_identity:
+                        classification = "RUNNING"
+                        detail = "pid exists and identity matches; orphaned from this supervisor instance"
+                    else:
+                        classification = "INTERRUPTED"
+                        detail = "pid exists but identity does not match recorded identity (pid reuse)"
 
-            if classification == "RUNNING":
-                if run["state"] != "RUNNING":
-                    # Only reachable for a matched QUEUED row (see docstring)
-                    # — QUEUED -> RUNNING is an already-allowed transition.
-                    run = db.update_run_state(
-                        self.db_path, run_id, expected_version=run["version"], new_state="RUNNING"
-                    )
-                db.append_run_event(
-                    self.db_path,
+                persisted = self._persist_reconciliation_state(
                     run_id,
-                    "lifecycle",
-                    stream_parser.lifecycle_event("reconciliation_orphaned", pid=pid, detail=detail)["payload"],
+                    classification=classification,
                 )
-                outcomes.append({"run_id": run_id, "classification": classification, "detail": detail})
-                continue
+                if persisted is not None and persisted["state"] in db.TERMINAL_STATES:
+                    classification = persisted["state"]
 
-            db.update_run_state(
-                self.db_path,
-                run_id,
-                expected_version=run["version"],
-                new_state=classification,
-                fields={"completed_at": iso_now()},
-            )
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event(
-                    "reconciliation_classified", pid=pid, classification=classification, detail=detail
-                )["payload"],
-            )
-            outcomes.append({"run_id": run_id, "classification": classification, "detail": detail})
+                if classification == "RUNNING":
+                    if not self._has_lifecycle_event(run_id, "reconciliation_orphaned"):
+                        self._append_lifecycle_event_best_effort(
+                            "reconciliation_orphaned",
+                            run_id,
+                            pid=pid,
+                            detail=detail,
+                        )
+                else:
+                    self._append_lifecycle_event_best_effort(
+                        "reconciliation_classified",
+                        run_id,
+                        pid=pid,
+                        classification=classification,
+                        detail=detail,
+                    )
+                outcomes.append({"run_id": run_id, "classification": classification, "detail": detail})
+            except Exception as exc:
+                # One damaged/contended row must not prevent recovery of every
+                # later run in the same reconciliation pass.
+                logger.exception("Could not reconcile run %s", run_id)
+                outcomes.append(
+                    {
+                        "run_id": run_id,
+                        "classification": "ERROR",
+                        "detail": str(exc),
+                    }
+                )
         return outcomes
 
     # ------------------------------------------------------------------
@@ -1224,8 +1998,32 @@ class Supervisor:
     def wait_for_run(self, run_id: str, timeout: float | None = None) -> dict:
         """Block until `run_id` leaves this instance's active-run registry
         (i.e. reaches a terminal state) or `timeout` elapses."""
-        with self._active_lock:
-            active = self._active.get(run_id)
-        if active is not None:
-            active.done_event.wait(timeout=timeout)
+        deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
+        while True:
+            with self._active_lock:
+                active = self._active.get(run_id)
+            if active is None or active.done_event.is_set():
+                break
+            if active.launch_cleanup_failed_event.is_set():
+                try:
+                    if self._retry_failed_launch_cleanup(run_id, active):
+                        break
+                except Exception:
+                    logger.exception(
+                        "Could not retry failed launch cleanup while waiting for run %s",
+                        run_id,
+                    )
+            if active.finalization_failed_event.is_set():
+                try:
+                    if self._retry_failed_finalization(run_id, active):
+                        break
+                except Exception:
+                    logger.exception("Could not retry finalization while waiting for run %s", run_id)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                active.done_event.wait(timeout=min(0.1, remaining))
+            else:
+                active.done_event.wait(timeout=0.1)
         return db.get_run(self.db_path, run_id)

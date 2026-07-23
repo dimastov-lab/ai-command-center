@@ -139,11 +139,14 @@ The primary launch path is asynchronous:
    insertion, SQLite transactionally enforces exact-workspace exclusivity; task-id preflight is not
    a durable claim and can race with another launcher.
 6. The API persists task, session, and run records in `data/runtime.db`.
-7. The Supervisor starts the Claude CLI with `Popen(shell=False, start_new_session=True)`,
-   records PID identity and workspace-verification evidence, streams bounded stdout/stderr events,
-   and returns control to Streamlit.
-8. Reader and watchdog threads handle output, timeout, completion, and report persistence.
-9. Cancellation signals the process group, escalating from termination to kill when needed.
+7. On a POSIX host with `waitid(WNOWAIT)`, the Supervisor starts the Claude CLI with
+   `Popen(shell=False, start_new_session=True)` and atomically records PID identity plus the
+   `RUNNING` transition. Unsupported hosts fail closed before `Popen`.
+8. Reader and watchdog threads handle output and timeout while process-group exit, durable terminal
+   persistence, and report finalization remain separate milestones.
+9. Cancellation and timeout serialize signal/exit/reap decisions against the captured launch-time
+   PGID, drain descendants before reaping the leader, and escalate from termination to kill when
+   needed. A post-exit cancellation is rejected rather than relabelling a completed run.
 10. Run-to-task reconciliation updates the Kanban projection and seeds or advances completion
     state.
 

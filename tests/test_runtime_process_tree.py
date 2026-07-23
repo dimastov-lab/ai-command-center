@@ -8,6 +8,8 @@ from __future__ import annotations
 import os
 import time
 
+import pytest
+
 from command_center.runtime import db, identity, supervisor
 
 
@@ -29,7 +31,7 @@ def _wait_for_tree_pids(pidfile_base: str, timeout: float = 10.0) -> dict[str, i
 def test_grandchild_process_tree_terminates_on_process_group_cancellation(
     git_repo, configure_project_repo, fake_claude_tree
 ):
-    env_overrides, pidfile_base = fake_claude_tree
+    _env_overrides, pidfile_base = fake_claude_tree
     configure_project_repo("AIOS", git_repo)
     sup = supervisor.Supervisor()
 
@@ -87,3 +89,69 @@ def test_grandchild_process_tree_terminates_even_when_parent_ignores_sigterm(
 
     for role in ("parent", "child", "grandchild"):
         assert identity.process_exists(pids[role]) is False, f"{role} must not survive a forced (SIGKILL) cancellation"
+
+
+def test_natural_leader_exit_drains_sigterm_ignoring_descendants_before_release(
+    git_repo, configure_project_repo, fake_claude_tree
+):
+    env_overrides, pidfile_base = fake_claude_tree
+    env_overrides["FAKE_CLAUDE_TREE_DESCENDANTS_IGNORE_SIGTERM"] = "1"
+    env_overrides["FAKE_CLAUDE_TREE_PARENT_EXIT_AFTER_START"] = "1"
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+    pids = _wait_for_tree_pids(pidfile_base)
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["state"] in {"COMPLETED", "FAILED"}
+    assert run["id"] not in sup.active_run_ids()
+    for role, pid in pids.items():
+        assert identity.process_exists(pid) is False, f"{role} survived natural leader exit cleanup"
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    lifecycles = [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
+    assert "process_group_cleanup_residual_sigterm_sent" in lifecycles
+    assert "process_group_cleanup_sigkill_sent" in lifecycles
+
+
+def test_launch_setup_failure_reaps_entire_spawned_process_group(
+    git_repo, configure_project_repo, fake_claude_tree, monkeypatch
+):
+    _env_overrides, pidfile_base = fake_claude_tree
+    configure_project_repo("AIOS", git_repo)
+
+    def fail_after_tree_is_running(*, target, args, name):
+        assert name.startswith("run-supervisor-")
+        _wait_for_tree_pids(pidfile_base)
+        raise RuntimeError("injected supervisor thread start failure")
+
+    monkeypatch.setattr(
+        supervisor.Supervisor,
+        "_start_daemon_thread",
+        staticmethod(fail_after_tree_is_running),
+    )
+
+    sup = supervisor.Supervisor()
+    with pytest.raises(RuntimeError, match="thread start failure"):
+        sup.start_raw(
+            project="AIOS",
+            repository_path=str(git_repo),
+            task_type="implementation",
+            prompt="p",
+            confirmed=True,
+        )
+
+    pids = _wait_for_tree_pids(pidfile_base)
+    for role, pid in pids.items():
+        assert identity.process_exists(pid) is False, f"{role} survived failed launch setup"
+    persisted = db.list_runs(sup.db_path)[0]
+    assert persisted["state"] == "FAILED"
+    assert persisted["failure_reason"] == "launch_setup_failed"
+    assert sup.active_run_ids() == []

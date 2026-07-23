@@ -216,14 +216,22 @@ The Supervisor:
 
 - constructs a fixed Claude CLI argument list and launches with
   `Popen(shell=False, start_new_session=True)`;
-- records PID and process-identity evidence in SQLite;
+- fails closed before launch unless POSIX `waitid(WNOWAIT)` process-group
+  ownership is available;
+- records PID, process-identity evidence, `started_at`, and the `RUNNING`
+  transition atomically in SQLite;
 - retains the live `Popen`, pipes, reader threads, watchdog, and cancellation state in memory;
 - streams bounded stdout/stderr chunks into run events;
 - detects first output and process startup failures;
 - enforces timeout;
-- cancels the process group with terminate-then-kill escalation;
+- observes the process-group leader without reaping it, drains live
+  descendants, and only then releases the pinned PID/PGID;
+- serializes cancel, timeout, signal, exit observation, and reap decisions;
+- cancels the process group with terminate-then-kill escalation and records a
+  `*_sent` event only after the signal syscall succeeds;
 - classifies exit, cancellation, timeout, spawn, and supervision failures;
-- persists final run/session state and report metadata;
+- tracks process-group termination, durable terminal-state persistence, and
+  report finalization as separate milestones;
 - triggers task and completion reconciliation.
 
 The Supervisor owns live subprocess handles only within the hosting Python process. Persisted state
@@ -238,8 +246,13 @@ This is process-local durability, not distributed execution or remote-worker own
 
 User cancellation is an explicit confirmed action. The Supervisor targets the spawned process
 group, sends a graceful termination signal, waits a bounded interval, and escalates to kill if
-needed. Timeout uses the same ownership and classification machinery. State-transition guards and
+needed. A cancellation or timeout can win only while the owned process group is still live; a
+request arriving after physical leader exit is rejected and cannot retroactively relabel a
+successful result. Timeout uses the same ownership and classification machinery, but watches
+process exit rather than slower database/report finalization. State-transition guards and
 compare-and-swap updates prevent late worker threads from overwriting a newer terminal decision.
+Failed post-launch cleanup and failed terminal persistence retain ownership and are retried by a
+recovery thread, `wait_for_run`, and reconciliation.
 
 ### 4.5 Legacy execution
 
