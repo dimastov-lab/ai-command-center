@@ -39,6 +39,7 @@ project without having gone through `context_service` first.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
@@ -48,6 +49,8 @@ from pathlib import Path
 from command_center import agent_runner
 from command_center.models import iso_now
 from command_center.runtime import context_service, db, identity, outcome, reports, stream_parser
+
+logger = logging.getLogger(__name__)
 
 # `AICC_CLAUDE_BINARY` lets a test point a genuinely separate OS process
 # (e.g. `scripts/execution_center_debug.py`, invoked as a real subprocess, not
@@ -74,6 +77,14 @@ DEFAULT_CANCEL_GRACE_SECONDS = 10.0
 # forever. Only one benign write can actually race a cancel today, so this is a
 # generous ceiling, not a tuning knob.
 _CANCEL_CAS_MAX_ATTEMPTS = 5
+
+# Final process-state persistence can race the single cancel-request write in
+# exactly the opposite direction: `_supervise()` may read RUNNING, then
+# `cancel()` bumps the version before the terminal CAS lands. Re-read and
+# reclassify so the persisted cancel request wins instead of leaving an exited
+# child stuck in RUNNING. The retry is bounded for the same reason as the
+# cancel-side CAS above.
+_TERMINAL_CAS_MAX_ATTEMPTS = 5
 
 # Defense in depth: `build_claude_command` never constructs these, but every
 # command is checked against this set before it is ever handed to `Popen`.
@@ -472,26 +483,53 @@ class Supervisor:
             return run
 
         pid = process.pid
-        proc_identity = identity.capture_identity(pid)
-        run = db.update_run_fields(
-            self.db_path,
-            run_id,
-            expected_version=run["version"],
-            fields={
-                "pid": pid,
-                "process_start_identity": proc_identity.as_string() if proc_identity else None,
-            },
-        )
-        run = db.update_run_state(
-            self.db_path,
-            run_id,
-            expected_version=run["version"],
-            new_state="RUNNING",
-            fields={"started_at": iso_now()},
-        )
-        db.append_run_event(
-            self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("process_started", pid=pid)["payload"]
-        )
+        try:
+            proc_identity = identity.capture_identity(pid)
+            run = db.update_run_fields(
+                self.db_path,
+                run_id,
+                expected_version=run["version"],
+                fields={
+                    "pid": pid,
+                    "process_start_identity": proc_identity.as_string() if proc_identity else None,
+                },
+            )
+            run = db.update_run_state(
+                self.db_path,
+                run_id,
+                expected_version=run["version"],
+                new_state="RUNNING",
+                fields={"started_at": iso_now()},
+            )
+        except Exception as exc:
+            # Popen succeeded, so this process is ours even if recording its
+            # identity/state fails. Never let an exception in the narrow
+            # Popen -> `_active` registration window leak a live, unsupervised
+            # process group.
+            self._terminate_unregistered_process(process)
+            current = db.get_run(self.db_path, run_id)
+            if current is not None and current["state"] in db.EXECUTION_CENTER_ACTIVE_STATES:
+                try:
+                    db.update_run_state(
+                        self.db_path,
+                        run_id,
+                        expected_version=current["version"],
+                        new_state="FAILED",
+                        fields={
+                            "exit_code": process.returncode,
+                            "completed_at": iso_now(),
+                            "failure_reason": "launch_setup_failed",
+                        },
+                    )
+                except Exception:
+                    logger.exception("Could not mark run %s FAILED after launch setup failed", run_id)
+            self._append_lifecycle_event_best_effort("launch_failed", run_id, error=str(exc), pid=pid)
+            raise
+
+        # The PID and RUNNING transition above are lifecycle correctness; this
+        # append-only event is audit telemetry. A transient event-store failure
+        # must not kill an otherwise registered, healthy child process.
+        self._append_lifecycle_event_best_effort("process_started", run_id, pid=pid)
 
         active = _ActiveRun(process=process, run_id=run_id)
         with self._active_lock:
@@ -507,7 +545,119 @@ class Supervisor:
             )
             watchdog.start()
 
-        return db.get_run(self.db_path, run_id)
+        return run
+
+    @staticmethod
+    def _signal_process_group(process: subprocess.Popen, sig: signal.Signals) -> None:
+        """Best-effort signal delivery to a Supervisor-owned process group.
+
+        Signal-delivery failures are logged but never allowed to skip the
+        caller's grace wait or SIGKILL escalation.
+        """
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            logger.exception("Could not send %s to process group for pid %s", sig.name, process.pid)
+
+    @classmethod
+    def _terminate_unregistered_process(cls, process: subprocess.Popen) -> None:
+        """Reap a child that was spawned but never installed in `_active`."""
+        cls._signal_process_group(process, signal.SIGTERM)
+        try:
+            process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            cls._signal_process_group(process, signal.SIGKILL)
+            try:
+                process.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.error("Spawned process %s did not exit after SIGKILL", process.pid)
+        finally:
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+
+    def _append_lifecycle_event_best_effort(self, lifecycle: str, run_id: str, **payload: object) -> None:
+        """Persist audit telemetry without making lifecycle safety depend on it."""
+        try:
+            db.append_run_event(
+                self.db_path,
+                run_id,
+                "lifecycle",
+                stream_parser.lifecycle_event(lifecycle, **payload)["payload"],
+            )
+        except Exception:
+            logger.exception("Could not persist %s lifecycle event for run %s", lifecycle, run_id)
+
+    def _persist_supervision_failure(self, run_id: str, *, exit_code: int | None) -> bool:
+        """Best-effort bounded fallback after background finalization fails.
+
+        Return true only when the run is gone or a terminal state is confirmed.
+        Callers must retain process-local ownership and leave waiters blocked
+        when this returns false: signalling completion for a persisted active
+        row would make ``wait_for_run`` lie and could strand its workspace lock.
+        """
+        for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
+            try:
+                current = db.get_run(self.db_path, run_id)
+                if current is None:
+                    return True
+                if current["state"] in db.TERMINAL_STATES:
+                    return True
+                if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
+                    return False
+                db.update_run_state(
+                    self.db_path,
+                    run_id,
+                    expected_version=current["version"],
+                    new_state="FAILED",
+                    fields={
+                        "exit_code": exit_code,
+                        "completed_at": iso_now(),
+                        "failure_reason": "supervision_failed",
+                    },
+                )
+                self._append_lifecycle_event_best_effort(
+                    "supervision_failed",
+                    run_id,
+                    exit_code=exit_code,
+                )
+                return True
+            except (db.LostUpdateError, db.InvalidTransitionError):
+                continue
+            except Exception:
+                logger.exception("Could not persist supervision failure for run %s", run_id)
+                return False
+        logger.error(
+            "Run %s remained active after %s supervision-failure persistence attempts",
+            run_id,
+            _TERMINAL_CAS_MAX_ATTEMPTS,
+        )
+        return False
+
+    def _terminate_active_process(
+        self,
+        run_id: str,
+        active: _ActiveRun,
+        *,
+        grace_seconds: float,
+        lifecycle_prefix: str,
+    ) -> None:
+        """SIGTERM, grace wait, and SIGKILL escalation with best-effort events."""
+        pid = active.process.pid
+        self._signal_process_group(active.process, signal.SIGTERM)
+        self._append_lifecycle_event_best_effort(f"{lifecycle_prefix}_sigterm_sent", run_id, pid=pid)
+
+        if active.done_event.wait(timeout=grace_seconds):
+            return
+
+        self._signal_process_group(active.process, signal.SIGKILL)
+        self._append_lifecycle_event_best_effort(f"{lifecycle_prefix}_sigkill_sent", run_id, pid=pid)
+        active.done_event.wait(timeout=grace_seconds)
 
     # ------------------------------------------------------------------
     # Streaming consumption (runs in background reader threads)
@@ -612,110 +762,141 @@ class Supervisor:
         return result_events[-1]["payload"]
 
     def _supervise(self, run_id: str, active: _ActiveRun, repo_path: Path) -> None:
-        process = active.process
-        stdout_thread = threading.Thread(target=self._drain_stdout, args=(run_id, active), daemon=True)
-        stderr_thread = threading.Thread(target=self._drain_stderr, args=(run_id, active), daemon=True)
-        stdout_thread.start()
-        stderr_thread.start()
+        terminal_persisted = False
+        try:
+            process = active.process
+            stdout_thread = threading.Thread(target=self._drain_stdout, args=(run_id, active), daemon=True)
+            stderr_thread = threading.Thread(target=self._drain_stderr, args=(run_id, active), daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
 
-        exit_code = process.wait()
-        stdout_thread.join()
-        stderr_thread.join()
+            exit_code = process.wait()
+            stdout_thread.join()
+            stderr_thread.join()
 
-        run = db.get_run(self.db_path, run_id)
-        cancel_requested = bool(run.get("cancel_requested"))
-        timed_out = active.timeout_triggered.is_set()
+            run = db.get_run(self.db_path, run_id)
+            if run is None:
+                raise KeyError(f"No such run: {run_id!r}")
 
-        post_status = agent_runner.git_snapshot(repo_path).get("status_summary")
-        pre_status = run.get("pre_run_git_status")
-        working_tree_changed = pre_status is not None and post_status != pre_status
+            post_status = agent_runner.git_snapshot(repo_path).get("status_summary")
+            pre_status = run.get("pre_run_git_status")
+            working_tree_changed = pre_status is not None and post_status != pre_status
+            result_payload = self._final_result_payload(run_id) if exit_code == 0 else None
 
-        # An explicit human cancellation takes precedence in classification
-        # over a timeout that may have fired concurrently with it.
-        failure_reason = None
-        if cancel_requested:
-            new_state = "CANCELLED"
-        elif timed_out:
-            new_state = "FAILED"
-            failure_reason = "timeout"
-        elif exit_code != 0:
-            new_state = "FAILED"
-        else:
-            # exit_code == 0 only proves the `claude` process itself did not
-            # crash — it does not prove the requested work actually happened
-            # (a denied `Write`/`Edit` call, or the agent's own final
-            # message saying it could not proceed, both still exit 0; see
-            # `runtime.outcome`'s module docstring). EvaluatingResult stage:
-            # decide what this exit actually means before ever recording
-            # COMPLETED.
-            result_payload = self._final_result_payload(run_id)
-            classification, reason = outcome.classify_process_result(
-                task_type=run["task_type"],
-                result_text=(result_payload or {}).get("result"),
-                permission_denials=(result_payload or {}).get("permission_denials"),
-                working_tree_changed=working_tree_changed,
-            )
-            if classification == outcome.OK:
-                new_state = "COMPLETED"
+            for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
+                cancel_requested = bool(run.get("cancel_requested"))
+                timed_out = active.timeout_triggered.is_set()
+
+                # An explicit human cancellation takes precedence in
+                # classification over a timeout that may have fired
+                # concurrently with it.
+                failure_reason = None
+                if cancel_requested:
+                    new_state = "CANCELLED"
+                elif timed_out:
+                    new_state = "FAILED"
+                    failure_reason = "timeout"
+                elif exit_code != 0:
+                    new_state = "FAILED"
+                else:
+                    # exit_code == 0 only proves the `claude` process itself
+                    # did not crash. Evaluate the persisted result before
+                    # recording COMPLETED.
+                    classification, reason = outcome.classify_process_result(
+                        task_type=run["task_type"],
+                        result_text=(result_payload or {}).get("result"),
+                        permission_denials=(result_payload or {}).get("permission_denials"),
+                        working_tree_changed=working_tree_changed,
+                    )
+                    if classification == outcome.OK:
+                        new_state = "COMPLETED"
+                    else:
+                        # Keep blocked and incomplete display-distinct while
+                        # both persist through the existing FAILED state.
+                        new_state = "FAILED"
+                        failure_reason = f"{classification}:{reason}"
+
+                try:
+                    run = db.update_run_state(
+                        self.db_path,
+                        run_id,
+                        expected_version=run["version"],
+                        new_state=new_state,
+                        fields={
+                            "exit_code": exit_code,
+                            "completed_at": iso_now(),
+                            "post_run_git_status": post_status,
+                            "working_tree_changed": 1 if working_tree_changed else 0,
+                            "failure_reason": failure_reason,
+                        },
+                    )
+                    terminal_persisted = True
+                    break
+                except (db.LostUpdateError, db.InvalidTransitionError):
+                    current = db.get_run(self.db_path, run_id)
+                    if current is None:
+                        raise KeyError(f"No such run: {run_id!r}") from None
+                    if current["state"] in db.TERMINAL_STATES:
+                        # Another owner already persisted a terminal decision.
+                        # Respect it and avoid a duplicate process-exited event
+                        # or report; this instance still releases ownership in
+                        # the outer finally block.
+                        terminal_persisted = True
+                        return
+                    if current["state"] != "RUNNING":
+                        raise
+                    run = current
             else:
-                # `classification` (`"blocked"`/`"incomplete"`) is prefixed
-                # onto `reason` so `session_view.derive_status` can tell a
-                # blocked run apart from a merely incomplete one from
-                # `failure_reason` alone — both persist to the same `FAILED`
-                # `run.state` (see `runtime.db.ALLOWED_TRANSITIONS`, which
-                # this deliberately does not expand), but they are display-
-                # distinct outcomes.
-                new_state = "FAILED"
-                failure_reason = f"{classification}:{reason}"
+                raise SupervisorError(
+                    f"Run {run_id!r} could not persist its terminal state after "
+                    f"{_TERMINAL_CAS_MAX_ATTEMPTS} attempts against concurrent writes."
+                )
 
-        run = db.update_run_state(
-            self.db_path,
-            run_id,
-            expected_version=run["version"],
-            new_state=new_state,
-            fields={
-                "exit_code": exit_code,
-                "completed_at": iso_now(),
-                "post_run_git_status": post_status,
-                "working_tree_changed": 1 if working_tree_changed else 0,
-                "failure_reason": failure_reason,
-            },
-        )
-        db.append_run_event(
-            self.db_path,
-            run_id,
-            "lifecycle",
-            stream_parser.lifecycle_event(
+            self._append_lifecycle_event_best_effort(
                 "process_exited",
+                run_id,
                 exit_code=exit_code,
                 state=new_state,
                 working_tree_changed=working_tree_changed,
                 failure_reason=failure_reason,
-            )["payload"],
-        )
-        if new_state == "CANCELLED" and working_tree_changed:
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event(
+            )
+            if new_state == "CANCELLED" and working_tree_changed:
+                self._append_lifecycle_event_best_effort(
                     "cancellation_working_tree_changed_requires_inspection",
+                    run_id,
                     pre_run_git_status=pre_status,
                     post_run_git_status=post_status,
-                )["payload"],
+                )
+
+            if new_state in ("COMPLETED", "FAILED", "CANCELLED"):
+                try:
+                    events = db.list_run_events(self.db_path, run_id, after_seq=0, limit=1_000_000)
+                    path = reports.save_report(run, events)
+                    # Relative to `REPORTS_ROOT`'s *parent* (not the hardcoded
+                    # repo root), so tests can redirect report persistence.
+                    db.create_report(
+                        self.db_path,
+                        run_id,
+                        str(path.relative_to(reports.REPORTS_ROOT.parent)),
+                    )
+                except Exception as exc:
+                    logger.exception("Could not persist report for run %s", run_id)
+                    self._append_lifecycle_event_best_effort(
+                        "report_persistence_failed",
+                        run_id,
+                        error=str(exc),
+                    )
+        except Exception:
+            logger.exception("Unexpected supervision failure for run %s", run_id)
+            terminal_persisted = self._persist_supervision_failure(
+                run_id,
+                exit_code=active.process.returncode,
             )
-
-        if new_state in ("COMPLETED", "FAILED", "CANCELLED"):
-            events = db.list_run_events(self.db_path, run_id, after_seq=0, limit=1_000_000)
-            path = reports.save_report(run, events)
-            # Relative to `REPORTS_ROOT`'s *parent* (not the hardcoded repo
-            # root), so this stays correct when a test monkeypatches
-            # `reports.REPORTS_ROOT` to an isolated directory.
-            db.create_report(self.db_path, run_id, str(path.relative_to(reports.REPORTS_ROOT.parent)))
-
-        with self._active_lock:
-            self._active.pop(run_id, None)
-        active.done_event.set()
+        finally:
+            if terminal_persisted:
+                with self._active_lock:
+                    self._active.pop(run_id, None)
+                active.done_event.set()
 
     # ------------------------------------------------------------------
     # Cancellation — requires explicit confirmation from the caller/UI
@@ -780,35 +961,13 @@ class Supervisor:
                 f"{_CANCEL_CAS_MAX_ATTEMPTS} attempts against concurrent writes."
             )
 
-        db.append_run_event(
-            self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("cancel_requested")["payload"]
-        )
-
-        pid = active.process.pid
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        db.append_run_event(
-            self.db_path,
+        self._append_lifecycle_event_best_effort("cancel_requested", run_id)
+        self._terminate_active_process(
             run_id,
-            "lifecycle",
-            stream_parser.lifecycle_event("cancel_sigterm_sent", pid=pid)["payload"],
+            active,
+            grace_seconds=grace_seconds,
+            lifecycle_prefix="cancel",
         )
-
-        exited_in_time = active.done_event.wait(timeout=grace_seconds)
-        if not exited_in_time:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event("cancel_sigkill_sent", pid=pid)["payload"],
-            )
-            active.done_event.wait(timeout=grace_seconds)
 
         return db.get_run(self.db_path, run_id)
 
@@ -838,37 +997,17 @@ class Supervisor:
             return  # finished on its own before the deadline; nothing to do
 
         active.timeout_triggered.set()
-        db.append_run_event(
-            self.db_path,
+        self._append_lifecycle_event_best_effort(
+            "timeout_exceeded",
             run_id,
-            "lifecycle",
-            stream_parser.lifecycle_event("timeout_exceeded", timeout_seconds=timeout_seconds)["payload"],
+            timeout_seconds=timeout_seconds,
         )
-
-        pid = active.process.pid
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        db.append_run_event(
-            self.db_path,
+        self._terminate_active_process(
             run_id,
-            "lifecycle",
-            stream_parser.lifecycle_event("timeout_sigterm_sent", pid=pid)["payload"],
+            active,
+            grace_seconds=grace_seconds,
+            lifecycle_prefix="timeout",
         )
-
-        exited_in_time = active.done_event.wait(timeout=grace_seconds)
-        if not exited_in_time:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event("timeout_sigkill_sent", pid=pid)["payload"],
-            )
 
     # ------------------------------------------------------------------
     # Startup reconciliation

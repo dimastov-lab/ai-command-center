@@ -291,6 +291,126 @@ def test_report_never_truncates_large_assistant_output(git_repo, configure_proje
     assert huge_text in content
 
 
+def test_report_failure_releases_active_ownership_and_signals_waiters(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    hold_file = git_repo.parent / "report-failure.hold"
+    hold_file.touch()
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold_file)
+    configure_project_repo("AIOS", git_repo)
+
+    def fail_report(*args, **kwargs):
+        raise RuntimeError("injected report persistence failure")
+
+    monkeypatch.setattr(supervisor.reports, "save_report", fail_report)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+    with sup._active_lock:
+        active = sup._active[run["id"]]
+
+    hold_file.unlink()
+    assert active.done_event.wait(timeout=10)
+
+    final = db.get_run(sup.db_path, run["id"])
+    assert final["state"] == "COMPLETED"
+    assert final["exit_code"] == 0
+    assert run["id"] not in sup.active_run_ids()
+    assert db.get_report(sup.db_path, run["id"]) is None
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    assert any(
+        event["event_type"] == "lifecycle"
+        and event["payload"].get("lifecycle") == "report_persistence_failed"
+        for event in events
+    )
+
+
+def test_supervision_failure_persists_failed_before_signalling_waiters(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    real_snapshot = agent_runner.git_snapshot
+    snapshot_calls = {"count": 0}
+
+    def fail_post_run_snapshot(path):
+        snapshot_calls["count"] += 1
+        if snapshot_calls["count"] == 2:
+            raise RuntimeError("injected finalization failure")
+        return real_snapshot(path)
+
+    monkeypatch.setattr(supervisor.agent_runner, "git_snapshot", fail_post_run_snapshot)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["state"] == "FAILED"
+    assert final["failure_reason"] == "supervision_failed"
+    assert run["id"] not in sup.active_run_ids()
+
+
+def test_unpersisted_supervision_failure_retains_ownership_and_does_not_signal(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    hold_file = git_repo.parent / "unpersisted-supervision-failure.hold"
+    hold_file.touch()
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold_file)
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+    with sup._active_lock:
+        active = sup._active[run["id"]]
+
+    monkeypatch.setattr(
+        supervisor.agent_runner,
+        "git_snapshot",
+        lambda path: (_ for _ in ()).throw(RuntimeError("injected finalization failure")),
+    )
+    real_update_run_state = supervisor.db.update_run_state
+    persistence_attempted = threading.Event()
+
+    def reject_terminal_state(db_path, run_id, *, expected_version, new_state, fields=None):
+        if new_state in db.TERMINAL_STATES:
+            persistence_attempted.set()
+            raise RuntimeError("injected terminal persistence failure")
+        return real_update_run_state(
+            db_path,
+            run_id,
+            expected_version=expected_version,
+            new_state=new_state,
+            fields=fields,
+        )
+
+    monkeypatch.setattr(supervisor.db, "update_run_state", reject_terminal_state)
+    hold_file.unlink()
+    active.process.wait(timeout=10)
+    assert persistence_attempted.wait(timeout=5)
+
+    assert db.get_run(sup.db_path, run["id"])["state"] == "RUNNING"
+    assert run["id"] in sup.active_run_ids()
+    assert not active.done_event.is_set()
+
+
 def test_stderr_lines_are_persisted(git_repo, configure_project_repo, fake_claude):
     fake_claude["FAKE_CLAUDE_STDERR"] = "a warning from claude"
     configure_project_repo("AIOS", git_repo)
@@ -360,6 +480,91 @@ def test_popen_failure_marks_run_failed_without_raising(git_repo, configure_proj
     )
     assert run["state"] == "FAILED"
     assert sup.active_run_ids() == []
+
+
+def test_post_popen_setup_failure_terminates_child_and_marks_run_failed(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """A child belongs to the Supervisor as soon as Popen succeeds, even when
+    persisting its pid fails before it can be registered in `_active`."""
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "30"
+    configure_project_repo("AIOS", git_repo)
+
+    spawned = {}
+    real_popen = supervisor.subprocess.Popen
+
+    def capturing_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        spawned["process"] = process
+        return process
+
+    real_update = supervisor.db.update_run_fields
+
+    def fail_pid_persistence(db_path, run_id, *, expected_version, fields):
+        if "pid" in fields:
+            raise RuntimeError("injected pid persistence failure")
+        return real_update(
+            db_path,
+            run_id,
+            expected_version=expected_version,
+            fields=fields,
+        )
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", capturing_popen)
+    monkeypatch.setattr(supervisor.db, "update_run_fields", fail_pid_persistence)
+
+    sup = supervisor.Supervisor()
+    with pytest.raises(RuntimeError, match="injected pid persistence failure"):
+        sup.start_raw(
+            project="AIOS",
+            repository_path=str(git_repo),
+            task_type="implementation",
+            prompt="p",
+            confirmed=True,
+        )
+
+    process = spawned["process"]
+    assert process.poll() is not None
+    assert identity.process_exists(process.pid) is False
+    assert sup.active_run_ids() == []
+    with sup._active_lock:
+        assert sup._launching == set()
+
+    runs = db.list_runs(sup.db_path)
+    assert len(runs) == 1
+    assert runs[0]["state"] == "FAILED"
+    assert runs[0]["failure_reason"] == "launch_setup_failed"
+
+
+def test_process_started_event_failure_does_not_abort_launch(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    real_append = supervisor.db.append_run_event
+    injected = {"done": False}
+
+    def fail_process_started(db_path, run_id, event_type, payload):
+        if payload.get("lifecycle") == "process_started":
+            injected["done"] = True
+            raise RuntimeError("injected process_started event failure")
+        return real_append(db_path, run_id, event_type, payload)
+
+    monkeypatch.setattr(supervisor.db, "append_run_event", fail_process_started)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert injected["done"]
+    assert final["state"] == "COMPLETED"
+    assert final["exit_code"] == 0
+    assert run["id"] not in sup.active_run_ids()
 
 
 # --------------------------------------------------------------------------
@@ -453,6 +658,166 @@ def test_cancel_survives_benign_concurrent_version_bump(
     assert result["state"] == "CANCELLED"
 
 
+def test_terminal_persistence_retries_when_cancel_wins_version_race(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """If cancel bumps the row after `_supervise` reads it, finalization must
+    re-read the request and persist CANCELLED instead of leaking RUNNING."""
+    hold_file = git_repo.parent / "terminal-cas-race.hold"
+    hold_file.touch()
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold_file)
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+    with sup._active_lock:
+        active = sup._active[run["id"]]
+
+    terminal_attempt_entered = threading.Event()
+    release_terminal_attempt = threading.Event()
+    terminal_attempts = []
+    blocked_first_terminal_attempt = {"done": False}
+    real_update_run_state = supervisor.db.update_run_state
+
+    def block_first_terminal_update(
+        db_path, run_id, *, expected_version, new_state, fields=None
+    ):
+        if new_state in db.TERMINAL_STATES:
+            terminal_attempts.append(new_state)
+            if not blocked_first_terminal_attempt["done"]:
+                blocked_first_terminal_attempt["done"] = True
+                terminal_attempt_entered.set()
+                assert release_terminal_attempt.wait(timeout=5)
+        return real_update_run_state(
+            db_path,
+            run_id,
+            expected_version=expected_version,
+            new_state=new_state,
+            fields=fields,
+        )
+
+    monkeypatch.setattr(supervisor.db, "update_run_state", block_first_terminal_update)
+    hold_file.unlink()
+    assert terminal_attempt_entered.wait(timeout=5)
+
+    outcome_box = {}
+
+    def request_cancel():
+        try:
+            outcome_box["result"] = sup.cancel(run["id"], confirmed=True, grace_seconds=5)
+        except Exception as exc:  # pragma: no cover - asserted below
+            outcome_box["error"] = exc
+
+    cancel_thread = threading.Thread(target=request_cancel)
+    cancel_thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if db.get_run(sup.db_path, run["id"])["cancel_requested"] == 1:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("cancel request CAS did not land during the race window")
+    finally:
+        release_terminal_attempt.set()
+
+    cancel_thread.join(timeout=5)
+    assert not cancel_thread.is_alive()
+    assert "error" not in outcome_box
+    assert outcome_box["result"]["state"] == "CANCELLED"
+
+    persisted = db.get_run(sup.db_path, run["id"])
+    assert persisted["state"] == "CANCELLED"
+    assert persisted["cancel_requested"] == 1
+    assert persisted["exit_code"] == 0
+    assert run["id"] not in sup.active_run_ids()
+    assert active.done_event.is_set()
+    assert terminal_attempts == ["COMPLETED", "CANCELLED"]
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    process_exited = [
+        event
+        for event in events
+        if event["event_type"] == "lifecycle"
+        and event["payload"].get("lifecycle") == "process_exited"
+    ]
+    assert len(process_exited) == 1
+    assert process_exited[0]["payload"]["state"] == "CANCELLED"
+
+
+def test_terminal_persistence_respects_concurrent_terminal_owner(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """SQLite validates the state transition before the CAS version, so a
+    concurrent terminal owner surfaces as InvalidTransitionError. Supervision
+    must accept that terminal row without duplicating events or reports."""
+    hold_file = git_repo.parent / "terminal-owner-race.hold"
+    hold_file.touch()
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold_file)
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+    with sup._active_lock:
+        active = sup._active[run["id"]]
+
+    real_update_run_state = supervisor.db.update_run_state
+    injected = {"done": False}
+
+    def let_other_terminal_owner_win(
+        db_path, run_id, *, expected_version, new_state, fields=None
+    ):
+        if new_state in db.TERMINAL_STATES and not injected["done"]:
+            injected["done"] = True
+            real_update_run_state(
+                db_path,
+                run_id,
+                expected_version=expected_version,
+                new_state="FAILED",
+                fields={
+                    "completed_at": "2026-01-01T00:00:00Z",
+                    "failure_reason": "concurrent_terminal_owner",
+                },
+            )
+        return real_update_run_state(
+            db_path,
+            run_id,
+            expected_version=expected_version,
+            new_state=new_state,
+            fields=fields,
+        )
+
+    monkeypatch.setattr(supervisor.db, "update_run_state", let_other_terminal_owner_win)
+    hold_file.unlink()
+    assert active.done_event.wait(timeout=10)
+
+    final = db.get_run(sup.db_path, run["id"])
+    assert injected["done"]
+    assert final["state"] == "FAILED"
+    assert final["failure_reason"] == "concurrent_terminal_owner"
+    assert run["id"] not in sup.active_run_ids()
+    assert db.get_report(sup.db_path, run["id"]) is None
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    assert not any(
+        event["event_type"] == "lifecycle"
+        and event["payload"].get("lifecycle") == "process_exited"
+        for event in events
+    )
+
+
 def test_cancel_surfaces_concurrent_terminal_state_without_retrying(monkeypatch):
     """A genuine terminal transition is still a conflict, not a successful cancel."""
     sup = supervisor.Supervisor()
@@ -508,6 +873,38 @@ def test_cancel_concurrent_write_retries_are_bounded(monkeypatch):
     ):
         sup.cancel(run_id, confirmed=True)
     assert attempts["count"] == supervisor._CANCEL_CAS_MAX_ATTEMPTS
+
+
+def test_cancel_still_terminates_process_when_event_persistence_fails(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "30"
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+    )
+
+    real_append = supervisor.db.append_run_event
+    injected = {"done": False}
+
+    def fail_cancel_requested(db_path, run_id, event_type, payload):
+        if payload.get("lifecycle") == "cancel_requested":
+            injected["done"] = True
+            raise RuntimeError("injected cancel event failure")
+        return real_append(db_path, run_id, event_type, payload)
+
+    monkeypatch.setattr(supervisor.db, "append_run_event", fail_cancel_requested)
+
+    result = sup.cancel(run["id"], confirmed=True, grace_seconds=2)
+    assert injected["done"]
+    assert result["state"] == "CANCELLED"
+    assert identity.process_exists(run["pid"]) is False
+    assert run["id"] not in sup.active_run_ids()
 
 
 def test_cancel_escalates_to_sigkill_after_grace_period_when_sigterm_ignored(
@@ -649,6 +1046,41 @@ def test_timeout_graceful_process_exits_on_sigterm(git_repo, configure_project_r
     assert "timeout_exceeded" in lifecycles
     assert "timeout_sigterm_sent" in lifecycles
     assert "timeout_sigkill_sent" not in lifecycles, "a process that dies from SIGTERM must not also receive SIGKILL"
+
+
+def test_timeout_still_terminates_process_when_event_persistence_fails(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "30"
+    configure_project_repo("AIOS", git_repo)
+
+    real_append = supervisor.db.append_run_event
+    injected = {"done": False}
+
+    def fail_timeout_exceeded(db_path, run_id, event_type, payload):
+        if payload.get("lifecycle") == "timeout_exceeded":
+            injected["done"] = True
+            raise RuntimeError("injected timeout event failure")
+        return real_append(db_path, run_id, event_type, payload)
+
+    monkeypatch.setattr(supervisor.db, "append_run_event", fail_timeout_exceeded)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+        timeout_seconds=0.1,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert injected["done"]
+    assert final["state"] == "FAILED"
+    assert final["failure_reason"] == "timeout"
+    assert identity.process_exists(run["pid"]) is False
+    assert run["id"] not in sup.active_run_ids()
 
 
 def test_timeout_escalates_to_sigkill_when_sigterm_ignored(git_repo, configure_project_repo, fake_claude):
