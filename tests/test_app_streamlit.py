@@ -11,6 +11,7 @@ network/billable call.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
@@ -1303,6 +1304,162 @@ def test_kanban_card_enqueue_button_adds_task_to_execution_queue():
     assert any(e["task_id"] == "seeded-task-1" for e in entries)
     captions = [c.value for c in at.caption]
     assert any("Готово к запуску" in c or "Ожидает зависимостей" in c for c in captions)
+
+
+# --------------------------------------------------------------------------
+# AICC-EXECUTION-QUEUE-LOCK-002 — the two enqueue-only UI actions must persist
+# through the lock-guarded `execution_queue.enqueue_and_persist`, never a raw
+# `load_queue` -> `enqueue` -> `save_queue` triple (which loses a concurrent
+# writer's update). Behavioural proof: stub `enqueue_and_persist` to a no-op
+# spy — the *only* intended persistence route for these actions — then assert
+# each click (a) calls it exactly once with the right root/task/tasks_by_id
+# and (b) leaves the on-disk queue untouched, which it could not if a raw
+# `save_queue` fallback still ran. `test_kanban_card_enqueue_button_adds_task_
+# to_execution_queue` above (and `test_recommendations_enqueue_button_...`
+# below) separately cover the unchanged end-to-end behaviour through the real
+# locked path.
+# --------------------------------------------------------------------------
+
+
+def _record_save_queue_callers(monkeypatch) -> list[tuple[str, str]]:
+    """Record the immediate caller of every queue save during an AppTest run."""
+    callers: list[tuple[str, str]] = []
+    real_save_queue = execution_queue.save_queue
+
+    def spy(root, entries):
+        frame = inspect.currentframe()
+        assert frame is not None and frame.f_back is not None
+        caller = frame.f_back
+        callers.append((Path(caller.f_code.co_filename).name, caller.f_code.co_name))
+        return real_save_queue(root, entries)
+
+    monkeypatch.setattr(execution_queue, "save_queue", spy)
+    return callers
+
+
+def test_kanban_card_enqueue_uses_locked_persistence(monkeypatch):
+    import app
+
+    _seed_task(id="seeded-task-1", workspace_path=None)
+
+    calls: list[tuple] = []
+    save_callers = _record_save_queue_callers(monkeypatch)
+
+    def spy(root, task, tasks_by_id):  # no-op: no persistence at all
+        calls.append((root, task, tasks_by_id))
+
+    monkeypatch.setattr(execution_queue, "enqueue_and_persist", spy)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_seeded-task-1_action_queue")
+    at = button.click().run()
+    assert not at.exception
+
+    assert len(calls) == 1, "card «В очередь» must call enqueue_and_persist exactly once"
+    root, task, tasks_by_id = calls[0]
+    assert root == app.ROOT
+    assert task.get("id") == "seeded-task-1"
+    assert tasks_by_id.get("seeded-task-1", {}).get("id") == "seeded-task-1"
+
+    # No raw fallback: with enqueue_and_persist stubbed to a no-op, nothing may
+    # have written this task into the queue via a bare save_queue.
+    entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
+    assert not any(e.get("task_id") == "seeded-task-1" for e in entries)
+    assert save_callers
+    assert all(caller == ("execution_queue.py", "_mutate_queue") for caller in save_callers)
+
+    # Success feedback is still emitted (UI behaviour unchanged).
+    assert any("очередь" in (msg.value or "").lower() for msg in at.success)
+
+
+def test_recommendations_enqueue_uses_locked_persistence(monkeypatch):
+    import app
+
+    _seed_task(id="seeded-task-1", workspace_path=None)
+
+    calls: list[tuple] = []
+    save_callers = _record_save_queue_callers(monkeypatch)
+
+    def spy(root, task, tasks_by_id):  # no-op: no persistence at all
+        calls.append((root, task, tasks_by_id))
+
+    monkeypatch.setattr(execution_queue, "enqueue_and_persist", spy)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_enqueue")
+    at = button.click().run()
+    assert not at.exception
+
+    assert len(calls) == 1, "recommendation «В очередь» must call enqueue_and_persist exactly once"
+    root, task, tasks_by_id = calls[0]
+    assert root == app.ROOT
+    assert task.get("id") == "seeded-task-1"
+    assert tasks_by_id.get("seeded-task-1", {}).get("id") == "seeded-task-1"
+
+    # No raw fallback and, crucially, the earlier-loaded `queue_entries`
+    # snapshot is not re-saved: with enqueue_and_persist stubbed out, the queue
+    # must stay empty of this task.
+    entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
+    assert not any(e.get("task_id") == "seeded-task-1" for e in entries)
+    assert save_callers
+    assert all(caller == ("execution_queue.py", "_mutate_queue") for caller in save_callers)
+
+
+def test_recommendations_enqueue_button_adds_task_to_execution_queue():
+    """End-to-end through the real locked path: the recommendation «В очередь»
+    action still queues the task (behaviour unchanged by the lock fix)."""
+    _seed_task(id="seeded-task-1", workspace_path=None)
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_enqueue")
+    at = button.click().run()
+    assert not at.exception
+
+    entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
+    assert any(e["task_id"] == "seeded-task-1" for e in entries)
+    rerendered_button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_enqueue")
+    assert rerendered_button.disabled is True
+    assert any(c.value == "В очереди · готово" for c in at.caption)
+
+
+def test_recommendations_launch_now_still_persists_and_is_unchanged(monkeypatch):
+    """The separate «Запустить» (launch-now) workflow already persists safely
+    through `launch_ready`'s lock-guarded commit — this remediation must not
+    touch it. Guard: launching from a recommendation still routes through
+    `execution_queue.launch_ready` (never the enqueue-only path) and reports a
+    per-entry result."""
+    import app
+
+    _seed_task(id="seeded-task-1", workspace_path=None)
+
+    launch_ready_calls: list[tuple] = []
+    real_launch_ready = execution_queue.launch_ready
+
+    def spy_launch_ready(root, entries, *args, **kwargs):
+        launch_ready_calls.append((root, entries, args, kwargs))
+        return real_launch_ready(root, entries, *args, **kwargs)
+
+    def fail_locked_enqueue(*args, **kwargs):
+        raise AssertionError("launch-now must not use the enqueue-only persistence helper")
+
+    monkeypatch.setattr(execution_queue, "launch_ready", spy_launch_ready)
+    monkeypatch.setattr(execution_queue, "enqueue_and_persist", fail_locked_enqueue)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_launch")
+    at = button.click().run()
+    assert not at.exception
+
+    assert len(launch_ready_calls) == 1, "launch-now must route through launch_ready exactly once"
+    root, entries, _, kwargs = launch_ready_calls[0]
+    assert root == app.ROOT
+    entry_ids = kwargs.get("entry_ids")
+    assert len(entry_ids) == 1
+    launched_entry = next(e for e in entries if e["id"] == entry_ids[0])
+    assert launched_entry["task_id"] == "seeded-task-1"
 
 
 def test_execution_queue_panel_launch_ready_button_present_once_queued():

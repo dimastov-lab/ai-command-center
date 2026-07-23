@@ -464,9 +464,18 @@ def _commit_launch_results(
     the unit tests exercise), and disk entries the caller never saw are
     appended, never dropped. The launch patches are applied last, so a
     freshly-launched entry always reflects its `LAUNCHED` state regardless of
-    which copy won the merge — and a patch for an entry a concurrent process
-    deleted in the meantime is simply dropped (the run itself is already
-    tracked in `runtime.db`; the queue is not resurrected behind that delete)."""
+    which copy won the merge.
+
+    Note on a concurrently-deleted launched entry: a launched entry is always
+    one this call took from `base_entries`, so when a concurrent process has
+    since dequeued it from disk the fallback above keeps the caller's copy in
+    the merge and the launch patch is applied to it — i.e. it is re-added and
+    recorded `LAUNCHED`, not dropped. That is deliberate: the run has actually
+    started (and is independently tracked in `runtime.db`), so the queue should
+    reflect it rather than silently lose it behind a racing delete. The
+    `if target is not None` guard below therefore never fires for a launched
+    entry today; it is defensive only, for any future caller that might pass a
+    patch id not present in `base_entries`."""
     with queue_lock(root):
         disk = load_queue(root)
         disk_by_id = {e.get("id"): e for e in disk}
