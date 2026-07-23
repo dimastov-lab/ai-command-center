@@ -1198,6 +1198,9 @@ def test_recommendations_panel_launch_button_starts_v2_run(fake_claude, tmp_path
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
+    # Normal task-v2 launches now fail closed unless workspace ownership can
+    # be verified against the project's canonical source repository.
+    project_config.save_repository_path("AIOS", str(repo))
     _seed_tasks([{"id": "reco-launch", "title": "Recommended task", "workspace_path": str(repo)}])
 
     at = _at_on_page("kanban")
