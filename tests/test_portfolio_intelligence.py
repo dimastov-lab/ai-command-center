@@ -8,6 +8,8 @@ records, matching how the Portfolio panel actually feeds the read-model.
 
 from __future__ import annotations
 
+import random
+import time
 from pathlib import Path
 
 from command_center.portfolio_intelligence import (
@@ -16,6 +18,7 @@ from command_center.portfolio_intelligence import (
     READINESS_BLOCKED,
     READINESS_GATED,
     READINESS_LAUNCHED,
+    READINESS_NOT_READY_LANE,
     READINESS_READY,
     READINESS_UNMAPPED,
     REC_BREAK_CYCLE,
@@ -25,7 +28,11 @@ from command_center.portfolio_intelligence import (
     REC_REVIEW_CONFLICT,
     compute_portfolio_overview,
 )
-from command_center.portfolio_models import load_portfolio_tasks
+from command_center.portfolio_models import (
+    PortfolioLoadResult,
+    PortfolioTask,
+    load_portfolio_tasks,
+)
 
 
 def _fmt_list(values: list[str]) -> str:
@@ -340,3 +347,173 @@ def test_overview_is_deterministic(tmp_path):
     assert first.graph.waves == second.graph.waves
     assert first.graph.critical_path == second.graph.critical_path
     assert [r.kind for r in first.recommendations] == [r.kind for r in second.recommendations]
+
+
+# --------------------------------------------------------------------------
+# Founder Gate remediation: graph scalability, deep-chain safety, determinism.
+#
+# These use direct `PortfolioTask`/`PortfolioLoadResult` construction rather
+# than on-disk cards so a 5,000-node graph does not mean 5,000 file writes —
+# the read-model under test consumes a `PortfolioLoadResult`, exactly what the
+# loader hands it. Each test below fails on commit ba3c182:
+#   - deep chains -> RecursionError (BLOCKER-1);
+#   - diamonds    -> exponential wall-time (MAJOR-1);
+#   - long chains -> critical path silently capped at 201 (MAJOR-2);
+#   - duplicate `requires` -> duplicate edges (MINOR-2);
+#   - blocked-lane card -> project reported healthy (MINOR-1).
+# --------------------------------------------------------------------------
+
+_compute = compute_portfolio_overview
+_PATHS = {"AICC": "/repo", "AIOS": "/repo2"}
+
+
+def _task(task_id: str, requires=None, *, project: str = "AICC", lane: str = "ready") -> PortfolioTask:
+    frontmatter = {
+        "task_id": task_id,
+        "project": project,
+        "title": f"T {task_id}",
+        "repository": "~/r",
+        "base_branch": "main",
+        "status": lane,
+        "requires": list(requires or []),
+    }
+    return PortfolioTask(
+        lane=lane, source_path=Path(f"/x/{task_id}.md"), frontmatter=frontmatter, body="", raw_text=""
+    )
+
+
+def _result(tasks: list[PortfolioTask]) -> PortfolioLoadResult:
+    return PortfolioLoadResult(portfolio_root=Path("/p"), missing=False, tasks=tasks, card_issues=[])
+
+
+def _tid(i: int) -> str:
+    return f"T{i:05d}"
+
+
+def test_forward_chain_3000_exact_and_consistent():
+    tasks = [_task(_tid(i), [_tid(i - 1)] if i else []) for i in range(3000)]
+    ov = _compute(_result(tasks), repository_paths=_PATHS)
+    assert len(ov.graph.waves) == 3000
+    assert len(ov.graph.critical_path) == 3000  # not silently capped at 201
+    assert ov.tasks_by_id()[_tid(2999)].wave == 2999
+
+
+def test_reverse_ordered_input_matches_forward():
+    tasks = [_task(_tid(i), [_tid(i - 1)] if i else []) for i in range(3000)]
+    forward = _compute(_result(tasks), repository_paths=_PATHS)
+    reverse = _compute(_result(list(reversed(tasks))), repository_paths=_PATHS)
+    assert forward.graph.waves == reverse.graph.waves
+    assert forward.graph.critical_path == reverse.graph.critical_path
+
+
+def test_deep_chain_dependency_points_to_larger_id_no_recursion_error():
+    # On ba3c182 this raised RecursionError: sorted order is reverse-topological.
+    tasks = [_task(_tid(i), [_tid(i + 1)] if i < 4999 else []) for i in range(5000)]
+    ov = _compute(_result(tasks), repository_paths=_PATHS)
+    assert len(ov.graph.waves) == 5000
+    assert len(ov.graph.critical_path) == 5000
+    assert ov.tasks_by_id()[_tid(0)].wave == 4999
+
+
+def test_five_thousand_node_chain_completes():
+    tasks = [_task(_tid(i), [_tid(i - 1)] if i else []) for i in range(5000)]
+    ov = _compute(_result(tasks), repository_paths=_PATHS)
+    assert ov.total_tasks == 5000
+    assert len(ov.graph.critical_path) == 5000
+
+
+def _diamond(layers: int) -> list[PortfolioTask]:
+    tasks = [_task("H000")]
+    for i in range(layers):
+        hub, nxt = f"H{i:03d}", f"H{i + 1:03d}"
+        tasks += [_task(f"A{i:03d}", [hub]), _task(f"B{i:03d}", [hub]), _task(nxt, [f"A{i:03d}", f"B{i:03d}"])]
+    return tasks
+
+
+def test_diamond_fork_join_is_not_exponential():
+    # 24 diamond layers => ~2^24 simple paths. Exponential on ba3c182 (minutes);
+    # linear here. Generous 10s bound catches exponential without CI flakiness.
+    tasks = _diamond(24)
+    start = time.perf_counter()
+    ov = _compute(_result(tasks), repository_paths=_PATHS)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 10.0, f"took {elapsed:.1f}s — exponential regression"
+    assert len(ov.graph.critical_path) == 2 * 24 + 1  # exact longest chain through the hubs
+
+
+def test_equal_length_paths_deterministic_tie_break():
+    # Two length-3 chains: H1->A->H0 and H1->B->H0. Deterministic rule picks the
+    # smallest task_id at each descent step.
+    tasks = [_task("H0"), _task("A", ["H0"]), _task("B", ["H0"]), _task("H1", ["A", "B"])]
+    ov = _compute(_result(tasks), repository_paths=_PATHS)
+    assert ov.graph.critical_path == ["H1", "A", "H0"]
+
+
+def test_shuffle_determinism_100_permutations():
+    base = _diamond(6) + [_task("ISO"), _task("XP", ["A000"], project="AIOS")]
+
+    def snapshot(ov):
+        return (
+            tuple((t.task_id, t.wave, t.readiness) for t in ov.tasks),
+            tuple(tuple(w) for w in ov.graph.waves),
+            tuple(ov.graph.critical_path),
+            tuple(sorted(ov.graph.cyclic_task_ids)),
+            tuple((e.from_id, e.to_id, e.cross_project, e.resolved) for e in ov.graph.edges),
+            tuple((r.kind, tuple(r.task_ids)) for r in ov.recommendations),
+        )
+
+    reference = snapshot(_compute(_result(base), repository_paths=_PATHS))
+    for seed in range(100):
+        shuffled = base[:]
+        random.Random(seed).shuffle(shuffled)
+        assert snapshot(_compute(_result(shuffled), repository_paths=_PATHS)) == reference
+
+
+def test_duplicate_requires_yields_single_edge_and_no_indegree_effect():
+    ov = _compute(_result([_task("A"), _task("B", ["A", "A", "A"])]), repository_paths=_PATHS)
+    b_to_a = [(e.from_id, e.to_id) for e in ov.graph.edges if e.from_id == "B"]
+    assert b_to_a == [("B", "A")]  # exactly one edge despite three declarations
+    assert ov.tasks_by_id()["B"].wave == 1  # in-degree/wave unaffected
+    assert ov.graph.waves == [["A"], ["B"]]
+
+
+def test_self_loop_is_cyclic_not_infinite():
+    ov = _compute(_result([_task("S", ["S"])]), repository_paths=_PATHS)
+    assert ov.graph.cyclic_task_ids == ["S"]
+    assert ov.tasks_by_id()["S"].wave is None
+    assert ov.graph.critical_path == []  # no path fabricated through the cycle
+
+
+def test_cycle_downstream_is_cyclic_and_critical_path_uses_acyclic_portion():
+    # A<->B cycle, C depends on A (downstream). D->E->F is a clean acyclic chain.
+    tasks = [
+        _task("A", ["B"]),
+        _task("B", ["A"]),
+        _task("C", ["A"]),
+        _task("D"),
+        _task("E", ["D"]),
+        _task("F", ["E"]),
+    ]
+    ov = _compute(_result(tasks), repository_paths=_PATHS)
+    assert ov.graph.cyclic_task_ids == ["A", "B", "C"]  # C is downstream of the cycle
+    assert ov.graph.critical_path == ["F", "E", "D"]  # exact chain over the acyclic portion
+    assert REC_BREAK_CYCLE in {r.kind for r in ov.recommendations}
+
+
+def test_blocked_lane_card_surfaces_in_project_health():
+    # MINOR-1: a card parked in the `blocked` lane with satisfied deps and no
+    # gate must not let the project report as healthy.
+    tasks = [_task("M", lane="blocked")]
+    ov = _compute(_result(tasks), repository_paths=_PATHS)
+    project = next(p for p in ov.projects if p.project == "AICC")
+    assert project.health != HEALTH_GOOD
+    assert project.blocked == 1
+    assert any("blocked" in e for e in project.evidence)
+
+
+def test_blocked_lane_card_does_not_change_launch_readiness():
+    # Readiness itself is unchanged — the card is still not launchable because
+    # it is not in the `ready` lane, not because of a dependency.
+    ov = _compute(_result([_task("M", lane="blocked")]), repository_paths=_PATHS)
+    assert ov.tasks_by_id()["M"].readiness == READINESS_NOT_READY_LANE
+    assert ov.blocked == []  # top-level dependency-blocked set is unaffected

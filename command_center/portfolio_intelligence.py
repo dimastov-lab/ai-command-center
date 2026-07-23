@@ -32,14 +32,22 @@ cards or fields it was derived from — never an opaque score. Ordering is
 always stabilized (sorted by task_id / a fixed key) so the same portfolio
 always yields the same overview, independent of dict/set iteration order.
 
-Cycle safety: `requires` is card-authored, external, editable data and may
-contain a dependency cycle. Wave and critical-path computation are both
-guarded so a cycle degrades to "these ids are in a cycle" (reported
-explicitly) plus a truncated path, never an infinite walk.
+Cycle safety and scale: `requires` is card-authored, external, editable data
+and may contain a dependency cycle or a very deep chain. Wave assignment and
+the critical path are both computed iteratively (Kahn-style topological
+traversal + linear dynamic programming over the resulting levels), so there is
+no Python recursion proportional to graph depth (no `RecursionError` on a
+5,000-node chain) and no exponential blow-up on diamond/fork-join graphs. A
+cycle degrades explicitly: every task on a `requires` cycle — or transitively
+depending on one — is reported in `cyclic_task_ids` and given no wave, and the
+critical path is computed only over the acyclic portion (never fabricated
+through a cycle). Nothing is silently truncated: the critical path is the
+exact longest dependency chain.
 """
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -61,9 +69,11 @@ HEALTH_AT_RISK = "At Risk"
 # kept as its own constant so the two id spaces can be tuned independently.
 AT_RISK_BLOCKED_RATIO = 0.3
 
-# Depth bound for the critical-path walk — a backstop against a pathological
-# `requires` chain, mirroring `project_intelligence._MAX_CRITICAL_PATH_DEPTH`.
-_MAX_CRITICAL_PATH_DEPTH = 200
+# The one loaded lane that explicitly parks work as blocked (see
+# `portfolio_models.PORTFOLIO_LANES`). A card sitting here is human-asserted
+# blocked, so it contributes to a project's blocked-health signal even when it
+# has no unmet `requires`/`gated_by` of its own.
+BLOCKED_LANE = "blocked"
 
 # Readiness states, in precedence order (the first that applies wins). A task
 # is offered for launch only in state READY.
@@ -197,68 +207,69 @@ class PortfolioOverview:
 def _compute_waves(
     task_ids: list[str], deps: dict[str, list[str]]
 ) -> tuple[dict[str, int], set[str]]:
-    """Topological readiness level of each task: wave 0 is a task whose
-    `requires` are all already satisfied (no dependency present in the loaded
-    set); wave N is `1 + max(wave(dep))`. Tasks caught in a `requires` cycle
-    get no wave and are returned in the cyclic set instead of looping."""
-    wave: dict[str, int] = {}
-    on_stack: set[str] = set()
-    cyclic: set[str] = set()
+    """Topological readiness level of each task, computed iteratively
+    (Kahn-style), so there is no Python recursion proportional to graph depth
+    — a 5,000-node chain (in any input order) assigns levels without a
+    `RecursionError`. Wave 0 is a task whose dependencies are all already
+    satisfied (none present in the loaded set); wave N is `1 + max(wave(dep))`.
 
-    def level(task_id: str) -> int | None:
-        if task_id in wave:
-            return wave[task_id]
-        if task_id in cyclic:
-            return None
-        if task_id in on_stack:
-            cyclic.add(task_id)
-            return None
-        on_stack.add(task_id)
-        best = -1
-        broken = False
-        for dep_id in deps.get(task_id, []):
-            dep_level = level(dep_id)
-            if dep_level is None:
-                broken = True
-            else:
-                best = max(best, dep_level)
-        on_stack.discard(task_id)
-        if broken:
-            cyclic.add(task_id)
-            return None
-        wave[task_id] = best + 1
-        return wave[task_id]
-
+    `deps[t]` must contain only resolved dependencies (present in `task_ids`)
+    and no duplicates — both guaranteed by `_build_graph`. Every task on a
+    `requires` cycle, or transitively depending on one, is never released by
+    the traversal and is returned in the cyclic set with no wave (rather than
+    being silently dropped or looping forever). The wave numbers do not depend
+    on processing order — longest-path level is well defined — so the result is
+    deterministic; the heap only fixes a stable release order. O(V + E)."""
+    remaining = {t: len(deps[t]) for t in task_ids}
+    dependents: dict[str, list[str]] = {t: [] for t in task_ids}
     for task_id in task_ids:
-        level(task_id)
-    return wave, cyclic
+        for dep_id in deps[task_id]:
+            dependents[dep_id].append(task_id)
+
+    wave: dict[str, int] = {t: 0 for t in task_ids}
+    ready = [t for t in task_ids if remaining[t] == 0]
+    heapq.heapify(ready)
+    processed: set[str] = set()
+    while ready:
+        node = heapq.heappop(ready)
+        processed.add(node)
+        for dependent in dependents[node]:
+            if wave[dependent] < wave[node] + 1:
+                wave[dependent] = wave[node] + 1
+            remaining[dependent] -= 1
+            if remaining[dependent] == 0:
+                heapq.heappush(ready, dependent)
+
+    cyclic = {t for t in task_ids if t not in processed}
+    final_wave = {t: wave[t] for t in processed}
+    return final_wave, cyclic
 
 
-def _longest_chain(task_ids: list[str], deps: dict[str, list[str]]) -> list[str]:
-    """Longest `requires` chain across the whole graph (the critical path),
-    returned dependent-first (task -> its deepest dependency). Depth-bounded
-    and revisit-guarded per branch so a cycle degrades to a truncated path
-    instead of an infinite walk — same discipline as
-    `project_intelligence._longest_blocked_chain`."""
+def _critical_path(deps: dict[str, list[str]], wave: dict[str, int]) -> list[str]:
+    """The exact longest dependency chain (critical path), returned
+    dependent-first, reconstructed in linear time from the wave levels — no
+    path enumeration, no recursion, no depth cap, no silent truncation. Since a
+    task's wave is exactly the length (in edges) of the longest dependency
+    chain ending at it, the chain's endpoint is the task with the greatest
+    wave, and each step down follows a dependency whose wave is exactly one
+    less — such a dependency always exists for an acyclic non-source task.
 
-    def walk(task_id: str, visited: list[str]) -> list[str]:
-        if len(visited) > _MAX_CRITICAL_PATH_DEPTH:
-            return visited
-        longest = visited
-        for dep_id in deps.get(task_id, []):
-            if dep_id in visited:
-                continue
-            candidate = walk(dep_id, [*visited, dep_id])
-            if len(candidate) > len(longest):
-                longest = candidate
-        return longest
-
-    best: list[str] = []
-    for task_id in task_ids:
-        chain = walk(task_id, [task_id])
-        if len(chain) > len(best):
-            best = chain
-    return best
+    Deterministic total order for equal-length candidates: the endpoint is the
+    highest-wave task, ties broken by the smallest `task_id`; at each step down
+    the smallest-`task_id` qualifying dependency is chosen. The result is
+    therefore identical under any input permutation. Only acyclic tasks (those
+    with a wave) participate — a cycle is never fabricated into the path. Empty
+    when there are no acyclic tasks. O(V + E)."""
+    if not wave:
+        return []
+    head = min(wave, key=lambda t: (-wave[t], t))
+    path = [head]
+    current = head
+    while wave[current] > 0:
+        target = wave[current] - 1
+        current = min(dep_id for dep_id in deps[current] if wave.get(dep_id) == target)
+        path.append(current)
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +386,20 @@ def _build_project_health(rows: list[TaskReadiness]) -> list[ProjectHealth]:
         ready = sum(1 for r in project_rows if r.readiness == READINESS_READY)
         launched = sum(1 for r in project_rows if r.launched)
         gated = sum(1 for r in project_rows if r.readiness == READINESS_GATED)
-        blocked_rows = [r for r in project_rows if r.readiness == READINESS_BLOCKED]
+        # Blocked-health signal is dependency-blocked work UNION work parked in
+        # the explicit `blocked` lane (Founder Gate MINOR-1). Readiness itself
+        # is unchanged — a card in the `blocked` lane with satisfied
+        # dependencies is still `not_ready_lane` for launch — but a project
+        # that is holding human-flagged blocked cards must not report as
+        # healthy. `project_rows` is already sorted by task_id, so both subsets
+        # (and the evidence naming them) stay deterministically ordered.
+        dependency_blocked = [r for r in project_rows if r.readiness == READINESS_BLOCKED]
+        lane_blocked = [
+            r
+            for r in project_rows
+            if r.lane == BLOCKED_LANE and r.readiness != READINESS_BLOCKED
+        ]
+        blocked_rows = dependency_blocked + lane_blocked
         blocked = len(blocked_rows)
         total = len(project_rows)
 
@@ -384,10 +408,15 @@ def _build_project_health(rows: list[TaskReadiness]) -> list[ProjectHealth]:
 
         blocked_ratio = blocked / total if total else 0.0
         evidence: list[str] = []
-        if blocked:
+        if dependency_blocked:
             evidence.append(
-                f"{blocked} из {total} задач заблокированы зависимостями "
-                f"({', '.join(r.task_id for r in blocked_rows)})"
+                f"{len(dependency_blocked)} из {total} задач заблокированы зависимостями "
+                f"({', '.join(r.task_id for r in dependency_blocked)})"
+            )
+        if lane_blocked:
+            evidence.append(
+                f"{len(lane_blocked)} задач в дорожке `blocked` "
+                f"({', '.join(r.task_id for r in lane_blocked)})"
             )
         if gated:
             evidence.append(f"{gated} задач под внешним гейтом")
@@ -443,7 +472,16 @@ def _build_graph(result: PortfolioLoadResult) -> DependencyGraph:
     for task_id in task_ids:
         task = tasks_by_id[task_id]
         present: list[str] = []
+        # A card that lists the same id twice in `requires` yields exactly one
+        # edge (and one dependency), so a duplicate declaration cannot inflate
+        # in-degree, waves, cycles, the critical path, or recommendations
+        # (Founder Gate MINOR-2). First occurrence order is preserved; the
+        # source card is never mutated.
+        seen_deps: set[str] = set()
         for dep_id in task.requires:
+            if dep_id in seen_deps:
+                continue
+            seen_deps.add(dep_id)
             dep_task = tasks_by_id.get(dep_id)
             resolved = dep_task is not None
             cross_project = bool(dep_task and dep_task.project != task.project)
@@ -466,7 +504,7 @@ def _build_graph(result: PortfolioLoadResult) -> DependencyGraph:
         if level is not None:
             waves[level].append(task_id)
 
-    critical_path = _longest_chain(task_ids, deps)
+    critical_path = _critical_path(deps, wave_map)
     critical_path_titles = [
         (tasks_by_id[t].title or t) if t in tasks_by_id else t for t in critical_path
     ]
