@@ -20,6 +20,43 @@ functional application milestones of `app.py`.
 - **Portfolio batch launch**: an explicit, concurrency-capped orchestration flow with collision
   preflight. It does not introduce autonomous scheduling.
 
+## [Unreleased] — Autonomy Proposal Foundation (AICC-AUTONOMY-002)
+
+The first safe, explainable autonomy foundation: a persisted, evidence-backed proposal lifecycle
+that makes the boundary between **recommendation, approval, and execution** explicit. The
+autonomy layer governs decisions but **never executes anything** — `dispatch` records the
+boundary crossing and returns a dry-run plan the caller must run explicitly via `start_run`. See
+`docs/adr/0005-autonomy-proposal-foundation.md`.
+
+### Added
+- **`command_center/runtime/autonomy.py`**: the pure domain core — proposal state machine
+  (`DRAFT → PROPOSED → ELIGIBLE/BLOCKED → AWAITING_APPROVAL → APPROVED → DISPATCHED → EXECUTED`,
+  plus `REJECTED`/`WITHDRAWN`) with an explicit transition guard; deterministic `classify_risk`
+  and `evaluate_eligibility` (pure, reproducible, hardest-block-first); an attributable,
+  immutable `Evidence` model with an order-independent digest; a conservative-by-default
+  `AutonomyPolicy` (closed on construction; CRITICAL risk never auto-approved); and side-effect-
+  free dry-run `ExecutionPlan`.
+- **`command_center/runtime/autonomy_service.py`**: the orchestration engine
+  (`create_proposal`, `assess`, `plan`, `approve`, `reject`, `withdraw`, `dispatch`,
+  `confirm_execution`, `fail_dispatch`) writing an append-only audit event per move. Dispatch is
+  refused unless the proposal is `APPROVED` **and** the policy explicitly enables execution
+  dispatch; a refusal is itself audited and leaves the proposal untouched.
+- **`runtime.db` migration 6**: `proposal`, `proposal_evidence` (immutable), `proposal_event`
+  (append-only) tables with CAS-guarded, transition-guarded updates; CRUD in `db.py`; reads and
+  gates exposed via `ExecutionCenterAPI` (`create_proposal`/`assess_proposal`/`plan_proposal`/
+  `approve_proposal`/`reject_proposal`/`withdraw_proposal`/`dispatch_proposal`/
+  `confirm_proposal_execution` + projections).
+- **Tests**: `tests/test_autonomy_domain.py`, `tests/test_autonomy_db.py`,
+  `tests/test_autonomy_service.py`, `tests/test_autonomy_api.py` — policy, risk, state
+  transitions, denials, malformed input, the full lifecycle, and reproducibility.
+- **`scripts/demo_autonomy_proposals.py`**: four end-to-end scenarios (disabled/blocked,
+  human-gate, full dispatch, critical merge) against a throwaway store; launches nothing.
+
+### Safety
+- No silent execution, no automatic merge, no hidden repository modifications, no fabricated
+  evidence, no execution without an explicit policy and approval state. Risky actions default to
+  blocked. Runtime code depends on no UI framework.
+
 ## [Unreleased] — Autonomous Task Completion Pipeline (AICC-AUTONOMY-001)
 
 Closes the gap between "Claude process finished" and "the engineering task is completed and

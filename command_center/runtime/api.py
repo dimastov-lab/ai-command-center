@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 from command_center import workspace_provisioning
-from command_center.runtime import context_service, db, scheduler, supervisor
+from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
 DEFAULT_TIMEOUT_SECONDS = 900
 
@@ -166,6 +166,83 @@ class ExecutionCenterAPI:
         """Advance every due, non-terminal completion row once. Delegates to the
         Supervisor; safe to call on demand (bounded)."""
         return self.supervisor.advance_completions(now=now, limit=limit, github=github)
+
+    # ------------------------------------------------------------------
+    # Autonomy proposals (AICC-AUTONOMY-002) — the pre-execution decision
+    # layer. The engine governs recommendation -> approval -> execution but
+    # never executes: `dispatch_proposal` only records the boundary crossing
+    # and returns a dry-run plan the caller must run via `start_run` itself.
+    # ------------------------------------------------------------------
+
+    @property
+    def autonomy(self) -> autonomy_service.AutonomyEngine:
+        engine = getattr(self, "_autonomy_engine", None)
+        if engine is None:
+            engine = autonomy_service.AutonomyEngine(self.db_path)
+            self._autonomy_engine = engine
+        return engine
+
+    def create_proposal(
+        self,
+        *,
+        kind: str,
+        project: str,
+        title: str,
+        rationale: str,
+        evidence: list | None = None,
+        task_id: str | None = None,
+        policy: "autonomy.AutonomyPolicy | None" = None,
+    ) -> dict:
+        return self.autonomy.create_proposal(
+            kind=kind,
+            project=project,
+            title=title,
+            rationale=rationale,
+            evidence=evidence,
+            task_id=task_id,
+            policy=policy,
+        )
+
+    def assess_proposal(self, proposal_id: str, *, policy=None, now=None) -> dict:
+        return self.autonomy.assess(proposal_id, policy=policy, now=now)
+
+    def plan_proposal(self, proposal_id: str) -> dict:
+        """Dry-run: describe what the proposal would do; execute nothing."""
+        return self.autonomy.plan(proposal_id)
+
+    def approve_proposal(self, proposal_id: str, *, actor: str, reason: str | None = None) -> dict:
+        return self.autonomy.approve(proposal_id, actor=actor, reason=reason)
+
+    def reject_proposal(self, proposal_id: str, *, actor: str, reason: str) -> dict:
+        return self.autonomy.reject(proposal_id, actor=actor, reason=reason)
+
+    def withdraw_proposal(self, proposal_id: str, *, actor: str, reason: str | None = None) -> dict:
+        return self.autonomy.withdraw(proposal_id, actor=actor, reason=reason)
+
+    def dispatch_proposal(self, proposal_id: str, *, actor: str, policy=None) -> dict:
+        """Record that an APPROVED proposal has crossed the execution boundary
+        and return its plan. Does not launch anything — the caller executes the
+        plan explicitly via `start_run`, then calls `confirm_proposal_execution`."""
+        return self.autonomy.dispatch(proposal_id, actor=actor, policy=policy)
+
+    def confirm_proposal_execution(
+        self, proposal_id: str, *, actor: str, run_id: str | None = None, task_id: str | None = None
+    ) -> dict:
+        return self.autonomy.confirm_execution(
+            proposal_id, actor=actor, run_id=run_id, task_id=task_id
+        )
+
+    def get_proposal(self, proposal_id: str) -> dict | None:
+        return self.autonomy.get(proposal_id)
+
+    def list_proposals(self, *, project=None, states=None, kind=None, limit: int = 200) -> list[dict]:
+        return self.autonomy.list(project=project, states=states, kind=kind, limit=limit)
+
+    def get_proposal_evidence(self, proposal_id: str) -> list[dict]:
+        return self.autonomy.evidence(proposal_id)
+
+    def get_proposal_events(self, proposal_id: str, *, limit: int = 500) -> list[dict]:
+        return self.autonomy.events(proposal_id, limit=limit)
 
     # ------------------------------------------------------------------
     # Cancellation — requires explicit confirmation from the caller/UI
