@@ -35,10 +35,27 @@ for "is this actually running" — putting it in the same store as run/session
 state would blur that boundary for no benefit; a JSON list is exactly as
 reusable by a future worker and carries zero migration risk to the frozen
 Supervisor schema.
+
+Cross-process consistency: `storage.atomic_write_json`'s temp-file +
+`os.replace` makes any *single* queue write atomic, but does nothing to stop a
+lost update across a read-modify-write *cycle* — two concurrent callers (two
+Streamlit sessions, a session plus the future Supervisor-driven poller the
+module docstring above anticipates) can both `load_queue`, each recompute from
+that same pre-write snapshot, and the second `save_queue` silently discards the
+first's change. Every read-modify-write cycle this module owns therefore runs
+inside `queue_lock` (a thin wrapper over `command_center.storage.file_lock`, the
+same OS advisory-lock primitive `portfolio_launch` and `task_import` already use
+for their JSON stores): `reevaluate_and_persist`, the `*_and_persist` helpers,
+and `launch_ready`'s state-commit all hold it across their whole load→save span.
+`load_queue`/`save_queue`/`enqueue`/`dequeue`/`evaluate_readiness` keep their
+existing signatures unchanged — a caller that already serializes its own access
+(or genuinely wants a lock-free read) can still use them directly; the locked
+`*_and_persist` variants are the safe default for a bare read-modify-write.
 """
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,8 +72,20 @@ STATE_CANCELLED = "cancelled"
 OPEN_STATES: frozenset[str] = frozenset({STATE_WAITING, STATE_READY})
 
 
+QUEUE_LOCK_FILE_NAME = "execution_queue.lock"
+QUEUE_LOCK_TIMEOUT_SECONDS = 30.0
+_QUEUE_LOCK_POLL_SECONDS = 0.05
+
+
 def queue_file_path(root: Path) -> Path:
     return storage.resolve_data_dir(root) / QUEUE_FILE_NAME
+
+
+def queue_lock_path(root: Path) -> Path:
+    """The dedicated lock file guarding `execution_queue.json`'s
+    read-modify-write cycle — a sibling of the queue file, never the queue file
+    itself, so a lock holder never blocks a plain unlocked `load_queue` read."""
+    return storage.resolve_data_dir(root) / QUEUE_LOCK_FILE_NAME
 
 
 def load_queue(root: Path) -> list[dict]:
@@ -65,6 +94,36 @@ def load_queue(root: Path) -> list[dict]:
 
 def save_queue(root: Path, entries: list[dict]) -> None:
     storage.atomic_write_json(queue_file_path(root), entries)
+
+
+@contextlib.contextmanager
+def queue_lock(root: Path, *, timeout: float = QUEUE_LOCK_TIMEOUT_SECONDS):
+    """Cross-process, cross-thread mutual exclusion for the *entire*
+    read-modify-write cycle on `data/execution_queue.json` — acquire this
+    before the `load_queue` and hold it through the `save_queue`, never just
+    around the write, or two callers can still both read the same pre-write
+    snapshot and each write back a version missing the other's change (the
+    lost update this lock exists to prevent).
+
+    Thin wrapper over `command_center.storage.file_lock` (see that function's
+    docstring for the underlying `fcntl`/`msvcrt` OS advisory-lock mechanism,
+    including that a crashed holder never wedges future callers). A
+    `storage.LockTimeoutError` propagates unchanged — a bounded, descriptive
+    failure instead of an indefinite hang."""
+    with storage.file_lock(queue_lock_path(root), timeout=timeout, poll_seconds=_QUEUE_LOCK_POLL_SECONDS):
+        yield
+
+
+def _mutate_queue(root: Path, transform, *, timeout: float = QUEUE_LOCK_TIMEOUT_SECONDS) -> list[dict]:
+    """Run one `load_queue -> transform -> save_queue` cycle entirely inside
+    `queue_lock`, so the read `transform` is computed from and the write that
+    commits it are adjacent and no concurrent writer can interleave between
+    them. `transform` takes the freshly-loaded entries and returns the entries
+    to persist."""
+    with queue_lock(root, timeout=timeout):
+        updated = transform(load_queue(root))
+        save_queue(root, updated)
+        return updated
 
 
 def _new_entry(task: dict) -> dict:
@@ -151,12 +210,27 @@ def evaluate_readiness(entries: list[dict], tasks_by_id: dict[str, dict]) -> lis
 def reevaluate_and_persist(root: Path, tasks_by_id: dict[str, dict]) -> list[dict]:
     """The single call the UI layer makes at each of the four checkpoints
     (app load, manual refresh, after a task-state change, after a run
-    reaches a terminal state) — loads, re-evaluates, saves, returns. Never
-    launches anything; see `launch_ready` for the only function in this
-    module that does."""
-    entries = evaluate_readiness(load_queue(root), tasks_by_id)
-    save_queue(root, entries)
-    return entries
+    reaches a terminal state) — loads, re-evaluates, saves, returns, with the
+    whole load→save cycle held under `queue_lock` so a concurrent writer's
+    update is never lost. Never launches anything; see `launch_ready` for the
+    only function in this module that does."""
+    return _mutate_queue(root, lambda entries: evaluate_readiness(entries, tasks_by_id))
+
+
+def enqueue_and_persist(root: Path, task: dict, tasks_by_id: dict[str, dict]) -> list[dict]:
+    """Lost-update-safe `load_queue -> enqueue -> save_queue`: the whole cycle
+    runs under `queue_lock`, so adding a task to the queue never clobbers a
+    concurrent re-evaluation or another enqueue in a different process. Prefer
+    this over hand-rolling the `load_queue`/`enqueue`/`save_queue` triple."""
+    return _mutate_queue(root, lambda entries: enqueue(entries, task, tasks_by_id))
+
+
+def dequeue_and_persist(root: Path, entry_id: str) -> list[dict]:
+    """Lost-update-safe `load_queue -> dequeue -> save_queue`: removing an
+    entry re-reads the current on-disk queue under `queue_lock` before writing,
+    so it never silently reverts a concurrent writer's change back to the stale
+    snapshot the caller happened to be holding."""
+    return _mutate_queue(root, lambda entries: dequeue(entries, entry_id))
 
 
 def ready_entries(entries: list[dict]) -> list[dict]:
@@ -228,19 +302,31 @@ def launch_ready(
     invalid workspace) is treated the same way — left in place, reported,
     never silently dropped.
 
-    Returns the updated entry list (callers persist it via `save_queue`, and
-    must separately persist `tasks` via `tasks_repository.save_tasks` — this
-    function mutates `task` dicts in place exactly like
-    `launch_service.execute_agent_launch_v2` already does) and one
-    `LaunchAttemptResult` per entry considered, in order, for the caller to
-    render a per-entry outcome."""
+    Persistence is cross-process safe: the launched-state transitions are
+    committed under `queue_lock`, re-reading the current on-disk queue and
+    merging onto it (see `_commit_launch_results`), so a concurrent
+    `reevaluate_and_persist`/enqueue in another process is preserved rather
+    than clobbered by this call's snapshot. The actual process launches happen
+    *outside* the lock — it is held only for the final merge-and-save, never
+    across a subprocess spawn. This function still saves the queue itself; the
+    returned entry list is the merged result (callers may persist it again
+    harmlessly), and callers must separately persist `tasks` via
+    `tasks_repository.save_tasks` — this function mutates `task` dicts in place
+    exactly like `launch_service.execute_agent_launch_v2` already does. One
+    `LaunchAttemptResult` per entry considered is returned, in order, for the
+    caller to render a per-entry outcome."""
     targets = ready_entries(entries)
     if entry_ids is not None:
         wanted = set(entry_ids)
         targets = [e for e in targets if e.get("id") in wanted]
 
     results: list[LaunchAttemptResult] = []
-    updated_by_id = {e["id"]: dict(e) for e in entries}
+    # entry_id -> the field patch to apply on a successful launch. Collected
+    # here rather than mutated straight into a working copy so the state commit
+    # (and its `queue_lock`) can happen once, after every launch, outside the
+    # lock — never holding the queue lock across an `execute_agent_launch_v2`
+    # subprocess spawn.
+    launched_patches: dict[str, dict] = {}
 
     for entry in targets:
         task_id = entry.get("task_id")
@@ -305,13 +391,55 @@ def launch_ready(
             results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))
             continue
 
-        launched_entry = updated_by_id[entry["id"]]
-        launched_entry["state"] = STATE_LAUNCHED
-        launched_entry["run_id"] = run["id"]
-        launched_entry["launched_at"] = models.iso_now()
-        launched_entry["reason"] = None
+        launched_patches[entry["id"]] = {
+            "state": STATE_LAUNCHED,
+            "run_id": run["id"],
+            "launched_at": models.iso_now(),
+            "reason": None,
+        }
         results.append(LaunchAttemptResult(entry["id"], task_id, True, run_id=run["id"]))
 
-    updated_entries = [updated_by_id[e["id"]] for e in entries]
-    save_queue(root, updated_entries)
+    updated_entries = _commit_launch_results(root, entries, launched_patches)
     return updated_entries, results
+
+
+def _commit_launch_results(
+    root: Path, base_entries: list[dict], patches: dict[str, dict]
+) -> list[dict]:
+    """Persist the launched-state `patches` (keyed by queue entry id) atomically
+    under `queue_lock`, merged onto whatever is *currently* on disk rather than
+    blindly overwriting it.
+
+    `base_entries` is the caller's in-memory view (what it passed to
+    `launch_ready`). The on-disk queue is re-read under the lock and wins for
+    every entry present in both, so a concurrent `reevaluate_and_persist` /
+    enqueue in another process is preserved, not clobbered (the lost update
+    this lock closes). Entries the caller holds that are absent from disk are
+    still kept (an empty/never-persisted queue file is the in-memory-only case
+    the unit tests exercise), and disk entries the caller never saw are
+    appended, never dropped. The launch patches are applied last, so a
+    freshly-launched entry always reflects its `LAUNCHED` state regardless of
+    which copy won the merge — and a patch for an entry a concurrent process
+    deleted in the meantime is simply dropped (the run itself is already
+    tracked in `runtime.db`; the queue is not resurrected behind that delete)."""
+    with queue_lock(root):
+        disk = load_queue(root)
+        disk_by_id = {e.get("id"): e for e in disk}
+        merged: list[dict] = []
+        seen: set[str | None] = set()
+        for entry in base_entries:
+            entry_id = entry.get("id")
+            seen.add(entry_id)
+            merged.append(dict(disk_by_id.get(entry_id, entry)))
+        for entry in disk:
+            if entry.get("id") not in seen:
+                merged.append(dict(entry))
+
+        by_id = {e.get("id"): e for e in merged}
+        for entry_id, patch in patches.items():
+            target = by_id.get(entry_id)
+            if target is not None:
+                target.update(patch)
+
+        save_queue(root, merged)
+    return merged
