@@ -26,7 +26,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from command_center.runtime import context_service, db, supervisor
+from command_center import workspace_provisioning
+from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
 DEFAULT_TIMEOUT_SECONDS = 900
 
@@ -61,6 +62,7 @@ class ExecutionCenterAPI:
         launch_source: str | None = None,
         prompt_version: int | None = None,
         repository_already_validated: bool = False,
+        workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -100,6 +102,7 @@ class ExecutionCenterAPI:
             launch_source=launch_source,
             prompt_version=prompt_version,
             repository_already_validated=repository_already_validated,
+            workspace_verification=workspace_verification,
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)
@@ -165,6 +168,85 @@ class ExecutionCenterAPI:
         return self.supervisor.advance_completions(now=now, limit=limit, github=github)
 
     # ------------------------------------------------------------------
+    # Autonomy proposals (AICC-AUTONOMY-002) — the pre-execution decision
+    # layer. The engine governs recommendation -> approval -> execution but
+    # never executes: `dispatch_proposal` only records the boundary crossing
+    # and returns a dry-run plan the caller must run via `start_run` itself.
+    # ------------------------------------------------------------------
+
+    @property
+    def autonomy(self) -> autonomy_service.AutonomyEngine:
+        engine = getattr(self, "_autonomy_engine", None)
+        if engine is None:
+            engine = autonomy_service.AutonomyEngine(self.db_path)
+            self._autonomy_engine = engine
+        return engine
+
+    def create_proposal(
+        self,
+        *,
+        kind: str,
+        project: str,
+        title: str,
+        rationale: str,
+        evidence: list | None = None,
+        task_id: str | None = None,
+        policy: "autonomy.AutonomyPolicy | None" = None,
+        parameters: dict | None = None,
+    ) -> dict:
+        return self.autonomy.create_proposal(
+            kind=kind,
+            project=project,
+            title=title,
+            rationale=rationale,
+            evidence=evidence,
+            task_id=task_id,
+            policy=policy,
+            parameters=parameters,
+        )
+
+    def assess_proposal(self, proposal_id: str, *, policy=None, now=None) -> dict:
+        return self.autonomy.assess(proposal_id, policy=policy, now=now)
+
+    def plan_proposal(self, proposal_id: str) -> dict:
+        """Dry-run: describe what the proposal would do; execute nothing."""
+        return self.autonomy.plan(proposal_id)
+
+    def approve_proposal(self, proposal_id: str, *, actor: str, reason: str | None = None) -> dict:
+        return self.autonomy.approve(proposal_id, actor=actor, reason=reason)
+
+    def reject_proposal(self, proposal_id: str, *, actor: str, reason: str) -> dict:
+        return self.autonomy.reject(proposal_id, actor=actor, reason=reason)
+
+    def withdraw_proposal(self, proposal_id: str, *, actor: str, reason: str | None = None) -> dict:
+        return self.autonomy.withdraw(proposal_id, actor=actor, reason=reason)
+
+    def dispatch_proposal(self, proposal_id: str, *, actor: str, policy=None) -> dict:
+        """Record that an APPROVED proposal has crossed the execution boundary
+        and return its plan. Does not launch anything — the caller executes the
+        plan explicitly via `start_run`, then calls `confirm_proposal_execution`."""
+        return self.autonomy.dispatch(proposal_id, actor=actor, policy=policy)
+
+    def confirm_proposal_execution(
+        self, proposal_id: str, *, actor: str, run_id: str | None = None, task_id: str | None = None
+    ) -> dict:
+        return self.autonomy.confirm_execution(
+            proposal_id, actor=actor, run_id=run_id, task_id=task_id
+        )
+
+    def get_proposal(self, proposal_id: str) -> dict | None:
+        return self.autonomy.get(proposal_id)
+
+    def list_proposals(self, *, project=None, states=None, kind=None, limit: int = 200) -> list[dict]:
+        return self.autonomy.list(project=project, states=states, kind=kind, limit=limit)
+
+    def get_proposal_evidence(self, proposal_id: str) -> list[dict]:
+        return self.autonomy.evidence(proposal_id)
+
+    def get_proposal_events(self, proposal_id: str, *, limit: int = 500) -> list[dict]:
+        return self.autonomy.events(proposal_id, limit=limit)
+
+    # ------------------------------------------------------------------
     # Cancellation — requires explicit confirmation from the caller/UI
     # ------------------------------------------------------------------
 
@@ -180,6 +262,35 @@ class ExecutionCenterAPI:
 
     def reconcile(self) -> list[dict]:
         return self.supervisor.reconcile()
+
+    # ------------------------------------------------------------------
+    # Scheduling (read-only decision layer — never launches anything here)
+    # ------------------------------------------------------------------
+
+    def plan_schedule(
+        self,
+        work_items: list[scheduler.WorkItem],
+        *,
+        registry: scheduler.AgentRegistry | None = None,
+        config: scheduler.SchedulerConfig | None = None,
+        policy: scheduler.RetryPolicy | None = None,
+        now: str | None = None,
+    ) -> scheduler.SchedulingPlan:
+        """Deterministically plan which `work_items` should be assigned,
+        deferred, or blocked *right now*, against the live in-flight load read
+        from this API's own `runtime.db`. Pure decision only — this returns a
+        `SchedulingPlan` and launches nothing. Acting on an `ASSIGN` decision
+        is a separate, explicit `start_run` call by the caller, so the launch
+        confirmation / sensitive-content boundary is never bypassed here."""
+        load = scheduler.build_load_snapshot(self.db_path)
+        return scheduler.plan(
+            work_items,
+            registry=registry or scheduler.default_registry(),
+            load=load,
+            config=config,
+            policy=policy,
+            now=now,
+        )
 
     # ------------------------------------------------------------------
     # Context assembly (BANK/LEGAL sensitive-project boundary)

@@ -9,6 +9,7 @@ data/portfolio_config.json
 data/portfolio_launches.json
 data/portfolio_locks/
 data/tasks.lock
+data/execution_queue.lock
 
 # Transient AI task artifacts and agent reports generated at runtime
 # (scripts/start-task.sh and the v1.2 Claude Code runner)

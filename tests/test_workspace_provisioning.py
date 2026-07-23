@@ -1,0 +1,335 @@
+"""Regression coverage for the shared workspace provisioning + verification
+gate (`command_center.workspace_provisioning`).
+
+Root cause it guards against: a task whose expected branch was
+`audit/execution-queue` launched Claude in the *main* repository on `main`,
+reached "Workspace Verified", and left untracked files behind — branch
+mismatch was only a warning, never a hard gate, and the workspace silently
+fell back to `repository_path`.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from command_center import git_info, workspace_provisioning as wp
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+
+def _make_repo(path: Path, *, default_branch: str = "main") -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q")
+    _git(path, "config", "user.email", "test@test.com")
+    _git(path, "config", "user.name", "test")
+    (path / "f.txt").write_text("hello\n")
+    _git(path, "add", "f.txt")
+    _git(path, "commit", "-q", "-m", "init")
+    _git(path, "branch", "-M", default_branch)
+    return path
+
+
+def _current_branch(path: Path) -> str:
+    return git_info.get_status(path)["branch"]
+
+
+# --------------------------------------------------------------------------
+# Provisioning
+# --------------------------------------------------------------------------
+
+
+def test_missing_workspace_is_created_automatically(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "worktrees" / "audit"
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="audit/execution-queue",
+        base_branch="main",
+        repository_path=str(repo),
+    )
+
+    assert not workspace.exists()
+    evidence = wp.provision_and_verify(spec)
+
+    assert workspace.is_dir()
+    assert evidence.provision_outcome == "created"
+    assert _current_branch(workspace) == "audit/execution-queue"
+    assert evidence.is_isolated_worktree is True
+
+
+def test_branch_is_created_from_base_branch(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    # A distinct base commit so we can prove the worktree forked from it.
+    _git(repo, "checkout", "-q", "-b", "release")
+    (repo / "release.txt").write_text("release\n")
+    _git(repo, "add", "release.txt")
+    _git(repo, "commit", "-q", "-m", "release work")
+    _git(repo, "checkout", "-q", "main")
+
+    workspace = tmp_path / "wt" / "feat"
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="feature/x",
+        base_branch="release",
+        repository_path=str(repo),
+    )
+    wp.provision_and_verify(spec)
+
+    # Forked from `release`: the base-only file is present in the new worktree.
+    assert (workspace / "release.txt").exists()
+    assert "feature/x" in git_info.get_branches(repo)
+
+
+def test_remote_only_branch_is_attached_without_recreating_from_base(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    _git(repo, "checkout", "-q", "-b", "remote-source")
+    (repo / "remote.txt").write_text("remote history\n")
+    _git(repo, "add", "remote.txt")
+    _git(repo, "commit", "-q", "-m", "remote history")
+    remote_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "branch", "-D", "remote-source")
+    _git(repo, "remote", "add", "origin", str(repo))
+    _git(repo, "update-ref", "refs/remotes/origin/feature/remote", remote_commit)
+
+    workspace = tmp_path / "wt" / "remote"
+    evidence = wp.provision_and_verify(
+        wp.WorkspaceSpec(
+            workspace_path=str(workspace),
+            expected_branch="feature/remote",
+            base_branch="main",
+            repository_path=str(repo),
+        )
+    )
+
+    assert evidence.provision_outcome == "attached"
+    assert _current_branch(workspace) == "feature/remote"
+    assert (workspace / "remote.txt").read_text() == "remote history\n"
+
+
+def test_existing_correct_worktree_is_reused_untouched(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "reuse"
+    _git(repo, "worktree", "add", "-b", "audit/execution-queue", str(workspace), "main")
+    marker = workspace / "user_work.txt"
+    marker.write_text("in progress\n")
+
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="audit/execution-queue",
+        base_branch="main",
+        repository_path=str(repo),
+    )
+    evidence = wp.provision_and_verify(spec)
+
+    assert evidence.provision_outcome == "reused"
+    # Reuse never removes/resets: the user's in-progress file survives.
+    assert marker.read_text() == "in progress\n"
+
+
+def test_parallel_tasks_get_separate_worktrees(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    ws_a = tmp_path / "wt" / "a"
+    ws_b = tmp_path / "wt" / "b"
+    spec_a = wp.WorkspaceSpec(
+        workspace_path=str(ws_a), expected_branch="task/a", base_branch="main", repository_path=str(repo)
+    )
+    spec_b = wp.WorkspaceSpec(
+        workspace_path=str(ws_b), expected_branch="task/b", base_branch="main", repository_path=str(repo)
+    )
+    wp.provision_and_verify(spec_a)
+    wp.provision_and_verify(spec_b)
+
+    assert ws_a.resolve() != ws_b.resolve()
+    assert _current_branch(ws_a) == "task/a"
+    assert _current_branch(ws_b) == "task/b"
+
+
+# --------------------------------------------------------------------------
+# Verification — fail-closed gates
+# --------------------------------------------------------------------------
+
+
+def test_branch_mismatch_blocks_launch_exact_observed_case(tmp_path):
+    """The exact production failure: expected `audit/execution-queue`, actual
+    `main`, in the primary repository working tree."""
+    repo = _make_repo(tmp_path / "repo")  # primary worktree on `main`
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(repo),
+        expected_branch="audit/execution-queue",
+        base_branch="main",
+        repository_path=str(repo),
+        allow_provision=False,  # the workspace already exists (the bug's fallback)
+    )
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.verify_workspace(spec)
+
+    err = exc_info.value
+    assert err.failed_step == "branch_matches"
+    assert err.expected_branch == "audit/execution-queue"
+    assert err.actual_branch == "main"
+    assert err.remediation
+    structured = err.as_dict()
+    assert structured["expected_branch"] == "audit/execution-queue"
+    assert structured["actual_branch"] == "main"
+
+
+def test_main_repository_cannot_be_used_for_a_feature_task(tmp_path):
+    """Even when the feature branch is checked out *in the main repo* (branch
+    matches), the primary working tree is refused for feature/audit work."""
+    repo = _make_repo(tmp_path / "repo")
+    _git(repo, "checkout", "-q", "-b", "audit/execution-queue")  # primary tree, feature branch
+
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(repo),
+        expected_branch="audit/execution-queue",
+        base_branch="main",
+        repository_path=str(repo),
+        allow_provision=False,
+    )
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.verify_workspace(spec)
+    assert exc_info.value.failed_step == "isolated_worktree_required"
+
+
+def test_wrong_repository_workspace_blocks_launch(tmp_path):
+    repo_a = _make_repo(tmp_path / "repo_a")
+    repo_b = _make_repo(tmp_path / "repo_b")
+    # A worktree of repo_a, but the spec claims it belongs to repo_b.
+    workspace = tmp_path / "wt_a"
+    _git(repo_a, "worktree", "add", "-b", "feature/x", str(workspace), "main")
+
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="feature/x",
+        base_branch="main",
+        repository_path=str(repo_b),  # wrong repo
+        allow_provision=False,
+    )
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.verify_workspace(spec)
+    assert exc_info.value.failed_step == "workspace_belongs_to_repository"
+
+
+def test_conflicting_worktree_blocks_launch(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    existing = tmp_path / "wt" / "existing"
+    _git(repo, "worktree", "add", "-b", "feature/x", str(existing), "main")
+
+    # Ask to provision a *second* worktree for the same, already-checked-out branch.
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(tmp_path / "wt" / "second"),
+        expected_branch="feature/x",
+        base_branch="main",
+        repository_path=str(repo),
+    )
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.provision_and_verify(spec)
+    assert exc_info.value.failed_step == "no_conflicting_worktree"
+
+
+def test_missing_workspace_that_cannot_be_provisioned_fails_closed(tmp_path):
+    """No fallback to repository_path: if the workspace is absent and cannot be
+    provisioned (provisioning disabled), it is a hard failure, never a silent
+    substitution of the source repository."""
+    repo = _make_repo(tmp_path / "repo")
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(tmp_path / "does_not_exist"),
+        expected_branch="audit/execution-queue",
+        base_branch="main",
+        repository_path=str(repo),
+        allow_provision=False,
+    )
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.provision_and_verify(spec)
+    assert exc_info.value.failed_step == "workspace_exists"
+
+
+def test_base_branch_must_exist(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "x"
+    _git(repo, "worktree", "add", "-b", "feature/x", str(workspace), "main")
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="feature/x",
+        base_branch="nonexistent-base",
+        repository_path=str(repo),
+        allow_provision=False,
+    )
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.verify_workspace(spec)
+    assert exc_info.value.failed_step == "base_branch_exists"
+
+
+def test_status_policy_clean_blocks_dirty_worktree(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "x"
+    _git(repo, "worktree", "add", "-b", "feature/x", str(workspace), "main")
+    (workspace / "untracked.txt").write_text("dirty\n")
+
+    strict = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="feature/x",
+        repository_path=str(repo),
+        allow_provision=False,
+        status_policy=wp.STATUS_POLICY_CLEAN,
+    )
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.verify_workspace(strict)
+    assert exc_info.value.failed_step == "status_policy_satisfied"
+
+    # Default policy tolerates a dirty tree.
+    lenient = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="feature/x",
+        repository_path=str(repo),
+        allow_provision=False,
+    )
+    evidence = wp.verify_workspace(lenient)
+    assert evidence.actual_branch == "feature/x"
+
+
+def test_main_line_task_in_primary_worktree_is_allowed(tmp_path):
+    """A legitimate main-branch task running in the primary working tree must
+    NOT be blocked — the isolation gate is only for feature/audit work."""
+    repo = _make_repo(tmp_path / "repo")
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(repo),
+        expected_branch="main",
+        base_branch="main",
+        repository_path=str(repo),
+        allow_provision=False,
+    )
+    evidence = wp.verify_workspace(spec)
+    assert evidence.actual_branch == "main"
+    assert all(check["passed"] for check in evidence.checks)
+
+
+def test_verification_never_modifies_the_repository(tmp_path):
+    """A failed verification against the main repo leaves it untouched — no
+    stray files (the observed failure left 3 untracked files behind)."""
+    repo = _make_repo(tmp_path / "repo")
+    before = git_info.get_status(repo)
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(repo),
+        expected_branch="audit/execution-queue",
+        base_branch="main",
+        repository_path=str(repo),
+        allow_provision=False,
+    )
+    with pytest.raises(wp.WorkspaceVerificationError):
+        wp.verify_workspace(spec)
+    after = git_info.get_status(repo)
+    assert after["dirty"] is False
+    assert after["status_lines"] == before["status_lines"] == []

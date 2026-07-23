@@ -101,8 +101,11 @@ def render_recommendations_panel(
                     width="stretch",
                 ):
                     task = tasks_by_id.get(view["task_id"])
-                    updated = execution_queue.enqueue(queue_entries, task, tasks_by_id)
-                    execution_queue.save_queue(root, updated)
+                    # Lost-update-safe: re-read and persist under `queue_lock`
+                    # rather than saving back the `queue_entries` snapshot loaded
+                    # earlier this render, which a concurrent writer may have
+                    # since superseded (see execution_queue.enqueue_and_persist).
+                    execution_queue.enqueue_and_persist(root, task, tasks_by_id)
                     st.rerun()
 
             with action_cols[1]:
@@ -113,7 +116,7 @@ def render_recommendations_panel(
                     width="stretch",
                 ):
                     task = tasks_by_id.get(view["task_id"])
-                    working_entries = execution_queue.enqueue(queue_entries, task, tasks_by_id)
+                    working_entries = execution_queue.enqueue_and_persist(root, task, tasks_by_id)
                     new_entry = next(
                         e
                         for e in working_entries

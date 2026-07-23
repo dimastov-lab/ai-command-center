@@ -22,4 +22,14 @@ Module map:
 - `api.py` — the minimal Execution Center backend surface described in the Sprint 1
   brief (list sessions/runs, inspect status, read events, request cancellation,
   reconcile).
+- `autonomy.py` — pure domain for the autonomy proposal foundation
+  (AICC-AUTONOMY-002): the pre-execution decision layer that makes the boundary
+  between recommendation, approval and execution explicit. Proposal state
+  machine, deterministic eligibility rules, risk classification, evidence model
+  and dry-run planning. Imports no persistence/UI; `db.py` imports it for its
+  transition guard.
+- `autonomy_service.py` — orchestrates a proposal through its lifecycle over
+  `autonomy` + `db`, writing an append-only audit event per move. It never
+  executes anything: `dispatch` records the boundary crossing and returns a
+  plan the caller must run through `api.start_run`.
 """

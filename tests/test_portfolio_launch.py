@@ -507,6 +507,17 @@ def test_launch_portfolio_task_rolls_back_worktree_and_branch_on_launch_failure(
     base_branch = _current_branch(git_repo)
     task = _write_card(tmp_path, base_branch=base_branch, repository=str(git_repo))
     api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    persisted_calls: list[str] = []
+    real_enqueue = execution_queue.enqueue_and_persist
+    real_dequeue = execution_queue.dequeue_and_persist
+
+    def spy_enqueue(root, synthetic_task, tasks_by_id):
+        persisted_calls.append("enqueue")
+        return real_enqueue(root, synthetic_task, tasks_by_id)
+
+    def spy_dequeue(root, entry_id):
+        persisted_calls.append("dequeue")
+        return real_dequeue(root, entry_id)
 
     def failing_launch_ready(root, entries, tasks, tasks_by_id, project_configs, execution_center_api, *, entry_ids=None):
         updated = [dict(e) for e in entries]
@@ -516,6 +527,8 @@ def test_launch_portfolio_task_rolls_back_worktree_and_branch_on_launch_failure(
         return updated, results
 
     monkeypatch.setattr(portfolio_launch.execution_queue, "launch_ready", failing_launch_ready)
+    monkeypatch.setattr(portfolio_launch.execution_queue, "enqueue_and_persist", spy_enqueue)
+    monkeypatch.setattr(portfolio_launch.execution_queue, "dequeue_and_persist", spy_dequeue)
 
     result = portfolio_launch.launch_portfolio_task(
         tmp_path, task, tasks_by_id={}, repository_paths={"AICC": str(git_repo)},
@@ -528,6 +541,7 @@ def test_launch_portfolio_task_rolls_back_worktree_and_branch_on_launch_failure(
     assert result.plan.branch not in git_info.get_branches(git_repo)
     assert task.task_id not in portfolio_launch.load_registry(tmp_path)
     assert execution_queue.load_queue(tmp_path) == []
+    assert persisted_calls == ["enqueue", "dequeue"]
 
     # The claim must have been released so a retry is possible.
     assert portfolio_launch._claim(tmp_path, task.task_id) is True

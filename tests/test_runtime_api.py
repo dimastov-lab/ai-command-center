@@ -279,3 +279,25 @@ def test_assemble_context_for_non_sensitive_project_includes_content(tmp_path):
     api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
     bundle = api.assemble_context(project_id="AIOS", candidate_content={"file:a.md": "hello"}, confirmed_items=None)
     assert bundle["content"] == {"file:a.md": "hello"}
+
+
+def test_plan_schedule_reads_live_load_and_defers_busy_workspace(git_repo, configure_project_repo, fake_claude):
+    """`plan_schedule` is a read-only decision: it projects the live in-flight
+    load from the API's own db, so a workspace with an active run is deferred,
+    and it never launches anything itself."""
+    from command_center.runtime import scheduler
+
+    configure_project_repo("AIOS", git_repo)
+    api = ExecutionCenterAPI()
+    run = api.start_run(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", instruction="p", confirmed=True,
+        timeout_seconds=None,
+    )
+    assert run["state"] == "RUNNING"
+    try:
+        plan = api.plan_schedule([scheduler.WorkItem(task_id="t-new", workspace=str(git_repo))], now="2026-07-23T12:00:00")
+        assert len(plan.assignments()) == 0
+        assert plan.deferrals()[0].reason_code == scheduler.REASON_WORKSPACE_BUSY
+    finally:
+        api.request_cancel(run["id"], confirmed=True)
+        api.supervisor.wait_for_run(run["id"], timeout=10)

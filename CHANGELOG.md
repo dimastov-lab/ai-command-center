@@ -6,9 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project does not yet follow strict semantic versioning tags in Git; versions below refer to
 functional application milestones of `app.py`.
 
-## [Unreleased] — Portfolio Execution and Intelligence
+## [Unreleased]
 
-### Added
+### Integrated runtime safety and architecture reconciliation
+
+#### Added
+
+- **CI workflow**: Python 3.14 validation for pull requests and `main` pushes, with committed-diff
+  whitespace checks, Ruff, byte compilation of `command_center scripts tests app.py`, and the
+  complete pytest suite. Actions are SHA-pinned, the token is read-only, and superseded runs are
+  cancelled.
+- **Fail-closed task workspace provisioning**: normal task-v2 launch surfaces provision or attach
+  an isolated branch/worktree only after explicit confirmation, then pass a persisted
+  `WorkspaceSpec` through a second Supervisor verification immediately before spawn. Source
+  repository, exact launch path, branch, worktree isolation, and status are verified without a
+  network fetch; low-level ad-hoc runtime calls remain a separate boundary.
+- **Deterministic scheduler planner**: `runtime/scheduler.py` produces explainable
+  `ASSIGN`/`DEFER`/`BLOCKED` decisions from immutable work, agent, load, dependency, capability,
+  capacity, and retry inputs. It is a read-only planner: it creates no claim, lease, queue entry,
+  run, poller, or automatic launch.
+
+#### Fixed
+
+- **Execution queue concurrency**: application-owned enqueue, dequeue, reevaluation, Portfolio
+  insertion/rollback, and launch-result commits now hold a bounded same-host OS advisory lock
+  across the complete load-transform-save cycle. Atomic replacement remains the write primitive;
+  process launch is never performed while the queue lock is held, and raw load/save helpers remain
+  intentionally uncoordinated primitives.
+- **Launch and scheduler races**: workspace verification is registered before lifecycle evidence
+  can trigger reconciliation; confirmation precedes worktree mutation; remote-tracking branches,
+  persisted provisioning outcomes, active task IDs, deterministic agent tie-breaking, and corrupt
+  retry state now fail safely.
+- **Autonomy authority (schema 7)**: migration 7 adds canonical immutable
+  `proposal.parameters_json`; malformed policies close completely; proposal authority and evidence
+  freeze at assessment; CAS is checked before lifecycle guards; plans carry an exact action digest;
+  dispatch rechecks policy, kind, payload, evidence digest, blockers, and staleness; confirmations
+  must bind to a matching persisted result. Only TASK_CREATION and TASK_EXECUTION are currently
+  dispatchable; priority, dependency, and merge plans remain advisory.
+- **Runtime documentation**: README, current-state, architecture, changelog, and ADR 0005 are
+  reconciled with schema 7, queue locking, workspace provisioning, scheduler and autonomy
+  boundaries, and CI.
+
+### Portfolio Execution and Intelligence
+
+#### Added
 - **Portfolio Execution**: parses ready task cards from a separate Portfolio checkout, validates
   dependencies/conflicts and repository mappings, previews a launch plan, creates or attaches an
   isolated branch/worktree after explicit confirmation, and launches through the asynchronous
@@ -20,13 +61,52 @@ functional application milestones of `app.py`.
 - **Portfolio batch launch**: an explicit, concurrency-capped orchestration flow with collision
   preflight. It does not introduce autonomous scheduling.
 
-## [Unreleased] — Autonomous Task Completion Pipeline (AICC-AUTONOMY-001)
+### Autonomy Proposal Foundation (AICC-AUTONOMY-002)
+
+The first safe, explainable autonomy foundation: a persisted, evidence-backed proposal lifecycle
+that makes the boundary between **recommendation, approval, and execution** explicit. The
+autonomy layer governs decisions but **never executes anything** — `dispatch` records the
+boundary crossing and returns a dry-run plan the caller must run explicitly via `start_run`. See
+`docs/adr/0005-autonomy-proposal-foundation.md`.
+
+#### Added
+- **`command_center/runtime/autonomy.py`**: the pure domain core — proposal state machine
+  (`DRAFT → PROPOSED → ELIGIBLE/BLOCKED → AWAITING_APPROVAL → APPROVED → DISPATCHED → EXECUTED`,
+  plus `REJECTED`/`WITHDRAWN`) with an explicit transition guard; deterministic `classify_risk`
+  and `evaluate_eligibility` (pure, reproducible, hardest-block-first); an attributable,
+  immutable `Evidence` model with an order-independent digest; a conservative-by-default
+  `AutonomyPolicy` (closed on construction; CRITICAL risk never auto-approved); and side-effect-
+  free dry-run `ExecutionPlan`.
+- **`command_center/runtime/autonomy_service.py`**: the orchestration engine
+  (`create_proposal`, `assess`, `plan`, `approve`, `reject`, `withdraw`, `dispatch`,
+  `confirm_execution`, `fail_dispatch`) writing an append-only audit event per move. Dispatch is
+  refused unless the proposal is `APPROVED` **and** the policy explicitly enables execution
+  dispatch; a refusal is itself audited and leaves the proposal untouched.
+- **`runtime.db` migration 6**: `proposal`, `proposal_evidence` (append-only and frozen after
+  assessment), `proposal_event` (append-only) tables with CAS-guarded, transition-guarded updates;
+  CRUD in `db.py`; reads and
+  gates exposed via `ExecutionCenterAPI` (`create_proposal`/`assess_proposal`/`plan_proposal`/
+  `approve_proposal`/`reject_proposal`/`withdraw_proposal`/`dispatch_proposal`/
+  `confirm_proposal_execution` + projections).
+- **Tests**: `tests/test_autonomy_domain.py`, `tests/test_autonomy_db.py`,
+  `tests/test_autonomy_service.py`, `tests/test_autonomy_api.py` — policy, risk, state
+  transitions, denials, malformed input, the full lifecycle, and reproducibility.
+- **`scripts/demo_autonomy_proposals.py`**: four end-to-end scenarios (disabled/blocked,
+  human-gate, full dispatch, critical merge) against a throwaway store; launches nothing.
+
+#### Safety
+- No silent execution, no automatic merge, no hidden repository modifications, no fabricated
+  evidence, no execution without an explicit policy and approval state. Hard denials block;
+  eligible actions outside the auto-approval ceiling require a human. Runtime code depends on no
+  UI framework.
+
+### Autonomous Task Completion Pipeline (AICC-AUTONOMY-001)
 
 Closes the gap between "Claude process finished" and "the engineering task is completed and
 merged into the target branch". See `docs/adr/0004-autonomous-task-completion-pipeline.md` and
 `docs/completion-pipeline.md`.
 
-### Added
+#### Added
 - **`command_center/runtime/completion.py`**: the pure domain core — completion state machine
   (`EXECUTION_FINISHED → … → COMPLETED`, plus `VALIDATION_FAILED`/`PR_CLOSED_UNMERGED`/
   `MERGE_BLOCKED`/`REQUIRES_ATTENTION`/`RECOVERY_PENDING`/`RECOVERY_FAILED`), reason codes,
@@ -56,9 +136,9 @@ merged into the target branch". See `docs/adr/0004-autonomous-task-completion-pi
 - **`scripts/demo_completion_pipeline.py`**: deterministic Scenario A/B/C demonstration against
   real git + a fake GitHub client.
 
-## [Unreleased] — Desktop Architecture D0
+### Desktop Architecture D0
 
-### Added
+#### Added
 - **`docs/desktop/`**: canonical, implementation-ready documentation set for a native
   PySide6/Qt Widgets desktop application — product vision, target architecture, information
   architecture, design directions (Professional Control Plane approved), design system, a
@@ -67,13 +147,13 @@ merged into the target branch". See `docs/adr/0004-autonomous-task-completion-pi
   commit-sized implementation roadmap. Documentation only — no desktop code, dependencies, or
   packaging exist yet. Next implementation stage: D1A.
 
-## [Unreleased] — Sprint 3 Increment 1: Workspace Home
+### Sprint 3 Increment 1: Workspace Home
 
 Implements `WORKSPACE_HOME_ARCHITECTURE.md` in full (all 10 steps of §17's implementation
 plan). That document's own status header ("architecture only, no code changed") is now stale —
 the design is implemented, not just approved.
 
-### Added
+#### Added
 - **`command_center/git_info.py`**: per-project git/worktree discovery (`get_status`,
   `get_worktrees`, `get_log`, `get_diff_stat`, `get_branches`, `get_remotes`), extracted from
   `app.py`'s original ROOT-only helpers and parameterized by `cwd: Path`. `app.py`'s Git Center
@@ -98,7 +178,7 @@ the design is implemented, not just approved.
   389 tests total (up from 333), including a dual-layer (snapshot + rendered-page) regression
   test that no BANK/LEGAL prompt/log/report-body/raw-path content ever reaches the page.
 
-### Deviation from the architecture document
+#### Deviation from the architecture document
 - §4's data-source map lists `load_tasks()` (the v1.2 Kanban store, which lives only in `app.py`)
   as a Projects-section input. `workspace_home.py` cannot import `app.py` under any circumstance
   (§6/§9.2, a hard constraint stated three times in the document) and `load_tasks` was not in
@@ -111,7 +191,8 @@ the design is implemented, not just approved.
 
 ### Added
 - **`command_center/` package**: `models`, `storage`, `project_config`, `agent_runner`,
-  `report_parser`, `chat_service`, `workflow`, `activity_log` — see ARCHITECTURE.md §11.
+  `report_parser`, `chat_service`, `workflow`, `activity_log` — see
+  [Application and domain services](ARCHITECTURE.md#22-application-and-domain-services).
 - **Project Chat** (`chat` page): per-project conversations with a provider abstraction (local
   manual mode, Claude Code CLI, optional OpenAI Responses API gated on `OPENAI_API_KEY` +
   `OPENAI_MODEL`); save any message into `reports/`, or convert it into a task.
@@ -144,7 +225,8 @@ the design is implemented, not just approved.
 
 ### Changed
 - `data/runs.jsonl` and `data/activity.jsonl` use JSON Lines instead of a single JSON array — see
-  ARCHITECTURE.md §11.2 for why. `reports/` is now gitignored (may contain BANK/LEGAL content).
+  [Persistence architecture](ARCHITECTURE.md#3-persistence-architecture) for why. `reports/` is now
+  gitignored (may contain BANK/LEGAL content).
 
 ### Security
 - The Claude Code runner never calls git-write subcommands itself, and refuses to run against any
@@ -152,8 +234,9 @@ the design is implemented, not just approved.
 - Read-only task types (`review`/`final_gate`/`architecture_review`) run with the model's tool set
   restricted to `Read,Grep,Glob` via `--tools` — `Bash` and every file-edit tool are entirely absent
   from that run, not merely pattern-denied. Implementation/remediation task types keep `Bash` but
-  have the specific git-write subcommands denied via `--disallowedTools` — see ARCHITECTURE.md §11.3
-  for exactly what each task-type class does and does not enforce.
+  have the specific git-write subcommands denied via `--disallowedTools` — see
+  [Git and GitHub privileged boundaries](ARCHITECTURE.md#9-git-and-github-privileged-boundaries)
+  for what each task-type class enforces.
 - Fixed during independent review (F-01/F-02): an earlier version of this control denied specific
   `Bash(git ...)` patterns for read-only task types while leaving the general-purpose `Bash` tool
   available, which left `git apply`/`checkout`/`stash` and plain shell writes unrestricted for task

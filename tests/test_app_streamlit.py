@@ -11,6 +11,7 @@ network/billable call.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
@@ -537,6 +538,69 @@ def _init_repo(path: Path) -> None:
     (path / "f.txt").write_text("hello")
     subprocess.run(["git", "add", "f.txt"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=path, check=True)
+
+
+def test_launcher_provisions_missing_isolated_worktree_and_launches(fake_claude, tmp_path):
+    """Founder Gate regression, Kanban path: a task whose isolated worktree
+    does not exist yet must still be launchable — the launch control is
+    enabled (not permanently blocked), clicking it provisions the worktree,
+    and the agent runs *in that worktree*, never in the main repository."""
+    project_repo = tmp_path / "aios"
+    project_repo.mkdir()
+    _init_repo(project_repo)  # primary checkout on main
+
+    worktree = tmp_path / "worktrees" / "audit"  # absent — must be provisioned
+    project_config.save_repository_path("AIOS", str(project_repo))
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = "agent_ran_here.txt"
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(
+        [json.dumps({"type": "result", "result": "Verdict: APPROVED FOR COMMIT"})]
+    )
+
+    _seed_task(
+        workspace_path=str(worktree),
+        branch="audit/execution-queue",
+        base_branch="main",
+    )
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+    # The operator is told the worktree will be created, not shown a fatal error.
+    assert any("создан автоматически" in i.value for i in at.info)
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert not at.exception
+
+    launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
+    assert launch_button.disabled is False  # provisionable launch is actionable
+    at = launch_button.click().run()
+    assert not at.exception
+
+    db_path = runtime_db.resolve_db_path()
+    runs = runtime_db.list_runs(db_path, task_id="seeded-task-1")
+    assert len(runs) == 1
+    final = _wait_for_run_terminal(db_path, runs[0]["id"])
+    assert final["state"] == "COMPLETED"
+    assert final["repository_path"] == str(worktree.resolve())
+    assert final["expected_branch"] == "audit/execution-queue"
+
+    # The worktree exists on the expected branch; the agent ran inside it; the
+    # main repository was never touched.
+    assert worktree.is_dir()
+    status_out = subprocess.run(
+        ["git", "-C", str(worktree), "branch", "--show-current"],
+        capture_output=True, text=True, check=True,
+    )
+    assert status_out.stdout.strip() == "audit/execution-queue"
+    assert (worktree / "agent_ran_here.txt").exists()
+    assert not (project_repo / "agent_ran_here.txt").exists()
+    main_status = subprocess.run(
+        ["git", "-C", str(project_repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    )
+    assert main_status.stdout.strip() == ""
 
 
 def test_launcher_launches_claude_against_task_workspace_not_project_repository(fake_claude, tmp_path):
@@ -551,10 +615,16 @@ def test_launcher_launches_claude_against_task_workspace_not_project_repository(
     project_repo.mkdir()
     _init_repo(project_repo)
 
+    # The task's workspace is a real *isolated worktree* of the project repo on
+    # its own feature branch — what an isolated task workspace actually is. The
+    # workspace-isolation gate verifies it belongs to the project repo and is on
+    # the expected branch, so an unrelated repo standing in for it (the previous
+    # setup) is correctly rejected now.
     task_workspace = tmp_path / "aios-p1-deployment"
-    task_workspace.mkdir()
-    _init_repo(task_workspace)
-    subprocess.run(["git", "checkout", "-q", "-b", "feature/p1-7-deployment"], cwd=task_workspace, check=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/p1-7-deployment", str(task_workspace), "HEAD"],
+        cwd=project_repo, check=True, capture_output=True, text=True,
+    )
 
     project_config.save_repository_path("AIOS", str(project_repo))
     fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(
@@ -1128,6 +1198,9 @@ def test_recommendations_panel_launch_button_starts_v2_run(fake_claude, tmp_path
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_repo(repo)
+    # Normal task-v2 launches now fail closed unless workspace ownership can
+    # be verified against the project's canonical source repository.
+    project_config.save_repository_path("AIOS", str(repo))
     _seed_tasks([{"id": "reco-launch", "title": "Recommended task", "workspace_path": str(repo)}])
 
     at = _at_on_page("kanban")
@@ -1234,6 +1307,165 @@ def test_kanban_card_enqueue_button_adds_task_to_execution_queue():
     assert any(e["task_id"] == "seeded-task-1" for e in entries)
     captions = [c.value for c in at.caption]
     assert any("Готово к запуску" in c or "Ожидает зависимостей" in c for c in captions)
+
+
+# --------------------------------------------------------------------------
+# AICC-EXECUTION-QUEUE-LOCK-002 — the two enqueue-only UI actions must persist
+# through the lock-guarded `execution_queue.enqueue_and_persist`, never a raw
+# `load_queue` -> `enqueue` -> `save_queue` triple (which loses a concurrent
+# writer's update). Behavioural proof: stub `enqueue_and_persist` to a no-op
+# spy — the *only* intended persistence route for these actions — then assert
+# each click (a) calls it exactly once with the right root/task/tasks_by_id
+# and (b) leaves the on-disk queue untouched, which it could not if a raw
+# `save_queue` fallback still ran. `test_kanban_card_enqueue_button_adds_task_
+# to_execution_queue` above (and `test_recommendations_enqueue_button_...`
+# below) separately cover the unchanged end-to-end behaviour through the real
+# locked path.
+# --------------------------------------------------------------------------
+
+
+def _record_save_queue_callers(monkeypatch) -> list[tuple[str, str]]:
+    """Record the immediate caller of every queue save during an AppTest run."""
+    callers: list[tuple[str, str]] = []
+    real_save_queue = execution_queue.save_queue
+
+    def spy(root, entries):
+        frame = inspect.currentframe()
+        assert frame is not None and frame.f_back is not None
+        caller = frame.f_back
+        callers.append((Path(caller.f_code.co_filename).name, caller.f_code.co_name))
+        return real_save_queue(root, entries)
+
+    monkeypatch.setattr(execution_queue, "save_queue", spy)
+    return callers
+
+
+def test_kanban_card_enqueue_uses_locked_persistence(monkeypatch):
+    import app
+
+    _seed_task(id="seeded-task-1", workspace_path=None)
+
+    calls: list[tuple] = []
+    save_callers = _record_save_queue_callers(monkeypatch)
+
+    def spy(root, task, tasks_by_id):  # no-op: no persistence at all
+        calls.append((root, task, tasks_by_id))
+
+    monkeypatch.setattr(execution_queue, "enqueue_and_persist", spy)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_seeded-task-1_action_queue")
+    at = button.click().run()
+    assert not at.exception
+
+    assert len(calls) == 1, "card «В очередь» must call enqueue_and_persist exactly once"
+    root, task, tasks_by_id = calls[0]
+    assert root == app.ROOT
+    assert task.get("id") == "seeded-task-1"
+    assert tasks_by_id.get("seeded-task-1", {}).get("id") == "seeded-task-1"
+
+    # No raw fallback: with enqueue_and_persist stubbed to a no-op, nothing may
+    # have written this task into the queue via a bare save_queue.
+    entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
+    assert not any(e.get("task_id") == "seeded-task-1" for e in entries)
+    assert save_callers
+    assert all(caller == ("execution_queue.py", "_mutate_queue") for caller in save_callers)
+
+    # Success feedback is still emitted (UI behaviour unchanged).
+    assert any("очередь" in (msg.value or "").lower() for msg in at.success)
+
+
+def test_recommendations_enqueue_uses_locked_persistence(monkeypatch):
+    import app
+
+    _seed_task(id="seeded-task-1", workspace_path=None)
+
+    calls: list[tuple] = []
+    save_callers = _record_save_queue_callers(monkeypatch)
+
+    def spy(root, task, tasks_by_id):  # no-op: no persistence at all
+        calls.append((root, task, tasks_by_id))
+
+    monkeypatch.setattr(execution_queue, "enqueue_and_persist", spy)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_enqueue")
+    at = button.click().run()
+    assert not at.exception
+
+    assert len(calls) == 1, "recommendation «В очередь» must call enqueue_and_persist exactly once"
+    root, task, tasks_by_id = calls[0]
+    assert root == app.ROOT
+    assert task.get("id") == "seeded-task-1"
+    assert tasks_by_id.get("seeded-task-1", {}).get("id") == "seeded-task-1"
+
+    # No raw fallback and, crucially, the earlier-loaded `queue_entries`
+    # snapshot is not re-saved: with enqueue_and_persist stubbed out, the queue
+    # must stay empty of this task.
+    entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
+    assert not any(e.get("task_id") == "seeded-task-1" for e in entries)
+    assert save_callers
+    assert all(caller == ("execution_queue.py", "_mutate_queue") for caller in save_callers)
+
+
+def test_recommendations_enqueue_button_adds_task_to_execution_queue():
+    """End-to-end through the real locked path: the recommendation «В очередь»
+    action still queues the task (behaviour unchanged by the lock fix)."""
+    _seed_task(id="seeded-task-1", workspace_path=None)
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_enqueue")
+    at = button.click().run()
+    assert not at.exception
+
+    entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
+    assert any(e["task_id"] == "seeded-task-1" for e in entries)
+    rerendered_button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_enqueue")
+    assert rerendered_button.disabled is True
+    assert any(c.value == "В очереди · готово" for c in at.caption)
+
+
+def test_recommendations_launch_now_uses_locked_enqueue_then_launch_ready(monkeypatch):
+    """Launch-now atomically finds-or-creates its queue entry before routing
+    that exact entry through `launch_ready`."""
+    import app
+
+    _seed_task(id="seeded-task-1", workspace_path=None)
+
+    launch_ready_calls: list[tuple] = []
+    real_launch_ready = execution_queue.launch_ready
+    enqueue_calls: list[tuple] = []
+    real_enqueue = execution_queue.enqueue_and_persist
+
+    def spy_launch_ready(root, entries, *args, **kwargs):
+        launch_ready_calls.append((root, entries, args, kwargs))
+        return real_launch_ready(root, entries, *args, **kwargs)
+
+    def spy_locked_enqueue(root, task, tasks_by_id):
+        enqueue_calls.append((root, task, tasks_by_id))
+        return real_enqueue(root, task, tasks_by_id)
+
+    monkeypatch.setattr(execution_queue, "launch_ready", spy_launch_ready)
+    monkeypatch.setattr(execution_queue, "enqueue_and_persist", spy_locked_enqueue)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button = next(b for b in at.button if b.key == "kanban_reco_seeded-task-1_launch")
+    at = button.click().run()
+    assert not at.exception
+
+    assert len(launch_ready_calls) == 1, "launch-now must route through launch_ready exactly once"
+    assert len(enqueue_calls) == 1
+    assert enqueue_calls[0][0] == app.ROOT
+    assert enqueue_calls[0][1]["id"] == "seeded-task-1"
+    root, entries, _, kwargs = launch_ready_calls[0]
+    assert root == app.ROOT
+    entry_ids = kwargs.get("entry_ids")
+    assert len(entry_ids) == 1
+    launched_entry = next(e for e in entries if e["id"] == entry_ids[0])
+    assert launched_entry["task_id"] == "seeded-task-1"
 
 
 def test_execution_queue_panel_launch_ready_button_present_once_queued():

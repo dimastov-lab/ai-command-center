@@ -133,7 +133,7 @@ def render_execution_queue_panel(
             row = st.columns([4, 1])
             row[0].caption(f"🟢 {task.get('title', entry.get('task_id'))} — {task.get('project', '—')}")
             if row[1].button("Убрать", key=f"{key_prefix}_remove_{entry['id']}"):
-                execution_queue.save_queue(root, execution_queue.dequeue(entries, entry["id"]))
+                execution_queue.dequeue_and_persist(root, entry["id"])
                 st.rerun()
 
     if waiting:
@@ -143,5 +143,5 @@ def render_execution_queue_panel(
             row = st.columns([4, 1])
             row[0].caption(f"🟡 {task.get('title', entry.get('task_id'))} — {entry.get('reason') or '—'}")
             if row[1].button("Убрать", key=f"{key_prefix}_remove_{entry['id']}"):
-                execution_queue.save_queue(root, execution_queue.dequeue(entries, entry["id"]))
+                execution_queue.dequeue_and_persist(root, entry["id"])
                 st.rerun()
