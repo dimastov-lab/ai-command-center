@@ -62,10 +62,12 @@ Project Chat, Kanban, AI Agents, Live Execution Center, Run Journal, Timeline, P
 Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode, Portfolio
 Execution, and Portfolio Overview.
 
-`app.py` remains a large presentation and orchestration surface. Extracted panels live in
-`command_center/ui/`, including execution queue, Execution Center, completion, workspace home,
-Portfolio execution, and Portfolio overview UI. `command_center/ui/` may import Streamlit;
-domain, storage, and runtime services remain plain Python.
+`app.py` remains a large presentation and orchestration surface. `command_center/ui/` contains
+selected extracted panels and components, including the execution queue, recommendations, project
+selection and intelligence, Portfolio execution and overview, and shared shell elements. The
+primary Live Execution Center, completion-status, and Workspace Home renderers remain in `app.py`.
+`command_center/ui/` may import Streamlit; domain, storage, and runtime services remain plain
+Python.
 
 ### 2.2 Application and domain services
 

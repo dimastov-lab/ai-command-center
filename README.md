@@ -14,9 +14,9 @@ single-host control plane whose durable state is local to the machine running St
 
 | Classification | Capabilities |
 |---|---|
-| Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; execution queue; Portfolio parsing, intelligence, and guarded worktree launch; manual completion controls |
+| Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; current JSON/JSONL project-chat and activity stores; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; execution queue; Portfolio parsing, intelligence, and guarded worktree launch; completion-state seeding and read-only completion status |
 | Implemented but opt-in | Completion autopilot through `AICC_COMPLETION_AUTOPILOT`; OpenAI project-chat provider when its package and environment variables are supplied; project-specific completion policies that permit automatic merge or recovery |
-| Legacy but still present | Synchronous Claude execution; `runs.jsonl` run journal; JSON/JSONL chat and activity stores; generated-task shell workflow |
+| Legacy but still present | Synchronous Claude execution; `runs.jsonl` run journal; generated-task shell workflow |
 | Designed or planned, not implemented | Native PySide6 desktop client and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
 
 Normal task launches always require an explicit user action and confirmation. There is no general
@@ -93,7 +93,7 @@ AI Command Center deliberately has more than one persistence authority:
 | `data/runtime.db` | Authoritative SQLite state for runtime tasks, sessions, runs, run events, reports, and completion |
 | `data/execution_queue.json` | Separate persisted planning/execution queue |
 | `data/runs.jsonl` | Legacy append-only synchronous run journal |
-| `data/chats.json`, `data/activity.jsonl` | Legacy/current chat and activity artifacts |
+| `data/chats.json`, `data/activity.jsonl` | Currently used project-chat and activity stores, separate from SQLite |
 | `data/project_config.json` | Local project repository and completion-policy overrides |
 | `data/portfolio_config.json` | Portfolio project-to-repository mapping |
 | `data/portfolio_launches.json`, `data/portfolio_locks/` | Portfolio launch registry and coordination locks |
@@ -101,11 +101,12 @@ AI Command Center deliberately has more than one persistence authority:
 | `generated/<PROJECT>/` | Generated legacy task artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative
-for execution and completion state. Legacy JSON and JSONL stores still coexist with SQLite, while
-`execution_queue.json` and Portfolio registries, reports, and generated artifacts are additional
-persisted boundaries. Reconciliation is therefore required: Execution Center refreshes project
-SQLite run/completion state back to Kanban tasks, and queue readiness is recomputed from the
-planning store. These are projections, not a single transactional database.
+for execution and completion state. The legacy `runs.jsonl` journal and the current JSON/JSONL
+project-chat and activity stores coexist with SQLite, while `execution_queue.json` and Portfolio
+registries, reports, and generated artifacts are additional persisted boundaries. Reconciliation
+is therefore required: Execution Center refreshes project SQLite run/completion state back to
+Kanban tasks, and queue readiness is recomputed from the planning store. These are projections, not
+a single transactional database.
 
 Most local artifacts are excluded by the checked-in [`.gitignore`](.gitignore). `runtime.db` is
 local state and must remain untracked; the current checkout excludes it through repository-local
@@ -188,7 +189,9 @@ Completion state, attempts, validation results, and events are stored in `runtim
 defaults require validation and a pull request, use manual merge, and disable recovery. The
 completion autopilot is opt-in through `AICC_COMPLETION_AUTOPILOT` and is disabled by default.
 When enabled, it advances due completion records in a process-local background thread; it is not a
-general task scheduler.
+general task scheduler. The Streamlit completion panel only displays persisted status; it does not
+expose manual advancement controls. Programmatic on-demand advancement is available through the
+runtime API.
 
 ## Git and GitHub safety boundaries
 
