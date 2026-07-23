@@ -1046,9 +1046,10 @@ def render_task_card(
                 report_open = st.button("Отчёт", key=f"{key_prefix}_action_report", icon=":material/description:")
             with action_cols[4]:
                 if st.button("В очередь", key=f"{key_prefix}_action_queue", icon=":material/playlist_add:"):
-                    existing_queue = execution_queue.load_queue(ROOT)
-                    updated_queue = execution_queue.enqueue(existing_queue, task, tasks_by_id)
-                    execution_queue.save_queue(ROOT, updated_queue)
+                    # Lost-update-safe: the whole load→enqueue→save cycle runs
+                    # under `queue_lock` so a concurrent writer's queue change is
+                    # never clobbered by a stale snapshot (see execution_queue).
+                    execution_queue.enqueue_and_persist(ROOT, task, tasks_by_id)
                     st.success("Добавлено в очередь запуска.")
 
             if git_open:
