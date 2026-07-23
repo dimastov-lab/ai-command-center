@@ -2,7 +2,8 @@
 
 This document describes how the application is built as of **v1.2**. It reflects the code in
 `app.py` and `command_center/`, not aspirations — if this file and the code disagree, the code is
-authoritative. §§1–10 describe the v1.1 baseline (still accurate); §11 describes what v1.2 added.
+authoritative. §§1–10 describe the v1.1 baseline (still accurate); §11 describes what v1.2 added;
+§12 records the execution queue's persistence and concurrency boundary.
 
 A future native desktop application will reuse `command_center/` and `command_center/runtime/`
 unchanged, adding new `command_center.desktop`/`command_center.application`/
@@ -361,3 +362,71 @@ started by a *previous* run); if you need to stop it, find and terminate the `cl
 directly (e.g. `pkill -f "claude -p"`) from a terminal. The run record will then be missing its
 terminal state — this app does not fabricate one — so re-launch a fresh run for that task afterward
 rather than trusting a run that never reached `completed`/`failed`/`timed_out` in `data/runs.jsonl`.
+
+## 12. Execution queue persistence and concurrency
+
+### 12.1 Storage and recovery
+
+The execution queue is planning state, separate from the authoritative run/session state in
+`runtime.db`. It is stored as one UTF-8 JSON array at `data/execution_queue.json` (or under
+`AICC_DATA_DIR` when that test override is set). `save_queue` rewrites the complete array through
+`storage.atomic_write_json`: it creates a temporary file in the same directory, serializes and
+flushes the JSON, calls `fsync` on that file, then replaces the destination with `os.replace`.
+Readers therefore see the old complete file or the new complete file under the normal same-filesystem
+rename guarantees, not an in-place partial rewrite. The parent directory is not fsynced, so this is
+not a database transaction or a stronger power-loss guarantee than the host filesystem provides.
+
+`load_queue` is an unlocked snapshot read. A missing file, malformed JSON, or read error produces an
+empty list; there is no backup, quarantine, or automatic reconstruction of the prior queue. A later
+successful mutation can replace that unreadable state. The loader also does not validate the schema
+of otherwise valid JSON. Atomic replacement makes a partial destination unlikely for writes made
+through `save_queue`, but it does not make externally written or wrong-shaped data valid.
+
+Queue mutations use the sibling `data/execution_queue.lock`. `queue_lock` delegates to
+`storage.file_lock`, an advisory OS file lock (`fcntl.flock` on POSIX and `msvcrt.locking` on
+Windows), with a 30-second default acquisition timeout. The kernel releases ownership when the
+holder closes the descriptor or exits, including after a crash; the lock file may remain on disk,
+but it does not retain stale ownership. Contention that lasts through the timeout raises
+`storage.LockTimeoutError`; the queue layer does not retry or merge that failed mutation
+automatically.
+
+### 12.2 Concurrency guarantees
+
+The supported persisted mutation paths are:
+
+- `enqueue_and_persist` for adding an entry;
+- `dequeue_and_persist` for removing an entry;
+- `reevaluate_and_persist` for recomputing readiness; and
+- `launch_ready` for explicit launches and their queue-state commit.
+
+The first three hold `queue_lock` across the complete read → transform → write cycle. This provides
+mutual exclusion for cooperating threads and processes on the same host that resolve the same lock
+file, so two callers using these APIs serialize rather than silently dropping one another's update.
+`launch_ready` deliberately starts processes outside the queue lock; afterward its commit acquires
+the lock, re-reads the current file, preserves newly added disk entries, and applies launched-state
+patches by queue-entry id. The runtime workspace lock remains the authority for duplicate active
+execution; the queue lock is only the persistence boundary for the JSON planning state.
+
+There is no queue revision number, compare-and-set token, conflict journal, or automatic general
+conflict merge. Consequently there is no “lost update detected” recovery path: the supported
+helpers prevent that race through serialization, while an unprotected writer can still overwrite a
+newer snapshot without detection. Reads (`load_queue`) are lock-free and may become stale
+immediately. The in-memory helpers `enqueue`, `dequeue`, and `evaluate_readiness`, and the raw
+whole-file `save_queue`, provide no concurrency guarantee by themselves. These guarantees are
+same-host only: the lock is advisory, requires every writer to cooperate, and provides neither
+distributed nor cross-host coordination.
+
+### 12.3 Known Portfolio boundary
+
+Portfolio launch currently performs direct `load_queue` → `enqueue` → `save_queue` work, and its
+failed-launch cleanup directly saves a dequeued in-memory snapshot. Those sequences do not hold
+`queue_lock` across their full read-modify-write cycle. Although `launch_ready` itself uses the
+locked merge described above, the surrounding Portfolio insertion and cleanup can still lose a
+concurrent queue update. This queue-hardening increment does not remediate those paths, so Portfolio
+must not be described as cross-process lost-update-safe.
+
+Future contributors must use the public persisted mutation helpers above. A new composite mutation
+must acquire `queue_lock` before loading and hold it through `save_queue`; it must not read, mutate an
+in-memory copy, and write the entire queue through an unprotected path. Preserve the lock/merge
+checks in `launch_ready`, add thread and real-process race tests for new mutation sequences, and
+never commit generated queue state, its lock file, or other runtime data.
