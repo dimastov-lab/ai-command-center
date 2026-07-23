@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import ast
 import json
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
-from command_center import launch, launch_service
+from command_center import launch, launch_service, models, project_config, storage
 from command_center.runtime import api as runtime_api
-from command_center.runtime import db, providers, session_view, supervisor
+from command_center.runtime import db, providers, reports, session_view, supervisor, task_sync
 
 
 def _add_worktree(repo: Path, target: Path, branch: str = "feature/codex-test") -> Path:
@@ -24,13 +25,35 @@ def _start_codex(sup, *, canonical, worktree, branch="feature/codex-test", **kwa
         repository_path=str(worktree),
         canonical_repository_path=str(canonical),
         expected_branch=branch,
-        task_type=kwargs.pop("task_type", "implementation"),
+        task_type=kwargs.pop("task_type", "review"),
         prompt=kwargs.pop("prompt", "implement safely"),
         confirmed=True,
         repository_already_validated=True,
         executor_id="codex",
         **kwargs,
     )
+
+
+def _persisted_database_text(db_path: Path) -> str:
+    """Serialize every user table cell from the actual SQLite database."""
+    with sqlite3.connect(db_path) as conn:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+        rows = {
+            table: conn.execute(f'SELECT * FROM "{table}"').fetchall()  # noqa: S608 - names come from sqlite_master
+            for table in tables
+        }
+    return json.dumps(rows, ensure_ascii=False, default=str)
+
+
+def _report_text(db_path: Path, run_id: str) -> str:
+    report = db.get_report(db_path, run_id)
+    assert report is not None
+    return (reports.REPORTS_ROOT.parent / report["path"]).read_text(encoding="utf-8")
 
 
 def test_codex_discovery_and_version_probe_use_fake_only(fake_codex):
@@ -129,9 +152,11 @@ def test_codex_launch_handshake_prompt_transport_and_audit(fake_codex, git_repo,
     monkeypatch.setenv("FAKE_CODEX_PROMPT_CAPTURE", str(capture))
     prompt = "sensitive prompt that must not be argv-visible"
     sup = supervisor.Supervisor()
-    run = _start_codex(sup, canonical=git_repo, worktree=worktree, prompt=prompt)
+    run = _start_codex(
+        sup, canonical=git_repo, worktree=worktree, prompt=prompt, title=prompt
+    )
     final = sup.wait_for_run(run["id"], timeout=10)
-    assert final["state"] == "COMPLETED"
+    assert final["state"] == "COMPLETED", final["failure_reason"]
     assert final["provider_id"] == "codex"
     assert final["prompt"].startswith("[redacted:")
     assert prompt not in final["command_json"]
@@ -150,6 +175,7 @@ def test_codex_launch_handshake_prompt_transport_and_audit(fake_codex, git_repo,
 def test_codex_duplicate_prevention_and_cancellation(fake_codex, git_repo, tmp_path, monkeypatch):
     worktree = _add_worktree(git_repo, tmp_path / "worktree")
     monkeypatch.setenv("FAKE_CODEX_EXTRA_SLEEP", "5")
+    monkeypatch.delenv("FAKE_CODEX_TOUCH_FILE")
     sup = supervisor.Supervisor()
     first = _start_codex(sup, canonical=git_repo, worktree=worktree)
     with pytest.raises(supervisor.WorkspaceLockedError):
@@ -265,7 +291,7 @@ def test_launch_service_selects_codex_through_existing_api(
     )
     run = launch_service.execute_agent_launch_v2(
         project="AIOS",
-        task_type="implementation",
+        task_type="review",
         prompt="implement",
         timeout_seconds=30,
         repository_path=worktree,
@@ -305,6 +331,35 @@ def test_codex_restart_reconciliation_never_fabricates_success(tmp_path):
     assert final["state"] != "COMPLETED"
 
 
+def test_codex_restart_reconciliation_uses_real_fake_process_identity(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    monkeypatch.setenv("FAKE_CODEX_EXTRA_SLEEP", "5")
+    monkeypatch.delenv("FAKE_CODEX_TOUCH_FILE")
+    db_path = tmp_path / "restart-runtime.db"
+    original = supervisor.Supervisor(db_path)
+    run = _start_codex(original, canonical=git_repo, worktree=worktree)
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if db.get_run(db_path, run["id"])["first_output_at"]:
+            break
+        time.sleep(0.02)
+    restarted = supervisor.Supervisor(db_path)
+    outcomes = restarted.reconcile()
+    assert outcomes == [
+        {
+            "run_id": run["id"],
+            "classification": "RUNNING",
+            "detail": "pid exists and identity matches; orphaned from this supervisor instance",
+        }
+    ]
+    assert db.get_run(db_path, run["id"])["state"] == "RUNNING"
+    assert db.get_run(db_path, run["id"])["state"] != "COMPLETED"
+    original.cancel(run["id"], confirmed=True, grace_seconds=1)
+
+
 def test_provider_fields_are_additive_and_default_claude(tmp_path):
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)
@@ -337,3 +392,373 @@ def test_unknown_provider_configuration_fails_before_persistence(git_repo):
             executor_id="malformed-provider",
         )
     assert db.list_runs(sup.db_path) == []
+
+
+def test_legacy_project_policy_is_claude_only_and_codex_rejection_precedes_persistence(
+    fake_codex, git_repo, tmp_path, configure_project_repo
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    project_config.save_allowed_agents("AIOS", ["claude_code"])
+    configure_project_repo("AIOS", git_repo)
+    api = runtime_api.ExecutionCenterAPI()
+
+    with pytest.raises(project_config.ProviderAuthorizationError, match="not authorized"):
+        api.start_run(
+            project="AIOS",
+            repository_path=str(worktree),
+            task_type="review",
+            instruction="private instruction",
+            confirmed=True,
+            repository_already_validated=True,
+            expected_branch="feature/codex-test",
+            executor_id="codex",
+        )
+
+    assert api.list_tasks() == []
+    assert api.list_sessions() == []
+    assert api.list_runs() == []
+
+
+def test_launch_service_enforces_claude_only_policy_before_task_mutation(
+    fake_codex, git_repo, tmp_path
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    project_config.save_allowed_agents("AIOS", ["claude_code"])
+    task = {"id": "policy-task", "title": "Policy task", "prompt_history": []}
+    api = runtime_api.ExecutionCenterAPI()
+
+    with pytest.raises(project_config.ProviderAuthorizationError, match="not authorized"):
+        launch_service.execute_agent_launch_v2(
+            project="AIOS",
+            task_type="review",
+            prompt="must not persist",
+            timeout_seconds=30,
+            repository_path=worktree,
+            execution_center_api=api,
+            confirmed=True,
+            task=task,
+            executor_id="codex",
+            expected_branch="feature/codex-test",
+        )
+
+    assert task == {"id": "policy-task", "title": "Policy task", "prompt_history": []}
+    assert db.list_runs(api.db_path) == []
+    assert db.list_sessions(api.db_path) == []
+    assert db.list_tasks(api.db_path) == []
+
+
+@pytest.mark.parametrize("policy", [[], "codex", ["codex", "unknown-provider"]])
+def test_malformed_or_unknown_project_policy_fails_closed(policy):
+    storage.atomic_write_json(project_config.CONFIG_FILE, {"AIOS": {"allowed_agents": policy}})
+    with pytest.raises(project_config.ProviderAuthorizationError, match="policy|unknown"):
+        project_config.allowed_execution_providers("AIOS")
+
+
+def test_missing_policy_safely_defaults_to_claude_only():
+    storage.atomic_write_json(project_config.CONFIG_FILE, {"AIOS": {"repository_path": "/tmp/example"}})
+    assert project_config.allowed_execution_providers("AIOS") == ("claude_code",)
+
+
+def test_codex_rejects_symlinked_and_dirty_worktrees_before_persistence(
+    fake_codex, git_repo, tmp_path
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    symlink = tmp_path / "worktree-link"
+    symlink.symlink_to(worktree, target_is_directory=True)
+
+    symlink_sup = supervisor.Supervisor(tmp_path / "symlink-runtime.db")
+    with pytest.raises(supervisor.SupervisorError, match="symlinked"):
+        _start_codex(symlink_sup, canonical=git_repo, worktree=symlink)
+    assert db.list_runs(symlink_sup.db_path) == []
+
+    (worktree / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+    dirty_sup = supervisor.Supervisor(tmp_path / "dirty-runtime.db")
+    with pytest.raises(supervisor.SupervisorError, match="Unsafe Codex target worktree"):
+        _start_codex(dirty_sup, canonical=git_repo, worktree=worktree)
+    assert db.list_runs(dirty_sup.db_path) == []
+    assert db.list_sessions(dirty_sup.db_path) == []
+    assert db.list_tasks(dirty_sup.db_path) == []
+
+
+@pytest.mark.parametrize(
+    ("lines", "stderr", "expected_reason", "has_handshake"),
+    [
+        (["not-json{{{"], None, "incomplete:provider_handshake_missing", False),
+        ([json.dumps({"type": "future.event", "message": "warning"})], None,
+         "incomplete:provider_handshake_missing", False),
+        ([json.dumps({"type": "thread.started"})], None,
+         "incomplete:provider_result_missing", True),
+    ],
+)
+def test_codex_handshake_and_result_require_recognized_evidence(
+    fake_codex, git_repo, tmp_path, monkeypatch, lines, stderr, expected_reason, has_handshake
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    monkeypatch.setenv("FAKE_CODEX_LINES", json.dumps(lines))
+    if stderr:
+        monkeypatch.setenv("FAKE_CODEX_STDERR", stderr)
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    final = sup.wait_for_run(run["id"], timeout=10)
+    assert final["state"] == "FAILED"
+    assert final["failure_reason"] == expected_reason
+    assert bool(final["first_output_at"]) is has_handshake
+
+
+def test_codex_stderr_cannot_satisfy_handshake(fake_codex, git_repo, tmp_path, monkeypatch):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    monkeypatch.setenv("FAKE_CODEX_SCENARIO", "startup_failure")
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    final = sup.wait_for_run(run["id"], timeout=10)
+    assert final["state"] == "FAILED"
+    assert final["first_output_at"] is None
+
+
+def test_codex_valid_multi_event_sequence_normalizes_result_and_report(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    first = "First normalized output"
+    final_text = "Verdict: APPROVED FOR COMMIT\nSecond normalized output"
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": first}}),
+        json.dumps({"type": "future.event", "result": "must not replace"}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": final_text}}),
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 3}}),
+    ]
+    monkeypatch.setenv("FAKE_CODEX_LINES", json.dumps(lines))
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    completed = sup.wait_for_run(run["id"], timeout=10)
+    assert completed["state"] == "COMPLETED"
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    assert reports.result_text(events) == final_text
+    report = _report_text(sup.db_path, run["id"])
+    assert report.index(first) < report.index(final_text)
+    assert any(
+        event["event_type"] == "unknown_type" and event["payload"].get("result") == "must not replace"
+        for event in events
+    )
+    assert reports.result_text(events) != "must not replace"
+
+    task = {
+        "id": run["task_id"],
+        "title": "Projection",
+        "project": "AIOS",
+        "progress": 0,
+        "current_stage": "Backlog",
+        "launch_status": "Not Started",
+    }
+    models.normalize_task_workflow(task)
+    models.normalize_task_execution(task)
+    assert task_sync.sync_task_from_run(task, completed, db_path=sup.db_path)
+    assert task["latest_verdict"] == models.VERDICT_APPROVED_FOR_COMMIT
+
+
+def test_codex_structured_output_is_sanitized_before_sqlite_and_report_persistence(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    prompt = "PROMPT-SENTINEL-34981 never persist this instruction"
+    uppercase_token = "SK-UPPERCASESECRET123456"
+    bearer = "Bearer bearer-secret-987654"
+    quoted_assignment = 'API_KEY="quoted-secret-246810"'
+    environment_secret = "environment-derived-sentinel-112233"
+    monkeypatch.setenv("AICC_TEST_ACCESS_TOKEN", environment_secret)
+    result = (
+        f"{prompt}\n{uppercase_token}\n{bearer}\n{quoted_assignment}\n{environment_secret}"
+    )
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "secret-thread"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": result}}),
+        json.dumps({"type": "turn.completed"}),
+    ]
+    monkeypatch.setenv("FAKE_CODEX_LINES", json.dumps(lines))
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree, prompt=prompt)
+    final = sup.wait_for_run(run["id"], timeout=10)
+    assert final["state"] == "COMPLETED"
+
+    persisted = _persisted_database_text(sup.db_path)
+    report = _report_text(sup.db_path, run["id"])
+    for secret in (
+        prompt,
+        uppercase_token,
+        "bearer-secret-987654",
+        "quoted-secret-246810",
+        environment_secret,
+    ):
+        assert secret not in persisted
+        assert secret not in report
+    assert "[REDACTED]" in persisted
+    metadata = json.loads(final["provider_metadata_json"])
+    assert prompt not in json.dumps(metadata)
+    assert "environment" not in metadata
+    assert db.get_task(sup.db_path, final["task_id"])["title"] == "Codex CLI run"
+
+
+def test_codex_malformed_stdout_and_stderr_are_prompt_aware_before_persistence(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    prompt = "PROMPT-MALFORMED-SENTINEL-135790"
+    lines = [
+        f"malformed echo: {prompt}",
+        json.dumps({"type": "thread.started"}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "safe result"}}),
+        json.dumps({"type": "turn.completed"}),
+    ]
+    monkeypatch.setenv("FAKE_CODEX_LINES", json.dumps(lines))
+    monkeypatch.setenv("FAKE_CODEX_STDERR", f"stderr prompt echo {prompt}")
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree, prompt=prompt)
+    assert sup.wait_for_run(run["id"], timeout=10)["state"] == "COMPLETED"
+
+    persisted = _persisted_database_text(sup.db_path)
+    report = _report_text(sup.db_path, run["id"])
+    assert prompt not in persisted
+    assert prompt not in report
+    assert any(event["event_type"] == "malformed" for event in db.list_run_events(sup.db_path, run["id"]))
+
+
+def test_codex_redacts_prompt_and_credentials_split_across_lines(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    prompt = "PROMPT-FRAGMENT-ALPHAOMEGA"
+    lines = [
+        "PROMPT-FRAGMENT-",
+        "ALPHAOMEGA",
+        "SK-SPLIT",
+        "SECRET123456",
+        json.dumps({"type": "thread.started"}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "safe"}}),
+        json.dumps({"type": "turn.completed"}),
+    ]
+    monkeypatch.setenv("FAKE_CODEX_LINES", json.dumps(lines))
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree, prompt=prompt)
+    assert sup.wait_for_run(run["id"], timeout=10)["state"] == "COMPLETED"
+    persisted = _persisted_database_text(sup.db_path)
+    assert "PROMPT-FRAGMENT-" not in persisted
+    assert "ALPHAOMEGA" not in persisted
+    assert "SK-SPLIT" not in persisted
+    assert "SECRET123456" not in persisted
+
+
+def test_sanitization_boundary_redacts_chunk_split_and_json_escaped_values():
+    prompt = 'PROMPT-CHUNK-SENTINEL\nquoted "value"'
+    boundary = providers.SanitizationBoundary(prompt)
+    assert boundary.feed_stderr("Bearer chunk-") == []
+    assert boundary.feed_stderr("secret-123456\n") == []
+    assert boundary.feed_stdout('{"type":"error","message":"PROMPT-CHUNK-') == []
+    assert boundary.feed_stdout('SENTINEL\\\\nquoted \\\\\"value\\\\\""}\n') == []
+    persisted = "".join(
+        boundary.flush_stderr() + boundary.flush_stdout()
+    )
+    assert "chunk-secret-123456" not in persisted
+    assert "PROMPT-CHUNK-SENTINEL" not in persisted
+    assert 'quoted \\\\"value\\\\"' not in persisted
+
+
+def test_codex_prompt_safety_limit_fails_before_runtime_persistence(fake_codex, git_repo, tmp_path):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    sup = supervisor.Supervisor()
+    with pytest.raises(supervisor.ProviderUnavailableError, match="safety limit"):
+        _start_codex(
+            sup,
+            canonical=git_repo,
+            worktree=worktree,
+            prompt="x" * (providers.MAX_CODEX_PROMPT_CHARS + 1),
+        )
+    assert db.list_tasks(sup.db_path) == []
+    assert db.list_sessions(sup.db_path) == []
+    assert db.list_runs(sup.db_path) == []
+
+
+def test_codex_failure_classification_ignores_assistant_and_result_text(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    lines = [
+        json.dumps({"type": "thread.started"}),
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "The task discussed quota and authentication as ordinary content.",
+            },
+        }),
+        json.dumps({"type": "turn.completed"}),
+    ]
+    monkeypatch.setenv("FAKE_CODEX_LINES", json.dumps(lines))
+    monkeypatch.setenv("FAKE_CODEX_EXIT_CODE", "9")
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    final = sup.wait_for_run(run["id"], timeout=10)
+    assert final["failure_reason"] == "provider_exit_nonzero"
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected"),
+    [
+        ("usage quota exhausted", "quota_limit"),
+        ("authentication required", "authentication_failed"),
+    ],
+)
+def test_codex_structured_provider_errors_are_classified(
+    fake_codex, git_repo, tmp_path, monkeypatch, provider_error, expected
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    monkeypatch.setenv(
+        "FAKE_CODEX_LINES",
+        json.dumps([json.dumps({"type": "error", "message": provider_error})]),
+    )
+    monkeypatch.setenv("FAKE_CODEX_EXIT_CODE", "9")
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    final = sup.wait_for_run(run["id"], timeout=10)
+    assert final["failure_reason"] == expected
+
+
+def test_provider_diagnostic_evidence_is_explicitly_bounded():
+    active = supervisor._ActiveRun(
+        process=object(),
+        run_id="bounded",
+        provider=providers.get_provider("codex"),
+        provider_runtime=providers.CodexRuntime("safe prompt"),
+    )
+    for _ in range(supervisor.MAX_PROVIDER_DIAGNOSTIC_EVENTS + 50):
+        active.add_diagnostic("x" * 4096)
+    evidence = active.diagnostic_lines()
+    assert len(evidence) <= supervisor.MAX_PROVIDER_DIAGNOSTIC_EVENTS
+    assert sum(len(line.encode("utf-8")) for line in evidence) <= supervisor.MAX_PROVIDER_DIAGNOSTIC_BYTES
+
+
+def test_identity_capture_failure_cleans_spawn_and_never_enters_running(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    terminated = []
+    original_terminate = supervisor.Supervisor._terminate_owned_spawn
+
+    def recording_terminate(process, *, grace_seconds=0.5):
+        terminated.append(process)
+        original_terminate(process, grace_seconds=grace_seconds)
+
+    monkeypatch.setattr(supervisor, "_capture_stable_process_identity", lambda _process: None)
+    monkeypatch.setattr(
+        supervisor.Supervisor, "_terminate_owned_spawn", staticmethod(recording_terminate)
+    )
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    assert run["state"] == "FAILED"
+    assert run["failure_reason"] == "process_identity_unavailable"
+    assert run["started_at"] is None
+    assert terminated and terminated[0].poll() is not None
+    assert db.list_runs(sup.db_path, state="RUNNING") == []

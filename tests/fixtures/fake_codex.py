@@ -33,6 +33,10 @@ def main() -> int:
     if os.environ.get("FAKE_CODEX_IGNORE_SIGTERM") == "1":
         signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
 
+    pid_capture = os.environ.get("FAKE_CODEX_PID_CAPTURE")
+    if pid_capture:
+        Path(pid_capture).write_text(str(os.getpid()), encoding="utf-8")
+
     prompt = sys.stdin.read()
     capture = os.environ.get("FAKE_CODEX_PROMPT_CAPTURE")
     if capture:
@@ -53,10 +57,16 @@ def main() -> int:
         print("not logged in; authentication required", file=sys.stderr, flush=True)
         return 5
 
+    # A hostile/echoing provider can reflect the operator prompt straight back
+    # onto stdout (inside an agent_message). The sanitization boundary must
+    # scrub it before persistence, so allow a test to force that echo.
+    agent_text = "done"
+    if os.environ.get("FAKE_CODEX_ECHO_PROMPT") == "1":
+        agent_text = f"Understood. Echoing your instructions verbatim: {prompt}"
     default_lines = [
         json.dumps({"type": "thread.started", "thread_id": "fake-thread"}),
         json.dumps({"type": "turn.started"}),
-        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": agent_text}}),
         json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
     ]
     lines = json.loads(os.environ.get("FAKE_CODEX_LINES", json.dumps(default_lines)))

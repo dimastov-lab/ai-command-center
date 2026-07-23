@@ -632,7 +632,7 @@ def render_agent_launcher(
     confirm_key = f"{key_prefix}_confirm_open"
     st.session_state.setdefault(confirm_key, False)
 
-    if st.button("Запустить Claude Code", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
+    if st.button("Запустить агента", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
         st.session_state[confirm_key] = True
 
     if not st.session_state[confirm_key]:
@@ -674,12 +674,16 @@ def render_agent_launcher(
             format_func=lambda value: TASK_TYPE_LABELS.get(value, value),
             key=f"{key_prefix}_task_type",
         )
-        executor_options = ["claude_code", "codex"]
+        try:
+            executor_options = list(project_config.allowed_execution_providers(project))
+        except project_config.ProviderAuthorizationError as exc:
+            st.error(str(exc))
+            return
         configured_executor = (
             (task_for_launch or {}).get("executor") or cfg.get("default_executor") or "claude_code"
         )
         if configured_executor not in executor_options:
-            configured_executor = "claude_code"
+            configured_executor = executor_options[0]
         executor_id = st.selectbox(
             "Execution provider",
             executor_options,
@@ -828,6 +832,7 @@ def render_agent_launcher(
         except (
             runtime_context_service.ConfirmationRequiredError,
             agent_runner.RunnerError,
+            project_config.ProviderAuthorizationError,
             runtime_supervisor.SupervisorError,
             launch_service.DuplicateActiveLaunchError,
         ) as exc:
@@ -1231,9 +1236,14 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
     launch_project = st.selectbox("Проект", models.PROJECT_IDS, key="exec_center_launch_project")
     cfg = project_config.get_project_config(launch_project)
     repo_path = cfg.get("repository_path")
+    try:
+        executor_options = list(project_config.allowed_execution_providers(launch_project))
+    except project_config.ProviderAuthorizationError as exc:
+        st.error(str(exc))
+        return
     executor_id = st.selectbox(
         "Execution provider",
-        ["claude_code", "codex"],
+        executor_options,
         format_func=lambda value: executors.get_executor(value).label,
         key="exec_center_launch_executor",
     )
@@ -1347,6 +1357,7 @@ def render_execution_center_launch_form(api: runtime_api.ExecutionCenterAPI) -> 
     except (
         runtime_context_service.ConfirmationRequiredError,
         agent_runner.RunnerError,
+        project_config.ProviderAuthorizationError,
         runtime_supervisor.SupervisorError,
     ) as exc:
         st.error(str(exc))

@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from command_center import activity_log, agent_runner, executors, launch, models, report_parser, workflow
+from command_center import activity_log, agent_runner, executors, launch, models, project_config, report_parser, workflow
 from command_center.runtime import db as runtime_db
 
 
@@ -61,6 +61,16 @@ def execute_agent_launch(
     direct write, so this module stays storage-agnostic (Streamlit's
     `save_tasks`, a future desktop adapter's own persistence call, or a
     test's no-op are all equally valid callers)."""
+
+    # Fail closed on the same authorization boundary the v2/API/Supervisor
+    # paths enforce, before any persistence side effect. This legacy
+    # synchronous path has no production caller today, but must never become a
+    # gap that runs (or leaks the prompt of) an unauthorized provider.
+    project_config.require_execution_provider_allowed(project, executor_id)
+    if executor_id == "codex":
+        raise RuntimeError(
+            "Codex CLI is supported through the PID-tracked Execution Center launcher only."
+        )
 
     if task is not None:
         models.push_prompt_history(task, prompt)
@@ -207,6 +217,7 @@ def execute_agent_launch_v2(
     this is a pure addition, not a replacement, so anything not yet bridged
     onto v2 keeps working exactly as before.
     """
+    project_config.require_execution_provider_allowed(project, executor_id)
     task_id = (task or {}).get("id")
     resolved_workspace = str(Path(repository_path).expanduser().resolve())
     conflict = find_active_run_conflict(
@@ -220,7 +231,12 @@ def execute_agent_launch_v2(
         )
 
     if task is not None:
-        models.push_prompt_history(task, prompt)
+        # Codex prompt transport is intentionally ephemeral. The task may
+        # already own an operator-authored prompt, but launching Codex must not
+        # copy the final assembled outbound prompt (including sensitive
+        # one-off context) into task persistence or prompt history.
+        if executor_id != "codex":
+            models.push_prompt_history(task, prompt)
         if validation is not None:
             launch.begin_launch(task, executor_id=executor_id, validation=validation)
         if on_task_state_changed is not None:

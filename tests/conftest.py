@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -178,6 +179,39 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     return generated_dir
 
 
+@pytest.fixture(autouse=True)
+def forbid_real_codex_subprocess(monkeypatch):
+    """Fail immediately if any test invokes Codex outside its fake fixture."""
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+
+    def check(command):
+        if isinstance(command, str):
+            try:
+                command = shlex.split(command)
+            except ValueError as exc:
+                raise AssertionError(f"Unparseable subprocess command in test: {command!r}") from exc
+        if not isinstance(command, (list, tuple)) or not command:
+            return
+        executable = Path(os.fspath(command[0])).expanduser()
+        if executable.name != "codex":
+            return
+        allowed = os.environ.get("AICC_TEST_FAKE_CODEX_BINARY")
+        if not allowed or executable.resolve() != Path(allowed).resolve():
+            raise AssertionError(f"Automated test attempted to invoke non-fixture Codex: {executable}")
+
+    def guarded_run(command, *args, **kwargs):
+        check(command)
+        return real_run(command, *args, **kwargs)
+
+    def guarded_popen(command, *args, **kwargs):
+        check(command)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded_run)
+    monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+
+
 _CONTAMINATION_MARKERS: tuple[str, ...] = (
     "pytest-of-",
     "aicc_test_data_",
@@ -263,8 +297,10 @@ def configure_project_repo(monkeypatch):
     from command_center import project_config
 
     def configure(project_id: str, repo_path: Path) -> None:
+        original_get_project_config = project_config.get_project_config
+
         def fake_get_project_config(pid, _repo_path=str(repo_path), _project_id=project_id):
-            cfg = project_config.default_project_config(pid)
+            cfg = original_get_project_config(pid)
             if pid == _project_id:
                 cfg["repository_path"] = _repo_path
             return cfg
@@ -323,11 +359,15 @@ def fake_claude(monkeypatch):
 @pytest.fixture
 def fake_codex(monkeypatch, tmp_path):
     """Install an isolated executable Codex double and route every probe/run to it."""
+    from command_center import project_config
+
     executable = tmp_path / "codex"
     shutil.copyfile(FAKE_CODEX_SCRIPT, executable)
     executable.chmod(0o700)
     monkeypatch.setenv("AICC_CODEX_BINARY", str(executable))
+    monkeypatch.setenv("AICC_TEST_FAKE_CODEX_BINARY", str(executable))
     monkeypatch.setenv("FAKE_CODEX_TOUCH_FILE", "fake_codex_default_touch.txt")
+    project_config.save_allowed_agents("AIOS", ["claude_code", "codex"])
     return executable
 
 

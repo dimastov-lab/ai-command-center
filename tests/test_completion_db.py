@@ -26,9 +26,9 @@ def _run(db_path):
     return task, session, run
 
 
-def test_schema_version_is_5(db_path):
+def test_schema_version_is_6(db_path):
     assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
-    assert runtime_db.SCHEMA_VERSION >= 5
+    assert runtime_db.SCHEMA_VERSION == 6
 
 
 def test_migrate_is_idempotent(db_path):

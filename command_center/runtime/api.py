@@ -77,6 +77,7 @@ class ExecutionCenterAPI:
         `timeout_seconds` defaults to 900s; pass `None` explicitly to disable
         the automatic timeout for this run.
         """
+        project_config.require_execution_provider_allowed(project, executor_id)
         context = context_service.assemble_context(
             project_id=project,
             metadata=metadata,

@@ -42,12 +42,13 @@ from __future__ import annotations
 import os
 import json
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
 from pathlib import Path
 
-from command_center import agent_runner
+from command_center import agent_runner, project_config
 from command_center.models import iso_now
 from command_center.runtime import context_service, db, identity, outcome, providers, reports, stream_parser
 
@@ -65,6 +66,8 @@ CLAUDE_BINARY = os.environ.get("AICC_CLAUDE_BINARY") or "claude"
 # the application layer (`ExecutionCenterAPI.start_run`), not this low-level
 # executor.
 DEFAULT_CANCEL_GRACE_SECONDS = 10.0
+MAX_PROVIDER_DIAGNOSTIC_EVENTS = 64
+MAX_PROVIDER_DIAGNOSTIC_BYTES = 32_768
 
 # Defense in depth: `build_claude_command` never constructs these, but every
 # command is checked against this set before it is ever handed to `Popen`.
@@ -158,17 +161,25 @@ def _assert_no_forbidden_flags(command: list[str]) -> None:
 
 
 class _ActiveRun:
-    def __init__(self, *, process: subprocess.Popen, run_id: str, provider: providers.ExecutionProvider) -> None:
+    def __init__(
+        self,
+        *,
+        process: subprocess.Popen,
+        run_id: str,
+        provider: providers.ExecutionProvider,
+        provider_runtime: providers.ProviderRuntime,
+    ) -> None:
         self.process = process
         self.run_id = run_id
         self.provider = provider
+        self.provider_runtime = provider_runtime
         self.done_event = threading.Event()
         # Set by `_timeout_watchdog` (never by `cancel()`) so `_supervise` can
         # tell a timeout-triggered termination apart from an explicit,
         # human-confirmed cancellation when it decides the final state.
         self.timeout_triggered = threading.Event()
-        # Set the first time either reader thread sees a line of process
-        # output — the in-memory guard that makes the `first_output_at` /
+        # Set the first time the provider runtime recognizes readiness
+        # evidence — the in-memory guard that makes the `first_output_at` /
         # `handshake_received` write happen exactly once per run (see
         # `_record_handshake`), without re-reading the run row on every line.
         # `handshake_lock` makes the check-and-set atomic across the two
@@ -177,10 +188,30 @@ class _ActiveRun:
         # milestone exactly once.
         self.handshake_recorded = threading.Event()
         self.handshake_lock = threading.Lock()
+        self.valid_result_recorded = threading.Event()
+        self._diagnostic_lines: list[str] = []
+        self._diagnostic_bytes = 0
+        self._diagnostic_lock = threading.Lock()
+
+    def add_diagnostic(self, text: str) -> None:
+        encoded = text.encode("utf-8", errors="replace")
+        with self._diagnostic_lock:
+            if len(self._diagnostic_lines) >= MAX_PROVIDER_DIAGNOSTIC_EVENTS:
+                return
+            remaining = MAX_PROVIDER_DIAGNOSTIC_BYTES - self._diagnostic_bytes
+            if remaining <= 0:
+                return
+            bounded = encoded[:remaining].decode("utf-8", errors="ignore")
+            self._diagnostic_lines.append(bounded)
+            self._diagnostic_bytes += len(bounded.encode("utf-8"))
+
+    def diagnostic_lines(self) -> list[str]:
+        with self._diagnostic_lock:
+            return list(self._diagnostic_lines)
 
 
 def _capture_stable_process_identity(
-    process: subprocess.Popen, *, attempts: int = 10, interval_seconds: float = 0.01
+    process: subprocess.Popen, *, attempts: int = 20, interval_seconds: float = 0.01
 ) -> identity.ProcessIdentity | None:
     """Wait briefly for shebang/interpreter exec transitions to settle.
 
@@ -190,15 +221,20 @@ def _capture_stable_process_identity(
     avoiding that false mismatch.
     """
     previous = None
+    consecutive = 0
     for _ in range(attempts):
         if process.poll() is not None:
-            return previous
+            return None
         current = identity.capture_identity(process.pid)
         if current is not None and previous is not None and current.as_string() == previous.as_string():
-            return current
+            consecutive += 1
+            if consecutive >= 1:
+                return current
+        else:
+            consecutive = 0
         previous = current
         time.sleep(interval_seconds)
-    return previous
+    return None
 
 
 class Supervisor:
@@ -347,14 +383,25 @@ class Supervisor:
         request (no such session).
         """
         provider = providers.get_provider(executor_id)
+        project_config.require_execution_provider_allowed(project, executor_id)
         context_service.require_launch_confirmation(confirmed, what=f"Launching a {provider.label} run")
 
         availability = provider.availability()
         if executor_id != providers.CLAUDE_ID and not availability.available:
             raise ProviderUnavailableError(f"{provider.label} unavailable ({availability.code}): {availability.message}")
+        try:
+            provider.validate_prompt(prompt)
+        except ValueError as exc:
+            raise ProviderUnavailableError(str(exc)) from exc
+
+        supplied_repo_path = Path(repository_path).expanduser()
+        if provider.requires_dedicated_worktree:
+            supplied_absolute = supplied_repo_path.absolute()
+            if supplied_absolute != supplied_absolute.resolve() or supplied_repo_path.is_symlink():
+                raise SupervisorError("Unsafe Codex target: symlinked worktree paths are not permitted.")
 
         if repository_already_validated:
-            repo_path = Path(repository_path).expanduser().resolve()
+            repo_path = supplied_repo_path.resolve()
             if not repo_path.is_dir():
                 raise SupervisorError(f"Workspace not found: {repo_path}")
         else:
@@ -368,16 +415,17 @@ class Supervisor:
             )
 
         safe_default_title = "Codex CLI run" if executor_id == providers.CODEX_ID else prompt[:120]
+        persisted_title = safe_default_title if executor_id == providers.CODEX_ID else (title or safe_default_title)
         if task_id is None:
             task = db.create_task(
-                self.db_path, project=project, title=title or safe_default_title, task_type=task_type
+                self.db_path, project=project, title=persisted_title, task_type=task_type
             )
             task_id = task["id"]
         elif db.get_task(self.db_path, task_id) is None:
             db.create_task(
                 self.db_path,
                 project=project,
-                title=title or safe_default_title,
+                title=persisted_title,
                 task_type=task_type,
                 task_id=task_id,
             )
@@ -489,7 +537,7 @@ class Supervisor:
             repository_root=canonical,
             worktree_path=repo_path,
             expected_branch=expected_branch,
-            require_clean=False,
+            require_clean=True,
         )
         if not validation.can_launch:
             detail = "; ".join(validation.errors) or "worktree validation failed"
@@ -503,8 +551,14 @@ class Supervisor:
         provider: providers.ExecutionProvider,
     ) -> dict:
         run_id = run["id"]
+        provider_runtime = provider.create_runtime(
+            prompt=spec.stdin_text if spec.stdin_text is not None else "",
+            environment=spec.environment,
+        )
         try:
-            return self._launch_process_unguarded(run, spec, repo_path, provider)
+            return self._launch_process_unguarded(
+                run, spec, repo_path, provider, provider_runtime
+            )
         finally:
             # Whatever happened above — a successful launch (`self._active`
             # now has `run_id`) or a failed `Popen` (state already FAILED) —
@@ -522,6 +576,7 @@ class Supervisor:
         spec: providers.LaunchSpec,
         repo_path: Path,
         provider: providers.ExecutionProvider,
+        provider_runtime: providers.ProviderRuntime,
     ) -> dict:
         run_id = run["id"]
         try:
@@ -558,6 +613,29 @@ class Supervisor:
 
         pid = process.pid
         proc_identity = _capture_stable_process_identity(process)
+        if provider_runtime.requires_verified_identity and proc_identity is None:
+            self._terminate_owned_spawn(process)
+            run = db.update_run_state(
+                self.db_path,
+                run_id,
+                expected_version=run["version"],
+                new_state="FAILED",
+                fields={
+                    "completed_at": iso_now(),
+                    "exit_code": process.returncode,
+                    "failure_reason": "process_identity_unavailable",
+                },
+            )
+            db.append_run_event(
+                self.db_path,
+                run_id,
+                "lifecycle",
+                stream_parser.lifecycle_event(
+                    "process_identity_unavailable",
+                    failure_reason="process_identity_unavailable",
+                )["payload"],
+            )
+            return run
         run = db.update_run_fields(
             self.db_path,
             run_id,
@@ -578,7 +656,12 @@ class Supervisor:
             self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("process_started", pid=pid)["payload"]
         )
 
-        active = _ActiveRun(process=process, run_id=run_id, provider=provider)
+        active = _ActiveRun(
+            process=process,
+            run_id=run_id,
+            provider=provider,
+            provider_runtime=provider_runtime,
+        )
         with self._active_lock:
             self._active[run_id] = active
 
@@ -601,6 +684,33 @@ class Supervisor:
             watchdog.start()
 
         return db.get_run(self.db_path, run_id)
+
+    @staticmethod
+    def _terminate_owned_spawn(process: subprocess.Popen, *, grace_seconds: float = 0.5) -> None:
+        """Boundedly clean up a just-spawned child before it becomes RUNNING.
+
+        The unreaped Popen handle proves ownership here, so its PID cannot
+        have been reused. This helper is used only during launch failure,
+        before the process is exposed as an active run.
+        """
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            process.wait(timeout=grace_seconds)
+            return
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
 
     def _write_stdin(self, run_id: str, active: _ActiveRun, prompt: str) -> None:
         try:
@@ -625,13 +735,13 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     def _record_handshake(self, run_id: str, active: _ActiveRun) -> None:
-        """Record the "Claude startup/handshake" milestone — the first moment
-        the spawned process produced *any* output — exactly once per run.
+        """Record the provider startup/handshake milestone exactly once.
 
-        This is deliberately separate from `process_started` (the moment
-        `Popen` returned a live PID, item 1 of the mission's lifecycle
-        separation): a valid PID proves the process was *created*, the first
-        line of output proves it is *alive and talking* (item 2). The gap
+        This is deliberately separate from `process_started`: a valid PID
+        proves the process was created; provider-approved readiness evidence
+        proves it reached its protocol startup milestone. For Claude the
+        historical any-output rule remains; for Codex only recognized
+        lifecycle JSON qualifies. The gap
         between the two is exactly the window in which a run is "started but
         early output not yet received" — surfaced to the UI as
         `session_view.STATUS_STARTING`, never as a failure.
@@ -685,30 +795,65 @@ class Supervisor:
     def _drain_stdout(self, run_id: str, active: _ActiveRun) -> None:
         process = active.process
         try:
-            for line in process.stdout:
-                self._record_handshake(run_id, active)
-                event = active.provider.parse_stdout_line(line)
-                if event is None:
-                    continue
-                db.append_run_event(self.db_path, run_id, event["event_type"], event["payload"])
+            for chunk in process.stdout:
+                for line in active.provider_runtime.feed_stdout(chunk):
+                    self._persist_stdout_event(run_id, active, line)
         finally:
+            for line in active.provider_runtime.flush_stdout():
+                self._persist_stdout_event(run_id, active, line)
             try:
                 process.stdout.close()
             except Exception:
                 pass
 
+    def _persist_stdout_event(self, run_id: str, active: _ActiveRun, line: str) -> None:
+        event = active.provider_runtime.parse_stdout_line(line)
+        if active.provider_runtime.stdout_event_is_readiness(line, event):
+            self._record_handshake(run_id, active)
+        if event is None:
+            return
+        if active.provider_runtime.event_is_valid_result(event):
+            active.valid_result_recorded.set()
+        if active.provider_runtime.event_is_provider_error(event):
+            active.add_diagnostic(json.dumps(event["payload"], ensure_ascii=False, sort_keys=True))
+        self._append_stream_event(run_id, event["event_type"], event["payload"])
+
     def _drain_stderr(self, run_id: str, active: _ActiveRun) -> None:
         process = active.process
         try:
-            for line in process.stderr:
-                self._record_handshake(run_id, active)
-                event = stream_parser.stderr_event(active.provider.sanitize_stderr(line))
-                db.append_run_event(self.db_path, run_id, event["event_type"], event["payload"])
+            for chunk in process.stderr:
+                for line in active.provider_runtime.feed_stderr(chunk):
+                    self._persist_stderr_event(run_id, active, line)
         finally:
+            for line in active.provider_runtime.flush_stderr():
+                self._persist_stderr_event(run_id, active, line)
             try:
                 process.stderr.close()
             except Exception:
                 pass
+
+    def _persist_stderr_event(self, run_id: str, active: _ActiveRun, line: str) -> None:
+        if active.provider_runtime.stderr_line_is_readiness(line):
+            self._record_handshake(run_id, active)
+        event = stream_parser.stderr_event(line[:providers.MAX_PERSISTED_EVENT_CHARS])
+        active.add_diagnostic(event["payload"]["line"])
+        self._append_stream_event(run_id, event["event_type"], event["payload"])
+
+    def _append_stream_event(self, run_id: str, event_type: str, payload: dict) -> None:
+        """Persist one stream event, tolerating a concurrently deleted run.
+
+        Stdout/stderr reader threads outlive the foreground launcher. If the
+        run (or its task/session parent) is deleted while output is still
+        draining, the append hits a FOREIGN KEY violation. That is a benign
+        race — there is nothing left to persist for a run that no longer
+        exists — so the reader thread stops recording quietly instead of
+        dying with an unhandled exception. This mirrors how the codebase
+        already treats a vanished run elsewhere (see `_record_handshake`).
+        """
+        try:
+            db.append_run_event(self.db_path, run_id, event_type, payload)
+        except sqlite3.IntegrityError:
+            pass
 
     def _final_result_payload(self, run_id: str) -> dict | None:
         """The payload of the run's own `result`-type event (the last line of
@@ -751,40 +896,34 @@ class Supervisor:
             failure_reason = "timeout"
         elif exit_code != 0:
             new_state = "FAILED"
-            diagnostic_events = db.list_run_events(
-                self.db_path, run_id, after_seq=0, limit=1_000_000
-            )
-            diagnostic_lines = [json.dumps(event["payload"], ensure_ascii=False) for event in diagnostic_events]
             failure_reason = active.provider.classify_failure(
-                exit_code=exit_code, diagnostic_lines=diagnostic_lines
+                exit_code=exit_code, diagnostic_lines=active.diagnostic_lines()
             )
         else:
-            # exit_code == 0 only proves the `claude` process itself did not
-            # crash — it does not prove the requested work actually happened
-            # (a denied `Write`/`Edit` call, or the agent's own final
-            # message saying it could not proceed, both still exit 0; see
-            # `runtime.outcome`'s module docstring). EvaluatingResult stage:
-            # decide what this exit actually means before ever recording
-            # COMPLETED.
-            result_payload = self._final_result_payload(run_id)
-            classification, reason = outcome.classify_process_result(
-                task_type=run["task_type"],
-                result_text=(result_payload or {}).get("result"),
-                permission_denials=(result_payload or {}).get("permission_denials"),
-                working_tree_changed=working_tree_changed,
-            )
-            if classification == outcome.OK:
-                new_state = "COMPLETED"
-            else:
-                # `classification` (`"blocked"`/`"incomplete"`) is prefixed
-                # onto `reason` so `session_view.derive_status` can tell a
-                # blocked run apart from a merely incomplete one from
-                # `failure_reason` alone — both persist to the same `FAILED`
-                # `run.state` (see `runtime.db.ALLOWED_TRANSITIONS`, which
-                # this deliberately does not expand), but they are display-
-                # distinct outcomes.
+            if active.provider_runtime.requires_valid_result and not active.handshake_recorded.is_set():
                 new_state = "FAILED"
-                failure_reason = f"{classification}:{reason}"
+                failure_reason = "incomplete:provider_handshake_missing"
+            elif active.provider_runtime.requires_valid_result and not active.valid_result_recorded.is_set():
+                new_state = "FAILED"
+                failure_reason = "incomplete:provider_result_missing"
+            else:
+                # exit_code == 0 only proves the provider process itself did
+                # not crash. EvaluatingResult decides whether the requested
+                # work genuinely completed.
+                result_payload = self._final_result_payload(run_id)
+                classification, reason = outcome.classify_process_result(
+                    task_type=run["task_type"],
+                    result_text=(result_payload or {}).get("result"),
+                    permission_denials=(result_payload or {}).get("permission_denials"),
+                    working_tree_changed=working_tree_changed,
+                )
+                if classification == outcome.OK:
+                    new_state = "COMPLETED"
+                else:
+                    # Both remain FAILED in the authoritative state model;
+                    # the prefix preserves the display distinction.
+                    new_state = "FAILED"
+                    failure_reason = f"{classification}:{reason}"
 
         run = db.update_run_state(
             self.db_path,
@@ -865,7 +1004,7 @@ class Supervisor:
         if run["state"] != "RUNNING":
             raise SupervisorError(f"Run {run_id!r} is not RUNNING (state={run['state']!r}); nothing to cancel.")
         if active.process.poll() is not None or (
-            active.provider.id == providers.CODEX_ID
+            active.provider_runtime.requires_verified_identity
             and not identity.identity_matches(active.process.pid, run.get("process_start_identity"))
         ):
             raise SupervisorError(
@@ -930,7 +1069,7 @@ class Supervisor:
         pid = active.process.pid
         if active.process.poll() is not None:
             return False
-        if active.provider.id == providers.CODEX_ID and not identity.identity_matches(
+        if active.provider_runtime.requires_verified_identity and not identity.identity_matches(
             pid, run.get("process_start_identity")
         ):
             return False

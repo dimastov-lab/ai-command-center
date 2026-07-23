@@ -10,12 +10,6 @@ unchanged, adding new `command_center.desktop`/`command_center.application`/
 any of it — see `docs/desktop/ARCHITECTURE.md` for that target architecture (status: D0,
 documentation only, no desktop code yet).
 
-Provider note: the v2 runtime now supports both Claude Code and Codex CLI
-through one Session Supervisor. Provider-specific discovery, argv/environment,
-stdin transport, stream parsing, and failure classification live in
-`command_center/runtime/providers.py`; process/state ownership remains in the
-Supervisor. See ADR 0005.
-
 ## 1. Shape of the system
 
 AI Command Center is a **single-process, single-file, local-only Streamlit application**. There
