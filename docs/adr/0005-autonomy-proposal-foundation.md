@@ -183,6 +183,31 @@ un-governed input.
 executes → confirm) rather than a single call. This is the point — it keeps the
 autonomy layer out of the execution path entirely.
 
+### Addendum (MINOR-REMEDIATION-001) — policy authority & atomicity
+
+Two Founder-Gate findings were closed without changing the architecture above:
+
+* **Persisted policy is authoritative (F1).** A caller-supplied runtime policy
+  can now only *further restrict* the persisted policy, never widen it. The
+  effective policy for `assess`/`dispatch` is the conservative *intersection*
+  (`AutonomyPolicy.intersect`) of persisted ∩ runtime: `enabled` and
+  `allow_execution_dispatch` combine by AND, `allowed_kinds` by set
+  intersection, `auto_approve_max_risk` by the lower ceiling, evidence window by
+  the stricter bound. A missing/invalid stored policy resolves to the
+  deny-by-default policy (fails closed). `assess` persists the *effective* policy
+  it evaluated, so a later `dispatch` is judged against the same policy the
+  approval was made under. Dispatch audit events carry non-sensitive policy
+  *fingerprints* (persisted / runtime / effective) and the allowed/denied result
+  — never raw policy JSON.
+* **Atomic creation & assessment (F2).** Proposal creation (row + evidence +
+  digest + CREATED event) and assessment (verdict + ASSESSED event + every state
+  transition) each commit as a single database transaction via
+  `db.create_proposal_atomic` / `db.apply_assessment_atomic` (and every lifecycle
+  move via `db.transition_proposal_atomic`). A crash commits all-or-nothing; a
+  stale/concurrent writer loses with `LostUpdateError` and writes nothing; there
+  is exactly one CREATED and one ASSESSED event per committed operation, with a
+  monotonic audit sequence. Future-dated evidence is treated as stale.
+
 ## Known limitations
 
 * No automated evidence collectors yet (repository analysis, gap detection); the

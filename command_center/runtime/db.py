@@ -1700,49 +1700,150 @@ def list_proposals(
         return [dict(row) for row in rows]
 
 
-def update_proposal(db_path: Path, proposal_id: str, *, expected_version: int, fields: dict) -> dict:
-    """Compare-and-set update of a `proposal` row, mirroring
-    `update_completion`: validates `fields` against `_UPDATABLE_PROPOSAL_FIELDS`,
-    refuses an illegal `state` transition (via
-    `autonomy.is_valid_proposal_transition`) *before* the CAS check, bumps
-    `version`, sets `updated_at`, and raises `LostUpdateError` on a version
-    mismatch. `requires_human` is coerced to 0/1 if supplied as a bool."""
+# --------------------------------------------------------------------------
+# Connection-level primitives (single-transaction building blocks). Each
+# operates on an already-open connection inside a caller-managed transaction,
+# so several can be composed into ONE atomic unit — see `create_proposal_atomic`
+# / `apply_assessment_atomic` / `transition_proposal_atomic`. The public
+# wrappers below open their own `connect()`/`transaction()` and delegate to a
+# single primitive. Atomicity is NEVER composed by nesting public functions
+# (each of which would open and commit its own connection).
+# --------------------------------------------------------------------------
+
+
+def _proposal_next_seq(conn: sqlite3.Connection, table: str, proposal_id: str) -> int:
+    row = conn.execute(
+        f"SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM {table} WHERE proposal_id = ?",
+        (proposal_id,),
+    ).fetchone()
+    return row["next_seq"]
+
+
+def _proposal_evidence_insert(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    *,
+    kind: str,
+    source: str,
+    summary: str | None,
+    observed_at: str,
+    is_blocker: bool,
+    data: dict | None,
+    now: str,
+) -> int:
+    seq = _proposal_next_seq(conn, "proposal_evidence", proposal_id)
+    data_json = json.dumps(data, ensure_ascii=False) if data is not None else None
+    conn.execute(
+        """INSERT INTO proposal_evidence
+               (proposal_id, seq, kind, source, summary, observed_at, is_blocker, data_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (proposal_id, seq, kind, source, summary, observed_at, 1 if is_blocker else 0, data_json, now),
+    )
+    return seq
+
+
+def _proposal_event_insert(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    event_type: str,
+    *,
+    now: str,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    actor: str | None = None,
+    reason_code: str | None = None,
+    message: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    seq = _proposal_next_seq(conn, "proposal_event", proposal_id)
+    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
+    conn.execute(
+        """INSERT INTO proposal_event
+               (proposal_id, seq, event_type, from_state, to_state, actor,
+                reason_code, message, metadata_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (proposal_id, seq, event_type, from_state, to_state, actor,
+         reason_code, message, metadata_json, now),
+    )
+    return seq
+
+
+def _proposal_event_from_spec(conn: sqlite3.Connection, proposal_id: str, spec: dict, *, now: str) -> int:
+    """Append one audit event from a spec dict (`append_proposal_event` kwargs;
+    `event_type` key optional). Used by the atomic composers so callers can pass
+    plain dicts."""
+    spec = dict(spec)
+    return _proposal_event_insert(
+        conn,
+        proposal_id,
+        spec.pop("event_type", "transition"),
+        now=now,
+        from_state=spec.get("from_state"),
+        to_state=spec.get("to_state"),
+        actor=spec.get("actor"),
+        reason_code=spec.get("reason_code"),
+        message=spec.get("message"),
+        metadata=spec.get("metadata"),
+    )
+
+
+def _proposal_update(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    *,
+    expected_version: int,
+    fields: dict,
+    now: str,
+) -> tuple[int, str]:
+    """CAS + transition-guarded UPDATE inside an open transaction. Returns
+    (new_version, resulting_state). Validates `fields` against the allowlist,
+    refuses an illegal `state` transition (via `is_valid_proposal_transition`)
+    *before* the CAS check, bumps `version`, sets `updated_at`. Raises
+    `KeyError`/`InvalidProposalTransitionError`/`LostUpdateError` as appropriate."""
     fields = dict(fields)
     fields.pop("version", None)
     fields.pop("created_at", None)
     _validate_updatable_proposal_fields(fields)
     if "requires_human" in fields and isinstance(fields["requires_human"], bool):
         fields["requires_human"] = 1 if fields["requires_human"] else 0
+    row = conn.execute("SELECT state, version FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"No such proposal: {proposal_id!r}")
+    new_state = fields.get("state")
+    if new_state is not None and not autonomy_domain.is_valid_proposal_transition(row["state"], new_state):
+        raise InvalidProposalTransitionError(
+            f"Proposal {proposal_id!r} cannot transition {row['state']!r} -> {new_state!r}"
+        )
+    if row["version"] != expected_version:
+        raise LostUpdateError(
+            f"Proposal {proposal_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
+        )
+    fields["updated_at"] = now
+    set_clause = ", ".join(f"{key} = :{key}" for key in fields)
+    params = dict(fields)
+    params["proposal_id"] = proposal_id
+    params["expected_version"] = expected_version
+    cur = conn.execute(
+        f"""UPDATE proposal SET {set_clause}, version = version + 1
+            WHERE id = :proposal_id AND version = :expected_version""",
+        params,
+    )
+    if cur.rowcount != 1:
+        raise LostUpdateError(f"Proposal {proposal_id!r} update affected {cur.rowcount} rows")
+    return expected_version + 1, (new_state if new_state is not None else row["state"])
+
+
+def update_proposal(db_path: Path, proposal_id: str, *, expected_version: int, fields: dict) -> dict:
+    """Compare-and-set update of a `proposal` row, mirroring `update_completion`:
+    validates `fields` against `_UPDATABLE_PROPOSAL_FIELDS`, refuses an illegal
+    `state` transition (via `autonomy.is_valid_proposal_transition`) *before* the
+    CAS check, bumps `version`, sets `updated_at`, and raises `LostUpdateError`
+    on a version mismatch. `requires_human` is coerced to 0/1 if supplied as a
+    bool."""
+    now = iso_now()
     with connect(db_path) as conn:
         with transaction(conn):
-            row = conn.execute(
-                "SELECT state, version FROM proposal WHERE id = ?", (proposal_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"No such proposal: {proposal_id!r}")
-            new_state = fields.get("state")
-            if new_state is not None and not autonomy_domain.is_valid_proposal_transition(
-                row["state"], new_state
-            ):
-                raise InvalidProposalTransitionError(
-                    f"Proposal {proposal_id!r} cannot transition {row['state']!r} -> {new_state!r}"
-                )
-            if row["version"] != expected_version:
-                raise LostUpdateError(
-                    f"Proposal {proposal_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
-                )
-            fields["updated_at"] = iso_now()
-            set_clause = ", ".join(f"{key} = :{key}" for key in fields)
-            params = dict(fields)
-            params["proposal_id"] = proposal_id
-            params["expected_version"] = expected_version
-            cur = conn.execute(
-                f"""UPDATE proposal SET {set_clause}, version = version + 1
-                    WHERE id = :proposal_id AND version = :expected_version""",
-                params,
-            )
-            if cur.rowcount != 1:
-                raise LostUpdateError(f"Proposal {proposal_id!r} update affected {cur.rowcount} rows")
+            _proposal_update(conn, proposal_id, expected_version=expected_version, fields=fields, now=now)
             updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
             return dict(updated)
 
@@ -1761,22 +1862,13 @@ def append_proposal_evidence(
     """Append one immutable evidence row and return its per-proposal `seq`.
     Evidence is never updated or deleted — the observations a decision rests on
     stay fixed, so the decision remains reproducible from them."""
-    data_json = json.dumps(data, ensure_ascii=False) if data is not None else None
     now = iso_now()
     with connect(db_path) as conn:
         with transaction(conn):
-            row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM proposal_evidence WHERE proposal_id = ?",
-                (proposal_id,),
-            ).fetchone()
-            seq = row["next_seq"]
-            conn.execute(
-                """INSERT INTO proposal_evidence
-                       (proposal_id, seq, kind, source, summary, observed_at, is_blocker, data_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (proposal_id, seq, kind, source, summary, observed_at, 1 if is_blocker else 0, data_json, now),
+            return _proposal_evidence_insert(
+                conn, proposal_id, kind=kind, source=source, summary=summary,
+                observed_at=observed_at, is_blocker=is_blocker, data=data, now=now,
             )
-            return seq
 
 
 def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
@@ -1810,24 +1902,14 @@ def append_proposal_event(
     """Append one proposal audit event and return its per-proposal `seq`.
     `metadata` is JSON-encoded; callers must never place credentials, tokens, or
     environment dumps in it."""
-    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
     now = iso_now()
     with connect(db_path) as conn:
         with transaction(conn):
-            row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM proposal_event WHERE proposal_id = ?",
-                (proposal_id,),
-            ).fetchone()
-            seq = row["next_seq"]
-            conn.execute(
-                """INSERT INTO proposal_event
-                       (proposal_id, seq, event_type, from_state, to_state, actor,
-                        reason_code, message, metadata_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (proposal_id, seq, event_type, from_state, to_state, actor,
-                 reason_code, message, metadata_json, now),
+            return _proposal_event_insert(
+                conn, proposal_id, event_type, now=now, from_state=from_state,
+                to_state=to_state, actor=actor, reason_code=reason_code,
+                message=message, metadata=metadata,
             )
-            return seq
 
 
 def list_proposal_events(db_path: Path, proposal_id: str, *, limit: int = 500) -> list[dict]:
@@ -1845,3 +1927,145 @@ def list_proposal_events(db_path: Path, proposal_id: str, *, limit: int = 500) -
             event["metadata"] = json.loads(raw) if raw else None
             events.append(event)
         return events
+
+
+# --------------------------------------------------------------------------
+# Atomic proposal composers — each owns its whole multi-row sequence in ONE
+# connection and ONE transaction, so either all rows commit or none do. This is
+# the F2 remediation: a crash can never leave a proposal without its required
+# evidence/digest/creation-event, nor a verdict without its state transition and
+# ASSESSED event, nor a lifecycle move without its audit event.
+# --------------------------------------------------------------------------
+
+
+def create_proposal_atomic(
+    db_path: Path,
+    *,
+    kind: str,
+    project: str,
+    title: str,
+    rationale: str,
+    state: str,
+    risk_level: str,
+    proposal_id: str | None = None,
+    task_id: str | None = None,
+    policy_json: str | None = None,
+    requires_human: bool = True,
+    evidence_digest: str | None = None,
+    evidence: list[dict] | None = None,
+    created_event: dict | None = None,
+) -> dict:
+    """Create a proposal row, its (immutable) evidence rows, its evidence digest,
+    and its CREATED audit event in ONE transaction. Either all commit or none do
+    — there is never a persisted proposal without its rationale (rejected here if
+    blank), evidence, digest, and creation event. `evidence` is a list of dicts
+    (kind/source/summary/observed_at/is_blocker/data); `created_event` is a dict
+    of `append_proposal_event` kwargs (`event_type` defaults to 'created').
+    Returns the persisted proposal row. Idempotency is by `proposal_id`: a retry
+    with the same id hits the PRIMARY KEY (IntegrityError) rather than creating a
+    duplicate; a retry after a rolled-back attempt succeeds cleanly."""
+    if not rationale or not str(rationale).strip():
+        raise ValueError("proposal.rationale must be non-empty — every proposal must explain itself")
+    now = iso_now()
+    pid = proposal_id or new_id()
+    record = {name: None for name in _PROPOSAL_INSERT_COLUMNS}
+    record.update(
+        {
+            "id": pid,
+            "kind": kind,
+            "project": project,
+            "task_id": task_id,
+            "title": title,
+            "rationale": rationale,
+            "state": state,
+            "risk_level": risk_level,
+            "policy_json": policy_json,
+            "evidence_digest": evidence_digest,
+            "requires_human": 1 if requires_human else 0,
+            "version": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    columns = ", ".join(_PROPOSAL_INSERT_COLUMNS)
+    placeholders = ", ".join(f":{name}" for name in _PROPOSAL_INSERT_COLUMNS)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+            for e in evidence or []:
+                _proposal_evidence_insert(
+                    conn, pid, kind=e["kind"], source=e["source"], summary=e.get("summary"),
+                    observed_at=e["observed_at"], is_blocker=bool(e.get("is_blocker", False)),
+                    data=e.get("data"), now=now,
+                )
+            if created_event is not None:
+                _proposal_event_from_spec(conn, pid, created_event, now=now)
+            stored = conn.execute("SELECT * FROM proposal WHERE id = ?", (pid,)).fetchone()
+            return dict(stored)
+
+
+def apply_assessment_atomic(
+    db_path: Path,
+    proposal_id: str,
+    *,
+    expected_version: int,
+    verdict_fields: dict,
+    assessed_event: dict,
+    transitions: list[dict],
+) -> dict:
+    """Persist an assessment verdict, its ASSESSED audit event, and the resulting
+    ordered state transitions (each with its own audit event) in ONE transaction.
+
+    A single CAS on `expected_version` guards the whole unit: a stale/concurrent
+    assessor loses with `LostUpdateError` and writes nothing. Guarantees: no
+    verdict without its transitions/events (and vice versa); the audit sequence
+    stays monotonic; and — because the caller only invokes this while the
+    proposal is still in a pre-assessment state — exactly one ASSESSED event per
+    committed assessment. `transitions` is an ordered list of
+    ``{"new_state": str, "event": {<append_proposal_event kwargs>},
+    "extra_fields": {<optional proposal columns>}}``; each transition's version
+    is chained from the previous update within the same locked transaction."""
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            version, _state = _proposal_update(
+                conn, proposal_id, expected_version=expected_version,
+                fields=dict(verdict_fields), now=now,
+            )
+            _proposal_event_from_spec(conn, proposal_id, {"event_type": "assessed", **assessed_event}, now=now)
+            for t in transitions:
+                fields = dict(t.get("extra_fields") or {})
+                fields["state"] = t["new_state"]
+                event_spec = dict(t["event"])
+                reason_code = event_spec.get("reason_code")
+                if reason_code is not None and "last_reason_code" not in fields:
+                    fields["last_reason_code"] = reason_code
+                version, _state = _proposal_update(
+                    conn, proposal_id, expected_version=version, fields=fields, now=now,
+                )
+                _proposal_event_from_spec(conn, proposal_id, event_spec, now=now)
+            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            return dict(updated)
+
+
+def transition_proposal_atomic(
+    db_path: Path,
+    proposal_id: str,
+    *,
+    expected_version: int,
+    new_state: str,
+    event: dict,
+    fields: dict | None = None,
+) -> dict:
+    """Apply one state transition and its audit event atomically (CAS update +
+    event in one transaction), so a lifecycle move can never persist a state
+    change without its audit event, or an audit event without the state change."""
+    now = iso_now()
+    upd_fields = dict(fields or {})
+    upd_fields["state"] = new_state
+    with connect(db_path) as conn:
+        with transaction(conn):
+            _proposal_update(conn, proposal_id, expected_version=expected_version, fields=upd_fields, now=now)
+            _proposal_event_from_spec(conn, proposal_id, event, now=now)
+            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            return dict(updated)

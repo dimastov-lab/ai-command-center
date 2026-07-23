@@ -379,6 +379,35 @@ class AutonomyPolicy:
     def allows_kind(self, kind: str) -> bool:
         return kind in self.allowed_kinds
 
+    def intersect(self, other: "AutonomyPolicy | None") -> "AutonomyPolicy":
+        """Conservative combination — the result grants a capability only if
+        BOTH `self` and `other` grant it. A caller-supplied runtime policy can
+        thus only ever *further restrict* the persisted policy, never widen it
+        (the F1 invariant: persisted policy is authoritative). `other is None`
+        returns `self` unchanged. Every field combines by its safe direction:
+
+        * `enabled`, `allow_execution_dispatch` — logical AND;
+        * `allowed_kinds` — set intersection;
+        * `auto_approve_max_risk` — the lower ceiling (min over `RISK_ORDER`);
+        * `max_evidence_age_seconds` — the smaller (stricter) window.
+
+        There is no OR/max anywhere, so no combination can be more permissive
+        than either input."""
+        if other is None:
+            return self
+        lower_ceiling = (
+            self.auto_approve_max_risk
+            if risk_at_most(self.auto_approve_max_risk, other.auto_approve_max_risk)
+            else other.auto_approve_max_risk
+        )
+        return AutonomyPolicy(
+            enabled=self.enabled and other.enabled,
+            allowed_kinds=self.allowed_kinds & other.allowed_kinds,
+            auto_approve_max_risk=lower_ceiling,
+            allow_execution_dispatch=self.allow_execution_dispatch and other.allow_execution_dispatch,
+            max_evidence_age_seconds=min(self.max_evidence_age_seconds, other.max_evidence_age_seconds),
+        )
+
     def may_auto_approve(self, risk: str) -> bool:
         if not self.enabled:
             return False
@@ -419,6 +448,16 @@ class AutonomyPolicy:
             return cls.from_dict(json.loads(raw))
         except (ValueError, TypeError):
             return cls()
+
+
+def policy_fingerprint(policy: "AutonomyPolicy | None") -> str | None:
+    """A short, non-sensitive content fingerprint of a policy (first 12 hex chars
+    of the SHA-256 over its canonical JSON), for audit metadata. `None` for a
+    missing policy. Deliberately a digest, not the raw JSON, so audit records
+    stay low-cardinality and never embed arbitrary policy blobs."""
+    if policy is None:
+        return None
+    return hashlib.sha256(policy.to_json().encode("utf-8")).hexdigest()[:12]
 
 
 # --------------------------------------------------------------------------
@@ -539,10 +578,12 @@ def evaluate_eligibility(
     if not evidence:
         return blocked(ReasonCode.EVIDENCE_MISSING)
 
-    # 4. No evidence item may be stale.
+    # 4. No evidence item may be stale. Unparseable, older than the window, OR
+    #    future-dated (negative age — an observation "from the future" is not a
+    #    valid basis for a decision) all count as stale and block.
     for e in evidence:
         age = evidence_age_seconds(e, now=now)
-        if age is None or age > policy.max_evidence_age_seconds:
+        if age is None or age < 0 or age > policy.max_evidence_age_seconds:
             reasons.append(ReasonCode.EVIDENCE_STALE)
             return blocked(ReasonCode.EVIDENCE_STALE)
 

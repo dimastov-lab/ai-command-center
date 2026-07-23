@@ -77,9 +77,15 @@ class AutonomyEngine:
         return row
 
     def _resolve_policy(self, row: dict, policy: autonomy.AutonomyPolicy | None) -> autonomy.AutonomyPolicy:
-        if policy is not None:
-            return policy
-        return autonomy.AutonomyPolicy.from_json(row.get("policy_json"))
+        """The *effective* policy for an operation: the persisted policy is
+        authoritative, and a caller-supplied runtime `policy` may only further
+        restrict it (conservative intersection — see `AutonomyPolicy.intersect`).
+        A caller can therefore never make an operation more permissive than the
+        policy the proposal was stored/assessed under. A missing/invalid stored
+        policy resolves to the deny-by-default `AutonomyPolicy()` and so fails
+        closed. This is the F1 invariant."""
+        stored = autonomy.AutonomyPolicy.from_json(row.get("policy_json"))
+        return stored.intersect(policy)
 
     def _load_evidence(self, proposal_id: str) -> list[autonomy.Evidence]:
         """Reconstruct the `Evidence` set purely from the frozen evidence rows,
@@ -111,33 +117,35 @@ class AutonomyEngine:
         extra_fields: dict | None = None,
         metadata: dict | None = None,
     ) -> dict:
-        """One compare-and-set lifecycle move + its audit event. Returns the
-        updated row. The structural guard lives in `db.update_proposal`; this
-        raises `IllegalProposalActionError` for a rejected transition so callers
-        get a domain error rather than a persistence one."""
+        """One compare-and-set lifecycle move + its audit event, applied
+        atomically (both in one DB transaction — F2). Returns the updated row.
+        The structural guard lives in `db._proposal_update`; this raises
+        `IllegalProposalActionError` for a rejected transition so callers get a
+        domain error rather than a persistence one."""
         from_state = row["state"]
         fields = dict(extra_fields or {})
-        fields["state"] = new_state
         if reason_code is not None:
             fields["last_reason_code"] = reason_code
+        event = {
+            "event_type": event_type,
+            "from_state": from_state,
+            "to_state": new_state,
+            "actor": actor,
+            "reason_code": reason_code,
+            "message": message,
+            "metadata": metadata,
+        }
         try:
-            updated = db.update_proposal(
-                self.db_path, row["id"], expected_version=row["version"], fields=fields
+            return db.transition_proposal_atomic(
+                self.db_path,
+                row["id"],
+                expected_version=row["version"],
+                new_state=new_state,
+                event=event,
+                fields=fields,
             )
         except db.InvalidProposalTransitionError as exc:
             raise IllegalProposalActionError(str(exc)) from exc
-        db.append_proposal_event(
-            self.db_path,
-            row["id"],
-            event_type,
-            from_state=from_state,
-            to_state=new_state,
-            actor=actor,
-            reason_code=reason_code,
-            message=message,
-            metadata=metadata,
-        )
-        return updated
 
     # ------------------------------------------------------------------
     # Create
@@ -164,7 +172,10 @@ class AutonomyEngine:
             raise ValueError(f"Unknown proposal kind: {kind!r}")
         evidence = list(evidence or [])
         risk = autonomy.classify_risk(kind, evidence)
-        row = db.create_proposal(
+        digest = autonomy.evidence_digest(evidence)
+        # One atomic unit (F2): the proposal row, its immutable evidence, its
+        # digest, and the CREATED audit event all commit together or not at all.
+        return db.create_proposal_atomic(
             self.db_path,
             kind=kind,
             project=project,
@@ -175,33 +186,15 @@ class AutonomyEngine:
             task_id=task_id,
             policy_json=policy.to_json() if policy is not None else None,
             requires_human=True,
+            evidence_digest=digest,
+            evidence=[e.to_dict() for e in evidence],
+            created_event={
+                "event_type": autonomy.EventType.CREATED,
+                "to_state": autonomy.ProposalState.DRAFT,
+                "message": rationale,
+                "metadata": {"kind": kind, "risk_level": risk, "evidence_count": len(evidence)},
+            },
         )
-        for e in evidence:
-            db.append_proposal_evidence(
-                self.db_path,
-                row["id"],
-                kind=e.kind,
-                source=e.source,
-                summary=e.summary,
-                observed_at=e.observed_at,
-                is_blocker=e.is_blocker,
-                data=e.data,
-            )
-        digest = autonomy.evidence_digest(evidence)
-        row = db.update_proposal(
-            self.db_path, row["id"], expected_version=row["version"],
-            fields={"evidence_digest": digest, "risk_level": risk},
-        )
-        db.append_proposal_event(
-            self.db_path,
-            row["id"],
-            autonomy.EventType.CREATED,
-            to_state=autonomy.ProposalState.DRAFT,
-            reason_code=None,
-            message=rationale,
-            metadata={"kind": kind, "risk_level": risk, "evidence_count": len(evidence)},
-        )
-        return row
 
     # ------------------------------------------------------------------
     # Assess — deterministic, reproducible from stored evidence
@@ -227,10 +220,12 @@ class AutonomyEngine:
         if state not in (autonomy.ProposalState.DRAFT, autonomy.ProposalState.PROPOSED):
             return row
 
-        resolved_policy = self._resolve_policy(row, policy)
+        stored_policy = autonomy.AutonomyPolicy.from_json(row.get("policy_json"))
+        resolved_policy = stored_policy.intersect(policy)  # effective = persisted ∩ runtime (F1)
         evidence = self._load_evidence(proposal_id)
+        assessed_at = now or iso_now()
         verdict = autonomy.evaluate_eligibility(
-            kind=row["kind"], evidence=evidence, policy=resolved_policy, now=now
+            kind=row["kind"], evidence=evidence, policy=resolved_policy, now=assessed_at
         )
         plan = autonomy.build_execution_plan(
             kind=row["kind"],
@@ -238,76 +233,109 @@ class AutonomyEngine:
             rationale=row["rationale"],
             parameters={"task_id": row.get("task_id"), "project": row["project"]},
         )
-
-        # Persist verdict + plan + refreshed risk before moving state, so even a
-        # crash mid-transition leaves a readable, reproducible record.
         digest = autonomy.evidence_digest(evidence)
-        row = db.update_proposal(
-            self.db_path,
-            proposal_id,
-            expected_version=row["version"],
-            fields={
-                "eligibility_json": json.dumps(verdict.to_dict(), ensure_ascii=False, sort_keys=True),
-                "plan_json": json.dumps(plan.to_dict(), ensure_ascii=False, sort_keys=True),
-                "risk_level": verdict.risk,
-                "evidence_digest": digest,
-                "requires_human": verdict.requires_human,
-                "policy_json": resolved_policy.to_json(),
-            },
-        )
-        db.append_proposal_event(
-            self.db_path,
-            proposal_id,
-            autonomy.EventType.ASSESSED,
-            from_state=state,
-            to_state=state,
-            reason_code=verdict.primary_reason,
-            message=f"decision={verdict.decision} risk={verdict.risk}",
-            metadata=verdict.to_dict(),
-        )
 
-        # DRAFT -> PROPOSED (submit for the structural record).
-        if row["state"] == autonomy.ProposalState.DRAFT:
-            row = self._transition(
-                row,
-                autonomy.ProposalState.PROPOSED,
-                event_type=autonomy.EventType.TRANSITION,
-                reason_code=verdict.primary_reason,
+        # The verdict, its ASSESSED event, and every state transition below are
+        # applied as ONE atomic unit (F2): a crash commits all or none, and a
+        # concurrent assessor on the same version loses with LostUpdateError.
+        # The *effective* (intersected) policy is what gets persisted, so a later
+        # dispatch is evaluated against the same policy assessment used (F1).
+        verdict_fields = {
+            "eligibility_json": json.dumps(verdict.to_dict(), ensure_ascii=False, sort_keys=True),
+            "plan_json": json.dumps(plan.to_dict(), ensure_ascii=False, sort_keys=True),
+            "risk_level": verdict.risk,
+            "evidence_digest": digest,
+            "requires_human": verdict.requires_human,
+            "policy_json": resolved_policy.to_json(),
+        }
+        policy_prints = {
+            "persisted_policy_fingerprint": autonomy.policy_fingerprint(stored_policy),
+            "runtime_policy_fingerprint": autonomy.policy_fingerprint(policy),
+            "effective_policy_fingerprint": autonomy.policy_fingerprint(resolved_policy),
+        }
+        assessed_event = {
+            "from_state": state,
+            "to_state": state,
+            "reason_code": verdict.primary_reason,
+            "message": f"decision={verdict.decision} risk={verdict.risk}",
+            "metadata": {**verdict.to_dict(), "assessed_at": assessed_at, **policy_prints},
+        }
+
+        transitions: list[dict] = []
+        cur = state
+        if cur == autonomy.ProposalState.DRAFT:
+            transitions.append(
+                self._hop(cur, autonomy.ProposalState.PROPOSED,
+                          event_type=autonomy.EventType.TRANSITION, reason_code=verdict.primary_reason)
             )
+            cur = autonomy.ProposalState.PROPOSED
 
         if verdict.decision == autonomy.DECISION_BLOCKED:
-            return self._transition(
-                row,
-                autonomy.ProposalState.BLOCKED,
-                event_type=autonomy.EventType.TRANSITION,
-                reason_code=verdict.primary_reason,
-                message="blocked by eligibility rules",
+            transitions.append(
+                self._hop(cur, autonomy.ProposalState.BLOCKED,
+                          event_type=autonomy.EventType.TRANSITION, reason_code=verdict.primary_reason,
+                          message="blocked by eligibility rules")
             )
+        else:
+            transitions.append(
+                self._hop(cur, autonomy.ProposalState.ELIGIBLE,
+                          event_type=autonomy.EventType.TRANSITION, reason_code=verdict.primary_reason)
+            )
+            cur = autonomy.ProposalState.ELIGIBLE
+            if verdict.next_state == autonomy.ProposalState.APPROVED:
+                transitions.append(
+                    self._hop(cur, autonomy.ProposalState.APPROVED,
+                              event_type=autonomy.EventType.APPROVAL, actor="policy:auto",
+                              reason_code=autonomy.ReasonCode.AUTO_APPROVED, message="auto-approved by policy",
+                              extra_fields={"decided_by": "policy:auto",
+                                            "decision_reason": "auto-approved by policy"})
+                )
+            else:
+                transitions.append(
+                    self._hop(cur, autonomy.ProposalState.AWAITING_APPROVAL,
+                              event_type=autonomy.EventType.TRANSITION,
+                              reason_code=autonomy.ReasonCode.HUMAN_APPROVAL_REQUIRED,
+                              message="awaiting human approval")
+                )
 
-        # Eligible: PROPOSED -> ELIGIBLE, then route.
-        row = self._transition(
-            row,
-            autonomy.ProposalState.ELIGIBLE,
-            event_type=autonomy.EventType.TRANSITION,
-            reason_code=verdict.primary_reason,
-        )
-        if verdict.next_state == autonomy.ProposalState.APPROVED:
-            return self._transition(
-                row,
-                autonomy.ProposalState.APPROVED,
-                event_type=autonomy.EventType.APPROVAL,
-                actor="policy:auto",
-                reason_code=autonomy.ReasonCode.AUTO_APPROVED,
-                message="auto-approved by policy",
-                extra_fields={"decided_by": "policy:auto", "decision_reason": "auto-approved by policy"},
+        try:
+            return db.apply_assessment_atomic(
+                self.db_path,
+                proposal_id,
+                expected_version=row["version"],
+                verdict_fields=verdict_fields,
+                assessed_event=assessed_event,
+                transitions=transitions,
             )
-        return self._transition(
-            row,
-            autonomy.ProposalState.AWAITING_APPROVAL,
-            event_type=autonomy.EventType.TRANSITION,
-            reason_code=autonomy.ReasonCode.HUMAN_APPROVAL_REQUIRED,
-            message="awaiting human approval",
-        )
+        except db.InvalidProposalTransitionError as exc:
+            raise IllegalProposalActionError(str(exc)) from exc
+
+    @staticmethod
+    def _hop(
+        from_state: str,
+        new_state: str,
+        *,
+        event_type: str,
+        actor: str | None = None,
+        reason_code: str | None = None,
+        message: str | None = None,
+        extra_fields: dict | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        """Build one transition spec for `db.apply_assessment_atomic`."""
+        return {
+            "new_state": new_state,
+            "extra_fields": dict(extra_fields or {}),
+            "event": {
+                "event_type": event_type,
+                "from_state": from_state,
+                "to_state": new_state,
+                "actor": actor,
+                "reason_code": reason_code,
+                "message": message,
+                "metadata": metadata,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Dry-run planning (pure read; never mutates state)
@@ -436,10 +464,22 @@ class AutonomyEngine:
             raise IllegalProposalActionError(
                 f"Only an APPROVED proposal may be dispatched; state is {row['state']!r}"
             )
-        resolved_policy = self._resolve_policy(row, policy)
+        # Effective policy = persisted ∩ runtime (F1): a caller-supplied policy
+        # can only further restrict, never re-permit, dispatch. The persisted
+        # policy the proposal was approved under stays authoritative.
+        stored_policy = autonomy.AutonomyPolicy.from_json(row.get("policy_json"))
+        resolved_policy = stored_policy.intersect(policy)
+        # Non-sensitive policy fingerprints for the audit trail (F1) — a digest,
+        # never the raw policy JSON.
+        policy_prints = {
+            "persisted_policy_fingerprint": autonomy.policy_fingerprint(stored_policy),
+            "runtime_policy_fingerprint": autonomy.policy_fingerprint(policy),
+            "effective_policy_fingerprint": autonomy.policy_fingerprint(resolved_policy),
+        }
         if not resolved_policy.allow_execution_dispatch:
             # The proposal stays APPROVED; nothing crosses the boundary. Record
-            # the refusal in the audit trail without a state change.
+            # the refusal (with the fingerprints and result) in the audit trail
+            # without a state change.
             db.append_proposal_event(
                 self.db_path,
                 proposal_id,
@@ -448,10 +488,12 @@ class AutonomyEngine:
                 to_state=row["state"],
                 actor=actor,
                 reason_code=autonomy.ReasonCode.DISPATCH_DISABLED,
-                message="dispatch refused: policy.allow_execution_dispatch is False",
+                message="dispatch refused: effective policy.allow_execution_dispatch is False",
+                metadata={**policy_prints, "dispatch_allowed": False},
             )
             raise DispatchNotPermittedError(
-                "Policy does not allow execution dispatch (allow_execution_dispatch=False)"
+                "Effective policy does not allow execution dispatch "
+                "(persisted ∩ runtime allow_execution_dispatch is False)"
             )
         plan = self.plan(proposal_id)
         updated = self._transition(
@@ -461,7 +503,7 @@ class AutonomyEngine:
             actor=actor,
             reason_code=autonomy.ReasonCode.DISPATCHED,
             message="approved plan handed to caller for explicit execution",
-            metadata={"plan": plan},
+            metadata={"plan": plan, **policy_prints, "dispatch_allowed": True},
         )
         return {"proposal": updated, "plan": plan}
 
