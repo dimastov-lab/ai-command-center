@@ -271,7 +271,9 @@ def test_report_never_truncates_large_assistant_output(git_repo, configure_proje
         json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": huge_text}]}}),
         json.dumps({"type": "result", "result": "done"}),
     ]
-    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(lines)
+    lines_file = git_repo.parent / "large-fake-claude-lines.json"
+    lines_file.write_text(json.dumps(lines), encoding="utf-8")
+    fake_claude["FAKE_CLAUDE_LINES_FILE"] = str(lines_file)
     configure_project_repo("AIOS", git_repo)
 
     sup = supervisor.Supervisor()

@@ -11,6 +11,9 @@ without needing a new script per scenario:
   already a JSON string (so a test can also ask for a deliberately malformed
   line by including plain non-JSON text here). Defaults to a small realistic
   stream-json sequence.
+- `FAKE_CLAUDE_LINES_FILE`: path to a UTF-8 JSON file containing that same
+  list. Takes precedence over `FAKE_CLAUDE_LINES` and lets tests provide large
+  payloads without exceeding Linux's per-environment-string exec limit.
 - `FAKE_CLAUDE_INITIAL_DELAY`: seconds to sleep *before* emitting the first
   line (default 0) — simulates a spawned, alive process that produces no early
   stdout (a late handshake). Distinct from `FAKE_CLAUDE_DELAY` (between lines)
@@ -52,8 +55,13 @@ def main() -> int:
     if os.environ.get("FAKE_CLAUDE_IGNORE_SIGTERM") == "1":
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
 
+    lines_file = os.environ.get("FAKE_CLAUDE_LINES_FILE")
     lines_env = os.environ.get("FAKE_CLAUDE_LINES")
-    lines = json.loads(lines_env) if lines_env else DEFAULT_LINES
+    if lines_file:
+        with open(lines_file, encoding="utf-8") as handle:
+            lines = json.load(handle)
+    else:
+        lines = json.loads(lines_env) if lines_env else DEFAULT_LINES
     delay = float(os.environ.get("FAKE_CLAUDE_DELAY", "0.05"))
 
     initial_delay = float(os.environ.get("FAKE_CLAUDE_INITIAL_DELAY", "0"))
