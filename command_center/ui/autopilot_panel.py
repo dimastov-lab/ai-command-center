@@ -118,6 +118,21 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
                 "reset --hard и clean не выполняются ни при каких настройках."
             ),
         )
+        max_run_attempts = st.number_input(
+            "Попыток запуска",
+            min_value=pipeline_settings.MIN_RUN_ATTEMPTS,
+            max_value=pipeline_settings.MAX_RUN_ATTEMPTS,
+            value=settings.max_run_attempts,
+            step=1,
+            key=f"{key_prefix}_max_run_attempts",
+            disabled=not enabled,
+            help=(
+                "Сколько раз планировщик разрешает запустить задачу, прежде чем "
+                "пометить её retry_exhausted. Поднимите, если попытки съела внешняя "
+                "причина (истёкшая сессия, недоступный демон) — история прогонов "
+                "при этом сохраняется."
+            ),
+        )
         max_rework = st.number_input(
             "Попыток доработки",
             min_value=pipeline_settings.MIN_REWORK_ATTEMPTS,
@@ -181,6 +196,7 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
         "max_global_concurrency": int(max_global),
         "max_agent_concurrency": int(max_agent),
         "max_rework_attempts": int(max_rework),
+        "max_run_attempts": int(max_run_attempts),
     }
     if changes != {k: v for k, v in settings.as_dict().items() if k in changes}:
         settings = pipeline_settings.update_settings(root, actor="desktop_ui", **changes)

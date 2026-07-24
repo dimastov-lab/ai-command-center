@@ -1680,6 +1680,10 @@ def _plan_wave(
         list(wave.work_items),
         registry=scheduler.default_registry(max_concurrency=settings.max_agent_concurrency),
         config=scheduler.SchedulerConfig(max_global_concurrency=settings.max_global_concurrency),
+        # Without this the planner used its own default budget and the operator
+        # had no way to grant a further attempt to a task whose earlier ones
+        # were consumed by an external fault.
+        policy=scheduler.RetryPolicy(max_attempts=settings.max_run_attempts),
         now=now,
     )
     return map_decisions(plan, wave, tasks_by_id), wave, tasks_by_id

@@ -55,6 +55,20 @@ DEFAULT_MAX_REWORK_ATTEMPTS = 2
 MIN_REWORK_ATTEMPTS = 0
 MAX_REWORK_ATTEMPTS = 5
 
+# How many *execution* attempts the scheduler allows a task before it refuses
+# to schedule further ones (`retry_exhausted`). Distinct from the rework budget
+# above: that governs relaunching after a failed validation, this governs
+# relaunching after a failed run. The default matches
+# `scheduler.RetryPolicy.max_attempts`, which this replaces once persisted.
+#
+# Raising it is the honest remedy when attempts were consumed by a condition
+# outside the task — an expired session, an unreachable daemon — because it
+# grants a fresh attempt without rewriting the run history that recorded the
+# failures.
+DEFAULT_MAX_RUN_ATTEMPTS = 3
+MIN_RUN_ATTEMPTS = 1
+MAX_RUN_ATTEMPTS = 10
+
 
 def settings_file_path(root: Path) -> Path:
     return storage.resolve_data_dir(root) / SETTINGS_FILE_NAME
@@ -113,6 +127,7 @@ class PipelineSettings:
     max_global_concurrency: int = DEFAULT_MAX_GLOBAL_CONCURRENCY
     max_agent_concurrency: int = DEFAULT_MAX_AGENT_CONCURRENCY
     max_rework_attempts: int = DEFAULT_MAX_REWORK_ATTEMPTS
+    max_run_attempts: int = DEFAULT_MAX_RUN_ATTEMPTS
     updated_at: str | None = None
     updated_by: str | None = None
 
@@ -178,6 +193,7 @@ class PipelineSettings:
             "max_global_concurrency": self.max_global_concurrency,
             "max_agent_concurrency": self.max_agent_concurrency,
             "max_rework_attempts": self.max_rework_attempts,
+            "max_run_attempts": self.max_run_attempts,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
         }
@@ -208,6 +224,12 @@ class PipelineSettings:
                 DEFAULT_MAX_REWORK_ATTEMPTS,
                 MIN_REWORK_ATTEMPTS,
                 MAX_REWORK_ATTEMPTS,
+            ),
+            max_run_attempts=_bounded_int(
+                data.get("max_run_attempts"),
+                DEFAULT_MAX_RUN_ATTEMPTS,
+                MIN_RUN_ATTEMPTS,
+                MAX_RUN_ATTEMPTS,
             ),
             updated_at=updated_at if isinstance(updated_at, str) else None,
             updated_by=updated_by if isinstance(updated_by, str) else None,
@@ -260,6 +282,7 @@ def update_settings(root: Path, *, actor: str | None = None, **changes) -> Pipel
         "max_global_concurrency",
         "max_agent_concurrency",
         "max_rework_attempts",
+        "max_run_attempts",
     }
     if unknown:
         raise TypeError(f"Unknown pipeline setting(s): {', '.join(sorted(unknown))}")

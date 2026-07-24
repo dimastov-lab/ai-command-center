@@ -1068,3 +1068,38 @@ def test_a_free_branch_still_gets_a_fresh_derived_worktree(tmp_path, git_repo, a
 
 def test_branch_lookup_degrades_quietly_on_a_bad_repository():
     assert task_pipeline._worktree_holding_branch("/nonexistent/repo", "any") is None
+
+
+def test_run_attempt_budget_is_operator_configurable(tmp_path):
+    """Attempts consumed by an external fault — an expired session, an
+    unreachable daemon — leave a task `retry_exhausted` with no honest remedy
+    unless the budget can be raised. Raising it grants a fresh attempt without
+    rewriting the run history that recorded the failures."""
+    assert PipelineSettings().max_run_attempts == pipeline_settings.DEFAULT_MAX_RUN_ATTEMPTS
+    saved = pipeline_settings.save_settings(tmp_path, PipelineSettings(max_run_attempts=5))
+    assert pipeline_settings.load_settings(tmp_path).max_run_attempts == 5
+    assert saved.max_run_attempts == 5
+    # Out of range falls back rather than clamping, so a typo is visible.
+    assert PipelineSettings.from_dict({"max_run_attempts": 999}).max_run_attempts == (
+        pipeline_settings.DEFAULT_MAX_RUN_ATTEMPTS
+    )
+
+
+def test_the_planner_receives_the_configured_run_attempt_budget(tmp_path, git_repo, api, monkeypatch):
+    """A budget that never reaches `scheduler.plan` would be decorative."""
+    from command_center.runtime import scheduler
+
+    seen = {}
+    real_plan = api.plan_schedule
+
+    def capture(items, **kwargs):
+        seen["max_attempts"] = kwargs.get("policy").max_attempts if kwargs.get("policy") else None
+        return real_plan(items, **kwargs)
+
+    monkeypatch.setattr(api, "plan_schedule", capture)
+    pipeline_settings.save_settings(
+        tmp_path, PipelineSettings(enabled=True, max_run_attempts=7)
+    )
+    task_pipeline.tick(tmp_path, api, {}, advance_wait_seconds=1)
+    assert seen["max_attempts"] == 7
+    assert scheduler.RetryPolicy().max_attempts != 7  # not merely the default
