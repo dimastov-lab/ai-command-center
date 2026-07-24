@@ -1,6 +1,6 @@
 # ADR 0007 — Unify task and execution-queue storage
 
-Status: **Proposed.** Nothing in this document is implemented. It exists to be
+Status: **Accepted, not implemented.** Nothing in this document is implemented. It exists to be
 agreed before code is written, because the change moves live operator data
 (122 tasks, 24 queue entries at the time of writing) and a half-finished
 attempt would be worse than the problem it fixes.
@@ -128,12 +128,32 @@ point of the dual-write phases.
 - Introducing a general-purpose ORM or query layer. `runtime.db` is hand-written
   SQL with explicit migrations, and that has been an asset.
 
-## Open question for review
+## Divergence handling (decided)
 
-Step 2's divergence check needs a decision on **what to do when the stores
-disagree while both are still live**: log and continue on JSON (safe, slow to
-surface problems), or fail loudly (surfaces immediately, but turns a storage
-bug into an outage on a tool the operator uses to fix things). The
-conservative answer is to log and continue, with the divergence count shown in
-the autopilot panel so it is visible rather than buried — but this should be
-agreed, not assumed.
+When the two stores disagree during the dual-write phases, the JSON store stays
+authoritative, the divergence is logged, and **the count is surfaced in the
+autopilot panel** rather than only in a log file.
+
+Failing loudly was the alternative and was rejected: a storage inconsistency
+would then take down the very tool the operator uses to inspect and repair
+state — the failure mode would be "the dashboard is gone" at exactly the moment
+the dashboard is needed. Logging alone was also rejected, for the opposite
+reason: a divergence written only to a log is a divergence nobody reads, and
+step 4 (stop writing JSON) is gated on "a session with no divergence", which is
+a claim the operator must be able to *see* rather than take on faith.
+
+Concretely:
+
+- `execution_queue` compares the two reads on every read during phases 2–3 and
+  increments a counter when they differ, recording the entry id and which
+  fields disagreed.
+- The count is exposed the way the pipeline already exposes its own health: as
+  a field on `PipelineTickResult`, rendered by `autopilot_panel` next to the
+  existing tick summary. Zero divergences render nothing — a permanent "0" is
+  noise that trains people to ignore the row.
+- A non-zero count is rendered as a warning, not an error: the system is still
+  correct (JSON is authoritative), but step 4 must not proceed.
+
+This mirrors how the pipeline already treats a transient completion-advance
+failure: recorded, surfaced, and non-fatal, because degrading a tick is better
+than aborting one.
