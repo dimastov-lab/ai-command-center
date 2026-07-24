@@ -26,14 +26,14 @@ def _run(db_path):
     return task, session, run
 
 
-def test_schema_version_is_7(db_path):
-    assert runtime_db.current_schema_version(db_path) == 7
-    assert runtime_db.SCHEMA_VERSION == 7
+def test_schema_version_is_8(db_path):
+    assert runtime_db.current_schema_version(db_path) == 8
+    assert runtime_db.SCHEMA_VERSION == 8
 
 
 def test_migrate_is_idempotent(db_path):
     runtime_db.migrate(db_path)  # second run must not error
-    assert runtime_db.current_schema_version(db_path) == 7
+    assert runtime_db.current_schema_version(db_path) == 8
 
 
 def test_create_and_get_completion(db_path):

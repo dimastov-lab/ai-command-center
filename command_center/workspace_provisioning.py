@@ -206,6 +206,35 @@ def _is_primary_worktree(cwd: Path) -> bool:
     return git_dir == common
 
 
+def is_pipeline_owned_worktree(workspace: str | Path, repository_path: str | Path | None) -> bool:
+    """True when `workspace` is a *linked* worktree of `repository_path` — i.e. a
+    directory this application provisions and owns, not a human's primary
+    working tree and not an unrelated repository.
+
+    This is the safety boundary for any automatic repair of a workspace. A
+    linked worktree of the configured project repository exists only because the
+    launch path created it for one task's feature branch, so tidying it (for
+    example stashing leftovers from a previous attempt) cannot touch work a
+    person is doing. The primary working tree, or any other repository, is
+    never in scope.
+
+    Fails closed on every uncertainty: an unresolvable path, a non-repository, a
+    different repository, or an undeterminable worktree kind all return False.
+    """
+    if not repository_path:
+        return False
+    try:
+        ws = _resolve(workspace)
+        repo = _resolve(repository_path)
+    except OSError:
+        return False
+    if not ws.is_dir() or _is_primary_worktree(ws):
+        return False
+    ws_common = _git_common_dir(ws)
+    repo_common = _git_common_dir(repo)
+    return ws_common is not None and repo_common is not None and ws_common == repo_common
+
+
 def _conflicting_worktree(repo: Path, branch: str, workspace_resolved: Path) -> str | None:
     """Path of another worktree of `repo` that already has `branch` checked
     out (a different path than `workspace_resolved`), or `None`."""

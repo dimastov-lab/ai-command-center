@@ -250,6 +250,21 @@ def waiting_entries(entries: list[dict]) -> list[dict]:
     return [e for e in entries if e.get("state") == STATE_WAITING]
 
 
+# Machine-readable outcome codes for one `launch_ready` attempt. `message` is
+# a human-facing (Russian) sentence and is deliberately never parsed; anything
+# that needs to *branch* on why a launch did not happen — the autopilot's audit
+# trail, the desktop wave view's remediation hints, tests — reads `reason_code`
+# instead. Every `LaunchAttemptResult` carries exactly one.
+LAUNCH_OK = "launched"
+LAUNCH_SKIP_TASK_NOT_FOUND = "task_not_found"
+LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED = "workspace_not_configured"
+LAUNCH_SKIP_BLOCKED = "launch_blocked"
+LAUNCH_SKIP_NEEDS_CONFIRMATION = "needs_confirmation"
+LAUNCH_SKIP_DUPLICATE_ACTIVE = "duplicate_active_launch"
+LAUNCH_SKIP_WORKSPACE_VERIFICATION = "workspace_verification_failed"
+LAUNCH_SKIP_LAUNCH_ERROR = "launch_error"
+
+
 @dataclass
 class LaunchAttemptResult:
     entry_id: str
@@ -257,6 +272,10 @@ class LaunchAttemptResult:
     launched: bool
     run_id: str | None = None
     message: str = ""
+    # One of the `LAUNCH_*` constants above — the machine-readable counterpart
+    # to `message`. Defaults to the generic error code so an unannotated
+    # construction is never mistaken for a success.
+    reason_code: str = LAUNCH_SKIP_LAUNCH_ERROR
     # Populated only for the "blocked by validation warnings" case (dirty
     # tree, detached HEAD, branch mismatch) — the exact strings from
     # `launch.LaunchValidation.warnings`, so the UI layer can render each as
@@ -341,7 +360,15 @@ def launch_ready(
         task_id = entry.get("task_id")
         task = tasks_by_id.get(task_id)
         if task is None:
-            results.append(LaunchAttemptResult(entry["id"], task_id, False, message="задача не найдена"))
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message="задача не найдена",
+                    reason_code=LAUNCH_SKIP_TASK_NOT_FOUND,
+                )
+            )
             continue
 
         # `project_configs` is keyed by canonical id, but a task may store a
@@ -356,7 +383,13 @@ def launch_ready(
         prep = launch_service.prepare_task_launch(task=task, project_config=cfg)
         if not prep.selection.path:
             results.append(
-                LaunchAttemptResult(entry["id"], task_id, False, message="workspace не настроен для задачи")
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message="workspace не настроен для задачи",
+                    reason_code=LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED,
+                )
             )
             continue
 
@@ -372,6 +405,7 @@ def launch_ready(
                     task_id,
                     False,
                     message="; ".join(prep.fatal_messages) or "запуск заблокирован",
+                    reason_code=LAUNCH_SKIP_BLOCKED,
                 )
             )
             continue
@@ -382,6 +416,7 @@ def launch_ready(
                     task_id,
                     False,
                     message="требует подтверждения предупреждений — запустите вручную из карточки задачи",
+                    reason_code=LAUNCH_SKIP_NEEDS_CONFIRMATION,
                     warnings=list(validation.warnings),
                     validation_report=_validation_report(validation, expected_branch=expected_branch),
                 )
@@ -407,7 +442,15 @@ def launch_ready(
                 source_repository_path=source_repository_path,
             )
         except launch_service.DuplicateActiveLaunchError as exc:
-            results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=str(exc),
+                    reason_code=LAUNCH_SKIP_DUPLICATE_ACTIVE,
+                )
+            )
             continue
         except (
             workspace_provisioning.WorkspaceVerificationError,
@@ -428,12 +471,21 @@ def launch_ready(
                     task_id,
                     False,
                     message=f"workspace не прошёл проверку изоляции ({structured['failed_step']}): {reason}",
+                    reason_code=LAUNCH_SKIP_WORKSPACE_VERIFICATION,
                     validation_report=structured,
                 )
             )
             continue
         except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the batch
-            results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=str(exc),
+                    reason_code=LAUNCH_SKIP_LAUNCH_ERROR,
+                )
+            )
             continue
 
         launched_patches[entry["id"]] = {
@@ -442,7 +494,9 @@ def launch_ready(
             "launched_at": models.iso_now(),
             "reason": None,
         }
-        results.append(LaunchAttemptResult(entry["id"], task_id, True, run_id=run["id"]))
+        results.append(
+            LaunchAttemptResult(entry["id"], task_id, True, run_id=run["id"], reason_code=LAUNCH_OK)
+        )
 
     updated_entries = _commit_launch_results(root, entries, launched_patches)
     return updated_entries, results

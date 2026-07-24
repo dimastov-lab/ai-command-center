@@ -225,7 +225,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -554,6 +554,28 @@ def _migration_7_add_proposal_parameters_json(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migration_8_add_independent_review_fields(conn: sqlite3.Connection) -> None:
+    """Add the independent-review verdict to `completion`.
+
+    The blocking review gate needs three facts per completion: which run
+    produced the verdict, what the verdict was, and the reviewer's reasoning.
+    They live on the completion row rather than in a side table because there is
+    exactly one review outcome per completion and it is read on the same access
+    path as every other completion field.
+
+    Existing schema-7 databases keep NULLs, which read as "no verdict yet" — the
+    same thing a brand-new row means. That is the safe direction: with the gate
+    enabled, no verdict means *wait*, never *proceed*. The check-and-add runs
+    under the same write lock as the earlier callable migrations, so concurrent
+    and repeated migration attempts are safe.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(completion)").fetchall()}
+        for column in ("review_verdict", "review_run_id", "review_summary"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE completion ADD COLUMN {column} TEXT")
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -565,6 +587,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (5, _SCHEMA_V5),
     (6, _SCHEMA_V6),
     (7, _migration_7_add_proposal_parameters_json),
+    (8, _migration_8_add_independent_review_fields),
 ]
 
 
@@ -1262,6 +1285,9 @@ _UPDATABLE_COMPLETION_FIELDS: frozenset[str] = frozenset(
         "is_recoverable",
         "recommended_action",
         "validation_summary",
+        "review_verdict",
+        "review_run_id",
+        "review_summary",
         "policy_json",
         "last_checked_at",
         "next_retry_at",
@@ -1383,10 +1409,19 @@ def get_completion(db_path: Path, run_id: str) -> dict | None:
 
 def get_completion_by_task(db_path: Path, task_id: str) -> dict | None:
     """The most recently created completion row for a task (there is one per
-    run, and a task may have several runs over time)."""
+    run, and a task may have several runs over time).
+
+    `created_at` is an ISO timestamp at *second* resolution, so two completions
+    for the same task created within the same second tie, and a bare
+    `ORDER BY created_at DESC` would return an arbitrary one of them. That is
+    not hypothetical: an automatic rework relaunches a task as soon as its
+    failure is observed, so several completions per task is the normal case, and
+    a caller reading the stale row would act on a failure that has already been
+    superseded. `rowid` — monotonic per insert — breaks the tie in true
+    insertion order."""
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         return _row_to_dict(row)

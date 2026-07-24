@@ -99,6 +99,21 @@ class LaunchPreparation:
         return self.decision == LAUNCH_DECISION_PROVISIONABLE
 
 
+def resolved_workspace_path(selection_path: str | None) -> str | None:
+    """The single canonical form of a workspace path: `~` expanded and fully
+    resolved. This is the exact string handed to `execute_agent_launch_v2` and
+    therefore persisted as `run.repository_path`, so anything that needs to
+    reason about "is this workspace busy" (the scheduler's workspace
+    exclusivity, `db.create_run`'s workspace lock) must compare against *this*
+    form, not the raw configured path. Factored out of `prepare_task_launch` so
+    a planner can resolve a workspace without paying for the full git-touching
+    validation that function runs — and so the two can never drift into two
+    different spellings of the same directory."""
+    if not selection_path:
+        return None
+    return str(Path(selection_path).expanduser().resolve())
+
+
 def prepare_task_launch(*, task: dict | None, project_config: dict | None) -> LaunchPreparation:
     """Shared, **non-mutating** pre-launch classification for the normal task
     paths (Kanban launcher and execution queue). Resolves the single workspace
@@ -126,9 +141,7 @@ def prepare_task_launch(*, task: dict | None, project_config: dict | None) -> La
     source_repository_path = (project_config or {}).get("repository_path")
 
     validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
-    resolved_workspace = (
-        str(Path(selection.path).expanduser().resolve()) if selection.path else None
-    )
+    resolved_workspace = resolved_workspace_path(selection.path)
 
     if validation.can_launch:
         decision = (

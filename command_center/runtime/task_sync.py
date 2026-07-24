@@ -196,12 +196,16 @@ _LAUNCH_STATUS_BY_COMPLETION_STATE: dict[str, str] = {
     completion_states.CompletionState.RESULT_VALID: "Running",
     completion_states.CompletionState.PREPARING_PULL_REQUEST: "Running",
     completion_states.CompletionState.RECOVERY_PENDING: "Running",
+    # Waiting on the blocking independent review: honest "Needs Review" — the
+    # work is done and something is judging it.
+    completion_states.CompletionState.AWAITING_REVIEW: "Needs Review",
     completion_states.CompletionState.PULL_REQUEST_OPEN: "Needs Review",
     completion_states.CompletionState.AWAITING_MERGE: "Needs Review",
     completion_states.CompletionState.MERGED: "Needs Review",
     completion_states.CompletionState.VERIFYING_TARGET_BRANCH: "Needs Review",
     completion_states.CompletionState.COMPLETED: "Completed",
     completion_states.CompletionState.VALIDATION_FAILED: "Requires Attention",
+    completion_states.CompletionState.REVIEW_REJECTED: "Requires Attention",
     completion_states.CompletionState.PR_CLOSED_UNMERGED: "Requires Attention",
     completion_states.CompletionState.MERGE_BLOCKED: "Requires Attention",
     completion_states.CompletionState.REQUIRES_ATTENTION: "Requires Attention",
@@ -242,31 +246,76 @@ def sync_task_from_completion(task: dict, completion: dict) -> bool:
     return mutated
 
 
-def _seed_and_project_completion(api: ExecutionCenterAPI, task: dict, run: dict) -> bool:
+def project_completion_to_kanban(task: dict, completion: dict) -> bool:
+    """The final, planning-lane half of the completion projection: move the
+    Kanban task itself to `Done` once — and only once — the completion pipeline
+    has *verified* the merge landed in the target branch.
+
+    Kept separate from `sync_task_from_completion` (which owns the execution-
+    facing `launch_status`/stage/progress fields) because these are two
+    genuinely different assertions with different consequences. `launch_status
+    == "Completed"` says "this run's lifecycle finished"; `status == "Done"` is
+    what `models.unmet_dependencies` reads, so setting it *releases every
+    dependent task for execution*. That is the single most consequential field
+    write in the whole pipeline, and it is deliberately gated on
+    `CompletionState.COMPLETED` — the state reached only after
+    `VERIFYING_TARGET_BRANCH` confirms the commit is reachable from the base
+    branch. A PR that is merely open, or merged-but-unverified, never unblocks
+    anything.
+
+    Returns whether `task` was mutated."""
+    if completion.get("completion_state") != completion_states.CompletionState.COMPLETED:
+        return False
+    if task.get("status") == "Done":
+        return False
+    task["status"] = "Done"
+    models.append_timeline_event(
+        task, "completed", "Задача закрыта: merge подтверждён в целевой ветке."
+    )
+    task["updated_at"] = models.iso_now()
+    return True
+
+
+def _seed_and_project_completion(
+    api: ExecutionCenterAPI, task: dict, run: dict, *, policy_overrides: dict | None = None
+) -> bool:
     """Ensure a completion row exists for a terminally-completed run (seeding is
     cheap and DB-only — it never runs validation or touches GitHub; that
     happens in the Supervisor's completion autopilot), then project its state
-    onto the task. No-op for runs that did not complete successfully."""
+    onto the task. No-op for runs that did not complete successfully.
+
+    `policy_overrides` is forwarded to `begin_completion` and therefore applies
+    only to a row being created right now (see that method's docstring)."""
     completion = db.get_completion(api.db_path, run["id"])
     if completion is None:
         if run.get("state") != "COMPLETED":
             return False
         cfg = project_config.get_project_config(run["project"])
-        completion = CompletionOrchestrator(api.db_path).begin_completion(run, task=task, project_cfg=cfg)
+        completion = CompletionOrchestrator(api.db_path).begin_completion(
+            run, task=task, project_cfg=cfg, policy_overrides=policy_overrides
+        )
         if completion is None:
             return False
     return sync_task_from_completion(task, completion)
 
 
-def reconcile_and_sync(api: ExecutionCenterAPI, tasks: list[dict]) -> list[dict]:
-    """Reconciles every persisted `RUNNING` row against real OS processes
-    (`Supervisor.reconcile()`, already implemented and tested — never
-    duplicated here), then syncs every task that has a `current_run_id`
-    (i.e. was launched, at some point, through the v2 bridge) against that
-    run's current state. Tasks never touched by v2 launch have no
-    `current_run_id` and are left completely alone. Returns the mutated
-    tasks for the caller to persist."""
-    api.reconcile()
+def sync_tasks(
+    api: ExecutionCenterAPI,
+    tasks: list[dict],
+    *,
+    policy_overrides: dict | None = None,
+) -> list[dict]:
+    """Sync every task that has a `current_run_id` (i.e. was launched, at some
+    point, through the v2 bridge) against that run's current state, seeding and
+    projecting its completion row. Tasks never touched by v2 launch have no
+    `current_run_id` and are left completely alone. Returns the mutated tasks
+    for the caller to persist.
+
+    Split out of `reconcile_and_sync` so a caller that has *already* reconciled
+    — the desktop pipeline runs reconcile, then a completion advance, then this
+    — can order those steps itself without paying for a second redundant
+    `Supervisor.reconcile()`. `reconcile_and_sync` remains the one-call form for
+    every existing caller."""
     mutated: list[dict] = []
     for task in tasks:
         run_id = task.get("current_run_id")
@@ -277,8 +326,18 @@ def reconcile_and_sync(api: ExecutionCenterAPI, tasks: list[dict]) -> list[dict]
             continue
         changed = sync_task_from_run(task, run, db_path=api.db_path)
         # Seed + project the completion pipeline (post-execution lifecycle).
-        if _seed_and_project_completion(api, task, run):
+        if _seed_and_project_completion(api, task, run, policy_overrides=policy_overrides):
             changed = True
         if changed:
             mutated.append(task)
     return mutated
+
+
+def reconcile_and_sync(api: ExecutionCenterAPI, tasks: list[dict]) -> list[dict]:
+    """Reconciles every persisted `RUNNING` row against real OS processes
+    (`Supervisor.reconcile()`, already implemented and tested — never
+    duplicated here), then syncs every launched task against its run's current
+    state via `sync_tasks`. Returns the mutated tasks for the caller to
+    persist."""
+    api.reconcile()
+    return sync_tasks(api, tasks)

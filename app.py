@@ -23,6 +23,7 @@ from command_center import (
     report_parser,
     storage,
     task_import,
+    task_pipeline,
     task_view,
     tasks_repository,
     workflow,
@@ -36,6 +37,7 @@ from command_center.runtime import log_tail, project_overview, session_view, tas
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
+    autopilot_panel,
     content_area,
     portfolio_overview_panel,
     portfolio_panel,
@@ -1735,6 +1737,23 @@ def _render_execution_center_sections(
             _render_execution_center_card(api, session, tasks_by_id, now=now)
 
 
+def _run_autopilot_tick(api: runtime_api.ExecutionCenterAPI):
+    """One bounded `task_pipeline.tick`, or `None` if it could not even be
+    attempted.
+
+    Isolated behind a broad `except` on purpose: the autopilot is an optional,
+    opt-in convenience layered on top of the Live Execution Center, and an
+    unexpected fault inside it must degrade to "no autopilot this refresh"
+    rather than take down the dashboard that operators use to see and cancel
+    real running processes. The failure is surfaced in the panel, not
+    swallowed silently."""
+    try:
+        return task_pipeline.tick(ROOT, api, project_config.load_project_configs())
+    except Exception as exc:  # noqa: BLE001 — never let autopilot break the dashboard
+        st.session_state[autopilot_panel.TICK_ERROR_KEY] = str(exc)
+        return None
+
+
 def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     """One refresh tick's worth of work: reconcile+sync, then re-render the
     whole dashboard from freshly-read state. Called directly (no
@@ -1747,6 +1766,16 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     acquisition (cheap, uncontended) but not a disk write. `tasks` is then
     rebound to that fresh, reconciled list for the rest of this render."""
     now = datetime.now()
+
+    # Desktop autopilot (AICC-DESKTOP-016). The bounded pipeline tick runs from
+    # *this* existing refresh checkpoint — the same one that already owns
+    # reconcile-and-sync — and never from a second Supervisor, a background
+    # thread, or a poller of its own. `tick` returns immediately doing nothing
+    # when autopilot is not explicitly opted in (the default) or when another
+    # process already holds the pipeline lock, so this call is safe to make on
+    # every refresh. It subsumes the reconcile+sync and queue re-evaluation
+    # below; those still run for the disabled case, which is the normal one.
+    tick_result = _run_autopilot_tick(api)
 
     def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
         return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
@@ -1761,6 +1790,12 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # `Supervisor.reconcile()` does. Relabels waiting/ready only — never
     # launches anything.
     execution_queue.reevaluate_and_persist(ROOT, {t["id"]: t for t in tasks if t.get("id")})
+
+    if tick_result is not None and tick_result.ran:
+        # Durable outcome for the autopilot panel (AICC-DESKTOP-017): stashing
+        # it rather than rendering inline is what keeps launches/skips/merge
+        # results visible across the rerun this refresh path performs.
+        st.session_state[autopilot_panel.TICK_RESULT_KEY] = tick_result
 
     sessions, tasks_by_id = _build_execution_center_sessions(api, tasks, now=now)
     _render_execution_center_project_overview(sessions, now)
@@ -1829,6 +1864,13 @@ def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: lis
 
     if refresh_clicked:
         st.rerun()
+
+    # The autopilot surface renders *before* the poller fragment below, so its
+    # controls stay interactive at a fixed position instead of being torn down
+    # and rebuilt on every fragment refresh. It reads the tick result the
+    # refresh path stashes; it never runs a tick itself.
+    with st.expander("Автопилот рабочего стола", icon=":material/auto_mode:"):
+        autopilot_panel.render_autopilot_panel(ROOT)
 
     if auto_refresh:
         _EXECUTION_CENTER_POLLERS[interval](api, tasks)

@@ -1,0 +1,272 @@
+"""Persisted, explicitly opted-in settings for the desktop task pipeline
+(`command_center.task_pipeline`).
+
+Two things make this module worth existing rather than reading a few keys out
+of `st.session_state`:
+
+- **Persistence is the point.** "Autopilot is on" must survive a Streamlit
+  rerun, a page switch, a browser refresh, and an app restart — otherwise the
+  operator cannot tell whether the machine is currently allowed to launch work
+  on their behalf. Session state answers "what did this browser tab do
+  recently"; this file answers "what is this machine permitted to do", which
+  is the question the safety invariants are written about.
+- **Fail-closed parsing.** Every gate here defaults to *off*, and a value that
+  is not exactly a JSON boolean `true` reads as `False` (see `_opt_in`). A
+  hand-edited or half-written `pipeline_settings.json` can therefore only ever
+  *disable* automation, never silently enable it. The same rule applies to the
+  concurrency caps: an unparseable or out-of-range value falls back to the
+  conservative default rather than being clamped up from garbage.
+
+Storage is `data/pipeline_settings.json`, using the same atomic-write +
+sibling-lock-file convention as `execution_queue.json` and `tasks.json` (see
+`command_center.storage`), so a read-modify-write from two Streamlit sessions
+cannot lose an update. Deliberately *not* a `runtime.db` table: this is
+operator configuration, not execution state, and ADR 0003 reserves `runtime.db`
+for the latter.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+from command_center import models, storage
+
+SETTINGS_FILE_NAME = "pipeline_settings.json"
+SETTINGS_LOCK_FILE_NAME = "pipeline_settings.lock"
+SETTINGS_LOCK_TIMEOUT_SECONDS = 30.0
+_SETTINGS_LOCK_POLL_SECONDS = 0.05
+
+# Conservative defaults. Two concurrent agents is what a single developer
+# machine comfortably sustains; the ceiling exists so a typo (`200`) cannot
+# fork-bomb the host.
+DEFAULT_MAX_GLOBAL_CONCURRENCY = 2
+DEFAULT_MAX_AGENT_CONCURRENCY = 2
+MIN_CONCURRENCY = 1
+MAX_CONCURRENCY = 16
+
+# How many times a task whose validation failed may be relaunched
+# automatically before it is left for a human. Deliberately small: an agent
+# that cannot fix its own failure in two further attempts is usually facing a
+# problem the prompt does not describe, and burning attempts costs real money
+# without converging. 0 disables rework even when the switch is on.
+DEFAULT_MAX_REWORK_ATTEMPTS = 2
+MIN_REWORK_ATTEMPTS = 0
+MAX_REWORK_ATTEMPTS = 5
+
+
+def settings_file_path(root: Path) -> Path:
+    return storage.resolve_data_dir(root) / SETTINGS_FILE_NAME
+
+
+def settings_lock_path(root: Path) -> Path:
+    return storage.resolve_data_dir(root) / SETTINGS_LOCK_FILE_NAME
+
+
+def _opt_in(value: object) -> bool:
+    """`True` only for a genuine JSON boolean `true`.
+
+    Deliberately stricter than `bool(value)`: under that, the strings
+    `"false"`, `"no"` and `"0"` are all truthy, so a corrupted or
+    hand-edited settings file could *enable* autopilot. Every gate in this
+    module is a safety gate, so ambiguity resolves to off."""
+    return value is True
+
+
+def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    """An integer within `[minimum, maximum]`, or `default`. A bool is rejected
+    explicitly (`True` is an `int` in Python and would otherwise silently mean
+    the value 1). Out-of-range falls back to `default` rather than clamping: a
+    hand-edited `200` is a mistake, and silently reading it as the ceiling would
+    hide that."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    number = int(value)
+    if number < minimum or number > maximum:
+        return default
+    return number
+
+
+def _concurrency(value: object, default: int) -> int:
+    """A concurrency cap within `[MIN_CONCURRENCY, MAX_CONCURRENCY]`."""
+    return _bounded_int(value, default, MIN_CONCURRENCY, MAX_CONCURRENCY)
+
+
+@dataclass(frozen=True)
+class PipelineSettings:
+    """The complete persisted opt-in surface for the pipeline.
+
+    `enabled` is the master switch: with it off, no other field can cause any
+    automatic action, which is why the `*_active` properties below — not the
+    raw booleans — are what `task_pipeline` branches on. Storing the two
+    switches separately (rather than collapsing them into one "autopilot"
+    flag) keeps "launch queued work for me" and "merge my pull requests for
+    me" as distinct decisions with distinct blast radii."""
+
+    enabled: bool = False
+    auto_launch: bool = False
+    auto_merge_after_checks: bool = False
+    auto_rework: bool = False
+    auto_remediate_workspace: bool = False
+    require_independent_review: bool = False
+    max_global_concurrency: int = DEFAULT_MAX_GLOBAL_CONCURRENCY
+    max_agent_concurrency: int = DEFAULT_MAX_AGENT_CONCURRENCY
+    max_rework_attempts: int = DEFAULT_MAX_REWORK_ATTEMPTS
+    updated_at: str | None = None
+    updated_by: str | None = None
+
+    @property
+    def independent_review_active(self) -> bool:
+        """Whether a blocking independent review must approve a change before
+        any pull request is opened for it.
+
+        Requires only the master switch, not auto-launch: a *closed* gate is
+        meaningful on its own — with auto-launch off the completion simply waits
+        in `AWAITING_REVIEW` for a reviewer the operator starts, which is still
+        stricter than opening a pull request unreviewed."""
+        return self.enabled and self.require_independent_review
+
+    @property
+    def auto_remediate_workspace_active(self) -> bool:
+        """Whether the pipeline may tidy a workspace it owns so a task that
+        would otherwise never start can start.
+
+        Scope is deliberately narrow and non-destructive: leftovers in a *linked
+        worktree of the task's own project repository* are stashed (recoverable
+        via `git stash list`), never discarded. A human's primary working tree,
+        and any repository that is not the project's, are never touched — see
+        `workspace_provisioning.is_pipeline_owned_worktree`. Requires
+        auto-launch, because the only reason to tidy is to launch."""
+        return self.auto_launch_active and self.auto_remediate_workspace
+
+    @property
+    def auto_rework_active(self) -> bool:
+        """Whether a task whose validation failed may be relaunched
+        automatically as a new attempt, carrying the failure output into its
+        prompt. Same both-switches rule as `auto_launch_active` — and rework
+        additionally requires `auto_launch_active`, because a rework *is* a
+        launch: enabling "fix it again" while "start work for me" is off would
+        be a contradiction, and the more restrictive answer is the safe one."""
+        return self.auto_launch_active and self.auto_rework
+
+    @property
+    def auto_launch_active(self) -> bool:
+        """Whether a tick may actually start processes. Requires *both* the
+        master switch and the launch switch — a single `auto_launch=true` left
+        in the file by an earlier experiment can never launch anything on its
+        own."""
+        return self.enabled and self.auto_launch
+
+    @property
+    def auto_merge_active(self) -> bool:
+        """Whether newly-seeded completion rows may be given an auto-merge
+        policy. Same both-switches rule as `auto_launch_active`. Note this only
+        governs *policy assignment*: the checks/review/mergeability gates in
+        `runtime.completion` remain authoritative over whether a merge actually
+        happens."""
+        return self.enabled and self.auto_merge_after_checks
+
+    def as_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "auto_launch": self.auto_launch,
+            "auto_merge_after_checks": self.auto_merge_after_checks,
+            "auto_rework": self.auto_rework,
+            "auto_remediate_workspace": self.auto_remediate_workspace,
+            "require_independent_review": self.require_independent_review,
+            "max_global_concurrency": self.max_global_concurrency,
+            "max_agent_concurrency": self.max_agent_concurrency,
+            "max_rework_attempts": self.max_rework_attempts,
+            "updated_at": self.updated_at,
+            "updated_by": self.updated_by,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> "PipelineSettings":
+        """Total and fail-closed: anything that is not a dict of recognized,
+        well-typed values yields the all-off defaults."""
+        if not isinstance(data, dict):
+            return cls()
+        updated_at = data.get("updated_at")
+        updated_by = data.get("updated_by")
+        return cls(
+            enabled=_opt_in(data.get("enabled")),
+            auto_launch=_opt_in(data.get("auto_launch")),
+            auto_merge_after_checks=_opt_in(data.get("auto_merge_after_checks")),
+            max_global_concurrency=_concurrency(
+                data.get("max_global_concurrency"), DEFAULT_MAX_GLOBAL_CONCURRENCY
+            ),
+            max_agent_concurrency=_concurrency(
+                data.get("max_agent_concurrency"), DEFAULT_MAX_AGENT_CONCURRENCY
+            ),
+            auto_rework=_opt_in(data.get("auto_rework")),
+            auto_remediate_workspace=_opt_in(data.get("auto_remediate_workspace")),
+            require_independent_review=_opt_in(data.get("require_independent_review")),
+            max_rework_attempts=_bounded_int(
+                data.get("max_rework_attempts"),
+                DEFAULT_MAX_REWORK_ATTEMPTS,
+                MIN_REWORK_ATTEMPTS,
+                MAX_REWORK_ATTEMPTS,
+            ),
+            updated_at=updated_at if isinstance(updated_at, str) else None,
+            updated_by=updated_by if isinstance(updated_by, str) else None,
+        )
+
+
+@contextlib.contextmanager
+def settings_lock(root: Path, *, timeout: float = SETTINGS_LOCK_TIMEOUT_SECONDS):
+    """Cross-process mutual exclusion for the settings read-modify-write cycle
+    — same OS advisory-lock primitive as `execution_queue.queue_lock`."""
+    with storage.file_lock(
+        settings_lock_path(root), timeout=timeout, poll_seconds=_SETTINGS_LOCK_POLL_SECONDS
+    ):
+        yield
+
+
+def load_settings(root: Path) -> PipelineSettings:
+    """Read the persisted settings, or the all-off defaults if nothing has been
+    saved yet. Unlocked by design (a plain read of an atomically-written file);
+    use `update_settings` for anything that writes."""
+    return PipelineSettings.from_dict(storage.read_json(settings_file_path(root), {}))
+
+
+def save_settings(root: Path, settings: PipelineSettings) -> PipelineSettings:
+    """Persist `settings` wholesale under `settings_lock`. Prefer
+    `update_settings` when changing individual fields, so a concurrent writer's
+    unrelated change is not discarded."""
+    with settings_lock(root):
+        storage.atomic_write_json(settings_file_path(root), settings.as_dict())
+    return settings
+
+
+def update_settings(root: Path, *, actor: str | None = None, **changes) -> PipelineSettings:
+    """Lost-update-safe partial update: re-reads the current on-disk settings
+    under `settings_lock`, applies `changes`, stamps `updated_at`/`updated_by`,
+    and writes back — so toggling auto-merge in one session never reverts a
+    concurrency change made in another.
+
+    Unknown field names raise `TypeError` rather than being silently dropped: a
+    typo'd `auto_merge=True` must not read as "auto-merge is enabled" while
+    persisting nothing. Values pass through the same fail-closed coercion as
+    `from_dict`."""
+    unknown = set(changes) - {
+        "enabled",
+        "auto_launch",
+        "auto_merge_after_checks",
+        "auto_rework",
+        "auto_remediate_workspace",
+        "require_independent_review",
+        "max_global_concurrency",
+        "max_agent_concurrency",
+        "max_rework_attempts",
+    }
+    if unknown:
+        raise TypeError(f"Unknown pipeline setting(s): {', '.join(sorted(unknown))}")
+
+    with settings_lock(root):
+        current = PipelineSettings.from_dict(storage.read_json(settings_file_path(root), {}))
+        merged = PipelineSettings.from_dict({**current.as_dict(), **changes})
+        updated = replace(merged, updated_at=models.iso_now(), updated_by=actor)
+        storage.atomic_write_json(settings_file_path(root), updated.as_dict())
+    return updated

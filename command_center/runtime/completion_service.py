@@ -61,10 +61,18 @@ EV_TASK_COMPLETED = "TASK_COMPLETED"
 EV_REQUIRES_ATTENTION = "REQUIRES_ATTENTION"
 EV_RECOVERY_FAILED = "RECOVERY_FAILED"
 EV_STATE_CHANGED = "STATE_CHANGED"
+# Independent review gate (blocking, before any pull request).
+EV_REVIEW_REQUESTED = "REVIEW_REQUESTED"
+EV_REVIEW_APPROVED = "REVIEW_APPROVED"
+EV_REVIEW_REJECTED = "REVIEW_REJECTED"
 # A same-state backoff re-check was scheduled (no state change). Kept distinct
 # from `STATE_CHANGED` so the audit trail never claims a transition happened
 # when only `next_retry_at`/`retry_count` moved.
 EV_RETRY_SCHEDULED = "RETRY_SCHEDULED"
+
+# Canonical independent-review verdicts persisted in `completion.review_verdict`.
+REVIEW_VERDICT_APPROVED = "approved"
+REVIEW_VERDICT_REJECTED = "rejected"
 
 _BACKOFF_BASE_SECONDS = 30
 _BACKOFF_CAP_SECONDS = 3600
@@ -117,6 +125,7 @@ class CompletionOrchestrator:
         *,
         task: dict | None = None,
         project_cfg: dict | None = None,
+        policy_overrides: dict | None = None,
         now: datetime | None = None,
     ) -> dict | None:
         """Create the completion row for a terminally-`COMPLETED` run, if one
@@ -124,7 +133,11 @@ class CompletionOrchestrator:
         the run is not eligible (not a successful execution).
 
         Idempotent: a second call for the same run returns the existing row and
-        never creates a duplicate (the PK on run_id guarantees it)."""
+        never creates a duplicate (the PK on run_id guarantees it). Because the
+        policy is resolved *once*, at seeding, and then persisted in
+        `policy_json`, `policy_overrides` only affects rows this call actually
+        creates — an in-flight completion keeps the policy it was born with
+        rather than having the rules changed underneath it mid-pipeline."""
         run_id = run["id"]
         existing = runtime_db.get_completion(self.db_path, run_id)
         if existing is not None:
@@ -132,7 +145,9 @@ class CompletionOrchestrator:
         if run.get("state") != "COMPLETED":
             return None
 
-        policy = CompletionPolicy.resolve(task=task, project_cfg=project_cfg)
+        policy = CompletionPolicy.resolve(
+            task=task, project_cfg=project_cfg, overrides=policy_overrides
+        )
         repo = run["repository_path"]
         base_branch = (project_cfg or {}).get("default_branch") or DEFAULT_BASE_BRANCH
         # Head branch: prefer the live worktree branch, fall back to the run's
@@ -304,9 +319,80 @@ class CompletionOrchestrator:
         if state in (CompletionState.MERGED, CompletionState.VERIFYING_TARGET_BRANCH):
             return self._step_verify(row, policy=policy, now=now)
 
+        # --- independent review gate (blocking, pre-pull-request) ----------
+        if policy.requires_independent_review and state in (
+            CompletionState.RESULT_VALID,
+            CompletionState.AWAITING_REVIEW,
+        ):
+            gated = self._step_review_gate(row, policy=policy, now=now)
+            if gated is not None:
+                return gated
+
         # --- PR phase (result valid / preparing / open / awaiting / blocked /
         #     closed-unmerged / recovery) ---------------------------------------
         return self._step_pull_request(row, policy=policy, now=now)
+
+    def _step_review_gate(self, row: dict, *, policy: CompletionPolicy, now: datetime):
+        """The blocking independent-review gate.
+
+        Returns `(row, progressed)` while the gate is in control, or `None` once
+        the review has been approved and the PR phase may proceed.
+
+        The orchestrator deliberately does **not** launch the reviewer itself —
+        it is the privileged actor that may push and merge, and launching agents
+        is the launch path's job. It only holds the row in `AWAITING_REVIEW` and
+        reads the verdict that `task_pipeline` writes back. That split is what
+        keeps this module free of any ability to start a process.
+
+        No verdict means *wait*, never *proceed*: a NULL `review_verdict` (which
+        is also what every pre-migration row has) leaves the gate closed."""
+        verdict = (row.get("review_verdict") or "").strip().lower()
+
+        if verdict == REVIEW_VERDICT_APPROVED:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_REVIEW_APPROVED,
+                reason_code=ReasonCode.REVIEW_APPROVED,
+                message=row.get("review_summary") or "Independent review approved the change.",
+            )
+            return None
+
+        if verdict == REVIEW_VERDICT_REJECTED:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_REVIEW_REJECTED,
+                reason_code=ReasonCode.REVIEW_REJECTED,
+                message=row.get("review_summary") or "Independent review rejected the change.",
+            )
+            self._transition(
+                row,
+                state=CompletionState.REVIEW_REJECTED,
+                reason_code=ReasonCode.REVIEW_REJECTED,
+                recommended=(
+                    "Независимая проверка не одобрила изменение: "
+                    + (row.get("review_summary") or "причина не указана")
+                ),
+                requires_human=True,
+                now=now,
+                progressed=False,
+            )
+            return runtime_db.get_completion(self.db_path, row["run_id"]), False
+
+        # No verdict yet. Enter/stay in the gate and wait for one.
+        if row["completion_state"] != CompletionState.AWAITING_REVIEW:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_REVIEW_REQUESTED,
+                reason_code=ReasonCode.REVIEW_PENDING,
+                message="Waiting for an independent review before opening a pull request.",
+            )
+            self._transition(
+                row,
+                state=CompletionState.AWAITING_REVIEW,
+                reason_code=ReasonCode.REVIEW_PENDING,
+                recommended="Ожидается независимая проверка перед созданием pull request.",
+                now=now,
+                progressed=True,
+            )
+            return runtime_db.get_completion(self.db_path, row["run_id"]), True
+        return runtime_db.get_completion(self.db_path, row["run_id"]), False
 
     def _step_validation(self, row: dict, *, policy: CompletionPolicy, now: datetime) -> tuple[dict, bool]:
         repo = row["repository_path"]
@@ -835,6 +921,7 @@ _TERMINAL = frozenset(
     {
         CompletionState.COMPLETED,
         CompletionState.VALIDATION_FAILED,
+        CompletionState.REVIEW_REJECTED,
         CompletionState.REQUIRES_ATTENTION,
         CompletionState.RECOVERY_FAILED,
     }
@@ -842,6 +929,7 @@ _TERMINAL = frozenset(
 _ACTIVE = frozenset(
     {
         CompletionState.EXECUTION_FINISHED,
+        CompletionState.AWAITING_REVIEW,
         CompletionState.VALIDATING_RESULT,
         CompletionState.RESULT_VALID,
         CompletionState.PREPARING_PULL_REQUEST,
