@@ -308,11 +308,20 @@ def _capture_stable_process_identity(
     identical captures retain full start-time+command protection while
     avoiding that false mismatch.
     """
+    # Sample once, immediately, before spending any time stabilizing. A short
+    # run can finish inside the stabilization window, and once it has, its
+    # identity is no longer readable at all — so waiting first and asking later
+    # would refuse to launch exactly the fastest, healthiest runs.
+    immediate = identity.capture_identity(process.pid)
     previous = None
     consecutive = 0
     for _ in range(attempts):
         if process.poll() is not None:
-            return None
+            # Finished before the exec transitions settled. Its PID is pinned by
+            # this unreaped handle and cannot have been reused, so the immediate
+            # sample is exactly as trustworthy as two matching ones.
+            return immediate
+
         current = identity.capture_identity(process.pid)
         if current is not None and previous is not None and current.as_string() == previous.as_string():
             consecutive += 1
@@ -322,7 +331,7 @@ def _capture_stable_process_identity(
             consecutive = 0
         previous = current
         time.sleep(interval_seconds)
-    return None
+    return immediate
 
 
 class Supervisor:
