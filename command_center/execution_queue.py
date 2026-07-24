@@ -56,6 +56,7 @@ existing signatures unchanged — a caller that already serializes its own acces
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,7 +69,14 @@ from command_center import (
     storage,
     workspace_provisioning,
 )
+from command_center.runtime import db as runtime_db
 from command_center.runtime import supervisor as runtime_supervisor
+
+logger = logging.getLogger(__name__)
+
+# Sentinel `entry_id` for "the mirror could not be read at all" — see
+# `queue_divergence`, which must never report an absent mirror as agreement.
+MIRROR_UNAVAILABLE = "__mirror_unavailable__"
 
 QUEUE_FILE_NAME = "execution_queue.json"
 
@@ -102,7 +110,89 @@ def load_queue(root: Path) -> list[dict]:
 
 
 def save_queue(root: Path, entries: list[dict]) -> None:
+    """Persist the queue. JSON is authoritative; the SQLite mirror is written
+    alongside it (ADR 0007 step 1).
+
+    Order matters: JSON first, then the mirror. If the mirror write fails the
+    authoritative store has already committed, so the queue is correct and only
+    the mirror is stale — the divergence check will see it, which is exactly
+    what that check is for. Writing the mirror first would allow the opposite:
+    a mirror ahead of the real queue, which no check would flag as wrong.
+
+    A mirror failure is swallowed for the same reason: during dual-write the
+    mirror is not load-bearing, and letting it break a queue write would mean a
+    migration step could take down the queue it is migrating."""
     storage.atomic_write_json(queue_file_path(root), entries)
+    _mirror_to_runtime_db(root, entries)
+
+
+def _mirror_to_runtime_db(root: Path, entries: list[dict]) -> None:
+    """Best-effort write of the queue into `runtime.db` (ADR 0007 dual-write).
+
+    Deliberately silent on failure — see `save_queue`. The mirror's health is
+    reported by `queue_divergence`, not by exceptions raised at write time."""
+    try:
+        runtime_db.replace_queue_entries(runtime_db.resolve_db_path(root), entries)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        logger.debug("Could not mirror execution queue into runtime.db", exc_info=True)
+
+
+def queue_divergence(root: Path) -> list[dict]:
+    """Entries where the JSON store and the SQLite mirror disagree.
+
+    Returns one record per differing entry: `{entry_id, fields, json, mirror}`,
+    or `[]` when they match.
+
+    An *unreadable* mirror reports a single `MIRROR_UNAVAILABLE` record rather
+    than an empty list. Returning `[]` there would be the dangerous answer: ADR
+    0007 gates "stop writing JSON" on a session with no divergence, and a
+    missing mirror would satisfy that gate by having nothing to disagree with —
+    the migration would advance on the strength of a store that was never
+    written.
+
+    Read-only, and never raises: this runs on a read path during the dual-write
+    phases, and a check that can break the thing it checks is worse than no
+    check."""
+    try:
+        json_entries = load_queue(root)
+        mirror_entries = runtime_db.list_queue_entries(runtime_db.resolve_db_path(root))
+    except Exception as exc:  # noqa: BLE001
+        return [
+            {
+                "entry_id": MIRROR_UNAVAILABLE,
+                "fields": ["*"],
+                "json": None,
+                "mirror": None,
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        ]
+
+    mirror_by_id = {entry.get("id"): entry for entry in mirror_entries}
+    divergences: list[dict] = []
+    for entry in json_entries:
+        entry_id = entry.get("id")
+        mirrored = mirror_by_id.pop(entry_id, None)
+        if mirrored is None:
+            divergences.append(
+                {"entry_id": entry_id, "fields": ["*"], "json": entry, "mirror": None}
+            )
+            continue
+        differing = [
+            field
+            for field in runtime_db._QUEUE_ENTRY_COLUMNS
+            if entry.get(field) != mirrored.get(field)
+        ]
+        if differing:
+            divergences.append(
+                {"entry_id": entry_id, "fields": differing, "json": entry, "mirror": mirrored}
+            )
+    # Anything left in the mirror exists there but not in the authoritative
+    # store — a stale row the mirror failed to delete.
+    for entry_id, mirrored in mirror_by_id.items():
+        divergences.append(
+            {"entry_id": entry_id, "fields": ["*"], "json": None, "mirror": mirrored}
+        )
+    return divergences
 
 
 @contextlib.contextmanager

@@ -90,7 +90,10 @@ def test_upgrade_from_every_supported_historical_schema(
         db.migrate(path)
         assert db.current_schema_version(path) == historical_version
 
-    assert db.SCHEMA_VERSION == current_version == 9
+    # Pinned to the module constant, not a literal: hard-coding the number here
+    # made this test fail on every schema addition for a reason unrelated to
+    # what it verifies (that a historical database upgrades cleanly).
+    assert db.SCHEMA_VERSION == current_version
     db.migrate(path)
     db.migrate(path)
     assert db.current_schema_version(path) == db.SCHEMA_VERSION

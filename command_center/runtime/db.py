@@ -225,7 +225,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -586,6 +586,39 @@ def _migration_8_add_independent_review_fields(conn: sqlite3.Connection) -> None
                 conn.execute(f"ALTER TABLE completion ADD COLUMN {column} TEXT")
 
 
+_SCHEMA_V10 = """
+-- ADR 0007 step 1: the execution queue's home in the execution-state store.
+--
+-- Mirrors `data/execution_queue.json`'s entry shape exactly, field for field,
+-- because during the dual-write phases the two must be comparable without any
+-- translation — a divergence check that had to normalise shapes first would be
+-- checking its own translation as much as the data.
+--
+-- `task_id` is deliberately NOT a foreign key. The task lives in tasks.json,
+-- which stays a human-editable file (see the ADR); the queue's reference to it
+-- is advisory, and an entry whose task has vanished resolves to `cancelled`
+-- with a reason, exactly as `evaluate_readiness` already does today.
+CREATE TABLE IF NOT EXISTS queue_entry (
+    id            TEXT PRIMARY KEY,
+    task_id       TEXT,
+    project       TEXT,
+    state         TEXT NOT NULL,
+    reason        TEXT,
+    run_id        TEXT,
+    added_at      TEXT,
+    evaluated_at  TEXT,
+    launched_at   TEXT,
+    -- Preserves the JSON file's list order, which is load-bearing: the queue is
+    -- displayed and planned in insertion order, and a set-shaped table would
+    -- silently reorder it.
+    position      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_entry_state ON queue_entry(state);
+CREATE INDEX IF NOT EXISTS idx_queue_entry_task ON queue_entry(task_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -604,6 +637,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     # idempotent, so a database that already ran it under the old number simply
     # finds the columns present.
     (9, _migration_9_add_execution_provider_fields),
+    (10, _SCHEMA_V10),
 ]
 
 
@@ -2288,3 +2322,67 @@ def transition_proposal_atomic(
             _proposal_event_from_spec(conn, proposal_id, event, now=now)
             updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
             return dict(updated)
+
+
+# --------------------------------------------------------------------------
+# Execution queue (ADR 0007) — the SQLite home of `execution_queue.json`
+#
+# These are storage primitives only. Every rule about *what* a queue entry may
+# contain, when it becomes ready, and what launching it means stays in
+# `command_center.execution_queue`; this layer just stores and returns rows.
+# During the dual-write phases the JSON file remains authoritative, so nothing
+# here may raise on data the JSON store would have accepted.
+# --------------------------------------------------------------------------
+
+_QUEUE_ENTRY_COLUMNS: tuple[str, ...] = (
+    "id",
+    "task_id",
+    "project",
+    "state",
+    "reason",
+    "run_id",
+    "added_at",
+    "evaluated_at",
+    "launched_at",
+)
+
+
+def replace_queue_entries(db_path: Path, entries: list[dict]) -> None:
+    """Persist `entries` as the complete queue, in the given order.
+
+    Whole-list replacement rather than per-entry upsert, deliberately: that is
+    exactly the semantics `execution_queue.save_queue` has today, so during
+    dual-write the two stores cannot drift through a difference in *how* they
+    are written. `position` preserves list order, which the queue's display and
+    planning both depend on.
+
+    Unknown keys on an entry are ignored rather than rejected — the JSON store
+    accepts them, and a dual-write phase where SQLite is stricter than the
+    authoritative store would fail on data that is, by definition, valid."""
+    rows = [
+        {
+            **{column: entry.get(column) for column in _QUEUE_ENTRY_COLUMNS},
+            "position": index,
+        }
+        for index, entry in enumerate(entries)
+    ]
+    columns = ", ".join((*_QUEUE_ENTRY_COLUMNS, "position"))
+    placeholders = ", ".join(f":{name}" for name in (*_QUEUE_ENTRY_COLUMNS, "position"))
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute("DELETE FROM queue_entry")
+            if rows:
+                conn.executemany(
+                    f"INSERT INTO queue_entry ({columns}) VALUES ({placeholders})", rows
+                )
+
+
+def list_queue_entries(db_path: Path) -> list[dict]:
+    """Every queue entry in stored order, shaped exactly like a JSON entry so a
+    divergence check can compare the two directly, with no translation step of
+    its own to be wrong about."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(_QUEUE_ENTRY_COLUMNS)} FROM queue_entry ORDER BY position ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
