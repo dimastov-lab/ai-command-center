@@ -218,6 +218,17 @@ REMEDIATION_BY_REASON: dict[str, str] = {
         "проверьте изоляцию worktree."
     ),
     execution_queue.LAUNCH_SKIP_LAUNCH_ERROR: "Запуск завершился ошибкой — см. сообщение.",
+    # Provider-reported causes (see `providers.*.classify_failure`). These
+    # arrive as a run's `failure_reason`, and the wave shows them verbatim, so
+    # each needs the one action that actually resolves it.
+    "session_expired": "Сессия Claude истекла — выполните `claude` в терминале и войдите заново.",
+    "authentication_failed": "Не пройдена аутентификация провайдера — проверьте вход и ключи.",
+    "quota_limit": "Исчерпан лимит/квота провайдера — дождитесь сброса или смените план.",
+    "provider_api_error": "Временная ошибка API провайдера — задача будет повторена.",
+    "provider_exit_nonzero": "Процесс завершился с ненулевым кодом — см. отчёт прогона.",
+    "daemon_unreachable": "Локальный сервер Ollama недоступен — запустите `ollama serve`.",
+    "model_missing": "Модель не скачана — выполните `ollama pull <модель>`.",
+    "insufficient_memory": "Недостаточно памяти для модели — выберите модель меньше.",
 }
 
 

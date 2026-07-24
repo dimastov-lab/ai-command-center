@@ -497,7 +497,13 @@ class ClaudeRuntime:
 
     @staticmethod
     def event_is_provider_error(event: dict) -> bool:
-        return False
+        """A `result` carrying `is_error` is the CLI reporting that the turn
+        failed on its side — an expired session, an exhausted quota, an API
+        fault. Treating it as diagnostic evidence is what lets
+        `classify_failure` turn a bare exit code into an actionable reason;
+        without it the operator sees only "FAILED" for a run that never even
+        reached the model."""
+        return bool(event.get("event_type") == "result" and event.get("payload", {}).get("is_error"))
 
 
 class CodexRuntime:
@@ -668,7 +674,24 @@ class ClaudeProvider:
 
     @staticmethod
     def classify_failure(*, exit_code: int, diagnostic_lines: list[str]) -> str | None:
-        return None
+        """Name the cause when the CLI itself reported one.
+
+        `diagnostic_lines` is already sanitized and bounded by the Supervisor.
+        The checks are ordered most-specific first: an expired session and an
+        exhausted quota are both "authentication-adjacent" in wording, and
+        conflating them would send the operator to the wrong remedy."""
+        text = "\n".join(diagnostic_lines).lower()
+        if not text:
+            return "provider_exit_nonzero" if exit_code else None
+        if "oauth" in text or "session expired" in text or "log in" in text or "login" in text:
+            return "session_expired"
+        if any(token in text for token in ("quota", "usage limit", "spend limit", "rate limit")):
+            return "quota_limit"
+        if any(token in text for token in ("authenticate", "authentication", "unauthorized", "api key")):
+            return "authentication_failed"
+        if "overloaded" in text or "api_error" in text or "api error" in text:
+            return "provider_api_error"
+        return "provider_exit_nonzero" if exit_code else None
 
 
 class CodexProvider:

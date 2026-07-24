@@ -159,3 +159,70 @@ def test_ollama_is_a_recognized_provider_requiring_explicit_project_opt_in():
     assert providers.OLLAMA_ID in project_config.EXECUTION_PROVIDER_IDS
     # Never allowed by default — the legacy-safe default stays Claude-only.
     assert providers.OLLAMA_ID not in project_config.DEFAULT_ALLOWED_AGENTS
+
+
+# --------------------------------------------------------------------------
+# Claude failure classification (reported by the CLI, not inferred)
+# --------------------------------------------------------------------------
+
+
+def _claude():
+    return providers.get_provider(providers.CLAUDE_ID)
+
+
+def test_an_errored_result_becomes_diagnostic_evidence():
+    """Without this the CLI's own explanation never reaches
+    `classify_failure`, and a run that never reached the model reports only
+    a bare exit code."""
+    runtime = providers.ClaudeRuntime()
+    assert runtime.event_is_provider_error(
+        {"event_type": "result", "payload": {"is_error": True, "result": "boom"}}
+    )
+    assert not runtime.event_is_provider_error(
+        {"event_type": "result", "payload": {"is_error": False}}
+    )
+    assert not runtime.event_is_provider_error({"event_type": "assistant", "payload": {}})
+
+
+@pytest.mark.parametrize(
+    "evidence,expected",
+    [
+        # The real payload observed from an expired local session.
+        ("Failed to authenticate: OAuth session expired and could not be refreshed", "session_expired"),
+        ("Please run /login to continue", "session_expired"),
+        ("usage limit reached; check your quota", "quota_limit"),
+        ("unauthorized: invalid api key", "authentication_failed"),
+        ("Upstream overloaded, try again", "provider_api_error"),
+        ("something unrecognized", "provider_exit_nonzero"),
+    ],
+)
+def test_claude_failures_are_named_from_cli_evidence(evidence, expected):
+    assert _claude().classify_failure(exit_code=1, diagnostic_lines=[evidence]) == expected
+
+
+def test_session_expiry_is_not_conflated_with_a_quota_limit():
+    """Both read as 'authentication-adjacent' in wording, but they send the
+    operator to different remedies."""
+    assert _claude().classify_failure(
+        exit_code=1, diagnostic_lines=["OAuth session expired"]
+    ) != _claude().classify_failure(exit_code=1, diagnostic_lines=["spend limit exceeded"])
+
+
+def test_a_clean_claude_exit_is_not_a_failure():
+    assert _claude().classify_failure(exit_code=0, diagnostic_lines=[]) is None
+
+
+def test_every_provider_failure_code_has_operator_remediation():
+    from command_center import task_pipeline
+
+    codes = set()
+    for provider in (providers.get_provider(pid) for pid in providers.provider_ids()):
+        for evidence in (
+            "OAuth session expired", "usage limit", "unauthorized", "overloaded",
+            "could not connect to ollama app", "model 'x' not found", "cannot allocate memory", "?",
+        ):
+            code = provider.classify_failure(exit_code=1, diagnostic_lines=[evidence])
+            if code:
+                codes.add(code)
+    missing = codes - set(task_pipeline.REMEDIATION_BY_REASON)
+    assert not missing, f"нет подсказки для: {sorted(missing)}"
