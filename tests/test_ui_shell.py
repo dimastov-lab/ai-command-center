@@ -33,10 +33,11 @@ def test_shell_renders_title_and_sidebar_navigation():
     at = _at_on_page("dashboard")
     assert not at.exception
     assert at.title[0].value == "🧭 AI Command Center"
-    assert at.sidebar.radio[0].key == "nav_page"
-    options = at.sidebar.radio[0].options
-    assert any("Обзор" in option for option in options)
-    assert any("Focus Mode" in option for option in options)
+    # The nav is grouped buttons now, not one flat radio. Asserts the property
+    # — sections are reachable — rather than the widget implementing it.
+    keys = {b.key for b in at.sidebar.button}
+    assert "nav_btn_dashboard" in keys
+    assert "nav_btn_focus" in keys
 
 
 def test_sidebar_still_has_command_palette_trigger():

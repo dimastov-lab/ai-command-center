@@ -1291,28 +1291,26 @@ def _repoint_to_own_worktree(
         return None
     try:
         current = Path(workspace).expanduser().resolve()
+        current_str = str(current)
         repo = Path(repository_path).expanduser().resolve()
     except OSError:
         return None
-    if current != repo:
-        # Pointing somewhere else entirely — that is a configuration question
-        # this function must not answer by guessing.
-        return None
-
-    # A branch can only be checked out in one worktree at a time. If this
-    # branch already lives somewhere — an older worktree from a previous
-    # session, a directory the operator made by hand — adopt that path instead
-    # of deriving a fresh one: `git worktree add` would refuse with "cannot
-    # attach an already-checked-out branch to a second worktree", leaving the
-    # task permanently unlaunchable for a reason it cannot fix itself.
+    # A branch already checked out somewhere is the strongest constraint git
+    # imposes, and it applies wherever the task currently points — not only
+    # when it points at the primary tree. Checked before the "points elsewhere"
+    # guard below, which would otherwise return early and leave the task
+    # permanently refused by `no_conflicting_worktree`.
     existing = _worktree_holding_branch(repository_path, branch)
-    if existing is not None:
-        if existing == workspace:
-            return None
+    if existing is not None and existing != current_str:
         return existing, (
             f"ветка «{branch}» уже выгружена в {existing}; задача направлена туда, "
             "второй worktree на ту же ветку git не допускает"
         )
+
+    if current != repo:
+        # Pointing somewhere else entirely, and its branch is free — that is a
+        # configuration question this function must not answer by guessing.
+        return None
 
     target = derive_worktree_path(repository_path, branch)
     if target.exists():

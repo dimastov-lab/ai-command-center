@@ -85,8 +85,8 @@ def test_execution_center_page_renders_and_nav_entry_exists():
     assert not at.exception
     assert at.subheader[0].value == "Live Execution Center"
 
-    nav_options = at.radio(key="nav_page").options
-    assert any("Live Execution Center" in option for option in nav_options)
+    # Nav is grouped buttons now, not one flat radio.
+    assert any(b.key == "nav_btn_execution_center" for b in at.sidebar.button)
 
 
 def test_execution_center_provider_selector_defaults_to_claude_only():
