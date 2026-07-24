@@ -62,6 +62,7 @@ from pathlib import Path
 
 from command_center import (
     agent_runner,
+    prompts,
     launch,
     launch_service,
     models,
@@ -538,7 +539,11 @@ def launch_ready(
             run = launch_service.execute_agent_launch_v2(
                 project=task.get("project"),
                 task_type=task.get("task_type") or "implementation",
-                prompt=task.get("prompt") or task.get("goal") or task.get("title") or "",
+                # A task without its own prompt used to reach the agent as
+                # nothing but its title. `prompts.build_prompt` composes the
+                # instruction for its task type instead, and returns a
+                # deliberately-written prompt untouched when there is one.
+                prompt=prompts.build_prompt(task),
                 timeout_seconds=(
                     timeout_seconds
                     if timeout_seconds is not None
