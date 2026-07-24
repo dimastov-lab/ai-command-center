@@ -38,6 +38,7 @@ from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
     autopilot_panel,
+    waves_panel,
     content_area,
     portfolio_overview_panel,
     portfolio_panel,
@@ -178,6 +179,7 @@ NAV: dict[str, tuple[str, str]] = {
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
     "kanban": ("Kanban", ":material/view_kanban:"),
+    "waves": ("Волны", ":material/waves:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
     "execution_center": ("Live Execution Center", ":material/bolt:"),
     "runs": ("Журнал запусков", ":material/history:"),
@@ -2839,6 +2841,10 @@ elif page_key == "chat":
 # --------------------------------------------------------------------------
 # Kanban board
 # --------------------------------------------------------------------------
+
+elif page_key == "waves":
+    project_filter = project_selector.render_project_selector(tasks, key="waves_project_selector")
+    waves_panel.render_waves_page(tasks, tasks_by_id, ROOT, project=project_filter)
 
 elif page_key == "kanban":
     st.subheader("Kanban")
