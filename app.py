@@ -1863,6 +1863,13 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # launches anything.
     execution_queue.reevaluate_and_persist(ROOT, {t["id"]: t for t in tasks if t.get("id")})
 
+    # Only a tick that actually ran replaces what is on screen. A disabled or
+    # busy tick carries no wave, and letting it through would wipe the last
+    # real one — leaving the operator staring at "нет данных" mid-session.
+    autopilot_panel.render_autopilot_wave(
+        tick_result if tick_result is not None and tick_result.ran else None
+    )
+
     if tick_result is not None and tick_result.ran:
         # Durable outcome for the autopilot panel (AICC-DESKTOP-017): stashing
         # it rather than rendering inline is what keeps launches/skips/merge
@@ -1941,8 +1948,10 @@ def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: lis
     # controls stay interactive at a fixed position instead of being torn down
     # and rebuilt on every fragment refresh. It reads the tick result the
     # refresh path stashes; it never runs a tick itself.
+    # Controls only. The wave is rendered inside the refresh body below, where
+    # it re-renders on every tick; here it would freeze at first load.
     with st.expander("Автопилот рабочего стола", icon=":material/auto_mode:"):
-        autopilot_panel.render_autopilot_panel(ROOT)
+        autopilot_panel.render_autopilot_controls(ROOT)
 
     if auto_refresh:
         _EXECUTION_CENTER_POLLERS[interval](api, tasks)

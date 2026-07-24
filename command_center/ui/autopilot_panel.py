@@ -241,16 +241,29 @@ def _render_decisions(decisions, *, empty_caption: str) -> None:
 
 
 def render_autopilot_panel(root: Path, *, key_prefix: str = "autopilot") -> None:
-    """The full surface: controls, the wave, and the last tick's durable
-    outcome. Reads the tick result stashed by the app's refresh path; renders
-    nothing about execution it has not been given."""
+    """Controls plus the wave, for callers that render both in one place."""
     render_autopilot_controls(root, key_prefix=key_prefix)
+    render_autopilot_wave()
+
+
+def render_autopilot_wave(result=None) -> None:
+    """The wave and the last tick's durable outcome.
+
+    Separate from the controls because the two have opposite refresh needs: the
+    toggles must keep a stable identity and position across reruns, while the
+    wave is only meaningful if it re-renders with every tick. Rendering both
+    outside the auto-refresh fragment left the wave frozen at whatever existed
+    on first load — which, on a fresh session, is nothing at all.
+
+    `result` may be passed directly by the refresh path that just computed it;
+    otherwise the stashed one is used."""
+    if result is None:
+        result = st.session_state.get(TICK_RESULT_KEY)
 
     failure = st.session_state.pop(TICK_ERROR_KEY, None)
     if failure:
         st.error(f"Тик автопилота не выполнен: {failure}", icon=":material/error:")
 
-    result = st.session_state.get(TICK_RESULT_KEY)
     if result is None:
         st.caption("Пока нет данных: волна появится после первого обновления Live Execution Center.")
         return
