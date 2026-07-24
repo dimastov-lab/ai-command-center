@@ -558,6 +558,26 @@ def _skip(entry: dict, task: dict | None, reason_code: str, explanation: str) ->
     )
 
 
+
+def _preferred_agent(task: dict, project_id: str | None) -> str | None:
+    """The execution provider this task should be planned onto, or `None` to
+    let capability matching decide.
+
+    Precedence: the task's own `executor` when the project authorizes it, else
+    the project's first authorized provider. A task naming a provider its
+    project forbids is *not* silently redirected — it keeps its choice so the
+    launcher's authorization gate refuses it visibly, rather than the work
+    quietly running somewhere the operator did not intend."""
+    try:
+        allowed = project_config.allowed_execution_providers(project_id)
+    except Exception:  # noqa: BLE001 — malformed policy is reported by the launcher
+        return task.get("executor") or None
+    requested = task.get("executor")
+    if requested:
+        return requested
+    return allowed[0] if allowed else None
+
+
 def adapt_ready_entries(
     entries: list[dict],
     tasks_by_id: dict[str, dict],
@@ -655,15 +675,16 @@ def adapt_ready_entries(
                     task.get("task_type") or "implementation"
                 ),
                 priority=task.get("priority") or "Medium",
-                # Deliberately unpinned. `task["executor"]` is bookkeeping on
-                # the v2 launch path: `execute_agent_launch_v2` -> `start_run`
-                # -> `Supervisor.start_raw` always spawns the Claude CLI
-                # regardless of its value. Pinning it here would let the planner
-                # emit BLOCKED/`no_capable_agent` for work the launcher would in
-                # fact have run — a decision that does not describe what
-                # happens. Capability matching picks the agent that really
-                # executes, so `decision.agent_id` stays truthful.
-                preferred_agent=None,
+                # Pinned to a provider the project actually authorizes. This
+                # was deliberately left unpinned while `start_raw` always
+                # spawned the Claude CLI regardless of `executor`; once the
+                # provider abstraction landed that stopped being true, and an
+                # unpinned planner started assigning whichever available agent
+                # had the most spare capacity — including one the project
+                # forbids, producing an ASSIGN that `require_execution_provider_
+                # allowed` then refused at launch. The planner must not propose
+                # work the launcher is required to reject.
+                preferred_agent=_preferred_agent(task, canonical),
                 # A READY entry is by definition dependency-satisfied, but the
                 # queue file is persisted state that could be stale relative to
                 # `tasks.json`. Recomputing from the live graph is pure and
@@ -1219,6 +1240,24 @@ def derive_worktree_path(repository_path: str, branch: str) -> Path:
     return repo.parent / f"{repo.name}{WORKTREE_PARENT_SUFFIX}" / slug
 
 
+
+def _worktree_holding_branch(repository_path: str, branch: str) -> str | None:
+    """The resolved path of the worktree that currently has `branch` checked
+    out, or `None`. Read-only; a git failure resolves to `None` so a missing or
+    unreadable repository degrades to "derive a fresh path" rather than raising
+    inside planning."""
+    try:
+        for entry in git_info.get_worktrees(Path(repository_path)):
+            if entry.get("branch") != branch:
+                continue
+            path = entry.get("path")
+            if path:
+                return str(Path(path).expanduser().resolve())
+    except Exception:  # noqa: BLE001 — planning must not fail on a git hiccup
+        return None
+    return None
+
+
 def _repoint_to_own_worktree(
     task: dict, prep, *, repository_path: str | None
 ) -> tuple[str, str] | None:
@@ -1257,6 +1296,21 @@ def _repoint_to_own_worktree(
         # Pointing somewhere else entirely — that is a configuration question
         # this function must not answer by guessing.
         return None
+
+    # A branch can only be checked out in one worktree at a time. If this
+    # branch already lives somewhere — an older worktree from a previous
+    # session, a directory the operator made by hand — adopt that path instead
+    # of deriving a fresh one: `git worktree add` would refuse with "cannot
+    # attach an already-checked-out branch to a second worktree", leaving the
+    # task permanently unlaunchable for a reason it cannot fix itself.
+    existing = _worktree_holding_branch(repository_path, branch)
+    if existing is not None:
+        if existing == workspace:
+            return None
+        return existing, (
+            f"ветка «{branch}» уже выгружена в {existing}; задача направлена туда, "
+            "второй worktree на ту же ветку git не допускает"
+        )
 
     target = derive_worktree_path(repository_path, branch)
     if target.exists():

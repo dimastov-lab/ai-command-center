@@ -989,3 +989,82 @@ def test_a_workspace_pointing_somewhere_unrelated_is_not_guessed_at(tmp_path, gi
     )
     assert [r["outcome"] for r in records] != [task_pipeline.REMEDIATION_REPOINTED]
     assert tasks_repository.load_tasks(tmp_path)[0]["workspace_path"] == str(other)
+
+
+# --------------------------------------------------------------------------
+# Planning must not propose work the launcher is required to reject
+# --------------------------------------------------------------------------
+
+
+def test_planner_pins_a_provider_the_project_authorizes(tmp_path, git_repo, api, monkeypatch):
+    """Once providers became real, an unpinned planner assigned whichever agent
+    had the most spare capacity — including one the project forbids, producing
+    an ASSIGN that the launch authorization gate then refused."""
+    from command_center import project_config
+
+    monkeypatch.setattr(
+        project_config, "allowed_execution_providers", lambda pid: ("claude_code",)
+    )
+    task = _task(id="a", workspace_path=str(git_repo))
+    wave = task_pipeline.adapt_ready_entries(
+        [_entry("q1", "a")], {"a": task}, {"AIOS": {"repository_path": str(git_repo)}},
+        db_path=api.db_path,
+    )
+    assert wave.work_items[0].preferred_agent == "claude_code"
+
+
+def test_a_task_naming_a_forbidden_provider_is_not_silently_redirected(
+    tmp_path, git_repo, api, monkeypatch
+):
+    """Redirecting it would run the work somewhere the operator did not choose.
+    Keeping the request lets the authorization gate refuse it visibly."""
+    from command_center import project_config
+
+    monkeypatch.setattr(
+        project_config, "allowed_execution_providers", lambda pid: ("claude_code",)
+    )
+    task = _task(id="a", workspace_path=str(git_repo), executor="codex")
+    wave = task_pipeline.adapt_ready_entries(
+        [_entry("q1", "a")], {"a": task}, {"AIOS": {"repository_path": str(git_repo)}},
+        db_path=api.db_path,
+    )
+    assert wave.work_items[0].preferred_agent == "codex"
+
+
+def test_an_already_checked_out_branch_reuses_its_worktree(tmp_path, git_repo, api):
+    """git allows one worktree per branch. Deriving a second path would fail
+    with "cannot attach an already-checked-out branch", leaving the task
+    permanently unlaunchable for a reason it cannot fix itself."""
+    import subprocess
+
+    existing = tmp_path / "already-here"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/taken", str(existing), "HEAD"],
+        cwd=git_repo, check=True, capture_output=True,
+    )
+    assert task_pipeline._worktree_holding_branch(str(git_repo), "feature/taken") == str(
+        existing.resolve()
+    )
+
+    task = _task(id="a", workspace_path=None, branch="feature/taken")
+    tasks_repository.save_tasks(tmp_path, [task])
+    cfg = {"AIOS": {"repository_path": str(git_repo), "default_branch": "main"}}
+    records = task_pipeline.remediate_workspaces(
+        tmp_path, {"a": task}, cfg, settings=_remediate_settings()
+    )
+    assert [r["outcome"] for r in records] == [task_pipeline.REMEDIATION_REPOINTED]
+    assert tasks_repository.load_tasks(tmp_path)[0]["workspace_path"] == str(existing.resolve())
+
+
+def test_a_free_branch_still_gets_a_fresh_derived_worktree(tmp_path, git_repo, api):
+    assert task_pipeline._worktree_holding_branch(str(git_repo), "feature/unused") is None
+    task = _task(id="a", workspace_path=None, branch="feature/unused")
+    tasks_repository.save_tasks(tmp_path, [task])
+    cfg = {"AIOS": {"repository_path": str(git_repo), "default_branch": "main"}}
+    task_pipeline.remediate_workspaces(tmp_path, {"a": task}, cfg, settings=_remediate_settings())
+    expected = task_pipeline.derive_worktree_path(str(git_repo), "feature/unused")
+    assert tasks_repository.load_tasks(tmp_path)[0]["workspace_path"] == str(expected)
+
+
+def test_branch_lookup_degrades_quietly_on_a_bad_repository():
+    assert task_pipeline._worktree_holding_branch("/nonexistent/repo", "any") is None
