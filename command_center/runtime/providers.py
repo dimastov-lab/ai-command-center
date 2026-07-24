@@ -25,9 +25,16 @@ from command_center.runtime import stream_parser
 
 CLAUDE_ID = "claude_code"
 CODEX_ID = "codex"
+OLLAMA_ID = "ollama"
 
 MAX_PERSISTED_EVENT_CHARS = 65_536
 MAX_CODEX_PROMPT_CHARS = 100_000
+
+# Ollama runs a local model with a fixed context window and no retrieval, so an
+# oversized prompt is silently truncated by the runner rather than refused. A
+# lower ceiling than Codex's keeps the failure explicit and on our side.
+MAX_OLLAMA_PROMPT_CHARS = 32_000
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
 MAX_REDACTION_SOURCE_CHARS = 16_384
 MAX_PROMPT_PATTERNS = 96
 MAX_CREDENTIAL_CHARS = 512
@@ -777,9 +784,211 @@ class CodexProvider:
         return "provider_exit_nonzero" if exit_code else None
 
 
+
+class OllamaRuntime:
+    """Plain-text runtime: Ollama emits prose, not a structured event stream.
+
+    `requires_valid_result = False` because there is no machine-checkable
+    "the turn completed successfully" marker to require — the process exit code
+    is the only completion signal the runner gives. `requires_verified_identity`
+    stays True: identity verification protects against signalling a reused PID
+    during cancellation, which has nothing to do with what the process prints.
+    """
+
+    requires_valid_result = False
+    requires_verified_identity = True
+
+    def __init__(self, prompt: str, sensitive_values: tuple[str, ...] = ()) -> None:
+        self._boundary = SanitizationBoundary(prompt, sensitive_values)
+
+    def feed_stdout(self, chunk: str) -> list[str]:
+        return self._boundary.feed_stdout(chunk)
+
+    def feed_stderr(self, chunk: str) -> list[str]:
+        return self._boundary.feed_stderr(chunk)
+
+    def flush_stdout(self) -> list[str]:
+        return self._boundary.flush_stdout()
+
+    def flush_stderr(self) -> list[str]:
+        return self._boundary.flush_stderr()
+
+    @staticmethod
+    def parse_stdout_line(line: str) -> dict | None:
+        """Every non-blank line is assistant text. Ollama has no event
+        vocabulary to normalize, so nothing is invented here: the line is
+        persisted as-is under the existing `assistant` event type."""
+        text = line.rstrip("\n").rstrip("\r")
+        if not text.strip():
+            return None
+        return {"event_type": "assistant", "payload": {"text": text}}
+
+    @staticmethod
+    def stdout_event_is_readiness(line: str, event: dict | None) -> bool:
+        return bool(line.strip())
+
+    @staticmethod
+    def stderr_line_is_readiness(line: str) -> bool:
+        # Ollama writes model-pull and load progress to stderr before the first
+        # token. That proves the process is alive and working, which is exactly
+        # what readiness means here.
+        return bool(line.strip())
+
+    @staticmethod
+    def event_is_valid_result(event: dict) -> bool:
+        return False
+
+    @staticmethod
+    def event_is_provider_error(event: dict) -> bool:
+        return False
+
+
+class OllamaProvider:
+    """A local Ollama model as an execution provider.
+
+    **Scope, stated plainly.** Ollama's stable non-interactive interface is
+    `ollama run MODEL` — text in, text out. It has no file editing, no shell and
+    no git. Tools exist only behind `--experimental`, whose companion flag
+    `--experimental-yolo` skips every tool approval; neither is used here, and
+    enabling them by default would hand an unsupervised local model write access
+    to a repository.
+
+    So this provider is deliberately restricted to **read-only task types**
+    (`agent_runner.READ_ONLY_TASK_TYPES` — review, audit and the like). That is
+    not a temporary limitation to be relaxed later by flipping a flag: a run
+    that cannot modify the working tree can never satisfy an implementation
+    task, and letting one be dispatched would produce a run that "succeeds"
+    while changing nothing. Refusing at launch is the honest failure.
+
+    Within that scope it is genuinely useful: an independent reviewer that costs
+    nothing per token and never leaves the machine.
+    """
+
+    id = OLLAMA_ID
+    label = "Ollama (local)"
+    supports_resume = False
+    # A read-only model cannot write, so it cannot corrupt a shared tree; the
+    # dedicated-worktree requirement exists to stop two *writers* colliding.
+    requires_dedicated_worktree = False
+
+    def _executable(self) -> str | None:
+        configured = os.environ.get("AICC_OLLAMA_BINARY")
+        if configured:
+            path = Path(configured).expanduser()
+            return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+        return shutil.which("ollama")
+
+    def _model(self, model: str | None) -> str:
+        return model or os.environ.get("AICC_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL
+
+    def availability(self) -> ProviderAvailability:
+        executable = self._executable()
+        if executable is None:
+            return ProviderAvailability(
+                self.id,
+                False,
+                "executable_missing",
+                "Ollama not found; install it or configure AICC_OLLAMA_BINARY.",
+            )
+        version_ok, version = _probe(executable, ["--version"], provider_id=self.id)
+        if not version_ok:
+            return ProviderAvailability(self.id, False, "version_probe_failed", version, executable=executable)
+        # `ollama list` is the cheapest proof that the local daemon is actually
+        # reachable. Without it the binary exists but every run would fail on
+        # first token with a connection error.
+        daemon_ok, listing = _probe(executable, ["list"], provider_id=self.id)
+        if not daemon_ok:
+            return ProviderAvailability(
+                self.id,
+                False,
+                "daemon_unreachable",
+                "Ollama binary found but the local server is not reachable; start it with `ollama serve`.",
+                executable,
+                version,
+            )
+        return ProviderAvailability(self.id, True, "usable", "Ollama is available.", executable, version)
+
+    @staticmethod
+    def validate_prompt(prompt: str) -> None:
+        if len(prompt) > MAX_OLLAMA_PROMPT_CHARS:
+            raise ValueError(
+                f"Ollama prompt exceeds the {MAX_OLLAMA_PROMPT_CHARS}-character limit; "
+                "a local model would silently truncate it."
+            )
+        _sensitive_environment_values(dict(os.environ))
+
+    def build_launch(
+        self,
+        *,
+        repository_path: Path,
+        session_id: str,
+        prompt: str,
+        task_type: str,
+        is_resume: bool,
+        model: str | None,
+    ) -> LaunchSpec:
+        if is_resume:
+            raise ValueError("Ollama resume is not supported: each run is a fresh, stateless completion.")
+        if task_type not in agent_runner.READ_ONLY_TASK_TYPES:
+            raise ValueError(
+                f"Ollama cannot run task type {task_type!r}: it has no file-editing or shell "
+                "capability, so it is restricted to read-only task types "
+                f"({', '.join(sorted(agent_runner.READ_ONLY_TASK_TYPES))})."
+            )
+        self.validate_prompt(prompt)
+        environment = dict(os.environ)
+        _sensitive_environment_values(environment)
+        availability = self.availability()
+        if not availability.available or not availability.executable:
+            raise RuntimeError(availability.message)
+
+        resolved_model = self._model(model)
+        argv = [
+            availability.executable,
+            "run",
+            resolved_model,
+            # Keep output a plain token stream: no reflowing that would corrupt
+            # quoted diffs, and no chain-of-thought for reasoning models, which
+            # is noise the reviewer's verdict must not be parsed out of.
+            "--nowordwrap",
+            "--hidethinking",
+        ]
+        audit = {
+            "provider_id": self.id,
+            "provider_version": availability.version,
+            "model": resolved_model,
+            "non_interactive": True,
+            "sandbox": "read_only_no_tools",
+            "readiness": "first_output_line",
+            "result_evidence": "process_exit_zero",
+            "cancellation": "verified_process_group_sigterm_then_sigkill",
+            **_prompt_audit(prompt, "stdin"),
+        }
+        return LaunchSpec(tuple(argv), environment, prompt, audit)
+
+    @staticmethod
+    def create_runtime(*, prompt: str, environment: dict[str, str]) -> ProviderRuntime:
+        return OllamaRuntime(prompt, _sensitive_environment_values(environment))
+
+    def parse_stdout_line(self, line: str) -> dict | None:
+        return OllamaRuntime("").parse_stdout_line(line)
+
+    @staticmethod
+    def classify_failure(*, exit_code: int, diagnostic_lines: list[str]) -> str | None:
+        text = "\n".join(diagnostic_lines).lower()
+        if any(token in text for token in ("connection refused", "could not connect", "dial tcp")):
+            return "daemon_unreachable"
+        if "not found" in text and "model" in text:
+            return "model_missing"
+        if any(token in text for token in ("out of memory", "insufficient memory", "cannot allocate")):
+            return "insufficient_memory"
+        return "provider_exit_nonzero" if exit_code else None
+
+
 _PROVIDERS: dict[str, ExecutionProvider] = {
     CLAUDE_ID: ClaudeProvider(),
     CODEX_ID: CodexProvider(),
+    OLLAMA_ID: OllamaProvider(),
 }
 
 
