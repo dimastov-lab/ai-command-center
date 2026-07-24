@@ -31,6 +31,16 @@ def render_sidebar(
         )
         st.divider()
         st.markdown("### Навигация")
+        # Session state does not survive a browser refresh — a reload starts a
+        # new session — so the section would silently reset to the first option
+        # every time. The URL does survive, so it is the honest place to keep
+        # "which section am I in". Seeded before the radio is created, because
+        # Streamlit refuses to reassign a widget's key once the widget exists.
+        if "nav_page" not in st.session_state:
+            requested = st.query_params.get("page")
+            if requested in nav:
+                st.session_state["nav_page"] = requested
+
         page_key = st.radio(
             "Раздел",
             options=list(nav.keys()),
@@ -38,6 +48,11 @@ def render_sidebar(
             label_visibility="collapsed",
             key="nav_page",
         )
+        # Mirror the section back into the URL so a refresh — or a copied link —
+        # reopens where the operator actually was.
+        if st.query_params.get("page") != page_key:
+            st.query_params["page"] = page_key
+
         st.divider()
         st.caption(f"Проектов в реестре: {project_count}")
         st.caption("Локальный режим · без внешних сервисов")
