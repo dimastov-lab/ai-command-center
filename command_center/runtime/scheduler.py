@@ -116,6 +116,26 @@ TERMINAL = "terminal"
 _TERMINAL_STATES: frozenset[str] = frozenset({"CANCELLED"})
 _TERMINAL_REASON_PREFIXES: tuple[str, ...] = ("blocked:",)
 
+# Exceptions to `blocked:` being terminal.
+#
+# `blocked:` means the agent did not do the work, and most such refusals are
+# genuinely terminal: `blocked:final_response` is the agent's own judgement
+# that it cannot proceed, and repeating the identical attempt cannot change a
+# judgement.
+#
+# A *permission* denial is different in kind. It records the state of the
+# environment's tool policy at the moment of the run, not anything about the
+# task — and that policy is exactly the thing an operator changes in response
+# to seeing the failure. Treating it as terminal meant a task stayed
+# permanently unrunnable after its permissions were fixed, with no way to
+# retry short of editing run history. (Observed: eight runs blocked on
+# `permission_denied:Glob,Read`, all still refused after the allow rule was
+# added.)
+#
+# Recoverable does not mean unbounded: the retry budget and backoff still
+# apply, so a genuinely mis-permissioned task exhausts its attempts and stops.
+_RECOVERABLE_REASON_PREFIXES: tuple[str, ...] = ("blocked:permission_denied",)
+
 # Prior run states that mean "an attempt was made and did NOT succeed", so the
 # retry policy (budget + backoff + terminal classification) must apply whenever
 # `attempts_made > 0`. This gate is deliberately **state-driven, never
@@ -139,6 +159,11 @@ def classify_failure(*, state: str | None, failure_reason: str | None) -> str:
     if state in _TERMINAL_STATES:
         return TERMINAL
     reason = (failure_reason or "").strip()
+    # The recoverable exception is checked first: it is a narrower match than
+    # the `blocked:` prefix it lives under, and order is what makes it an
+    # exception rather than dead code.
+    if any(reason.startswith(prefix) for prefix in _RECOVERABLE_REASON_PREFIXES):
+        return RECOVERABLE
     if any(reason.startswith(prefix) for prefix in _TERMINAL_REASON_PREFIXES):
         return TERMINAL
     return RECOVERABLE

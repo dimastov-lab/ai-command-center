@@ -332,7 +332,10 @@ def test_classify_timeout_is_recoverable():
 
 
 def test_classify_blocked_is_terminal():
-    assert scheduler.classify_failure(state="FAILED", failure_reason="blocked:permission_denied") == scheduler.TERMINAL
+    # Uses a self-refusal rather than a permission denial: the latter is now a
+    # deliberate exception (environment policy changes between attempts, so a
+    # repeat is not an identical attempt), covered by its own test below.
+    assert scheduler.classify_failure(state="FAILED", failure_reason="blocked:final_response") == scheduler.TERMINAL
 
 
 def test_classify_cancelled_is_terminal():
@@ -831,3 +834,43 @@ def test_an_executor_with_no_provider_is_still_structurally_absent(monkeypatch):
 
     monkeypatch.setattr(executors, "EXECUTORS", {"chatgpt": _Stub()})
     assert scheduler.default_registry().all() == []
+
+
+def test_a_permission_denial_is_recoverable_not_terminal():
+    """`blocked:` refusals are terminal because repeating an identical attempt
+    cannot change the agent's own judgement. A *permission* denial is different
+    in kind: it records the environment's tool policy at the moment of the run,
+    and that policy is exactly what an operator changes in response to seeing
+    the failure. Treating it as terminal left tasks permanently unrunnable
+    after their permissions were fixed."""
+    assert scheduler.classify_failure(
+        state="FAILED", failure_reason="blocked:permission_denied:Glob,Read"
+    ) == scheduler.RECOVERABLE
+
+
+def test_an_agent_self_refusal_stays_terminal():
+    """The distinction has to cut both ways, or it is just a blanket retry."""
+    assert scheduler.classify_failure(
+        state="FAILED", failure_reason="blocked:final_response:blocked by policy"
+    ) == scheduler.TERMINAL
+
+
+def test_a_recoverable_permission_denial_is_still_bounded_by_the_retry_budget():
+    """Recoverable does not mean unbounded — a genuinely mis-permissioned task
+    must still stop rather than retry forever."""
+    plan = scheduler.plan(
+        [
+            scheduler.WorkItem(
+                task_id="t",
+                workspace="/tmp/w",
+                attempts_made=3,
+                last_state="FAILED",
+                last_failure_reason="blocked:permission_denied:Bash",
+                last_completed_at="2026-07-01T00:00:00",
+            )
+        ],
+        registry=scheduler.default_registry(),
+        policy=scheduler.RetryPolicy(max_attempts=3),
+        now="2026-07-24T10:00:00",
+    )
+    assert plan.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED
