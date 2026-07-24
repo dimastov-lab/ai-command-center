@@ -137,6 +137,24 @@ def _mirror_to_runtime_db(root: Path, entries: list[dict]) -> None:
         logger.debug("Could not mirror execution queue into runtime.db", exc_info=True)
 
 
+def backfill_mirror(root: Path) -> int:
+    """One-shot import of the existing JSON queue into the SQLite mirror
+    (ADR 0007 step 2). Returns the number of entries written.
+
+    Idempotent, because `replace_queue_entries` replaces the whole list rather
+    than appending: running it twice leaves the same rows. That matters — the
+    backfill is expected to be run more than once (once per operator, once
+    after a rollback and re-advance), and a backfill that duplicated on the
+    second run would manufacture exactly the divergence it exists to remove.
+
+    Deliberately not called automatically from a read path. A migration step
+    that runs itself as a side effect of someone looking at the queue is a
+    migration nobody decided to perform."""
+    entries = load_queue(root)
+    runtime_db.replace_queue_entries(runtime_db.resolve_db_path(root), entries)
+    return len(entries)
+
+
 def queue_divergence(root: Path) -> list[dict]:
     """Entries where the JSON store and the SQLite mirror disagree.
 

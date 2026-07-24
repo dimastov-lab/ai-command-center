@@ -349,6 +349,17 @@ def render_autopilot_wave(result=None, *, live_running: int | None = None) -> No
             icon=":material/report:",
         )
 
+    # ADR 0007 dual-write health. Rendered only when non-zero: a permanent "0"
+    # is noise that trains people to ignore the row. A warning rather than an
+    # error — the queue is still correct while JSON is authoritative — but the
+    # migration's next step must not proceed while this is showing.
+    if result.queue_divergence:
+        st.warning(
+            f"Очередь: расхождений с зеркалом БД — {len(result.queue_divergence)}. "
+            "Данные верны (источник истины — JSON), но переход на БД откладывается.",
+            icon=":material/sync_problem:",
+        )
+
     requested = [r for r in result.reviews if r["outcome"] == task_pipeline.REVIEW_REQUESTED]
     recorded = [r for r in result.reviews if r["outcome"] == task_pipeline.REVIEW_RECORDED]
     if requested:

@@ -462,6 +462,7 @@ class PipelineTickResult:
     merge_policy_updates: tuple[dict, ...] = ()
     reworks: tuple[dict, ...] = ()
     reviews: tuple[dict, ...] = ()
+    queue_divergence: tuple[dict, ...] = ()
     remediations: tuple[dict, ...] = ()
     stuck: tuple[StuckTask, ...] = ()
     completed_task_ids: tuple[str, ...] = ()
@@ -492,6 +493,7 @@ class PipelineTickResult:
             "merge_policy_updates": [dict(u) for u in self.merge_policy_updates],
             "reworks": [dict(r) for r in self.reworks],
             "reviews": [dict(r) for r in self.reviews],
+            "queue_divergence": [dict(d) for d in self.queue_divergence],
             "remediations": [dict(r) for r in self.remediations],
             "stuck": [s.as_dict() for s in self.stuck],
             "completed_task_ids": list(self.completed_task_ids),
@@ -1986,6 +1988,17 @@ def _locked_tick(
     except Exception as exc:  # noqa: BLE001
         _record(exc, "remediate_workspaces")
 
+    # 7d. ADR 0007 dual-write health. Read-only and never fatal: JSON is still
+    #     authoritative, so a divergence means the mirror is behind, not that
+    #     the queue is wrong. Surfaced rather than logged because "stop writing
+    #     JSON" is gated on a session with none, and that is a claim the
+    #     operator must be able to see.
+    divergence: tuple[dict, ...] = ()
+    try:
+        divergence = tuple(execution_queue.queue_divergence(root))
+    except Exception as exc:  # noqa: BLE001
+        _record(exc, "queue_divergence")
+
     # 8. Plan the wave.
     decisions, _wave, tasks_by_id = _plan_wave(
         root, api, tasks, project_configs, settings, now=models.iso_now()
@@ -2031,6 +2044,7 @@ def _locked_tick(
         merge_policy_updates=tuple(merge_updates),
         reworks=tuple(reworks),
         reviews=tuple(reviews),
+        queue_divergence=divergence,
         remediations=tuple(remediations),
         stuck=stuck,
         completed_task_ids=tuple(completed_task_ids),

@@ -110,3 +110,49 @@ def test_unknown_keys_do_not_break_the_mirror(root):
     authoritative store would fail on data that is by definition valid."""
     execution_queue.save_queue(root, [{**_entry("q1"), "future_field": "x"}])
     assert execution_queue.queue_divergence(root) == []
+
+
+# --------------------------------------------------------------------------
+# ADR 0007 step 2 — backfill and the surfaced divergence count
+# --------------------------------------------------------------------------
+
+
+def test_backfill_imports_existing_entries(root):
+    """The JSON store predates the mirror, so the mirror starts empty and must
+    be seeded from what is already there."""
+    execution_queue.save_queue(root, [_entry("q1"), _entry("q2")])
+    runtime_db.replace_queue_entries(runtime_db.resolve_db_path(root), [])
+    assert len(execution_queue.queue_divergence(root)) == 2
+
+    assert execution_queue.backfill_mirror(root) == 2
+    assert execution_queue.queue_divergence(root) == []
+
+
+def test_backfill_is_idempotent(root):
+    """It is expected to run more than once — per operator, and again after a
+    rollback and re-advance. A backfill that appended on the second run would
+    manufacture the divergence it exists to remove."""
+    execution_queue.save_queue(root, [_entry("q1"), _entry("q2")])
+    first = execution_queue.backfill_mirror(root)
+    second = execution_queue.backfill_mirror(root)
+    assert first == second == 2
+    assert execution_queue.queue_divergence(root) == []
+
+
+def test_divergence_reaches_the_tick_result(root, tmp_path):
+    """The count is gating: ADR 0007 step 4 may not proceed while it is
+    non-zero, so it has to travel to where an operator can see it."""
+    from command_center import pipeline_settings, task_pipeline
+    from command_center.pipeline_settings import PipelineSettings
+    from command_center.runtime import api as runtime_api
+
+    pipeline_settings.save_settings(root, PipelineSettings(enabled=True))
+    execution_queue.save_queue(root, [_entry("q1")])
+    # Mirror drifts behind the authoritative store.
+    runtime_db.replace_queue_entries(runtime_db.resolve_db_path(root), [])
+
+    api = runtime_api.ExecutionCenterAPI(db_path=root / "runtime.db")
+    result = task_pipeline.tick(root, api, {}, advance_wait_seconds=0.1)
+    assert result.ran is True
+    assert [d["entry_id"] for d in result.queue_divergence] == ["q1"]
+    assert "queue_divergence" in result.as_dict()
