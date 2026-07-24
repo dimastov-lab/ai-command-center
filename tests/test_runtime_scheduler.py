@@ -787,3 +787,47 @@ def test_f6_known_priority_marked_recognized():
     reg = _registry()
     d = scheduler.plan([_item("t1", "/repo/a", priority="Critical")], registry=reg, now=NOW).decisions[0]
     assert d.priority_recognized is True
+
+
+def test_a_probe_failure_is_transient_not_structural(monkeypatch):
+    """`executor.available` is a live subprocess probe, so it can report False
+    for reasons unrelated to the executor existing — a loaded machine missing
+    the timeout, a daemon restarting.
+
+    Omitting such an executor made the planner answer `no_capable_agent`: a
+    *structural* verdict meaning "no agent can ever run this", which tells a
+    human to change configuration. The honest answer is `agent_unavailable` —
+    transient, and self-healing on the next tick."""
+    from command_center import executors
+
+    class _Down:
+        id = "claude_code"
+        availability_check = staticmethod(lambda: None)
+        available = False
+
+    monkeypatch.setattr(executors, "EXECUTORS", {"claude_code": _Down()})
+    registry = scheduler.default_registry()
+
+    assert registry.get("claude_code") is not None, "a down executor must still be registered"
+    plan = scheduler.plan(
+        [scheduler.WorkItem(task_id="t", workspace="/tmp/w")],
+        registry=registry,
+        now="2026-07-24T10:00:00",
+    )
+    decision = plan.decisions[0]
+    assert decision.action == scheduler.ACTION_DEFER
+    assert decision.reason_code == scheduler.REASON_AGENT_UNAVAILABLE
+
+
+def test_an_executor_with_no_provider_is_still_structurally_absent(monkeypatch):
+    """A stub with nothing behind it can never run anything, so its absence is
+    a genuine structural fact rather than a transient one."""
+    from command_center import executors
+
+    class _Stub:
+        id = "chatgpt"
+        availability_check = None
+        available = False
+
+    monkeypatch.setattr(executors, "EXECUTORS", {"chatgpt": _Stub()})
+    assert scheduler.default_registry().all() == []

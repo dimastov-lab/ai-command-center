@@ -222,21 +222,33 @@ class AgentRegistry:
 
 
 def default_registry(*, max_concurrency: int = 2) -> AgentRegistry:
-    """A registry seeded from `executors.EXECUTORS`: every *available* executor
-    becomes a general-purpose (`CAP_ANY`) agent whose id equals its executor
-    id. Today that is just `claude_code`; the moment another executor is
-    marked `available` in `executors.py` it is scheduled here with no change
-    to this module."""
+    """A registry seeded from `executors.EXECUTORS`: every executor that has a
+    provider behind it becomes a general-purpose (`CAP_ANY`) agent whose id
+    equals its executor id.
+
+    Availability is carried on the `AgentSpec` rather than deciding membership,
+    and that distinction is the whole point. `executor.available` is a *live
+    capability probe* — it shells out to the provider CLI — so it can report
+    False for a reason that has nothing to do with the executor existing: a
+    machine under load missing the probe timeout, a local daemon restarting.
+    Omitting such an executor makes the planner answer `no_capable_agent`,
+    which is a **structural** verdict meaning "no agent can ever run this" and
+    which a human is told to resolve by changing configuration. Registering it
+    as present-but-unavailable yields `agent_unavailable` instead — transient,
+    self-healing on the next tick, and true.
+
+    An executor with no provider at all (`availability_check is None`) is a
+    genuine structural absence and is still omitted."""
     agents = [
         AgentSpec(
             agent_id=executor.id,
             executor_id=executor.id,
             capabilities=frozenset({CAP_ANY}),
             max_concurrency=max_concurrency,
-            available=True,
+            available=executor.available,
         )
         for executor in executors.EXECUTORS.values()
-        if executor.available
+        if executor.availability_check is not None
     ]
     return AgentRegistry(agents)
 
