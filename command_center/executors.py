@@ -119,6 +119,14 @@ EXECUTORS: dict[str, Executor] = {
         availability_check=providers.get_provider("codex").availability,
         launch=_v2_only,
     ),
+    "ollama": Executor(
+        id="ollama",
+        label="Ollama (local)",
+        kind="cli",
+        supports_terminal_launch=True,
+        availability_check=providers.get_provider("ollama").availability,
+        launch=_v2_only,
+    ),
     "gemini": Executor(
         id="gemini",
         label="Gemini",

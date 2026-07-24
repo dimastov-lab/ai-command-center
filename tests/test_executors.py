@@ -22,8 +22,14 @@ def test_executors_module_never_constructs_a_git_subprocess_call():
 
 
 def test_claude_and_codex_are_available_when_codex_probe_succeeds(fake_codex):
+    """Availability is a live capability probe, so the exact roster depends on
+    what is installed on the host — Ollama, for instance, qualifies wherever it
+    is present. Assert the properties that must hold everywhere instead of a
+    fixed set that would fail on a well-equipped machine."""
     available = {executor.id for executor in executors.available_executors()}
-    assert available == {"claude_code", "codex"}
+    assert {"claude_code", "codex"} <= available
+    # Executors with no provider behind them can never become available.
+    assert available.isdisjoint({"chatgpt", "gemini", "human", "remote_agent"})
 
 
 def test_all_declared_executors_share_the_same_interface():
