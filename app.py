@@ -1803,12 +1803,29 @@ def _render_execution_center_sections(
         if title in ("Completed", "Failed"):
             section_sessions = section_sessions[:20]  # "recently completed" / bounded history, not the whole table
 
-        st.markdown(f"#### {title} ({len(section_sessions)})")
+        # Live sections stay open — those are the runs an operator acts on.
+        # Terminal ones collapse: thirty-four stacked cards of finished work is
+        # a wall to scroll past, and it buries the two runs that need
+        # attention. Collapsing rather than summarising keeps every detail one
+        # click away instead of dropping it.
+        live = title in ("Running", "Waiting")
         if not section_sessions:
-            st.caption("Пусто.")
+            # An empty terminal section is not worth a line; an empty live one
+            # is meaningful ("nothing is running").
+            if live:
+                st.markdown(f"#### {title} (0)")
+                st.caption("Пусто.")
             continue
-        for session in section_sessions:
-            _render_execution_center_card(api, session, tasks_by_id, now=now)
+
+        if live:
+            st.markdown(f"#### {title} ({len(section_sessions)})")
+            for session in section_sessions:
+                _render_execution_center_card(api, session, tasks_by_id, now=now)
+            continue
+
+        with st.expander(f"{title} ({len(section_sessions)})", expanded=False):
+            for session in section_sessions:
+                _render_execution_center_card(api, session, tasks_by_id, now=now)
 
 
 def _run_autopilot_tick(api: runtime_api.ExecutionCenterAPI):

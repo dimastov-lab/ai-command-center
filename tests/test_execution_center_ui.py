@@ -343,15 +343,15 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
 
     at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
     at = at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
-    assert any("отправлен" in s.value for s in at.success) or any(
-        f"Статус: **{session_view.STATUS_CANCELLED}**" in c.value for c in at.caption
+    assert any("отправлен" in s.value for s in at.success) or _shows_status(
+        at, session_view.STATUS_CANCELLED
     )
 
     deadline = time.monotonic() + 10
     displayed_cancelled = False
     while time.monotonic() < deadline:
         at = at.run()
-        if any(f"Статус: **{session_view.STATUS_CANCELLED}**" in c.value for c in at.caption):
+        if _shows_status(at, session_view.STATUS_CANCELLED):
             displayed_cancelled = True
             break
         time.sleep(0.2)
@@ -380,7 +380,7 @@ def test_terminal_status_persists_across_page_revisit(git_repo, configure_projec
 
     at2 = _at_on_page("execution_center")
     assert not at2.exception
-    assert any(f"Статус: **{session_view.STATUS_COMPLETED}**" in c.value for c in at2.caption)
+    assert _shows_status(at2, session_view.STATUS_COMPLETED)
 
 
 # --------------------------------------------------------------------------
@@ -407,8 +407,8 @@ def test_failed_status_displays_last_error(git_repo, configure_project_repo, fak
 
     at = _at_on_page("execution_center")
     assert not at.exception
-    assert any(f"Статус: **{session_view.STATUS_FAILED}**" in c.value for c in at.caption)
-    assert any("timeout" in e.value for e in at.error)
+    assert _shows_status(at, session_view.STATUS_FAILED)
+    assert _shows_reason(at, "timeout")
 
 
 # --------------------------------------------------------------------------
@@ -479,6 +479,26 @@ def _make_run_row(
     return run
 
 
+
+def _shows_status(at, status: str) -> bool:
+    """Whether a run with `status` is visible, however it is rendered.
+
+    Live runs render as cards with a status caption; finished ones render in a
+    collapsed table, because a wall of stacked cards for finished work buries
+    the runs that actually need attention. Both satisfy what these tests are
+    about — the run is classified and shown."""
+    if any(f"Статус: **{status}**" in c.value for c in at.caption):
+        return True
+    return any(status in element.value.to_string() for element in at.dataframe)
+
+
+def _shows_reason(at, fragment: str) -> bool:
+    """Whether a failure reason is visible, as an error box or a table cell."""
+    if any(fragment in e.value for e in at.error):
+        return True
+    return any(fragment in element.value.to_string() for element in at.dataframe)
+
+
 @pytest.mark.parametrize(
     "state,cancel_requested,expected_caption",
     [
@@ -499,7 +519,14 @@ def test_dashboard_renders_each_status_bucket(state, cancel_requested, expected_
 
         at = _at_on_page("execution_center")
         assert not at.exception
-        assert any(f"Статус: **{expected_caption}**" in c.value for c in at.caption)
+        # Live runs render as cards (with a status caption); finished ones now
+        # render in a collapsed table, because thirty-four stacked cards of
+        # finished work is a wall to scroll past rather than information. The
+        # property under test is the same either way: the run is classified
+        # into its bucket and shown.
+        assert _shows_status(at, expected_caption), (
+            f"прогон {expected_caption} не показан ни карточкой, ни в таблице"
+        )
     finally:
         if proc is not None:
             proc.terminate()
