@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,19 @@ import pytest
 
 _TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="aicc_test_data_"))
 os.environ["AICC_DATA_DIR"] = str(_TEST_DATA_DIR)
+
+
+@pytest.fixture(autouse=True)
+def clear_provider_probe_cache():
+    """Provider availability is memoized for a short TTL (see
+    `runtime.providers._PROBE_CACHE_TTL_SECONDS`). Tests install and remove fake
+    provider binaries between cases, so a verdict cached by one test must never
+    be read by the next."""
+    from command_center.runtime import providers
+
+    providers.clear_probe_cache()
+    yield
+    providers.clear_probe_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -178,6 +192,50 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     return generated_dir
 
 
+@pytest.fixture(autouse=True)
+def forbid_real_codex_subprocess(monkeypatch):
+    """Fail immediately if any test invokes Codex outside its fake fixture."""
+    real_run = subprocess.run
+    real_popen = subprocess.Popen
+
+    def check(command):
+        if isinstance(command, str):
+            try:
+                command = shlex.split(command)
+            except ValueError as exc:
+                raise AssertionError(f"Unparseable subprocess command in test: {command!r}") from exc
+        if not isinstance(command, (list, tuple)) or not command:
+            return
+        executable = Path(os.fspath(command[0])).expanduser()
+        if executable.name != "codex":
+            return
+        allowed = os.environ.get("AICC_TEST_FAKE_CODEX_BINARY")
+        if allowed and executable.resolve() == Path(allowed).resolve():
+            return
+        # A capability probe is not an execution. `providers._probe` runs
+        # `--version` and `exec --help` to decide whether a provider is usable
+        # at all, and `scheduler.default_registry()` consults that for every
+        # provider on every planning tick. Those read-only invocations spend no
+        # quota, touch no repository and start no agent, so blocking them would
+        # make the guard fail honest planning code while protecting nothing.
+        # Anything that could actually run a task is still refused.
+        probe_args = tuple(str(arg) for arg in command[1:])
+        if probe_args in (("--version",), ("exec", "--help")):
+            return
+        raise AssertionError(f"Automated test attempted to invoke non-fixture Codex: {executable}")
+
+    def guarded_run(command, *args, **kwargs):
+        check(command)
+        return real_run(command, *args, **kwargs)
+
+    def guarded_popen(command, *args, **kwargs):
+        check(command)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded_run)
+    monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+
+
 _CONTAMINATION_MARKERS: tuple[str, ...] = (
     "pytest-of-",
     "aicc_test_data_",
@@ -238,6 +296,7 @@ def guard_real_project_files():
 # --------------------------------------------------------------------------
 
 FAKE_CLAUDE_SCRIPT = Path(__file__).parent / "fixtures" / "fake_claude.py"
+FAKE_CODEX_SCRIPT = Path(__file__).parent / "fixtures" / "fake_codex.py"
 
 
 @pytest.fixture
@@ -262,8 +321,10 @@ def configure_project_repo(monkeypatch):
     from command_center import project_config
 
     def configure(project_id: str, repo_path: Path) -> None:
+        original_get_project_config = project_config.get_project_config
+
         def fake_get_project_config(pid, _repo_path=str(repo_path), _project_id=project_id):
-            cfg = project_config.default_project_config(pid)
+            cfg = original_get_project_config(pid)
             if pid == _project_id:
                 cfg["repository_path"] = _repo_path
             return cfg
@@ -317,6 +378,21 @@ def fake_claude(monkeypatch):
     monkeypatch.setattr(supervisor_module.subprocess, "Popen", popen_with_env)
 
     return env_overrides
+
+
+@pytest.fixture
+def fake_codex(monkeypatch, tmp_path):
+    """Install an isolated executable Codex double and route every probe/run to it."""
+    from command_center import project_config
+
+    executable = tmp_path / "codex"
+    shutil.copyfile(FAKE_CODEX_SCRIPT, executable)
+    executable.chmod(0o700)
+    monkeypatch.setenv("AICC_CODEX_BINARY", str(executable))
+    monkeypatch.setenv("AICC_TEST_FAKE_CODEX_BINARY", str(executable))
+    monkeypatch.setenv("FAKE_CODEX_TOUCH_FILE", "fake_codex_default_touch.txt")
+    project_config.save_allowed_agents("AIOS", ["claude_code", "codex"])
+    return executable
 
 
 FAKE_CLAUDE_TREE_SCRIPT = Path(__file__).parent / "fixtures" / "fake_claude_tree.py"

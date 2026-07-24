@@ -21,9 +21,9 @@ def test_executors_module_never_constructs_a_git_subprocess_call():
     assert "git" not in string_literals
 
 
-def test_claude_code_is_the_only_available_executor_today():
+def test_claude_and_codex_are_available_when_codex_probe_succeeds(fake_codex):
     available = {executor.id for executor in executors.available_executors()}
-    assert available == {"claude_code"}
+    assert available == {"claude_code", "codex"}
 
 
 def test_all_declared_executors_share_the_same_interface():
@@ -35,12 +35,18 @@ def test_all_declared_executors_share_the_same_interface():
         assert callable(executor.launch)
 
 
-def test_get_executor_falls_back_to_claude_code_for_unknown_id():
-    assert executors.get_executor("nonexistent").id == "claude_code"
+def test_get_executor_rejects_unknown_id_and_defaults_only_when_missing():
+    with pytest.raises(ValueError, match="Unknown executor"):
+        executors.get_executor("nonexistent")
     assert executors.get_executor(None).id == "claude_code"
 
 
 def test_stub_executors_raise_not_implemented_on_launch():
-    for executor_id in ("chatgpt", "codex", "gemini", "human", "remote_agent"):
+    for executor_id in ("chatgpt", "gemini", "human", "remote_agent"):
         with pytest.raises(NotImplementedError):
             executors.get_executor(executor_id).launch()
+
+
+def test_codex_sync_launch_fails_closed_instead_of_bypassing_supervisor(fake_codex):
+    with pytest.raises(RuntimeError, match="PID-tracked Execution Center"):
+        executors.get_executor("codex").launch()

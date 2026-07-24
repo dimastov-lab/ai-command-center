@@ -89,6 +89,26 @@ def test_execution_center_page_renders_and_nav_entry_exists():
     assert any("Live Execution Center" in option for option in nav_options)
 
 
+def test_execution_center_provider_selector_defaults_to_claude_only():
+    """Fail-closed: a project with no explicit allow-list offers Claude only,
+    never Codex, even though the Codex provider exists in the registry."""
+    at = _at_on_page("execution_center")
+    selector = at.selectbox(key="exec_center_launch_executor")
+    assert selector.options == ["Claude Code"]
+    assert selector.value == "claude_code"
+
+
+def test_execution_center_provider_selector_exposes_codex_only_when_authorized(fake_codex):
+    from command_center import models, project_config
+
+    # The launch form defaults to the first project id; authorize Codex there.
+    project_config.save_allowed_agents(models.PROJECT_IDS[0], ["claude_code", "codex"])
+    at = _at_on_page("execution_center")
+    selector = at.selectbox(key="exec_center_launch_executor")
+    assert selector.options == ["Claude Code", "Codex CLI"]
+    assert selector.value == "claude_code"
+
+
 def _assert_execution_center_page_rendered(at: AppTest) -> None:
     assert not at.exception
     assert at.subheader[0].value == "Live Execution Center"

@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from command_center import workspace_provisioning
+from command_center import project_config, workspace_provisioning
 from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -63,6 +63,7 @@ class ExecutionCenterAPI:
         prompt_version: int | None = None,
         repository_already_validated: bool = False,
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
+        executor_id: str = "claude_code",
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -77,6 +78,7 @@ class ExecutionCenterAPI:
         `timeout_seconds` defaults to 900s; pass `None` explicitly to disable
         the automatic timeout for this run.
         """
+        project_config.require_execution_provider_allowed(project, executor_id)
         context = context_service.assemble_context(
             project_id=project,
             metadata=metadata,
@@ -93,7 +95,7 @@ class ExecutionCenterAPI:
             prompt=prompt,
             confirmed=confirmed,
             task_id=task_id,
-            title=title or instruction[:120],
+            title=title or ("Codex CLI run" if executor_id == "codex" else instruction[:120]),
             session_id=session_id,
             is_resume=is_resume,
             model=model,
@@ -103,6 +105,8 @@ class ExecutionCenterAPI:
             prompt_version=prompt_version,
             repository_already_validated=repository_already_validated,
             workspace_verification=workspace_verification,
+            executor_id=executor_id,
+            canonical_repository_path=project_config.get_project_config(project).get("repository_path"),
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)

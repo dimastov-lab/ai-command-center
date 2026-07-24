@@ -16,6 +16,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from command_center import agent_runner, worktree_launcher
 
 
@@ -320,8 +322,8 @@ def test_launch_profile_bundles_executor_and_permission():
     assert "Read-only" in lp.label
 
 
-def test_launch_profile_unknown_executor_falls_back_to_claude_code():
-    lp = worktree_launcher.describe_launch_profile(executor_id="does-not-exist", task_type="implementation")
-    # `executors.get_executor` returns the claude_code default for an unknown id.
-    assert lp.executor_id == "claude_code"
-    assert lp.permission.key == worktree_launcher.PROFILE_IMPLEMENTATION
+def test_launch_profile_unknown_executor_fails_conservatively():
+    with pytest.raises(ValueError, match="Unknown executor"):
+        worktree_launcher.describe_launch_profile(
+            executor_id="does-not-exist", task_type="implementation"
+        )

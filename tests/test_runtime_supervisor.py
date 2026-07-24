@@ -1696,6 +1696,72 @@ def test_launching_set_is_cleared_after_a_prepared_to_queued_transition_failure(
     assert runs[0]["state"] == "PREPARED"
 
 
+def test_concurrent_reconcile_cannot_claim_a_just_created_live_launch(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """Exercise the real create/register boundary, not a manually seeded set.
+
+    The committed PREPARED row is held at the return boundary of create_run
+    while another thread calls reconcile(). Reconciliation must wait until the
+    launcher has registered ownership, then skip the row instead of changing it
+    to INTERRUPTED out from under PREPARED -> QUEUED.
+    """
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    real_create_run = supervisor.db.create_run
+    row_committed = threading.Event()
+    release_create = threading.Event()
+    launch_result = {}
+    reconcile_result = {}
+
+    def paused_create_run(*args, **kwargs):
+        run = real_create_run(*args, **kwargs)
+        row_committed.set()
+        assert release_create.wait(timeout=5), "test did not release create_run"
+        return run
+
+    monkeypatch.setattr(supervisor.db, "create_run", paused_create_run)
+
+    def launch():
+        try:
+            launch_result["run"] = sup.start_raw(
+                project="AIOS",
+                repository_path=str(git_repo),
+                task_type="implementation",
+                prompt="p",
+                confirmed=True,
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            launch_result["error"] = exc
+
+    def reconcile():
+        reconcile_result["outcomes"] = sup.reconcile()
+
+    launch_thread = threading.Thread(target=launch)
+    launch_thread.start()
+    assert row_committed.wait(timeout=5), "launch never committed its PREPARED row"
+
+    reconcile_thread = threading.Thread(target=reconcile)
+    reconcile_thread.start()
+    try:
+        # Give the concurrent call an opportunity to reach the boundary. On
+        # the regressed implementation it immediately claims the PREPARED row.
+        time.sleep(0.1)
+    finally:
+        release_create.set()
+
+    launch_thread.join(timeout=10)
+    reconcile_thread.join(timeout=10)
+    assert not launch_thread.is_alive()
+    assert not reconcile_thread.is_alive()
+    assert "error" not in launch_result, launch_result.get("error")
+    assert reconcile_result["outcomes"] == []
+
+    run = launch_result["run"]
+    assert run["state"] == "RUNNING"
+    assert sup.wait_for_run(run["id"], timeout=10)["state"] == "COMPLETED"
+
+
 # --------------------------------------------------------------------------
 # --permission-mode — the empirically-confirmed root cause of the reported
 # defect: without it, the real `claude` CLI denies `Write`/`Edit` tool calls

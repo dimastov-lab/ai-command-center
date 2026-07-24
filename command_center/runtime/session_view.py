@@ -287,7 +287,7 @@ def build_session_view(
     git_status = live_git_status(workspace_path)
 
     task_title = (kanban_task or {}).get("title") or (run.get("prompt") or "")[:80] or (run.get("id") or "")[:8]
-    executor = (kanban_task or {}).get("executor") or "claude_code"
+    executor = run.get("provider_id") or (kanban_task or {}).get("executor") or "claude_code"
 
     last_error = run.get("failure_reason")
     if not last_error and status == STATUS_FAILED and latest_event and latest_event.get("event_type") == "stderr_line":

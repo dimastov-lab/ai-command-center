@@ -167,13 +167,13 @@ def test_kanban_launcher_present_but_never_calls_subprocess_on_render(monkeypatc
     _seed_task()
     at = _at_on_page("kanban")
     assert not at.exception
-    assert any(b.label == "Запустить Claude Code" for b in at.button)
+    assert any(b.label == "Запустить агента" for b in at.button)
 
 
 def test_kanban_launcher_confirmation_renders_as_dialog_not_inline_in_narrow_lane(monkeypatch, tmp_path):
     """P1 layout regression test. The Kanban board renders one narrow
     `st.columns(len(KANBAN_COLUMNS))` lane per status, and each task card's
-    "Запустить Claude Code" button used to expand its confirmation form
+    "Запустить агента" button used to expand its confirmation form
     (workspace metadata, a 3-column workspace-action row, a 2-column
     confirm/cancel row) *inline* into that single narrow lane — collapsing
     it into a barely-readable, word-wrapped sliver with the rest of the page
@@ -205,7 +205,7 @@ def test_kanban_launcher_confirmation_renders_as_dialog_not_inline_in_narrow_lan
     at = _at_on_page("kanban")
     assert not at.exception
 
-    open_button = next(b for b in at.button if b.label == "Запустить Claude Code")
+    open_button = next(b for b in at.button if b.label == "Запустить агента")
     at = open_button.click().run()
     assert not at.exception
 
@@ -227,7 +227,7 @@ def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
     at = _at_on_page("kanban")
     assert not at.exception
 
-    open_button = next(b for b in at.button if b.label == "Запустить Claude Code")
+    open_button = next(b for b in at.button if b.label == "Запустить агента")
     at = open_button.click().run()
     assert not at.exception
 

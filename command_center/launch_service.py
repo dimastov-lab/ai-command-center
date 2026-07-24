@@ -30,6 +30,7 @@ from command_center import (
     git_info,
     launch,
     models,
+    project_config,
     report_parser,
     workflow,
     workspace_provisioning,
@@ -246,6 +247,16 @@ def execute_agent_launch(
     `save_tasks`, a future desktop adapter's own persistence call, or a
     test's no-op are all equally valid callers)."""
 
+    # Fail closed on the same authorization boundary the v2/API/Supervisor
+    # paths enforce, before any persistence side effect. This legacy
+    # synchronous path has no production caller today, but must never become a
+    # gap that runs (or leaks the prompt of) an unauthorized provider.
+    project_config.require_execution_provider_allowed(project, executor_id)
+    if executor_id == "codex":
+        raise RuntimeError(
+            "Codex CLI is supported through the PID-tracked Execution Center launcher only."
+        )
+
     if task is not None:
         models.push_prompt_history(task, prompt)
         if validation is not None:
@@ -410,6 +421,10 @@ def execute_agent_launch_v2(
     # Confirmation must precede every mutation, including provisioning a new
     # branch/worktree. Supervisor enforces it again immediately before launch.
     context_service.require_launch_confirmation(confirmed, what="Launching an agent run")
+    # Independent of confirmation: which execution providers this project is
+    # allowed to use at all is a project-level policy, not a per-launch choice.
+    project_config.require_execution_provider_allowed(project, executor_id)
+
 
     task_id = (task or {}).get("id")
     resolved_workspace = str(Path(repository_path).expanduser().resolve())
@@ -472,13 +487,18 @@ def execute_agent_launch_v2(
             )
 
     if task is not None:
-        models.push_prompt_history(task, prompt)
+        # Codex prompt transport is intentionally ephemeral. The task may
+        # already own an operator-authored prompt, but launching Codex must not
+        # copy the final assembled outbound prompt (including sensitive
+        # one-off context) into task persistence or prompt history.
+        if executor_id != "codex":
+            models.push_prompt_history(task, prompt)
         if validation is not None:
             launch.begin_launch(task, executor_id=executor_id, validation=validation)
         if on_task_state_changed is not None:
             on_task_state_changed()
 
-    title = (task or {}).get("title") or prompt[:120]
+    title = (task or {}).get("title") or ("Codex CLI run" if executor_id == "codex" else prompt[:120])
 
     run = execution_center_api.start_run(
         project=project,
@@ -519,6 +539,7 @@ def execute_agent_launch_v2(
         # Re-verified at the `start_raw` chokepoint (fail-closed) — no launch
         # path, present or future, can spawn the process without passing this.
         workspace_verification=workspace_verification,
+        executor_id=executor_id,
     )
 
     if task is not None:

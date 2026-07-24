@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from command_center import executors
 from command_center.runtime import db, scheduler, supervisor
 
 NOW = "2026-07-23T12:00:00"
@@ -40,11 +41,21 @@ def _item(task_id: str, workspace: str, **kw) -> scheduler.WorkItem:
 
 
 def test_default_registry_only_registers_available_executors():
+    """The invariant is the *filter*, not a fixed roster.
+
+    Availability is now a live capability probe (`executors.Executor.available`
+    -> `providers`), so which executors qualify depends on what is installed on
+    the host: Codex and Ollama register here when their CLI is present. Asserting
+    a hard-coded list would make this test pass or fail on the developer's
+    machine setup rather than on the behaviour it exists to protect."""
     reg = _registry()
+    registered = {a.agent_id for a in reg.all()}
+    available = {e.id for e in executors.EXECUTORS.values() if e.available}
+    assert registered == available
+    # Claude is always installed in this suite, and a permanently-unavailable
+    # executor must never be registered.
     assert reg.get("claude_code") is not None
-    # chatgpt/codex/gemini/human/remote_agent are all `available=False`.
     assert reg.get("chatgpt") is None
-    assert [a.agent_id for a in reg.all()] == ["claude_code"]
 
 
 def test_register_rejects_unknown_executor():
