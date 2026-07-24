@@ -421,6 +421,7 @@ def launch_ready(
     execution_center_api,
     *,
     entry_ids: list[str] | None = None,
+    timeout_seconds: int | None = None,
 ) -> tuple[list[dict], list[LaunchAttemptResult]]:
     """Launches every `READY` entry (or, if `entry_ids` is given, just those
     — the "launch next ready task" action passes a single id). Never called
@@ -538,7 +539,11 @@ def launch_ready(
                 project=task.get("project"),
                 task_type=task.get("task_type") or "implementation",
                 prompt=task.get("prompt") or task.get("goal") or task.get("title") or "",
-                timeout_seconds=agent_runner.DEFAULT_TIMEOUT_SECONDS,
+                timeout_seconds=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else agent_runner.DEFAULT_TIMEOUT_SECONDS
+                ),
                 repository_path=resolved_workspace,
                 execution_center_api=execution_center_api,
                 confirmed=True,

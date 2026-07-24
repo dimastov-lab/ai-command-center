@@ -133,6 +133,20 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
                 "при этом сохраняется."
             ),
         )
+        run_timeout = st.number_input(
+            "Таймаут прогона (с)",
+            min_value=pipeline_settings.MIN_RUN_TIMEOUT_SECONDS,
+            max_value=pipeline_settings.MAX_RUN_TIMEOUT_SECONDS,
+            value=settings.run_timeout_seconds,
+            step=300,
+            key=f"{key_prefix}_run_timeout",
+            disabled=not enabled,
+            help=(
+                "Сколько агент может работать до принудительной остановки. "
+                "Крупному аудиту 15 минут мало, и упёршийся в потолок прогон "
+                "тратит токены впустую."
+            ),
+        )
         max_rework = st.number_input(
             "Попыток доработки",
             min_value=pipeline_settings.MIN_REWORK_ATTEMPTS,
@@ -197,6 +211,7 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
         "max_agent_concurrency": int(max_agent),
         "max_rework_attempts": int(max_rework),
         "max_run_attempts": int(max_run_attempts),
+        "run_timeout_seconds": int(run_timeout),
     }
     if changes != {k: v for k, v in settings.as_dict().items() if k in changes}:
         settings = pipeline_settings.update_settings(root, actor="desktop_ui", **changes)

@@ -1698,6 +1698,7 @@ def _dispatch(
     tasks_by_id: dict[str, dict],
     project_configs: dict[str, dict],
     decisions: tuple[EntryDecision, ...],
+    settings: PipelineSettings,
 ) -> tuple[tuple[EntryDecision, ...], str]:
     """Launch exactly the `ASSIGN` decisions, through `execution_queue.
     launch_ready` and nothing else, then fold each per-entry outcome back onto
@@ -1724,6 +1725,7 @@ def _dispatch(
             project_configs,
             api,
             entry_ids=[d.entry_id for d in assigned],
+            timeout_seconds=settings.run_timeout_seconds,
         )
     except Exception as exc:  # noqa: BLE001 — a failed batch must not abort the tick
         return decisions, f"{LAUNCH_BATCH_FAILED}: {exc}"
@@ -2007,7 +2009,7 @@ def _locked_tick(
     # 9. Dispatch — only ASSIGN decisions, only on an active explicit opt-in.
     if settings.auto_launch_active:
         decisions, launch_status = _dispatch(
-            root, api, tasks, tasks_by_id, project_configs, decisions
+            root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
     else:
         launch_status = LAUNCH_DISABLED

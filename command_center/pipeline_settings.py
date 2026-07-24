@@ -69,6 +69,16 @@ DEFAULT_MAX_RUN_ATTEMPTS = 3
 MIN_RUN_ATTEMPTS = 1
 MAX_RUN_ATTEMPTS = 10
 
+# How long an autopilot-launched agent may run before the supervisor times it
+# out. `agent_runner.DEFAULT_TIMEOUT_SECONDS` (900s) was written for a single
+# interactive launch; a founder audit reading a whole repository routinely
+# needs more, and hitting the ceiling costs a full run's tokens for nothing.
+# Exposed as a setting rather than raised in code because the right value
+# depends on the work: a review is minutes, an audit is tens of minutes.
+DEFAULT_RUN_TIMEOUT_SECONDS = 2700
+MIN_RUN_TIMEOUT_SECONDS = 300
+MAX_RUN_TIMEOUT_SECONDS = 14_400
+
 
 def settings_file_path(root: Path) -> Path:
     return storage.resolve_data_dir(root) / SETTINGS_FILE_NAME
@@ -128,6 +138,7 @@ class PipelineSettings:
     max_agent_concurrency: int = DEFAULT_MAX_AGENT_CONCURRENCY
     max_rework_attempts: int = DEFAULT_MAX_REWORK_ATTEMPTS
     max_run_attempts: int = DEFAULT_MAX_RUN_ATTEMPTS
+    run_timeout_seconds: int = DEFAULT_RUN_TIMEOUT_SECONDS
     updated_at: str | None = None
     updated_by: str | None = None
 
@@ -194,6 +205,7 @@ class PipelineSettings:
             "max_agent_concurrency": self.max_agent_concurrency,
             "max_rework_attempts": self.max_rework_attempts,
             "max_run_attempts": self.max_run_attempts,
+            "run_timeout_seconds": self.run_timeout_seconds,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
         }
@@ -230,6 +242,12 @@ class PipelineSettings:
                 DEFAULT_MAX_RUN_ATTEMPTS,
                 MIN_RUN_ATTEMPTS,
                 MAX_RUN_ATTEMPTS,
+            ),
+            run_timeout_seconds=_bounded_int(
+                data.get("run_timeout_seconds"),
+                DEFAULT_RUN_TIMEOUT_SECONDS,
+                MIN_RUN_TIMEOUT_SECONDS,
+                MAX_RUN_TIMEOUT_SECONDS,
             ),
             updated_at=updated_at if isinstance(updated_at, str) else None,
             updated_by=updated_by if isinstance(updated_by, str) else None,
@@ -283,6 +301,7 @@ def update_settings(root: Path, *, actor: str | None = None, **changes) -> Pipel
         "max_agent_concurrency",
         "max_rework_attempts",
         "max_run_attempts",
+        "run_timeout_seconds",
     }
     if unknown:
         raise TypeError(f"Unknown pipeline setting(s): {', '.join(sorted(unknown))}")

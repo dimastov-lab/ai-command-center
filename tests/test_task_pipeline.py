@@ -1103,3 +1103,35 @@ def test_the_planner_receives_the_configured_run_attempt_budget(tmp_path, git_re
     task_pipeline.tick(tmp_path, api, {}, advance_wait_seconds=1)
     assert seen["max_attempts"] == 7
     assert scheduler.RetryPolicy().max_attempts != 7  # not merely the default
+
+
+def test_run_timeout_is_a_bounded_setting():
+    """900s was written for one interactive launch; an audit reading a whole
+    repository needs more, and a run that hits the ceiling costs a full run's
+    tokens for nothing."""
+    assert PipelineSettings().run_timeout_seconds == pipeline_settings.DEFAULT_RUN_TIMEOUT_SECONDS
+    assert PipelineSettings.from_dict({"run_timeout_seconds": 99}).run_timeout_seconds == (
+        pipeline_settings.DEFAULT_RUN_TIMEOUT_SECONDS
+    )
+    assert PipelineSettings.from_dict({"run_timeout_seconds": 3600}).run_timeout_seconds == 3600
+
+
+def test_the_dispatcher_passes_the_configured_timeout(tmp_path, git_repo, api, monkeypatch):
+    """A setting nothing reads is a setting that lies to the operator."""
+    from command_center import execution_queue as queue_module
+
+    seen = {}
+
+    def fake_launch(*args, **kwargs):
+        seen.update(kwargs)
+        return [], []
+
+    monkeypatch.setattr(queue_module, "launch_ready", fake_launch)
+    decision = task_pipeline.EntryDecision(
+        entry_id="q1", task_id="a", action="ASSIGN", reason_code="assigned", explanation="x"
+    )
+    task_pipeline._dispatch(
+        tmp_path, api, [], {}, {}, (decision,),
+        PipelineSettings(enabled=True, auto_launch=True, run_timeout_seconds=3600),
+    )
+    assert seen["timeout_seconds"] == 3600
