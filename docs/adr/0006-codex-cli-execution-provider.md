@@ -1,4 +1,4 @@
-# ADR 0005 — Codex CLI Execution Provider Foundation
+# ADR 0006 — Codex CLI Execution Provider Foundation
 
 Status: **Accepted, implemented.**
 
