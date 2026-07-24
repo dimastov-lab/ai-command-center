@@ -1863,13 +1863,6 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # launches anything.
     execution_queue.reevaluate_and_persist(ROOT, {t["id"]: t for t in tasks if t.get("id")})
 
-    # Only a tick that actually ran replaces what is on screen. A disabled or
-    # busy tick carries no wave, and letting it through would wipe the last
-    # real one — leaving the operator staring at "нет данных" mid-session.
-    autopilot_panel.render_autopilot_wave(
-        tick_result if tick_result is not None and tick_result.ran else None
-    )
-
     if tick_result is not None and tick_result.ran:
         # Durable outcome for the autopilot panel (AICC-DESKTOP-017): stashing
         # it rather than rendering inline is what keeps launches/skips/merge
@@ -1877,6 +1870,23 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
         st.session_state[autopilot_panel.TICK_RESULT_KEY] = tick_result
 
     sessions, tasks_by_id = _build_execution_center_sessions(api, tasks, now=now)
+
+    # Runs executing right now, across every tick — the answer to "is anything
+    # running?" that the autopilot panel should give without a scroll. Computed
+    # from the same session snapshot the Running section below renders, so the
+    # two can never disagree.
+    live_running = sum(
+        1 for s in sessions if s.get("status") in session_view.LIVE_PROCESS_DISPLAY_STATUSES
+    )
+
+    # Only a tick that actually ran replaces the wave on screen. A disabled or
+    # busy tick carries no wave, and letting it through would wipe the last real
+    # one — leaving the operator staring at "нет данных" mid-session.
+    autopilot_panel.render_autopilot_wave(
+        tick_result if tick_result is not None and tick_result.ran else None,
+        live_running=live_running,
+    )
+
     _render_execution_center_project_overview(sessions, now)
     _render_execution_center_sections(api, sessions, tasks_by_id, now=now)
     st.session_state["exec_center_last_refreshed_at"] = now.strftime("%H:%M:%S")

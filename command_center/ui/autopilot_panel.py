@@ -246,7 +246,7 @@ def render_autopilot_panel(root: Path, *, key_prefix: str = "autopilot") -> None
     render_autopilot_wave()
 
 
-def render_autopilot_wave(result=None) -> None:
+def render_autopilot_wave(result=None, *, live_running: int | None = None) -> None:
     """The wave and the last tick's durable outcome.
 
     Separate from the controls because the two have opposite refresh needs: the
@@ -256,13 +256,23 @@ def render_autopilot_wave(result=None) -> None:
     on first load — which, on a fresh session, is nothing at all.
 
     `result` may be passed directly by the refresh path that just computed it;
-    otherwise the stashed one is used."""
+    otherwise the stashed one is used. `live_running` is the number of runs
+    actually executing right now (across all ticks) — distinct from the tick's
+    own `launched()`, which counts only what *this* tick started. Showing it
+    here answers the question an operator actually asks of this panel — "is
+    anything running?" — without scrolling down to the Running section."""
     if result is None:
         result = st.session_state.get(TICK_RESULT_KEY)
 
     failure = st.session_state.pop(TICK_ERROR_KEY, None)
     if failure:
         st.error(f"Тик автопилота не выполнен: {failure}", icon=":material/error:")
+
+    if live_running:
+        st.success(
+            f"Сейчас выполняется: {live_running} — см. раздел «Running» ниже.",
+            icon=":material/bolt:",
+        )
 
     if result is None:
         st.caption("Пока нет данных: волна появится после первого обновления Live Execution Center.")
