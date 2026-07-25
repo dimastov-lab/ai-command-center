@@ -74,6 +74,37 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
     machine's real permission, not this browser tab's memory of it."""
     settings = pipeline_settings.load_settings(root)
 
+    # Reconcile the widgets with the disk before they render. A Streamlit widget,
+    # once created, ignores its `value=` argument on every later rerun and echoes
+    # its own session_state instead — so any settings change made elsewhere (the
+    # pipeline, another browser tab, a script) would be silently overwritten by
+    # this panel's stale toggles on the next rerun. We fingerprint the on-disk
+    # values and, whenever that fingerprint moves, push the disk truth back into
+    # the widget keys *before* the widgets read them. This is what makes the
+    # displayed state the machine's real permission, not this tab's memory of it.
+    _FIELD_KEYS = {
+        "enabled": f"{key_prefix}_enabled",
+        "auto_launch": f"{key_prefix}_auto_launch",
+        "auto_rework": f"{key_prefix}_auto_rework",
+        "auto_remediate_workspace": f"{key_prefix}_auto_remediate",
+        "auto_merge_after_checks": f"{key_prefix}_auto_merge",
+        "require_independent_review": f"{key_prefix}_require_review",
+        "max_global_concurrency": f"{key_prefix}_max_global",
+        "max_agent_concurrency": f"{key_prefix}_max_agent",
+        "max_rework_attempts": f"{key_prefix}_max_rework",
+        "max_run_attempts": f"{key_prefix}_max_run_attempts",
+        "run_timeout_seconds": f"{key_prefix}_run_timeout",
+    }
+    _disk_values = {field: getattr(settings, field) for field in _FIELD_KEYS}
+    _fingerprint_key = f"{key_prefix}_disk_fingerprint"
+    _disk_fingerprint = tuple(sorted(_disk_values.items()))
+    if st.session_state.get(_fingerprint_key) != _disk_fingerprint:
+        # First render, or the file changed under us: adopt the disk truth into
+        # the widget state so the controls show reality and don't overwrite it.
+        for _field, _widget_key in _FIELD_KEYS.items():
+            st.session_state[_widget_key] = _disk_values[_field]
+        st.session_state[_fingerprint_key] = _disk_fingerprint
+
     st.markdown("#### Автопилот")
     st.caption(
         "Автопилот запускает задачи из очереди и ведёт их до merge без ручного нажатия. "
@@ -84,20 +115,17 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
     with columns[0]:
         enabled = st.toggle(
             "Включить автопилот",
-            value=settings.enabled,
             key=f"{key_prefix}_enabled",
             help="Главный выключатель. Пока он выключен, ни один другой переключатель ничего не делает.",
         )
         auto_launch = st.toggle(
             "Автозапуск готовых задач",
-            value=settings.auto_launch,
             key=f"{key_prefix}_auto_launch",
             disabled=not enabled,
             help="Запускать задачи, которые планировщик пометил ASSIGN. Без него волна только показывается.",
         )
         auto_rework = st.toggle(
             "Автодоработка при провале проверки",
-            value=settings.auto_rework,
             key=f"{key_prefix}_auto_rework",
             disabled=not (enabled and auto_launch),
             help=(
@@ -108,7 +136,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
         )
         auto_remediate = st.toggle(
             "Автоочистка своих worktree",
-            value=settings.auto_remediate_workspace,
             key=f"{key_prefix}_auto_remediate",
             disabled=not (enabled and auto_launch),
             help=(
@@ -122,7 +149,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
             "Попыток запуска",
             min_value=pipeline_settings.MIN_RUN_ATTEMPTS,
             max_value=pipeline_settings.MAX_RUN_ATTEMPTS,
-            value=settings.max_run_attempts,
             step=1,
             key=f"{key_prefix}_max_run_attempts",
             disabled=not enabled,
@@ -137,7 +163,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
             "Таймаут прогона (с)",
             min_value=pipeline_settings.MIN_RUN_TIMEOUT_SECONDS,
             max_value=pipeline_settings.MAX_RUN_TIMEOUT_SECONDS,
-            value=settings.run_timeout_seconds,
             step=300,
             key=f"{key_prefix}_run_timeout",
             disabled=not enabled,
@@ -151,7 +176,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
             "Попыток доработки",
             min_value=pipeline_settings.MIN_REWORK_ATTEMPTS,
             max_value=pipeline_settings.MAX_REWORK_ATTEMPTS,
-            value=settings.max_rework_attempts,
             step=1,
             key=f"{key_prefix}_max_rework",
             disabled=not (enabled and auto_launch),
@@ -160,7 +184,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
     with columns[1]:
         auto_merge = st.toggle(
             "Автоматический merge после проверок",
-            value=settings.auto_merge_after_checks,
             key=f"{key_prefix}_auto_merge",
             disabled=not enabled,
             help=(
@@ -170,7 +193,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
         )
         require_review = st.toggle(
             "Независимая проверка перед PR",
-            value=settings.require_independent_review,
             key=f"{key_prefix}_require_review",
             disabled=not enabled,
             help=(
@@ -186,7 +208,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
                 "Всего параллельно",
                 min_value=pipeline_settings.MIN_CONCURRENCY,
                 max_value=pipeline_settings.MAX_CONCURRENCY,
-                value=settings.max_global_concurrency,
                 step=1,
                 key=f"{key_prefix}_max_global",
             )
@@ -195,7 +216,6 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
                 "На агента",
                 min_value=pipeline_settings.MIN_CONCURRENCY,
                 max_value=pipeline_settings.MAX_CONCURRENCY,
-                value=settings.max_agent_concurrency,
                 step=1,
                 key=f"{key_prefix}_max_agent",
             )

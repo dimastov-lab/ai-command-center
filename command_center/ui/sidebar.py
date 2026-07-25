@@ -18,14 +18,24 @@ from typing import Callable
 
 import streamlit as st
 
-# (title, page keys, open by default). Ordered like a working day: decide what
-# to do, watch it happen, then the things consulted occasionally.
+# (title, page keys, open by default). The UX analysis (task 1/2) found 17-20
+# flat entries far past the 7±2 scanning limit, with three overview pages, two
+# run monitors and several duplicate library pages competing for attention.
+#
+# Until the full page consolidation lands (design: 17 → 6 destinations), this
+# regroups the same pages so the SIX core destinations sit in one open
+# "Основное" group an operator can scan at a glance, and everything else —
+# secondary planning surfaces, analytics, portfolio, and the pages the redesign
+# folds away — collapses out of the daily path. No page is removed (the command
+# palette and every deep link still reach all of them); they are just no longer
+# all shouting at once.
 NAV_GROUPS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
-    ("Работа", ("dashboard", "kanban", "waves", "create"), True),
-    ("Исполнение", ("execution_center", "runs", "reports", "agents"), True),
-    ("Проекты", ("projects", "portfolio", "portfolio_overview", "workspace_home"), False),
-    ("Анализ", ("executive", "timeline", "generated", "context"), False),
-    ("Инструменты", ("git_center", "workspace", "chat", "focus"), False),
+    # The six destinations the redesign keeps: overview, planning, execution,
+    # projects, git, chat.
+    ("Основное", ("dashboard", "kanban", "execution_center", "projects", "git_center", "chat"), True),
+    ("Планирование", ("waves", "create", "reports", "generated"), False),
+    ("Аналитика", ("executive", "runs", "timeline", "context", "agents"), False),
+    ("Портфель и режимы", ("portfolio", "portfolio_overview", "workspace_home", "workspace", "focus"), False),
 )
 
 

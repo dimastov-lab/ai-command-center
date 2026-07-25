@@ -109,6 +109,27 @@ def test_persisted_settings_are_reflected_on_load(isolated_data_dir):
     assert at.number_input(key="autopilot_max_global").value == 5
 
 
+def test_external_settings_change_is_not_reverted_by_a_rerender(isolated_data_dir):
+    """Regression: the panel used to echo its own stale toggle state back to disk
+    on every rerun, silently reverting a change made anywhere else (the pipeline,
+    another browser tab, a script). Since a Streamlit widget ignores its `value=`
+    after first render and reports its own session_state, the panel would keep
+    re-writing the old value. It must instead adopt the on-disk truth: reflect the
+    external change *and* leave it on disk."""
+    pipeline_settings.save_settings(
+        ROOT, PipelineSettings(enabled=True, require_independent_review=True)
+    )
+    at = _at()
+    assert at.toggle(key="autopilot_require_review").value is True
+
+    # Something outside this tab flips the gate off (the pipeline / a script).
+    pipeline_settings.update_settings(ROOT, actor="pipeline", require_independent_review=False)
+
+    at.run()  # a plain refresh of the same session must not clobber the change
+    assert pipeline_settings.load_settings(ROOT).require_independent_review is False
+    assert at.toggle(key="autopilot_require_review").value is False
+
+
 # --------------------------------------------------------------------------
 # AICC-DESKTOP-013 — the wave: priority, agent, workspace, rationale
 # --------------------------------------------------------------------------

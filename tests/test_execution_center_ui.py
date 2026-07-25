@@ -574,3 +574,96 @@ def test_auto_refresh_does_not_duplicate_runs_or_task_mutations(git_repo, config
 
     all_runs = runtime_db.list_runs(api.db_path, limit=100)
     assert len(all_runs) == 1, "repeated refreshes must never create a new run"
+
+
+# --------------------------------------------------------------------------
+# 14. The rebuilt board: running-first order, summary, console actions,
+#     compact attention rows, and the project dependency tree.
+# --------------------------------------------------------------------------
+
+from command_center import tasks_repository  # noqa: E402
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_board_summary_and_console_actions_render():
+    """The console leads with a state summary and an action bar — create a
+    task, waves, reports — instead of the planner's wave and a project grid."""
+    api = runtime_api.ExecutionCenterAPI()  # constructs + migrates the isolated db
+    _make_run_row(api.db_path, state="RUNNING", pid=None)  # -> Requires Attention (no live pid)
+    at = _at_on_page("execution_center")
+    assert not at.exception
+
+    # The summary is rendered as `board_style`'s tinted HTML tiles (not
+    # `st.metric`), so it appears in the markdown stream.
+    markdown = " ".join(str(m.value) for m in at.markdown)
+    assert "Выполняется" in markdown
+    assert "Требуют внимания" in markdown
+
+    button_labels = [b.label for b in at.button]
+    assert "Создать задачу" in button_labels
+    assert "Волны" in button_labels
+    assert "Отчёты" in button_labels
+
+
+def test_console_create_task_panel_opens_and_creates_a_task():
+    at = _at_on_page("execution_center", exec_board_open_panel="create")
+    assert not at.exception
+
+    at.selectbox(key="console_create_project").select("AICC").run()
+    at.text_input(key="console_create_title").set_value("Задача из консоли").run()
+    # The submit lives inside an st.form; drive it through the form button.
+    form_submit = next(b for b in at.button if b.label == "Создать")
+    at = form_submit.click().run()
+    assert not at.exception
+
+    titles = [t.get("title") for t in tasks_repository.load_tasks(APP_ROOT)]
+    assert "Задача из консоли" in titles
+
+
+def test_attention_row_shows_reason_without_expanding():
+    """A failed run's reason must be readable on the row itself — collapsing it
+    behind the toggle would trade one unusable screen for another."""
+    api = runtime_api.ExecutionCenterAPI()
+    _make_run_row(api.db_path, state="FAILED", failure_reason="boom: the thing broke")
+    at = _at_on_page("execution_center")
+    assert not at.exception
+
+    errors = " ".join(e.value for e in at.error)
+    assert "boom: the thing broke" in errors
+
+
+def _seed_task(project: str, title: str, *, status: str = "Backlog", **fields) -> dict:
+    return tasks_repository.create_task(APP_ROOT, project, title, "review", status, **fields)
+
+
+def test_project_tree_renders_levels_when_a_project_is_selected():
+    """Selecting a project opens its plan as dependency levels in the main
+    column, coloured by state, with the next task to start flagged."""
+    # A run gives the project a card in the side strip; the tree itself is
+    # built from the Kanban tasks.
+    api = runtime_api.ExecutionCenterAPI()
+    _make_run_row(api.db_path, state="RUNNING", pid=None)
+    root = _seed_task("AICC", "Корневая задача", status="Done")
+    _seed_task("AICC", "Следующая задача", depends_on=[root["id"]])
+
+    at = _at_on_page("execution_center", exec_board_project_tree="AICC")
+    assert not at.exception
+
+    markdown = " ".join(str(m.value) for m in at.markdown)
+    assert "дерево задач" in markdown
+    assert "Уровень 0" in markdown
+    assert "Уровень 1" in markdown
+
+
+def test_project_tree_flags_the_next_task_to_launch():
+    api = runtime_api.ExecutionCenterAPI()
+    _make_run_row(api.db_path, state="RUNNING", pid=None)
+    done = _seed_task("AICC", "Уже сделано", status="Done")
+    _seed_task("AICC", "Пора запускать", depends_on=[done["id"]])
+
+    at = _at_on_page("execution_center", exec_board_project_tree="AICC")
+    assert not at.exception
+
+    captions = " ".join(c.value for c in at.caption)
+    assert "Следующая по плану" in captions

@@ -4,6 +4,15 @@
 # menu can switch between them; there is no separate Python "engine" beyond
 # this file plus command_center/ui/theme.py's st.context.theme helper.
 
+[client]
+# Hide Streamlit's own developer toolbar — "Deploy", "Stop", the hamburger
+# menu and the accessibility affordance it carries. This is a local desktop
+# operator console launched by double-clicking a .command file: none of those
+# controls do anything meaningful here, and they read as part of our UI (the
+# accessibility glyph in particular was mistaken for one of our own icons).
+# "minimal" keeps genuinely necessary notices, such as a rerun prompt.
+toolbarMode = "minimal"
+
 [theme]
 showWidgetBorder = true
 showSidebarBorder = true
