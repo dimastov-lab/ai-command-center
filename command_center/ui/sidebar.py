@@ -30,13 +30,19 @@ import streamlit as st
 # palette and every deep link still reach all of them); they are just no longer
 # all shouting at once.
 NAV_GROUPS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
-    # The six destinations the redesign keeps: overview, planning, execution,
-    # projects, git, chat.
-    ("Основное", ("dashboard", "kanban", "execution_center", "projects", "git_center", "chat"), True),
-    ("Планирование", ("waves", "create", "reports", "generated"), False),
-    ("Аналитика", ("executive", "runs", "timeline", "context", "agents"), False),
+    # The core destinations the redesign keeps: overview, planning, execution,
+    # projects, git. Chat/reports/generated/context are no longer their own
+    # sidebar entries — they live inside the project view (task 02661825).
+    ("Основное", ("dashboard", "kanban", "execution_center", "projects", "git_center"), True),
+    ("Планирование", ("waves", "create"), False),
+    ("Аналитика", ("executive", "runs", "timeline", "agents"), False),
     ("Портфель и режимы", ("portfolio", "portfolio_overview", "workspace_home", "workspace", "focus"), False),
 )
+
+# Pages whose handler is kept (for delegation / an existing deep link) but which
+# are no longer their own sidebar entry — everything about a project now opens
+# inside the project view as a tab: chat, generated tasks, reports, context.
+HIDDEN_FROM_SIDEBAR: frozenset[str] = frozenset({"chat", "generated", "reports", "context"})
 
 
 def _grouped(nav: dict[str, tuple[str, str]]) -> list[tuple[str, list[str], bool]]:
@@ -48,11 +54,14 @@ def _grouped(nav: dict[str, tuple[str, str]]) -> list[tuple[str, list[str], bool
     seen: set[str] = set()
     groups: list[tuple[str, list[str], bool]] = []
     for title, keys, expanded in NAV_GROUPS:
-        present = [key for key in keys if key in nav]
+        present = [key for key in keys if key in nav and key not in HIDDEN_FROM_SIDEBAR]
         seen.update(present)
         if present:
             groups.append((title, present, expanded))
-    leftover = [key for key in nav if key not in seen]
+    # `HIDDEN_FROM_SIDEBAR` pages are intentionally omitted from the catch-all
+    # too: their handler stays reachable by URL / delegation, but they are not
+    # a sidebar destination (they live inside the project view).
+    leftover = [key for key in nav if key not in seen and key not in HIDDEN_FROM_SIDEBAR]
     if leftover:
         groups.append(("Прочее", leftover, False))
     return groups

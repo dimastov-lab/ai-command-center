@@ -39,6 +39,7 @@ from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
     autopilot_panel,
+    backlog_proposals,
     backlog_reconcile_panel,
     board_style,
     home_dashboard,
@@ -3510,6 +3511,230 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
     proposals_panel.render_proposals_inbox(api, key_prefix="home_proposals")
 
 
+def render_project_chat(project: str, tasks: list[dict], tasks_by_id: dict[str, dict]) -> None:
+    """Project-scoped chat: conversations, provider send, save-to-report,
+    convert-a-message-to-a-task, and launch-Claude-from-the-conversation.
+
+    The project is passed in (not selected here), so this renders both as the
+    'Чат' tab inside the project view and from the standalone chat page handler —
+    the page is kept so an existing deep link still works, it just delegates
+    here (AICC task 02661825: everything about a project lives inside it)."""
+    conversations = chat_service.load_conversations()
+    project_conversations = [c for c in conversations if c.get("project") == project]
+    chat_cfg = project_configs[project]
+
+    if chat_cfg["sensitive"]:
+        st.warning(
+            f"{project} — чувствительный проект (BANK/LEGAL). Файлы не прикрепляются "
+            "автоматически — добавляйте разрешённый контекст вручную."
+        )
+
+    conv_options = ["+ Новый разговор"] + [c["id"] for c in project_conversations]
+    conv_labels = {c["id"]: f"{c.get('title', '—')} · {c.get('updated_at', '—')}" for c in project_conversations}
+    chosen_conv_id = st.selectbox(
+        "Разговор",
+        conv_options,
+        format_func=lambda value: "Новый разговор" if value == "+ Новый разговор" else conv_labels.get(value, value),
+        key=f"chat_conv_select_{project}",
+    )
+
+    if chosen_conv_id == "+ Новый разговор":
+        new_conv_title = st.text_input(
+            "Название нового разговора", key=f"chat_new_title_{project}", placeholder="Например: обсуждение архитектуры P1"
+        )
+        project_task_options = ["Без привязки"] + [
+            task["id"] for task in tasks if project_config.project_matches(task.get("project"), project)
+        ]
+        link_task_id = st.selectbox(
+            "Привязать к задаче (необязательно)",
+            project_task_options,
+            format_func=lambda value: "Без привязки" if value == "Без привязки" else task_label(tasks_by_id[value]),
+            key=f"chat_link_task_{project}",
+        )
+        if st.button("Создать разговор", key=f"chat_create_conv_btn_{project}", icon=":material/add_comment:"):
+            new_conv = models.new_conversation(
+                project,
+                new_conv_title.strip() or "Новый разговор",
+                task_id=None if link_task_id == "Без привязки" else link_task_id,
+            )
+            conversations.append(new_conv)
+            chat_service.save_conversations(conversations)
+            activity_log.log_event(
+                "conversation_created", project=project, task_id=new_conv.get("task_id"),
+                conversation_id=new_conv["id"], message=new_conv["title"],
+            )
+            st.session_state.pending_chat_conv = new_conv["id"]
+            st.rerun()
+    else:
+        active_conversation = chat_service.get_conversation(conversations, chosen_conv_id)
+        if active_conversation is None:
+            st.error("Разговор не найден.")
+            return
+        linked_task = tasks_by_id.get(active_conversation.get("task_id") or "")
+        caption = f"Проект: {active_conversation['project']} · создан {active_conversation['created_at']}"
+        if linked_task:
+            caption += f" · задача: {task_label(linked_task)}"
+        st.caption(caption)
+
+        include_context = st.checkbox(
+            "Включить контекст проекта в запрос провайдеру", value=True, key=f"chat_include_ctx_{active_conversation['id']}"
+        )
+
+        for message in active_conversation.get("messages", []):
+            with st.chat_message("user" if message["role"] == "user" else "assistant"):
+                role_label = "Вы" if message["role"] == "user" else "Ассистент"
+                provider_suffix = f" · {message['provider']}" if message.get("provider") else ""
+                st.caption(f"{role_label} · {message.get('created_at', '—')}{provider_suffix}")
+                st.write(message["content"])
+                msg_action_cols = st.columns(2)
+                with msg_action_cols[0]:
+                    if st.button("Сохранить в отчёты", key=f"chat_save_report_{message['id']}", icon=":material/save:"):
+                        saved_path = _save_message_as_report(active_conversation, message)
+                        st.success(f"Сохранено: `{saved_path.relative_to(ROOT)}`")
+                with msg_action_cols[1]:
+                    if st.button("Сделать задачей", key=f"chat_to_task_{message['id']}", icon=":material/add_task:"):
+                        st.session_state[f"chat_convert_open_{message['id']}"] = True
+
+                if st.session_state.get(f"chat_convert_open_{message['id']}"):
+                    with st.form(f"chat_convert_form_{message['id']}"):
+                        conv_task_type = st.selectbox(
+                            "Тип задачи", TASK_TYPES, format_func=lambda v: TASK_TYPE_LABELS.get(v, v),
+                            key=f"chat_convert_type_{message['id']}",
+                        )
+                        conv_objective = st.text_area(
+                            "Цель задачи", value=message["content"], key=f"chat_convert_obj_{message['id']}"
+                        )
+                        if st.form_submit_button("Создать задачу"):
+                            objective_clean = conv_objective.strip()
+                            if not objective_clean:
+                                st.error("Укажите цель задачи.")
+                            else:
+                                new_task_from_msg = create_task(
+                                    active_conversation["project"],
+                                    models.derive_short_title(objective_clean),
+                                    conv_task_type,
+                                    "Backlog",
+                                    goal=objective_clean,
+                                )
+                                activity_log.log_event(
+                                    "task_created_from_message", project=active_conversation["project"],
+                                    task_id=new_task_from_msg["id"], conversation_id=active_conversation["id"],
+                                    message="Задача создана из сообщения чата",
+                                )
+                                st.session_state[f"chat_convert_open_{message['id']}"] = False
+                                st.success("Задача создана.")
+                                st.rerun()
+
+        st.divider()
+        chat_providers = chat_service.available_providers()
+        provider_status = {provider.name: provider.is_available() for provider in chat_providers}
+        chosen_provider_name = st.selectbox(
+            "Провайдер",
+            [provider.name for provider in chat_providers],
+            format_func=lambda name: chat_service.get_provider(name).label,
+            key=f"chat_provider_{active_conversation['id']}",
+        )
+        provider_available, provider_reason = provider_status[chosen_provider_name]
+        if provider_reason:
+            st.info(provider_reason)
+        if chosen_provider_name == "openai":
+            st.caption("Использование OpenAI API оплачивается отдельно от подписки ChatGPT.")
+
+        user_input = st.chat_input("Введите сообщение...", key=f"chat_input_{active_conversation['id']}")
+        if user_input:
+            conversations = chat_service.load_conversations()
+            user_message = models.new_message("user", user_input, provider=None)
+            chat_service.append_message(conversations, active_conversation["id"], user_message)
+            activity_log.log_event(
+                "message_added", project=active_conversation["project"], conversation_id=active_conversation["id"],
+                message="Сообщение пользователя добавлено",
+            )
+
+            if chosen_provider_name != "local" and provider_available:
+                context_text = _build_project_context_text(project) if include_context else ""
+                updated_conversation = chat_service.get_conversation(conversations, active_conversation["id"])
+                try:
+                    with st.spinner("Ожидание ответа провайдера..."):
+                        response_text = chat_service.get_provider(chosen_provider_name).send(
+                            messages=updated_conversation["messages"],
+                            project_context=context_text,
+                            project_id=project,
+                            repository_path=chat_cfg.get("repository_path"),
+                            timeout_seconds=180,
+                        )
+                    conversations = chat_service.load_conversations()
+                    assistant_message = models.new_message("assistant", response_text, provider=chosen_provider_name)
+                    chat_service.append_message(conversations, active_conversation["id"], assistant_message)
+                    activity_log.log_event(
+                        "message_added", project=active_conversation["project"], conversation_id=active_conversation["id"],
+                        message=f"Ответ провайдера {chosen_provider_name} добавлен",
+                    )
+                except Exception as exc:  # noqa: BLE001 — surfaced to the user, never crashes the page
+                    st.error(f"Ошибка провайдера: {exc}")
+            st.rerun()
+
+        st.divider()
+        st.markdown("##### Запустить Claude Code из этого разговора")
+        last_user_message = next(
+            (m["content"] for m in reversed(active_conversation.get("messages", [])) if m["role"] == "user"), ""
+        )
+        render_agent_launcher(
+            key_prefix=f"chat_launch_{active_conversation['id']}",
+            project=project,
+            default_prompt=last_user_message,
+            tasks=tasks,
+            task_id=active_conversation.get("task_id"),
+        )
+
+
+def _project_audit_prompt(project: str) -> str:
+    """The read-only audit brief. It must end with a machine-parsable section so
+    `backlog_proposals.parse_candidate_tasks` can turn the report into tasks."""
+    return (
+        f"Проведи READ-ONLY аудит проекта {project} по четырём осям: архитектура, "
+        "соблюдение правил/конвенций, качество кода и тестов, UX. Ничего в коде НЕ меняй. "
+        "В конце отчёта ОБЯЗАТЕЛЬНО выведи секцию с заголовком '## Предлагаемые задачи', "
+        "где каждым пунктом списка дай одно улучшение в формате "
+        "'- **Короткий заголовок** — что и зачем сделать'. От 5 до 15 пунктов, по приоритету."
+    )
+
+
+def _latest_audit_report_text(project: str) -> str | None:
+    """Newest project report that looks like an audit, so the Audit tab can turn
+    it into candidate backlog tasks. Falls back to the newest report of any kind."""
+    files = artifacts.list_markdown_files(REPORTS_DIR / project)
+    audit_files = [f for f in files if any(k in f.name.lower() for k in ("audit", "architecture", "аудит"))]
+    chosen = audit_files or files
+    if not chosen:
+        return None
+    latest = max(chosen, key=lambda path: path.stat().st_mtime)
+    return read_text(latest)
+
+
+def _roadmap_reformat_prompt(project: str, wishes: str) -> str:
+    """Brief for a roadmap rebuild. Ends with the same machine-parsable section
+    the audit uses, so its output flows through the same candidate pipeline."""
+    wishes_clean = (wishes or "").strip() or "(без дополнительных пожеланий — опирайся на текущее состояние проекта)"
+    return (
+        f"Пересобери roadmap проекта {project} с учётом пожеланий пользователя:\n{wishes_clean}\n\n"
+        "Проанализируй текущее состояние (задачи, вехи, волны) и предложи обновлённый план. "
+        "НЕ предлагай работу, которая уже сделана или уже есть в задачах. "
+        "В конце ОБЯЗАТЕЛЬНО выведи секцию с заголовком '## Предлагаемые задачи', где каждым "
+        "пунктом дай одну задачу в формате '- **Короткий заголовок** — что и зачем сделать', "
+        "в порядке приоритета."
+    )
+
+
+def _latest_roadmap_report_text(project: str) -> str | None:
+    """Newest project report that looks like a roadmap rebuild."""
+    files = artifacts.list_markdown_files(REPORTS_DIR / project)
+    roadmap_files = [f for f in files if any(k in f.name.lower() for k in ("roadmap", "переформат", "план"))]
+    if not roadmap_files:
+        return None
+    latest = max(roadmap_files, key=lambda path: path.stat().st_mtime)
+    return read_text(latest)
+
+
 if page_key == "dashboard":
     render_home_dashboard(get_execution_center_api(), tasks)
 
@@ -3894,174 +4119,12 @@ elif page_key == "create":
 
 elif page_key == "chat":
     st.subheader("Чат по проекту")
-
-    conversations = chat_service.load_conversations()
+    # The chat now lives as the 'Чат' tab inside the project view; this page is
+    # kept so an existing deep link still resolves, and delegates to the same
+    # `render_project_chat` the tab uses. (task 02661825)
+    st.caption("Чат теперь встроен во вкладку «Чат» страницы «Проекты».")
     chat_project = st.selectbox("Проект", models.PROJECT_IDS, key="chat_project_select")
-    project_conversations = [c for c in conversations if c.get("project") == chat_project]
-    chat_cfg = project_configs[chat_project]
-
-    if chat_cfg["sensitive"]:
-        st.warning(
-            f"{chat_project} — чувствительный проект (BANK/LEGAL). Файлы не прикрепляются "
-            "автоматически — добавляйте разрешённый контекст вручную."
-        )
-
-    conv_options = ["+ Новый разговор"] + [c["id"] for c in project_conversations]
-    conv_labels = {c["id"]: f"{c.get('title', '—')} · {c.get('updated_at', '—')}" for c in project_conversations}
-    chosen_conv_id = st.selectbox(
-        "Разговор",
-        conv_options,
-        format_func=lambda value: "Новый разговор" if value == "+ Новый разговор" else conv_labels.get(value, value),
-        key="chat_conv_select",
-    )
-
-    if chosen_conv_id == "+ Новый разговор":
-        new_conv_title = st.text_input(
-            "Название нового разговора", key="chat_new_title", placeholder="Например: обсуждение архитектуры P1"
-        )
-        project_task_options = ["Без привязки"] + [
-            task["id"] for task in tasks if project_config.project_matches(task.get("project"), chat_project)
-        ]
-        link_task_id = st.selectbox(
-            "Привязать к задаче (необязательно)",
-            project_task_options,
-            format_func=lambda value: "Без привязки" if value == "Без привязки" else task_label(tasks_by_id[value]),
-            key="chat_link_task",
-        )
-        if st.button("Создать разговор", key="chat_create_conv_btn", icon=":material/add_comment:"):
-            new_conv = models.new_conversation(
-                chat_project,
-                new_conv_title.strip() or "Новый разговор",
-                task_id=None if link_task_id == "Без привязки" else link_task_id,
-            )
-            conversations.append(new_conv)
-            chat_service.save_conversations(conversations)
-            activity_log.log_event(
-                "conversation_created", project=chat_project, task_id=new_conv.get("task_id"),
-                conversation_id=new_conv["id"], message=new_conv["title"],
-            )
-            st.session_state.pending_chat_conv = new_conv["id"]
-            st.rerun()
-    else:
-        active_conversation = chat_service.get_conversation(conversations, chosen_conv_id)
-        if active_conversation is None:
-            st.error("Разговор не найден.")
-        else:
-            linked_task = tasks_by_id.get(active_conversation.get("task_id") or "")
-            caption = f"Проект: {active_conversation['project']} · создан {active_conversation['created_at']}"
-            if linked_task:
-                caption += f" · задача: {task_label(linked_task)}"
-            st.caption(caption)
-
-            include_context = st.checkbox(
-                "Включить контекст проекта в запрос провайдеру", value=True, key=f"chat_include_ctx_{active_conversation['id']}"
-            )
-
-            for message in active_conversation.get("messages", []):
-                with st.chat_message("user" if message["role"] == "user" else "assistant"):
-                    role_label = "Вы" if message["role"] == "user" else "Ассистент"
-                    provider_suffix = f" · {message['provider']}" if message.get("provider") else ""
-                    st.caption(f"{role_label} · {message.get('created_at', '—')}{provider_suffix}")
-                    st.write(message["content"])
-                    msg_action_cols = st.columns(2)
-                    with msg_action_cols[0]:
-                        if st.button("Сохранить в отчёты", key=f"chat_save_report_{message['id']}", icon=":material/save:"):
-                            saved_path = _save_message_as_report(active_conversation, message)
-                            st.success(f"Сохранено: `{saved_path.relative_to(ROOT)}`")
-                    with msg_action_cols[1]:
-                        if st.button("Сделать задачей", key=f"chat_to_task_{message['id']}", icon=":material/add_task:"):
-                            st.session_state[f"chat_convert_open_{message['id']}"] = True
-
-                    if st.session_state.get(f"chat_convert_open_{message['id']}"):
-                        with st.form(f"chat_convert_form_{message['id']}"):
-                            conv_task_type = st.selectbox(
-                                "Тип задачи", TASK_TYPES, format_func=lambda v: TASK_TYPE_LABELS.get(v, v),
-                                key=f"chat_convert_type_{message['id']}",
-                            )
-                            conv_objective = st.text_area(
-                                "Цель задачи", value=message["content"], key=f"chat_convert_obj_{message['id']}"
-                            )
-                            if st.form_submit_button("Создать задачу"):
-                                objective_clean = conv_objective.strip()
-                                if not objective_clean:
-                                    st.error("Укажите цель задачи.")
-                                else:
-                                    new_task_from_msg = create_task(
-                                        active_conversation["project"],
-                                        models.derive_short_title(objective_clean),
-                                        conv_task_type,
-                                        "Backlog",
-                                        goal=objective_clean,
-                                    )
-                                    activity_log.log_event(
-                                        "task_created_from_message", project=active_conversation["project"],
-                                        task_id=new_task_from_msg["id"], conversation_id=active_conversation["id"],
-                                        message="Задача создана из сообщения чата",
-                                    )
-                                    st.session_state[f"chat_convert_open_{message['id']}"] = False
-                                    st.success("Задача создана.")
-                                    st.rerun()
-
-            st.divider()
-            chat_providers = chat_service.available_providers()
-            provider_status = {provider.name: provider.is_available() for provider in chat_providers}
-            chosen_provider_name = st.selectbox(
-                "Провайдер",
-                [provider.name for provider in chat_providers],
-                format_func=lambda name: chat_service.get_provider(name).label,
-                key=f"chat_provider_{active_conversation['id']}",
-            )
-            provider_available, provider_reason = provider_status[chosen_provider_name]
-            if provider_reason:
-                st.info(provider_reason)
-            if chosen_provider_name == "openai":
-                st.caption("Использование OpenAI API оплачивается отдельно от подписки ChatGPT.")
-
-            user_input = st.chat_input("Введите сообщение...", key=f"chat_input_{active_conversation['id']}")
-            if user_input:
-                conversations = chat_service.load_conversations()
-                user_message = models.new_message("user", user_input, provider=None)
-                chat_service.append_message(conversations, active_conversation["id"], user_message)
-                activity_log.log_event(
-                    "message_added", project=active_conversation["project"], conversation_id=active_conversation["id"],
-                    message="Сообщение пользователя добавлено",
-                )
-
-                if chosen_provider_name != "local" and provider_available:
-                    context_text = _build_project_context_text(chat_project) if include_context else ""
-                    updated_conversation = chat_service.get_conversation(conversations, active_conversation["id"])
-                    try:
-                        with st.spinner("Ожидание ответа провайдера..."):
-                            response_text = chat_service.get_provider(chosen_provider_name).send(
-                                messages=updated_conversation["messages"],
-                                project_context=context_text,
-                                project_id=chat_project,
-                                repository_path=chat_cfg.get("repository_path"),
-                                timeout_seconds=180,
-                            )
-                        conversations = chat_service.load_conversations()
-                        assistant_message = models.new_message("assistant", response_text, provider=chosen_provider_name)
-                        chat_service.append_message(conversations, active_conversation["id"], assistant_message)
-                        activity_log.log_event(
-                            "message_added", project=active_conversation["project"], conversation_id=active_conversation["id"],
-                            message=f"Ответ провайдера {chosen_provider_name} добавлен",
-                        )
-                    except Exception as exc:  # noqa: BLE001 — surfaced to the user, never crashes the page
-                        st.error(f"Ошибка провайдера: {exc}")
-                st.rerun()
-
-            st.divider()
-            st.markdown("##### Запустить Claude Code из этого разговора")
-            last_user_message = next(
-                (m["content"] for m in reversed(active_conversation.get("messages", [])) if m["role"] == "user"), ""
-            )
-            render_agent_launcher(
-                key_prefix=f"chat_launch_{active_conversation['id']}",
-                project=chat_project,
-                default_prompt=last_user_message,
-                tasks=tasks,
-                task_id=active_conversation.get("task_id"),
-            )
+    render_project_chat(chat_project, tasks, tasks_by_id)
 
 
 # --------------------------------------------------------------------------
@@ -4416,11 +4479,30 @@ elif page_key == "timeline":
 elif page_key == "projects":
     st.subheader("Проекты")
 
-    selected_project = st.selectbox("Проект", models.PROJECT_IDS, key="project_browser_select")
+    project_choice = st.selectbox("Проект", ["Все", *models.PROJECT_IDS], key="project_browser_select")
+
+    # "Все" is a cross-project overview; picking a project opens it *inside* the
+    # project (status, tasks, reports, context, settings, chat as tabs) rather
+    # than as separate sidebar pages. (task 02661825)
+    if project_choice == "Все":
+        st.caption(
+            "Обзор всех проектов — выберите проект, чтобы открыть его внутри "
+            "(задания, отчёты, контекст, настройки, чат)."
+        )
+        for overview_pid in models.PROJECT_IDS:
+            pid_tasks = [t for t in tasks if project_config.project_matches(t.get("project"), overview_pid)]
+            pid_active = [t for t in pid_tasks if t.get("status") != "Done"]
+            pid_done = [t for t in pid_tasks if t.get("status") == "Done"]
+            with st.container(border=True):
+                st.markdown(f"**{project_configs[overview_pid]['display_name']}** (`{overview_pid}`)")
+                st.caption(f"{len(pid_active)} активных · {len(pid_done)} завершено · всего {len(pid_tasks)}")
+        st.stop()
+
+    selected_project = project_choice
     project_file = project_status_file_path(selected_project)
 
-    tab_status, tab_generated, tab_reports, tab_context, tab_settings = st.tabs(
-        ["Статус проекта", "Сгенерированные задачи", "Отчёты", "Контекст", "Настройки репозитория"]
+    tab_status, tab_generated, tab_reports, tab_context, tab_settings, tab_chat, tab_audit, tab_roadmap = st.tabs(
+        ["Статус", "Задания", "Отчёты", "Контекст", "Настройки", "Чат", "Аудит", "Roadmap"]
     )
 
     with tab_status:
@@ -4633,6 +4715,87 @@ elif page_key == "projects":
             )
             st.success("Настройки проекта сохранены.")
             st.rerun()
+
+    with tab_chat:
+        render_project_chat(selected_project, tasks, tasks_by_id)
+
+    with tab_audit:
+        st.caption(
+            "Read-only аудит проекта (архитектура, правила, качество, UX). Результат "
+            "превращается в предлагаемые задачи бэклога — примите нужные."
+        )
+        if st.button("Запустить аудит", key=f"proj_audit_run_{selected_project}", type="primary"):
+            audit_task = create_task(
+                selected_project,
+                f"Аудит проекта {selected_project}: архитектура/правила/качество/UX",
+                "architecture_review",
+                "Next",
+                goal="Провести read-only аудит проекта и предложить задачи для бэклога.",
+                prompt=_project_audit_prompt(selected_project),
+            )
+            execution_queue.enqueue_and_persist(ROOT, audit_task, {**tasks_by_id, audit_task["id"]: audit_task})
+            st.success(
+                f"Аудит поставлен в очередь (задача {audit_task['id'][:8]}). Когда read-only "
+                "агент завершит отчёт, его предложения появятся ниже."
+            )
+
+        report_text = _latest_audit_report_text(selected_project)
+        if report_text:
+            st.divider()
+            candidates = backlog_proposals.parse_candidate_tasks(report_text)
+            backlog_proposals.render_candidate_tasks(
+                candidates,
+                ROOT,
+                selected_project,
+                key_prefix=f"proj_audit_cand_{selected_project}",
+                heading="Предложения из аудита",
+            )
+        else:
+            st.caption("Отчётов аудита пока нет — запустите аудит выше.")
+
+    with tab_roadmap:
+        st.caption(
+            "Переформатировать Roadmap проекта по новым пожеланиям: агент пересоберёт "
+            "задачи/вехи/волны, покажет предпросмотр. Дубли уже сделанного отфильтровываются."
+        )
+        roadmap_wishes = st.text_area(
+            "Пожелания к Roadmap",
+            key=f"proj_roadmap_wishes_{selected_project}",
+            placeholder="Например: сфокусироваться на надёжности пайплайна и качестве UX",
+        )
+        if st.button("Переформатировать Roadmap", key=f"proj_roadmap_run_{selected_project}", type="primary"):
+            roadmap_task = create_task(
+                selected_project,
+                f"Переформатировать Roadmap: {selected_project}",
+                "architecture_review",
+                "Next",
+                goal="Пересобрать roadmap/задачи/вехи проекта по новым пожеланиям.",
+                prompt=_roadmap_reformat_prompt(selected_project, roadmap_wishes),
+            )
+            execution_queue.enqueue_and_persist(
+                ROOT, roadmap_task, {**tasks_by_id, roadmap_task["id"]: roadmap_task}
+            )
+            st.success(
+                f"Переформатирование поставлено в очередь (задача {roadmap_task['id'][:8]}). "
+                "Когда агент завершит, новые задачи появятся ниже как предложения."
+            )
+
+        roadmap_report = _latest_roadmap_report_text(selected_project)
+        if roadmap_report:
+            st.divider()
+            proposed = backlog_proposals.parse_candidate_tasks(roadmap_report)
+            fresh = backlog_proposals.filter_new_candidates(proposed, tasks)
+            if len(fresh) < len(proposed):
+                st.caption(f"Отфильтровано дублей уже существующих задач: {len(proposed) - len(fresh)}.")
+            backlog_proposals.render_candidate_tasks(
+                fresh,
+                ROOT,
+                selected_project,
+                key_prefix=f"proj_roadmap_cand_{selected_project}",
+                heading="Новые задачи из обновлённого roadmap",
+            )
+        else:
+            st.caption("Отчётов переформатирования пока нет — запустите выше.")
 
 
 # --------------------------------------------------------------------------
