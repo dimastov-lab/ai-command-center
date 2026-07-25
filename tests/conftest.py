@@ -40,6 +40,18 @@ def clear_provider_probe_cache():
 
 
 @pytest.fixture(autouse=True)
+def _immediate_reconcile(monkeypatch):
+    """reconcile()'s cross-process debounce (audit P0) waits a grace window before
+    terminalizing a run that only *looks* gone. Tests want deterministic,
+    immediate classification, so default the grace to 0 across the suite; the
+    debounce behaviour itself is covered in test_runtime_reconciliation.py, which
+    overrides `sup._reconcile_absence_grace` locally."""
+    from command_center.runtime import supervisor
+
+    monkeypatch.setattr(supervisor, "_RECONCILE_ABSENCE_GRACE_SECONDS", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def isolated_data_dir():
     if _TEST_DATA_DIR.exists():
         shutil.rmtree(_TEST_DATA_DIR)

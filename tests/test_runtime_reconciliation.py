@@ -344,3 +344,69 @@ def test_reconcile_continues_after_one_run_persistence_failure(tmp_path, monkeyp
     by_id = {item["run_id"]: item for item in outcomes}
     assert by_id[broken["id"]]["classification"] == "ERROR"
     assert by_id[healthy["id"]]["classification"] == "INTERRUPTED"
+
+
+# --------------------------------------------------------------------------
+# Cross-process debounce (audit P0): a run that only *looks* gone (a peer owns
+# it and is between create_run and Popen, or exited-but-finalizing) must not be
+# INTERRUPTED on a single observation, only after it stays gone across a grace
+# window — so a peer's succeeding run is never terminalized out from under it.
+# --------------------------------------------------------------------------
+
+
+def _dead_running_row(db_path):
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    time.sleep(0.2)  # ensure `ps` no longer reports it
+    return _make_running_row(db_path, pid=proc.pid, process_start_identity="whatever|whatever")
+
+
+def test_reconcile_does_not_terminalize_a_gone_run_on_first_observation(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _dead_running_row(db_path)
+
+    sup = supervisor.Supervisor(db_path)
+    sup._reconcile_absence_grace = 60.0  # long grace: never fires within the test
+    sup.reconcile()
+
+    assert db.get_run(db_path, run["id"])["state"] == "RUNNING"  # not interrupted yet
+    assert run["id"] in sup._suspected_gone
+
+
+def test_reconcile_terminalizes_a_gone_run_after_the_grace_window(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _dead_running_row(db_path)
+
+    sup = supervisor.Supervisor(db_path)
+    sup._reconcile_absence_grace = 0.05
+    sup.reconcile()  # first: suspicion only
+    assert db.get_run(db_path, run["id"])["state"] == "RUNNING"
+    time.sleep(0.06)  # let the grace elapse
+    sup.reconcile()  # second: now confirmed gone
+    assert db.get_run(db_path, run["id"])["state"] == "INTERRUPTED"
+
+
+def test_reconcile_never_clobbers_a_run_that_resolves_during_grace(tmp_path):
+    """The core protection: the owning process CAS's the run terminal
+    (COMPLETED) while our grace is still open — reconcile must not overwrite
+    that with INTERRUPTED, and must forget the suspicion."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _dead_running_row(db_path)
+
+    sup = supervisor.Supervisor(db_path)
+    sup._reconcile_absence_grace = 60.0
+    sup.reconcile()  # first: suspicion recorded, still RUNNING
+    assert run["id"] in sup._suspected_gone
+
+    current = db.get_run(db_path, run["id"])
+    db.update_run_state(
+        db_path, run["id"], expected_version=current["version"],
+        new_state="COMPLETED", fields={"completed_at": "2026-01-01T00:00:01"},
+    )
+    sup.reconcile()  # second: run is no longer active
+
+    assert db.get_run(db_path, run["id"])["state"] == "COMPLETED"  # never clobbered
+    assert run["id"] not in sup._suspected_gone  # suspicion pruned
