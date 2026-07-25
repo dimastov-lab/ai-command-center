@@ -48,6 +48,7 @@ from command_center.ui import (
     portfolio_overview_panel,
     portfolio_panel,
     project_intelligence_panel,
+    proposals_panel,
     project_selector,
     queue_panel,
     recommendations_panel,
@@ -3504,6 +3505,9 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
             })
         home_dashboard.simple_rows(agent_rows or [{"icon": "🤖", "name": "Нет активных прогонов", "meta": ""}])
         home_dashboard.card_close()
+
+    st.divider()
+    proposals_panel.render_proposals_inbox(api, key_prefix="home_proposals")
 
 
 if page_key == "dashboard":
