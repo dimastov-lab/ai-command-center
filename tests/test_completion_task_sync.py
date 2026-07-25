@@ -68,6 +68,28 @@ def test_non_completed_does_not_force_progress_100():
     assert task.get("pull_request_status") != "merged"
 
 
+@pytest.mark.parametrize("task_type", ["review", "architecture_review", "final_gate"])
+def test_read_only_completed_run_resolves_to_completed_not_needs_review(task_type):
+    """A read-only task (review/audit/gate) has no PR to review and nothing to
+    merge — a clean COMPLETED run is terminally "Completed", never "Needs Review"
+    (and never "Requires Attention" from a spurious merge completion)."""
+    from command_center.runtime import session_view
+
+    task = _task(task_type=task_type, progress=5)  # progress never reaches 100 for these
+    resolved = task_sync._resolve_target_launch_status(session_view.STATUS_COMPLETED, task)
+    assert resolved == "Completed"
+
+
+def test_non_read_only_completed_below_100_is_needs_review():
+    """An implementation task still gets the merge lifecycle: COMPLETED at
+    progress < 100 is "Needs Review" (PR ready, awaiting human), unchanged."""
+    from command_center.runtime import session_view
+
+    task = _task(task_type="implementation", progress=95)
+    resolved = task_sync._resolve_target_launch_status(session_view.STATUS_COMPLETED, task)
+    assert resolved == "Needs Review"
+
+
 def test_projection_is_idempotent():
     task = _task()
     completion = {"completion_state": "COMPLETED", "pull_request_url": None}

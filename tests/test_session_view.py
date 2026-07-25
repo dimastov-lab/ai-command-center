@@ -220,6 +220,92 @@ def test_build_session_view_uses_kanban_task_title_stage_and_progress():
     assert session["report_path"] == "reports/AIOS/x.md"
 
 
+def test_derive_live_progress_moves_off_5_for_a_running_run():
+    """The reported defect: a healthy run's bar sat at the task's pinned 5 %.
+    The live value reflects the run's elapsed time budget, not the stale stage —
+    a quarter of the way through the budget it already reads ~25 %."""
+    percent, stage = session_view.derive_live_progress(
+        session_view.STATUS_RUNNING, None, elapsed_seconds=250, timeout_seconds=1000
+    )
+    assert percent is not None and percent > 5
+    assert stage
+    assert stage
+
+
+def test_derive_live_progress_advances_through_completion_states():
+    """Each completion milestone yields a strictly higher bar than the one
+    before — the bar moves at real, observed transitions."""
+    order = [
+        "EXECUTION_FINISHED",
+        "VALIDATING_RESULT",
+        "RESULT_VALID",
+        "AWAITING_REVIEW",
+        "PREPARING_PULL_REQUEST",
+        "PULL_REQUEST_OPEN",
+        "AWAITING_MERGE",
+        "MERGED",
+        "VERIFYING_TARGET_BRANCH",
+        "COMPLETED",
+    ]
+    values = [session_view.derive_live_progress("Completed", {"state": s})[0] for s in order]
+    assert values == sorted(values), values
+    assert values[-1] == 100  # only a verified COMPLETED reaches 100
+
+
+def test_derive_live_progress_completed_process_without_completion_is_not_100():
+    """A process that exited cleanly but has no completion row yet is not
+    'done' — 100 is reserved for a verified merge."""
+    percent, _ = session_view.derive_live_progress(session_view.STATUS_COMPLETED, None)
+    assert percent is not None and percent < 100
+
+
+def test_derive_live_progress_read_only_completed_is_100():
+    """A read-only task (review/audit/gate) has no merge — a clean COMPLETED is
+    its terminal success, so it reads 100 %, not an incomplete 55 %."""
+    for tt in ("review", "architecture_review", "final_gate"):
+        percent, stage = session_view.derive_live_progress(
+            session_view.STATUS_COMPLETED, None, task_type=tt
+        )
+        assert percent == 100, tt
+        assert stage
+
+
+def test_derive_live_progress_running_tracks_elapsed_fraction_directly():
+    """The working phase tracks the fraction of the time budget spent directly:
+    at half the budget it reads ~50 %, at 79 % it reads ~79 % — "more elapsed
+    than remaining ⟹ past halfway" — and it never claims done while running."""
+    half, _ = session_view.derive_live_progress(
+        session_view.STATUS_RUNNING, None, elapsed_seconds=500, timeout_seconds=1000
+    )
+    mostly, _ = session_view.derive_live_progress(
+        session_view.STATUS_RUNNING, None, elapsed_seconds=790, timeout_seconds=1000
+    )
+    assert half == 50
+    assert mostly == 79           # elapsed (790) > remaining (210) → well past 50 %
+    assert mostly < 100           # never "done" while the process is running
+    # The old skew this fixes: 11 min in, 3 left (≈78.6 %) must read > 50 %.
+    skewed, _ = session_view.derive_live_progress(
+        session_view.STATUS_RUNNING, None, elapsed_seconds=11 * 60, timeout_seconds=14 * 60
+    )
+    assert skewed > 50
+
+
+def test_build_session_view_exposes_live_progress_fields():
+    # Half-way through a 1000 s budget → the live bar reads ~50 %, while the raw
+    # task field stays pinned at 5.
+    run = _run(timeout_seconds=1000)  # started_at 00:00:00
+    now = datetime(2026, 1, 1, 0, 8, 20)  # +500 s
+    task = {"title": "T", "current_stage": "Workspace Verified", "progress": 5, "executor": "claude_code"}
+    session = session_view.build_session_view(
+        run, kanban_task=task, project_cfg=None, latest_event=None, report_path=None, now=now
+    )
+    # Raw task fields preserved…
+    assert session["progress"] == 5
+    # …but the live bar reflects the elapsed time budget, not the stale 5.
+    assert session["live_progress"] == 50
+    assert session["live_stage"]
+
+
 def test_build_session_view_falls_back_to_prompt_or_id_for_title_when_no_task():
     now = datetime(2026, 1, 1, 0, 0, 0)
     run = _run(prompt="A short prompt")
@@ -376,3 +462,26 @@ def test_is_heartbeat_stale_true_when_probe_exceeds_threshold():
     probe_at = datetime(2026, 1, 1, 0, 0, 0)
     now = probe_at + timedelta(seconds=200)
     assert session_view.is_heartbeat_stale(probe_at, now, threshold_seconds=90) is True
+
+
+def test_median_completed_run_seconds_uses_only_completed_runs():
+    runs = [
+        {"state": "COMPLETED", "started_at": "2026-01-01T00:00:00", "completed_at": "2026-01-01T00:10:00"},  # 600s
+        {"state": "COMPLETED", "started_at": "2026-01-01T00:00:00", "completed_at": "2026-01-01T00:20:00"},  # 1200s
+        {"state": "FAILED", "started_at": "2026-01-01T00:00:00", "completed_at": "2026-01-01T09:00:00"},     # ignored
+        {"state": "RUNNING", "started_at": "2026-01-01T00:00:00"},                                            # ignored
+    ]
+    assert session_view.median_completed_run_seconds(runs) == 900.0  # median of 600 & 1200
+
+
+def test_median_completed_run_seconds_none_without_history():
+    assert session_view.median_completed_run_seconds([{"state": "RUNNING"}]) is None
+
+
+def test_median_filters_by_task_type():
+    runs = [
+        {"state": "COMPLETED", "task_type": "review", "started_at": "2026-01-01T00:00:00", "completed_at": "2026-01-01T00:05:00"},
+        {"state": "COMPLETED", "task_type": "implementation", "started_at": "2026-01-01T00:00:00", "completed_at": "2026-01-01T00:40:00"},
+    ]
+    assert session_view.median_completed_run_seconds(runs, task_type="review") == 300.0
+    assert session_view.median_completed_run_seconds(runs, task_type="implementation") == 2400.0

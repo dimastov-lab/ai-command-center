@@ -60,6 +60,29 @@ def run_git_write(repo: Path, args: list[str], *, timeout: int = _DEFAULT_TIMEOU
         raise GitOpsError(args, None, str(exc)) from exc
 
 
+def commit_all(repo: Path, *, message: str) -> subprocess.CompletedProcess | None:
+    """Stage every change in `repo` and commit it on the current branch.
+
+    This is how the *pipeline* commits the work an agent produced — the agent
+    runs sandboxed with no git-write tools, so it leaves its changes uncommitted
+    in its own isolated worktree, and the completion pipeline turns those into a
+    real commit on the task branch before validating and opening the pull
+    request. Only ever called on a task's own linked worktree (isolation is
+    enforced upstream), never on a primary tree.
+
+    Returns the commit `CompletedProcess`, or `None` when there was nothing to
+    commit (a clean tree — an idempotent no-op, not an error)."""
+    status = run_git_write(repo, ["status", "--porcelain"])
+    if status.returncode == 0 and not (status.stdout or "").strip():
+        return None  # nothing to commit
+    add = run_git_write(repo, ["add", "-A"])
+    if add.returncode != 0:
+        raise GitOpsError(["add", "-A"], add.returncode, add.stderr or "")
+    # `--no-verify` so a repo's own pre-commit hooks (lint/format) cannot block
+    # the pipeline from capturing the agent's work; validation runs separately.
+    return run_git_write(repo, ["commit", "--no-verify", "-m", message])
+
+
 def push_branch(
     repo: Path,
     *,

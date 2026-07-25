@@ -544,10 +544,13 @@ def launch_ready(
                 # instruction for its task type instead, and returns a
                 # deliberately-written prompt untouched when there is one.
                 prompt=prompts.build_prompt(task),
+                # An explicit caller timeout wins; otherwise the timeout is
+                # individualized to 200 % of the task's estimate (see
+                # `agent_runner.timeout_for_task`) rather than one fixed default.
                 timeout_seconds=(
                     timeout_seconds
                     if timeout_seconds is not None
-                    else agent_runner.DEFAULT_TIMEOUT_SECONDS
+                    else agent_runner.timeout_for_task(task)
                 ),
                 repository_path=resolved_workspace,
                 execution_center_api=execution_center_api,

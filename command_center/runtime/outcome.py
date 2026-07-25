@@ -97,17 +97,42 @@ def detect_blocker_language(text: str | None) -> str | None:
     return None
 
 
+# Git subcommands that a trusted implementation agent is *intentionally* denied
+# (the completion pipeline owns commit/push/merge, never the agent — see
+# `agent_runner.GIT_WRITE_DISALLOWED_TOOLS`). A denial of one of these is the
+# system working as designed, not a run that "could not do its work": the agent
+# poking at git it isn't allowed to touch, while its real work happened through
+# Read/Edit/Write/other Bash. Such denials must NOT fail an otherwise-productive
+# run. (`git stash` is included because the disallow pattern also catches the
+# read-only `git stash list` the agent sometimes runs to inspect state.)
+_EXPECTED_GIT_DENIAL_MARKERS: tuple[str, ...] = (
+    "git add", "git apply", "git checkout", "git restore", "git switch",
+    "git stash", "git commit", "git push", "git merge", "git reset",
+    "git rebase", "git clean", "git branch -d", "git branch -D",
+)
+
+
+def _is_expected_git_denial(entry: dict) -> bool:
+    """True when a denial is for one of the intentionally-blocked git-write
+    commands — expected and benign, not evidence the run was blocked."""
+    command = str((entry.get("tool_input") or {}).get("command") or "")
+    return any(marker in command for marker in _EXPECTED_GIT_DENIAL_MARKERS)
+
+
 def permission_denial_tool_names(permission_denials: list | None) -> list[str]:
     """Extracts the sorted, de-duplicated tool names from a `result` event's
     `permission_denials` array (each entry `{"tool_name": ..., ...}` per the
     real `claude -p --output-format json`/`stream-json` `result` event
-    shape). Never raises on a malformed/unexpected shape — returns `[]`."""
+    shape), **excluding intentionally-blocked git-write denials** (those are the
+    system working as designed, not a run that could not do its work — a run that
+    edited files and ran its tests but incidentally poked at `git` it is not
+    allowed to touch is not "blocked"). Never raises — returns `[]`."""
     if not permission_denials:
         return []
     names = {
         str(entry["tool_name"])
         for entry in permission_denials
-        if isinstance(entry, dict) and entry.get("tool_name")
+        if isinstance(entry, dict) and entry.get("tool_name") and not _is_expected_git_denial(entry)
     }
     return sorted(names)
 

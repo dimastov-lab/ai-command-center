@@ -756,8 +756,14 @@ def merge_policy_overrides(settings: PipelineSettings) -> dict:
     overrides: dict = {}
     if settings.auto_merge_active:
         overrides["merge_mode"] = completion_domain.MERGE_AUTO_AFTER_CHECKS
-    if settings.independent_review_active:
-        overrides["requires_independent_review"] = True
+    # The review flag is set explicitly both ways while autopilot is enabled: on
+    # when the operator opts in, and OFF when they opt out, so a deliberate
+    # "review off" genuinely forces the gate off instead of leaving a config
+    # default (auto_after_checks_and_review) to re-require it. That default-driven
+    # gate is what stalled runs at AWAITING_REVIEW -> auto REVIEW_REJECTED even
+    # with the operator's review switch off.
+    if settings.enabled:
+        overrides["requires_independent_review"] = settings.require_independent_review
     return overrides
 
 
@@ -912,7 +918,10 @@ def _rework_prompt(task: dict, row: dict) -> str:
     recommended = (row.get("recommended_action") or "").strip()
     lines = [base, "", "## Доработка", ""]
     lines.append(
-        "Предыдущая попытка завершилась, но проверка не прошла. Исправь причину и "
+        "Это ПРОДОЛЖЕНИЕ, а не новый старт: изменения предыдущей попытки уже лежат в "
+        "рабочем дереве. Сначала посмотри `git status` и уже созданные/изменённые файлы, "
+        "прими сделанное как есть и продолжай с этого места — не переписывай с нуля. "
+        "Предыдущая попытка не дошла до конца/не прошла проверку. Исправь причину и "
         "доведи задачу до состояния, в котором проверка проходит."
     )
     if summary:

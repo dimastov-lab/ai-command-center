@@ -412,6 +412,32 @@ class CompletionOrchestrator:
         pre = self.evaluator.evaluate(task, run, state, None, validation=None, policy=policy)
         if pre.reason_code == ReasonCode.TARGET_VERIFIED:
             return self._complete(row, now=now, pr=self._pr_from_row(row))
+
+        # The agent runs sandboxed (no git-write tools), so its work is sitting
+        # uncommitted in its own isolated worktree. Commit it here — this is the
+        # missing link that let a run reach "COMPLETED" yet stall forever at
+        # UNCOMMITTED_CHANGES: the pipeline, which owns all git for the task,
+        # turns the agent's changes into a real commit on the task branch, then
+        # re-inspects and proceeds to validation → PR → merge. Only the task's
+        # own linked worktree is ever touched (isolation enforced upstream).
+        if pre.reason_code == ReasonCode.UNCOMMITTED_CHANGES:
+            try:
+                git_ops.commit_all(
+                    Path(repo),
+                    message=f"{(task or {}).get('title') or 'task'} (agent run {row['run_id'][:8]})",
+                )
+            except git_ops.GitOpsError as exc:
+                self._apply_assessment(row, pre, now=now)
+                return runtime_db.get_completion(self.db_path, row["run_id"]), False
+            # Re-inspect after committing; fall through with the clean state.
+            state = repo_state.inspect_repository(
+                repo, base_branch=row.get("base_branch"), branch=row.get("branch"),
+                remote=row.get("remote") or DEFAULT_REMOTE, check_remote=False,
+            )
+            pre = self.evaluator.evaluate(task, run, state, None, validation=None, policy=policy)
+            if pre.reason_code == ReasonCode.TARGET_VERIFIED:
+                return self._complete(row, now=now, pr=self._pr_from_row(row))
+
         if pre.reason_code in (
             ReasonCode.UNCOMMITTED_CHANGES,
             ReasonCode.NO_TASK_COMMIT,

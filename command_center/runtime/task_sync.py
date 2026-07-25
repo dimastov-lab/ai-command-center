@@ -77,6 +77,13 @@ def _resolve_target_launch_status(status: str, task: dict) -> str:
     tautology that's vacuously true because nothing ever reaches it."""
     if status != session_view.STATUS_COMPLETED:
         return _LAUNCH_STATUS_BY_DISPLAY_STATUS[status]
+    # A read-only task (review/audit/gate) has no merge/review lifecycle: its
+    # report is the deliverable, so a clean `COMPLETED` is terminally "Completed",
+    # not "Needs Review" (there is no PR to review) and never "Requires Attention"
+    # (there is nothing to merge, so no completion pipeline runs for it — see
+    # `_seed_and_project_completion`).
+    if session_view.is_read_only_task_type(task.get("task_type")):
+        return "Completed"
     return "Completed" if (task.get("progress") or 0) >= 100 else "Needs Review"
 
 
@@ -286,6 +293,18 @@ def _seed_and_project_completion(
 
     `policy_overrides` is forwarded to `begin_completion` and therefore applies
     only to a row being created right now (see that method's docstring)."""
+    # A read-only task (review/audit/gate) has no merge lifecycle — its report is
+    # the deliverable. The completion pipeline is a validate → PR → merge → verify
+    # state machine; running it for an analysis has nothing to do and spuriously
+    # lands in MERGE_BLOCKED, which then projects the task to "Requires Attention"
+    # even though the run succeeded. So a read-only run never seeds a completion,
+    # and any completion left over from before this guard is ignored: the run's
+    # own terminal projection (`_resolve_target_launch_status` → "Completed")
+    # already says the true, terminal outcome.
+    task_type = run.get("task_type") or task.get("task_type")
+    if session_view.is_read_only_task_type(task_type):
+        return False
+
     completion = db.get_completion(api.db_path, run["id"])
     if completion is None:
         if run.get("state") != "COMPLETED":
