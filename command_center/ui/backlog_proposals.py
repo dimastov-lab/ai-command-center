@@ -22,7 +22,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from command_center import tasks_repository
+from command_center import backlog_reconcile, tasks_repository
 
 # A heading opens the candidate list when its text mentions any of these.
 _SECTION_HINTS = ("предлаг", "задач", "backlog", "roadmap", "recommend", "proposed", "предложен")
@@ -75,6 +75,25 @@ def parse_candidate_tasks(markdown: str, *, default_task_type: str = "implementa
         seen.add(title.lower())
         candidates.append(CandidateTask(title=title[:120], goal=goal, task_type=default_task_type))
     return candidates
+
+
+def filter_new_candidates(
+    candidates: list[CandidateTask],
+    existing_tasks: list[dict],
+    *,
+    threshold: float = backlog_reconcile.DEFAULT_SIMILARITY_THRESHOLD,
+) -> list[CandidateTask]:
+    """Drop candidates that already exist as a task (done or open), by title+goal
+    similarity — so reformatting a roadmap never re-proposes work that is already
+    tracked or finished (the user's "не запускать одну и ту же задачу дважды").
+    Reuses the same matcher the backlog-reconcile panel uses."""
+    fresh: list[CandidateTask] = []
+    for candidate in candidates:
+        as_task = {"title": candidate.title, "goal": candidate.goal}
+        if any(backlog_reconcile.similarity(as_task, task) >= threshold for task in existing_tasks):
+            continue
+        fresh.append(candidate)
+    return fresh
 
 
 def render_candidate_tasks(
