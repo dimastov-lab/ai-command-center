@@ -225,7 +225,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -376,6 +376,16 @@ def _migration_4_add_first_output_at(conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
         if "first_output_at" not in existing:
             conn.execute("ALTER TABLE run ADD COLUMN first_output_at TEXT")
+
+
+def _migration_9_add_execution_provider_fields(conn: sqlite3.Connection) -> None:
+    """Persist the selected provider and its redacted, deterministic launch metadata."""
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "provider_id" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'claude_code'")
+        if "provider_metadata_json" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_metadata_json TEXT")
 
 
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
@@ -554,6 +564,61 @@ def _migration_7_add_proposal_parameters_json(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migration_8_add_independent_review_fields(conn: sqlite3.Connection) -> None:
+    """Add the independent-review verdict to `completion`.
+
+    The blocking review gate needs three facts per completion: which run
+    produced the verdict, what the verdict was, and the reviewer's reasoning.
+    They live on the completion row rather than in a side table because there is
+    exactly one review outcome per completion and it is read on the same access
+    path as every other completion field.
+
+    Existing schema-7 databases keep NULLs, which read as "no verdict yet" — the
+    same thing a brand-new row means. That is the safe direction: with the gate
+    enabled, no verdict means *wait*, never *proceed*. The check-and-add runs
+    under the same write lock as the earlier callable migrations, so concurrent
+    and repeated migration attempts are safe.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(completion)").fetchall()}
+        for column in ("review_verdict", "review_run_id", "review_summary"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE completion ADD COLUMN {column} TEXT")
+
+
+_SCHEMA_V10 = """
+-- ADR 0007 step 1: the execution queue's home in the execution-state store.
+--
+-- Mirrors `data/execution_queue.json`'s entry shape exactly, field for field,
+-- because during the dual-write phases the two must be comparable without any
+-- translation — a divergence check that had to normalise shapes first would be
+-- checking its own translation as much as the data.
+--
+-- `task_id` is deliberately NOT a foreign key. The task lives in tasks.json,
+-- which stays a human-editable file (see the ADR); the queue's reference to it
+-- is advisory, and an entry whose task has vanished resolves to `cancelled`
+-- with a reason, exactly as `evaluate_readiness` already does today.
+CREATE TABLE IF NOT EXISTS queue_entry (
+    id            TEXT PRIMARY KEY,
+    task_id       TEXT,
+    project       TEXT,
+    state         TEXT NOT NULL,
+    reason        TEXT,
+    run_id        TEXT,
+    added_at      TEXT,
+    evaluated_at  TEXT,
+    launched_at   TEXT,
+    -- Preserves the JSON file's list order, which is load-bearing: the queue is
+    -- displayed and planned in insertion order, and a set-shaped table would
+    -- silently reorder it.
+    position      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_entry_state ON queue_entry(state);
+CREATE INDEX IF NOT EXISTS idx_queue_entry_task ON queue_entry(task_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -565,6 +630,14 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (5, _SCHEMA_V5),
     (6, _SCHEMA_V6),
     (7, _migration_7_add_proposal_parameters_json),
+    (8, _migration_8_add_independent_review_fields),
+    # Renumbered from 6 on integration: the execution-provider branch and the
+    # autonomy/review work both grew migrations from a shared base of 5, so this
+    # one moves to the end of the sequence. Its content is unchanged and it is
+    # idempotent, so a database that already ran it under the old number simply
+    # finds the columns present.
+    (9, _migration_9_add_execution_provider_fields),
+    (10, _SCHEMA_V10),
 ]
 
 
@@ -870,6 +943,8 @@ def create_run(
     expected_branch: str | None = None,
     launch_source: str | None = None,
     prompt_version: int | None = None,
+    provider_id: str = "claude_code",
+    provider_metadata_json: str | None = None,
     enforce_workspace_lock: bool = False,
 ) -> dict:
     """`expected_branch`/`launch_source`/`prompt_version` are write-once, like
@@ -934,28 +1009,25 @@ def create_run(
                 "expected_branch": expected_branch,
                 "launch_source": launch_source,
                 "prompt_version": prompt_version,
+                "provider_id": provider_id,
+                "provider_metadata_json": provider_metadata_json,
                 "commit_hash": None,
                 "pull_request_url": None,
                 "version": 0,
                 "created_at": now,
                 "updated_at": now,
             }
+            # Build the column list from the table as it exists rather than
+            # from a fixed literal. A database migrated only part-way — which
+            # is exactly what the historical-schema migration tests construct —
+            # has no `provider_*` columns yet, and naming them unconditionally
+            # would make `create_run` unusable against any schema older than
+            # the one that introduced them.
+            table_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+            insert_columns = [name for name in record if name in table_columns]
             conn.execute(
-                """INSERT INTO run (
-                    id, session_id, task_id, sequence, is_resume, state, project, task_type,
-                    repository_path, prompt, command_json, timeout_seconds, pid,
-                    process_start_identity, pre_run_git_status, post_run_git_status,
-                    working_tree_changed, exit_code, cancel_requested, cancel_requested_at,
-                    started_at, completed_at, expected_branch, launch_source, prompt_version,
-                    commit_hash, pull_request_url, version, created_at, updated_at
-                ) VALUES (
-                    :id, :session_id, :task_id, :sequence, :is_resume, :state, :project, :task_type,
-                    :repository_path, :prompt, :command_json, :timeout_seconds, :pid,
-                    :process_start_identity, :pre_run_git_status, :post_run_git_status,
-                    :working_tree_changed, :exit_code, :cancel_requested, :cancel_requested_at,
-                    :started_at, :completed_at, :expected_branch, :launch_source, :prompt_version,
-                    :commit_hash, :pull_request_url, :version, :created_at, :updated_at
-                )""",
+                f"""INSERT INTO run ({", ".join(insert_columns)})
+                    VALUES ({", ".join(f":{name}" for name in insert_columns)})""",
                 record,
             )
     return record
@@ -1262,6 +1334,9 @@ _UPDATABLE_COMPLETION_FIELDS: frozenset[str] = frozenset(
         "is_recoverable",
         "recommended_action",
         "validation_summary",
+        "review_verdict",
+        "review_run_id",
+        "review_summary",
         "policy_json",
         "last_checked_at",
         "next_retry_at",
@@ -1383,10 +1458,19 @@ def get_completion(db_path: Path, run_id: str) -> dict | None:
 
 def get_completion_by_task(db_path: Path, task_id: str) -> dict | None:
     """The most recently created completion row for a task (there is one per
-    run, and a task may have several runs over time)."""
+    run, and a task may have several runs over time).
+
+    `created_at` is an ISO timestamp at *second* resolution, so two completions
+    for the same task created within the same second tie, and a bare
+    `ORDER BY created_at DESC` would return an arbitrary one of them. That is
+    not hypothetical: an automatic rework relaunches a task as soon as its
+    failure is observed, so several completions per task is the normal case, and
+    a caller reading the stale row would act on a failure that has already been
+    superseded. `rowid` — monotonic per insert — breaks the tie in true
+    insertion order."""
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         return _row_to_dict(row)
@@ -2238,3 +2322,67 @@ def transition_proposal_atomic(
             _proposal_event_from_spec(conn, proposal_id, event, now=now)
             updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
             return dict(updated)
+
+
+# --------------------------------------------------------------------------
+# Execution queue (ADR 0007) — the SQLite home of `execution_queue.json`
+#
+# These are storage primitives only. Every rule about *what* a queue entry may
+# contain, when it becomes ready, and what launching it means stays in
+# `command_center.execution_queue`; this layer just stores and returns rows.
+# During the dual-write phases the JSON file remains authoritative, so nothing
+# here may raise on data the JSON store would have accepted.
+# --------------------------------------------------------------------------
+
+_QUEUE_ENTRY_COLUMNS: tuple[str, ...] = (
+    "id",
+    "task_id",
+    "project",
+    "state",
+    "reason",
+    "run_id",
+    "added_at",
+    "evaluated_at",
+    "launched_at",
+)
+
+
+def replace_queue_entries(db_path: Path, entries: list[dict]) -> None:
+    """Persist `entries` as the complete queue, in the given order.
+
+    Whole-list replacement rather than per-entry upsert, deliberately: that is
+    exactly the semantics `execution_queue.save_queue` has today, so during
+    dual-write the two stores cannot drift through a difference in *how* they
+    are written. `position` preserves list order, which the queue's display and
+    planning both depend on.
+
+    Unknown keys on an entry are ignored rather than rejected — the JSON store
+    accepts them, and a dual-write phase where SQLite is stricter than the
+    authoritative store would fail on data that is, by definition, valid."""
+    rows = [
+        {
+            **{column: entry.get(column) for column in _QUEUE_ENTRY_COLUMNS},
+            "position": index,
+        }
+        for index, entry in enumerate(entries)
+    ]
+    columns = ", ".join((*_QUEUE_ENTRY_COLUMNS, "position"))
+    placeholders = ", ".join(f":{name}" for name in (*_QUEUE_ENTRY_COLUMNS, "position"))
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute("DELETE FROM queue_entry")
+            if rows:
+                conn.executemany(
+                    f"INSERT INTO queue_entry ({columns}) VALUES ({placeholders})", rows
+                )
+
+
+def list_queue_entries(db_path: Path) -> list[dict]:
+    """Every queue entry in stored order, shaped exactly like a JSON entry so a
+    divergence check can compare the two directly, with no translation step of
+    its own to be wrong about."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(_QUEUE_ENTRY_COLUMNS)} FROM queue_entry ORDER BY position ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]

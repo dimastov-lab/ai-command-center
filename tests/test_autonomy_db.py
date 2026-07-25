@@ -41,13 +41,13 @@ def _migrations_through(version):
 # --------------------------------------------------------------------------
 
 
-def test_schema_migrated_to_7(db_path):
-    assert runtime_db.current_schema_version(db_path) == 7
+def test_schema_migrated_to_9(db_path):
+    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
 
 
 def test_migrate_is_idempotent(db_path):
     runtime_db.migrate(db_path)
-    assert runtime_db.current_schema_version(db_path) == 7
+    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
 
 
 def test_v5_to_v6_migration_preserves_runtime_and_completion_rows(tmp_path, monkeypatch):
@@ -156,7 +156,7 @@ def test_v6_to_v7_migration_backfills_parameters_and_preserves_proposal_children
     monkeypatch.setattr(runtime_db, "MIGRATIONS", all_migrations)
     runtime_db.migrate(db_path)
 
-    assert runtime_db.current_schema_version(db_path) == 7
+    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
     proposal = runtime_db.get_proposal(db_path, "proposal-v6")
     assert proposal["parameters_json"] == "{}"
     assert proposal["task_id"] == task["id"]

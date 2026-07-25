@@ -56,11 +56,13 @@ existing signatures unchanged — a caller that already serializes its own acces
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from command_center import (
     agent_runner,
+    prompts,
     launch,
     launch_service,
     models,
@@ -68,7 +70,14 @@ from command_center import (
     storage,
     workspace_provisioning,
 )
+from command_center.runtime import db as runtime_db
 from command_center.runtime import supervisor as runtime_supervisor
+
+logger = logging.getLogger(__name__)
+
+# Sentinel `entry_id` for "the mirror could not be read at all" — see
+# `queue_divergence`, which must never report an absent mirror as agreement.
+MIRROR_UNAVAILABLE = "__mirror_unavailable__"
 
 QUEUE_FILE_NAME = "execution_queue.json"
 
@@ -102,7 +111,107 @@ def load_queue(root: Path) -> list[dict]:
 
 
 def save_queue(root: Path, entries: list[dict]) -> None:
+    """Persist the queue. JSON is authoritative; the SQLite mirror is written
+    alongside it (ADR 0007 step 1).
+
+    Order matters: JSON first, then the mirror. If the mirror write fails the
+    authoritative store has already committed, so the queue is correct and only
+    the mirror is stale — the divergence check will see it, which is exactly
+    what that check is for. Writing the mirror first would allow the opposite:
+    a mirror ahead of the real queue, which no check would flag as wrong.
+
+    A mirror failure is swallowed for the same reason: during dual-write the
+    mirror is not load-bearing, and letting it break a queue write would mean a
+    migration step could take down the queue it is migrating."""
     storage.atomic_write_json(queue_file_path(root), entries)
+    _mirror_to_runtime_db(root, entries)
+
+
+def _mirror_to_runtime_db(root: Path, entries: list[dict]) -> None:
+    """Best-effort write of the queue into `runtime.db` (ADR 0007 dual-write).
+
+    Deliberately silent on failure — see `save_queue`. The mirror's health is
+    reported by `queue_divergence`, not by exceptions raised at write time."""
+    try:
+        runtime_db.replace_queue_entries(runtime_db.resolve_db_path(root), entries)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        logger.debug("Could not mirror execution queue into runtime.db", exc_info=True)
+
+
+def backfill_mirror(root: Path) -> int:
+    """One-shot import of the existing JSON queue into the SQLite mirror
+    (ADR 0007 step 2). Returns the number of entries written.
+
+    Idempotent, because `replace_queue_entries` replaces the whole list rather
+    than appending: running it twice leaves the same rows. That matters — the
+    backfill is expected to be run more than once (once per operator, once
+    after a rollback and re-advance), and a backfill that duplicated on the
+    second run would manufacture exactly the divergence it exists to remove.
+
+    Deliberately not called automatically from a read path. A migration step
+    that runs itself as a side effect of someone looking at the queue is a
+    migration nobody decided to perform."""
+    entries = load_queue(root)
+    runtime_db.replace_queue_entries(runtime_db.resolve_db_path(root), entries)
+    return len(entries)
+
+
+def queue_divergence(root: Path) -> list[dict]:
+    """Entries where the JSON store and the SQLite mirror disagree.
+
+    Returns one record per differing entry: `{entry_id, fields, json, mirror}`,
+    or `[]` when they match.
+
+    An *unreadable* mirror reports a single `MIRROR_UNAVAILABLE` record rather
+    than an empty list. Returning `[]` there would be the dangerous answer: ADR
+    0007 gates "stop writing JSON" on a session with no divergence, and a
+    missing mirror would satisfy that gate by having nothing to disagree with —
+    the migration would advance on the strength of a store that was never
+    written.
+
+    Read-only, and never raises: this runs on a read path during the dual-write
+    phases, and a check that can break the thing it checks is worse than no
+    check."""
+    try:
+        json_entries = load_queue(root)
+        mirror_entries = runtime_db.list_queue_entries(runtime_db.resolve_db_path(root))
+    except Exception as exc:  # noqa: BLE001
+        return [
+            {
+                "entry_id": MIRROR_UNAVAILABLE,
+                "fields": ["*"],
+                "json": None,
+                "mirror": None,
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        ]
+
+    mirror_by_id = {entry.get("id"): entry for entry in mirror_entries}
+    divergences: list[dict] = []
+    for entry in json_entries:
+        entry_id = entry.get("id")
+        mirrored = mirror_by_id.pop(entry_id, None)
+        if mirrored is None:
+            divergences.append(
+                {"entry_id": entry_id, "fields": ["*"], "json": entry, "mirror": None}
+            )
+            continue
+        differing = [
+            field
+            for field in runtime_db._QUEUE_ENTRY_COLUMNS
+            if entry.get(field) != mirrored.get(field)
+        ]
+        if differing:
+            divergences.append(
+                {"entry_id": entry_id, "fields": differing, "json": entry, "mirror": mirrored}
+            )
+    # Anything left in the mirror exists there but not in the authoritative
+    # store — a stale row the mirror failed to delete.
+    for entry_id, mirrored in mirror_by_id.items():
+        divergences.append(
+            {"entry_id": entry_id, "fields": ["*"], "json": None, "mirror": mirrored}
+        )
+    return divergences
 
 
 @contextlib.contextmanager
@@ -250,6 +359,21 @@ def waiting_entries(entries: list[dict]) -> list[dict]:
     return [e for e in entries if e.get("state") == STATE_WAITING]
 
 
+# Machine-readable outcome codes for one `launch_ready` attempt. `message` is
+# a human-facing (Russian) sentence and is deliberately never parsed; anything
+# that needs to *branch* on why a launch did not happen — the autopilot's audit
+# trail, the desktop wave view's remediation hints, tests — reads `reason_code`
+# instead. Every `LaunchAttemptResult` carries exactly one.
+LAUNCH_OK = "launched"
+LAUNCH_SKIP_TASK_NOT_FOUND = "task_not_found"
+LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED = "workspace_not_configured"
+LAUNCH_SKIP_BLOCKED = "launch_blocked"
+LAUNCH_SKIP_NEEDS_CONFIRMATION = "needs_confirmation"
+LAUNCH_SKIP_DUPLICATE_ACTIVE = "duplicate_active_launch"
+LAUNCH_SKIP_WORKSPACE_VERIFICATION = "workspace_verification_failed"
+LAUNCH_SKIP_LAUNCH_ERROR = "launch_error"
+
+
 @dataclass
 class LaunchAttemptResult:
     entry_id: str
@@ -257,6 +381,10 @@ class LaunchAttemptResult:
     launched: bool
     run_id: str | None = None
     message: str = ""
+    # One of the `LAUNCH_*` constants above — the machine-readable counterpart
+    # to `message`. Defaults to the generic error code so an unannotated
+    # construction is never mistaken for a success.
+    reason_code: str = LAUNCH_SKIP_LAUNCH_ERROR
     # Populated only for the "blocked by validation warnings" case (dirty
     # tree, detached HEAD, branch mismatch) — the exact strings from
     # `launch.LaunchValidation.warnings`, so the UI layer can render each as
@@ -294,6 +422,7 @@ def launch_ready(
     execution_center_api,
     *,
     entry_ids: list[str] | None = None,
+    timeout_seconds: int | None = None,
 ) -> tuple[list[dict], list[LaunchAttemptResult]]:
     """Launches every `READY` entry (or, if `entry_ids` is given, just those
     — the "launch next ready task" action passes a single id). Never called
@@ -341,7 +470,15 @@ def launch_ready(
         task_id = entry.get("task_id")
         task = tasks_by_id.get(task_id)
         if task is None:
-            results.append(LaunchAttemptResult(entry["id"], task_id, False, message="задача не найдена"))
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message="задача не найдена",
+                    reason_code=LAUNCH_SKIP_TASK_NOT_FOUND,
+                )
+            )
             continue
 
         # `project_configs` is keyed by canonical id, but a task may store a
@@ -356,7 +493,13 @@ def launch_ready(
         prep = launch_service.prepare_task_launch(task=task, project_config=cfg)
         if not prep.selection.path:
             results.append(
-                LaunchAttemptResult(entry["id"], task_id, False, message="workspace не настроен для задачи")
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message="workspace не настроен для задачи",
+                    reason_code=LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED,
+                )
             )
             continue
 
@@ -372,6 +515,7 @@ def launch_ready(
                     task_id,
                     False,
                     message="; ".join(prep.fatal_messages) or "запуск заблокирован",
+                    reason_code=LAUNCH_SKIP_BLOCKED,
                 )
             )
             continue
@@ -382,6 +526,7 @@ def launch_ready(
                     task_id,
                     False,
                     message="требует подтверждения предупреждений — запустите вручную из карточки задачи",
+                    reason_code=LAUNCH_SKIP_NEEDS_CONFIRMATION,
                     warnings=list(validation.warnings),
                     validation_report=_validation_report(validation, expected_branch=expected_branch),
                 )
@@ -394,8 +539,19 @@ def launch_ready(
             run = launch_service.execute_agent_launch_v2(
                 project=task.get("project"),
                 task_type=task.get("task_type") or "implementation",
-                prompt=task.get("prompt") or task.get("goal") or task.get("title") or "",
-                timeout_seconds=agent_runner.DEFAULT_TIMEOUT_SECONDS,
+                # A task without its own prompt used to reach the agent as
+                # nothing but its title. `prompts.build_prompt` composes the
+                # instruction for its task type instead, and returns a
+                # deliberately-written prompt untouched when there is one.
+                prompt=prompts.build_prompt(task),
+                # An explicit caller timeout wins; otherwise the timeout is
+                # individualized to 200 % of the task's estimate (see
+                # `agent_runner.timeout_for_task`) rather than one fixed default.
+                timeout_seconds=(
+                    timeout_seconds
+                    if timeout_seconds is not None
+                    else agent_runner.timeout_for_task(task)
+                ),
                 repository_path=resolved_workspace,
                 execution_center_api=execution_center_api,
                 confirmed=True,
@@ -407,7 +563,15 @@ def launch_ready(
                 source_repository_path=source_repository_path,
             )
         except launch_service.DuplicateActiveLaunchError as exc:
-            results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=str(exc),
+                    reason_code=LAUNCH_SKIP_DUPLICATE_ACTIVE,
+                )
+            )
             continue
         except (
             workspace_provisioning.WorkspaceVerificationError,
@@ -428,12 +592,21 @@ def launch_ready(
                     task_id,
                     False,
                     message=f"workspace не прошёл проверку изоляции ({structured['failed_step']}): {reason}",
+                    reason_code=LAUNCH_SKIP_WORKSPACE_VERIFICATION,
                     validation_report=structured,
                 )
             )
             continue
         except Exception as exc:  # noqa: BLE001 — one bad entry must not abort the batch
-            results.append(LaunchAttemptResult(entry["id"], task_id, False, message=str(exc)))
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=str(exc),
+                    reason_code=LAUNCH_SKIP_LAUNCH_ERROR,
+                )
+            )
             continue
 
         launched_patches[entry["id"]] = {
@@ -442,7 +615,9 @@ def launch_ready(
             "launched_at": models.iso_now(),
             "reason": None,
         }
-        results.append(LaunchAttemptResult(entry["id"], task_id, True, run_id=run["id"]))
+        results.append(
+            LaunchAttemptResult(entry["id"], task_id, True, run_id=run["id"], reason_code=LAUNCH_OK)
+        )
 
     updated_entries = _commit_launch_results(root, entries, launched_patches)
     return updated_entries, results

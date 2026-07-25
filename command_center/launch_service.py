@@ -30,6 +30,7 @@ from command_center import (
     git_info,
     launch,
     models,
+    project_config,
     report_parser,
     workflow,
     workspace_provisioning,
@@ -99,6 +100,21 @@ class LaunchPreparation:
         return self.decision == LAUNCH_DECISION_PROVISIONABLE
 
 
+def resolved_workspace_path(selection_path: str | None) -> str | None:
+    """The single canonical form of a workspace path: `~` expanded and fully
+    resolved. This is the exact string handed to `execute_agent_launch_v2` and
+    therefore persisted as `run.repository_path`, so anything that needs to
+    reason about "is this workspace busy" (the scheduler's workspace
+    exclusivity, `db.create_run`'s workspace lock) must compare against *this*
+    form, not the raw configured path. Factored out of `prepare_task_launch` so
+    a planner can resolve a workspace without paying for the full git-touching
+    validation that function runs — and so the two can never drift into two
+    different spellings of the same directory."""
+    if not selection_path:
+        return None
+    return str(Path(selection_path).expanduser().resolve())
+
+
 def prepare_task_launch(*, task: dict | None, project_config: dict | None) -> LaunchPreparation:
     """Shared, **non-mutating** pre-launch classification for the normal task
     paths (Kanban launcher and execution queue). Resolves the single workspace
@@ -126,9 +142,7 @@ def prepare_task_launch(*, task: dict | None, project_config: dict | None) -> La
     source_repository_path = (project_config or {}).get("repository_path")
 
     validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
-    resolved_workspace = (
-        str(Path(selection.path).expanduser().resolve()) if selection.path else None
-    )
+    resolved_workspace = resolved_workspace_path(selection.path)
 
     if validation.can_launch:
         decision = (
@@ -232,6 +246,16 @@ def execute_agent_launch(
     direct write, so this module stays storage-agnostic (Streamlit's
     `save_tasks`, a future desktop adapter's own persistence call, or a
     test's no-op are all equally valid callers)."""
+
+    # Fail closed on the same authorization boundary the v2/API/Supervisor
+    # paths enforce, before any persistence side effect. This legacy
+    # synchronous path has no production caller today, but must never become a
+    # gap that runs (or leaks the prompt of) an unauthorized provider.
+    project_config.require_execution_provider_allowed(project, executor_id)
+    if executor_id == "codex":
+        raise RuntimeError(
+            "Codex CLI is supported through the PID-tracked Execution Center launcher only."
+        )
 
     if task is not None:
         models.push_prompt_history(task, prompt)
@@ -397,6 +421,10 @@ def execute_agent_launch_v2(
     # Confirmation must precede every mutation, including provisioning a new
     # branch/worktree. Supervisor enforces it again immediately before launch.
     context_service.require_launch_confirmation(confirmed, what="Launching an agent run")
+    # Independent of confirmation: which execution providers this project is
+    # allowed to use at all is a project-level policy, not a per-launch choice.
+    project_config.require_execution_provider_allowed(project, executor_id)
+
 
     task_id = (task or {}).get("id")
     resolved_workspace = str(Path(repository_path).expanduser().resolve())
@@ -459,13 +487,18 @@ def execute_agent_launch_v2(
             )
 
     if task is not None:
-        models.push_prompt_history(task, prompt)
+        # Codex prompt transport is intentionally ephemeral. The task may
+        # already own an operator-authored prompt, but launching Codex must not
+        # copy the final assembled outbound prompt (including sensitive
+        # one-off context) into task persistence or prompt history.
+        if executor_id != "codex":
+            models.push_prompt_history(task, prompt)
         if validation is not None:
             launch.begin_launch(task, executor_id=executor_id, validation=validation)
         if on_task_state_changed is not None:
             on_task_state_changed()
 
-    title = (task or {}).get("title") or prompt[:120]
+    title = (task or {}).get("title") or ("Codex CLI run" if executor_id == "codex" else prompt[:120])
 
     run = execution_center_api.start_run(
         project=project,
@@ -506,6 +539,7 @@ def execute_agent_launch_v2(
         # Re-verified at the `start_raw` chokepoint (fail-closed) — no launch
         # path, present or future, can spawn the process without passing this.
         workspace_verification=workspace_verification,
+        executor_id=executor_id,
     )
 
     if task is not None:

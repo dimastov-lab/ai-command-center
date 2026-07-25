@@ -26,14 +26,16 @@ def _run(db_path):
     return task, session, run
 
 
-def test_schema_version_is_7(db_path):
-    assert runtime_db.current_schema_version(db_path) == 7
-    assert runtime_db.SCHEMA_VERSION == 7
+def test_schema_version_matches_the_migration_sequence(db_path):
+    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
+    # Compared against the migration list rather than a literal, so adding a
+    # migration does not fail a test about version *consistency*.
+    assert runtime_db.SCHEMA_VERSION == max(v for v, _ in runtime_db.MIGRATIONS)
 
 
 def test_migrate_is_idempotent(db_path):
     runtime_db.migrate(db_path)  # second run must not error
-    assert runtime_db.current_schema_version(db_path) == 7
+    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
 
 
 def test_create_and_get_completion(db_path):

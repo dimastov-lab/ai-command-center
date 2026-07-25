@@ -128,7 +128,11 @@ READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
 # classifier that also guards against this at the result-evaluation layer.
 PERMISSION_MODE_BY_PROFILE: dict[str, str] = {
     PROFILE_READ_ONLY: "acceptEdits",
-    PROFILE_TRUSTED_DEVELOPMENT: "acceptEdits",
+    # User-approved 2026-07-25: a headless implementation agent must be able to
+    # run its own tests/build without an interactive approver. Git-write stays
+    # blocked by `--disallowedTools` (verified to take precedence). See the note
+    # above for the empirical confirmation.
+    PROFILE_TRUSTED_DEVELOPMENT: "bypassPermissions",
 }
 
 
@@ -390,6 +394,25 @@ def resolve_timeout(requested: int | None) -> int:
     if not requested:
         return DEFAULT_TIMEOUT_SECONDS
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, int(requested)))
+
+
+# A task's timeout is set to 200 % of its estimated duration: enough headroom
+# that a normal run never hits it, without the one-size-fits-all cap being far
+# too long for a quick task or too short for a big one. Below the estimate the
+# bar/"осталось" track the estimate itself (100 %); the timeout is the 200 %
+# hard stop.
+TIMEOUT_ESTIMATE_MULTIPLIER = 2.0
+
+
+def timeout_for_task(task: dict | None) -> int:
+    """The run timeout for `task`, individualized as 200 % of its
+    `estimate_hours` (clamped to `[MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS]`),
+    or `DEFAULT_TIMEOUT_SECONDS` when the task carries no estimate."""
+    estimate_hours = (task or {}).get("estimate_hours")
+    if not estimate_hours:
+        return DEFAULT_TIMEOUT_SECONDS
+    seconds = int(float(estimate_hours) * 3600 * TIMEOUT_ESTIMATE_MULTIPLIER)
+    return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, seconds))
 
 
 def default_model() -> str | None:

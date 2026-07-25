@@ -167,6 +167,40 @@ def elapsed_seconds(started_at: str | None, finished_at: str | None, now: dateti
     return max(0.0, (end - started).total_seconds())
 
 
+def median_completed_run_seconds(runs: list[dict], *, task_type: str | None = None) -> float | None:
+    """The median wall-clock duration of *actually completed* runs — the real,
+    historical "how long a run takes" the operator cares about, so the progress
+    bar and the "осталось" estimate track typical execution instead of the run's
+    timeout budget (which a run almost never spends in full).
+
+    Only `COMPLETED` runs with both `started_at` and `completed_at` count — a
+    failed/interrupted/timed-out run is not a fair sample of a normal duration.
+    Optionally narrowed to one `task_type` (a review is quick, an implementation
+    is not). Returns `None` when there is no history yet, in which case the
+    caller falls back to the timeout budget or to elapsed-only display.
+    """
+    durations: list[float] = []
+    for run in runs:
+        if run.get("state") != "COMPLETED":
+            continue
+        if task_type is not None and (run.get("task_type") or None) != task_type:
+            continue
+        started = _parse_iso(run.get("started_at"))
+        ended = _parse_iso(run.get("completed_at"))
+        if started is None or ended is None:
+            continue
+        secs = (ended - started).total_seconds()
+        if secs > 0:
+            durations.append(secs)
+    if not durations:
+        return None
+    durations.sort()
+    mid = len(durations) // 2
+    if len(durations) % 2:
+        return durations[mid]
+    return (durations[mid - 1] + durations[mid]) / 2
+
+
 def live_git_status(workspace_path: str | None) -> dict[str, Any] | None:
     """Read-only, best-effort: never switches branches, never mutates the
     workspace. Returns `None` if the path is missing, not a directory, or not
@@ -259,6 +293,131 @@ def completion_view(completion: dict | None) -> dict | None:
     }
 
 
+# --------------------------------------------------------------------------
+# Live progress — a *display* progress derived from observed facts, never a
+# guess about how far into its work the agent is.
+#
+# The Kanban task carries a `progress` field pinned to a stage (`Workspace
+# Verified` == 5). Nothing advances that stage while a run executes, so a
+# healthy run's bar sat at 5 % from launch until the merge jumped it to 100 —
+# the "always 5 %" the operator saw. This function ignores that stale field and
+# reports the run's real position instead: the process phase before the run
+# finishes, then the completion pipeline's own state, which is a genuine,
+# observed milestone chain (validate -> review -> PR -> merge -> verify).
+#
+# Within the working phase there is no observable *fraction* done — an agent
+# emits work, not a percent-complete. The one honest, monotonic signal is how
+# much of the run's own time budget has been spent, so `Running` tracks
+# elapsed/timeout *directly* (clamped to [5 %, 92 %]). That keeps the operator's
+# expectation intact — "more time elapsed than remaining ⟹ past the halfway
+# mark" (at 50 % of the budget the bar reads 50 %, at 79 % it reads 79 %) — which
+# a compressed 25–50 % band violated (11 min in, 3 min left, yet only 44 %). The
+# 92 % cap leaves the top band for the post-process merge pipeline, so the bar
+# never claims "done" while the agent is still running.
+_RUN_WORKING_FLOOR = 5
+_RUN_WORKING_CEILING = 92
+
+# Task types that have no merge lifecycle — a review/audit/gate produces a
+# report and is *done* when its process exits cleanly; there is no PR to open
+# or branch to merge, so a clean `COMPLETED` is 100 %, not an incomplete run.
+_READ_ONLY_TASK_TYPES = frozenset({"review", "final_gate", "architecture_review"})
+
+_RUN_PHASE_PROGRESS: dict[str, tuple[int, str]] = {
+    STATUS_LAUNCHING: (2, "Запуск"),
+    STATUS_STARTING: (5, "Старт агента"),
+    STATUS_WAITING: (50, "Отмена в процессе"),
+}
+
+# Completion-pipeline state -> (percent, stage label). The merge pipeline runs
+# *after* the process exits, so it occupies the top band (93–100 %) above the
+# working phase's 92 % cap — reaching a completion state always moves the bar
+# forward, never back. Every entry is a milestone the pipeline actually reached.
+_COMPLETION_PROGRESS: dict[str, tuple[int, str]] = {
+    "EXECUTION_FINISHED": (93, "Процесс завершён"),
+    "VALIDATING_RESULT": (94, "Валидация"),
+    "RESULT_VALID": (95, "Валидация пройдена"),
+    "AWAITING_REVIEW": (95, "Ожидает независимой проверки"),
+    "PREPARING_PULL_REQUEST": (96, "Готовит pull request"),
+    "PULL_REQUEST_OPEN": (97, "PR открыт"),
+    "AWAITING_MERGE": (98, "Ожидает merge"),
+    "MERGED": (99, "Смёржено"),
+    "VERIFYING_TARGET_BRANCH": (99, "Проверка целевой ветки"),
+    "COMPLETED": (100, "Готово"),
+    # Non-progressing outcomes: the bar stops where it is and the card's own
+    # error/blocker line explains it. A failure is not "97 % done".
+    "VALIDATION_FAILED": (93, "Валидация не пройдена"),
+    "PR_CLOSED_UNMERGED": (96, "PR закрыт без merge"),
+    "MERGE_BLOCKED": (97, "Merge заблокирован"),
+    "REVIEW_REJECTED": (95, "Проверка не одобрила"),
+    "REQUIRES_ATTENTION": (93, "Требует внимания"),
+    "RECOVERY_PENDING": (60, "Восстановление"),
+    "RECOVERY_FAILED": (60, "Восстановление не удалось"),
+}
+
+
+def is_read_only_task_type(task_type: str | None) -> bool:
+    """A review/audit/gate task has no merge lifecycle — its clean process exit
+    *is* its terminal success."""
+    return task_type in _READ_ONLY_TASK_TYPES
+
+
+def derive_live_progress(
+    display_status: str,
+    completion: dict | None,
+    *,
+    task_type: str | None = None,
+    elapsed_seconds: float | None = None,
+    timeout_seconds: float | None = None,
+) -> tuple[int | None, str | None]:
+    """A truthful (percent, stage) for the progress bar, from what is actually
+    observed about the run — its process phase, then its completion state.
+
+    Returns `(None, None)` for a status that has no meaningful progress bar
+    (a plain terminal `Failed`/`Cancelled`/`Requires Attention` with no
+    completion row): the card shows the reason, not a bar. A completion row,
+    when present, always wins over the process phase — it is the later, more
+    specific fact.
+    """
+    # A read-only task that has exited cleanly is *done* — 100 %. This wins over
+    # any completion row: the auto-merge pipeline can spuriously seed a
+    # completion (and even reach MERGE_BLOCKED) for a review/audit run that has
+    # nothing to merge, and reporting "86 % · Merge заблокирован" for a
+    # successful analysis is exactly the confusion this guards against.
+    if display_status == STATUS_COMPLETED and is_read_only_task_type(task_type):
+        return 100, "Готово"
+
+    if completion:
+        mapped = _COMPLETION_PROGRESS.get(completion.get("state") or "")
+        if mapped:
+            return mapped
+
+    if display_status in (STATUS_RUNNING, STATUS_STALE):
+        # Track the fraction of the time budget spent *directly* (not a
+        # compressed band): at 50 % of the budget the bar reads ~50 %, at 79 % it
+        # reads ~79 % — so "more elapsed than remaining ⟹ past halfway" holds,
+        # which the old 25–50 % band broke. Clamped to [floor, 92 %] so it never
+        # claims "done" while the process is still running.
+        frac = 0.0
+        if elapsed_seconds and timeout_seconds and timeout_seconds > 0:
+            frac = min(1.0, max(0.0, elapsed_seconds / timeout_seconds))
+        percent = min(_RUN_WORKING_CEILING, max(_RUN_WORKING_FLOOR, round(frac * 100)))
+        return percent, "Выполняется"
+
+    phase = _RUN_PHASE_PROGRESS.get(display_status)
+    if phase:
+        return phase
+
+    if display_status == STATUS_COMPLETED:
+        # A read-only task (review/audit/gate) is truly done at a clean exit —
+        # there is nothing to merge, so it is 100 %. Everything else exited but
+        # has not yet merged: 55 %, deliberately not 100 (100 is reserved for a
+        # completion verified present in the target branch).
+        if is_read_only_task_type(task_type):
+            return 100, "Готово"
+        return 55, "Процесс завершён"
+    return None, None
+
+
 def build_session_view(
     run: dict,
     *,
@@ -269,10 +428,17 @@ def build_session_view(
     now: datetime,
     heartbeat_stale: bool = False,
     completion: dict | None = None,
+    reference_seconds: float | None = None,
 ) -> dict:
     """The canonical execution-session view model (mission field list). The
     only I/O performed here is one read-only `git status` call against the
     run's own resolved workspace — never a switch/checkout/write.
+
+    `reference_seconds` is the *expected* run duration (the task's estimate, or
+    the historical median for its type) — the realistic denominator for the
+    progress bar and the "осталось" estimate. It is preferred over the run's raw
+    timeout, which is a hard cap (~200 % of the estimate) a run almost never
+    spends in full, so basing "remaining" on it read as unreal.
 
     `heartbeat_stale` is the caller's (UI-owned) liveness-probe verdict for
     this run — kept out of this pure module and passed in, exactly like
@@ -287,7 +453,7 @@ def build_session_view(
     git_status = live_git_status(workspace_path)
 
     task_title = (kanban_task or {}).get("title") or (run.get("prompt") or "")[:80] or (run.get("id") or "")[:8]
-    executor = (kanban_task or {}).get("executor") or "claude_code"
+    executor = run.get("provider_id") or (kanban_task or {}).get("executor") or "claude_code"
 
     last_error = run.get("failure_reason")
     if not last_error and status == STATUS_FAILED and latest_event and latest_event.get("event_type") == "stderr_line":
@@ -325,9 +491,45 @@ def build_session_view(
         "handshake_received": bool(run.get("first_output_at")),
         "awaiting_handshake": awaiting_handshake,
         "elapsed_seconds": elapsed_seconds(started_at, finished_at, now),
+        # The run's hard timeout cap, and the realistic *expected* duration
+        # (estimate/history) the bar and "осталось" actually use. `reference`
+        # falls back to the timeout only when there is no estimate or history.
+        "timeout_seconds": run.get("timeout_seconds"),
+        "reference_seconds": reference_seconds if reference_seconds else run.get("timeout_seconds"),
         "status": status,
+        # `current_stage`/`progress` stay the raw Kanban-task fields — the
+        # display-status guard (`Completed` implies `progress == 100`) and the
+        # existing view contract both depend on them, so they are left exactly
+        # as they were.
         "current_stage": (kanban_task or {}).get("current_stage"),
         "progress": (kanban_task or {}).get("progress"),
+        # …but the Live Execution Center bar renders these instead: a truthful
+        # progress derived from the run's *observed* phase and completion state
+        # (see `derive_live_progress`), because the Kanban `progress` above is
+        # pinned to a stage nothing advances during a run and therefore sat at
+        # 5 % for a healthy run's whole life. `None` here means "no meaningful
+        # bar" — the card shows the reason instead.
+        **dict(
+            zip(
+                ("live_progress", "live_stage"),
+                derive_live_progress(
+                    status,
+                    completion_view(completion),
+                    task_type=run.get("task_type") or (kanban_task or {}).get("task_type"),
+                    elapsed_seconds=elapsed_seconds(started_at, finished_at, now),
+                    # Prefer the realistic expected duration (estimate/history);
+                    # fall back to the timeout only when neither exists.
+                    timeout_seconds=reference_seconds if reference_seconds else run.get("timeout_seconds"),
+                ),
+            )
+        ),
+        # The task's stated objective, carried alongside the prompt so a card
+        # can answer "what is this agent trying to achieve" without the reader
+        # parsing a multi-kilobyte prompt. Task-level, not run-level: the run
+        # stores the prompt it was launched with, while the goal belongs to the
+        # task the run serves — an ad-hoc run has a prompt and no goal.
+        "task_goal": (kanban_task or {}).get("goal"),
+        "task_type": run.get("task_type") or (kanban_task or {}).get("task_type"),
         "exit_code": run.get("exit_code"),
         "last_error": last_error,
         "blocker_reason": blocker_reason,

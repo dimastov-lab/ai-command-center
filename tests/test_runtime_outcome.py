@@ -121,3 +121,28 @@ def test_classify_blocked_takes_priority_over_incomplete():
     )
     assert classification == outcome.BLOCKED
     assert reason == "permission_denied:Bash"
+
+
+def test_intentional_git_write_denial_is_not_a_blocker():
+    """An implementation agent that did its work but incidentally tried a
+    blocked git command (`git stash list`, `git commit`, …) is NOT blocked —
+    git-write is denied by design (the pipeline owns it), not a permission gap."""
+    from command_center.runtime import outcome
+    denials = [{"tool_name": "Bash", "tool_input": {"command": 'cd /x && echo "===stash==="; git stash list'}}]
+    result, reason = outcome.classify_process_result(
+        task_type="implementation", result_text="Done.", permission_denials=denials, working_tree_changed=True
+    )
+    assert result == outcome.OK
+    assert reason is None
+
+
+def test_non_git_permission_denial_still_blocks():
+    """A denial that is NOT an intentional git-write block still marks the run
+    blocked — that is a real permission gap the operator must see."""
+    from command_center.runtime import outcome
+    denials = [{"tool_name": "WebFetch", "tool_input": {"url": "https://x"}}]
+    result, reason = outcome.classify_process_result(
+        task_type="implementation", result_text="", permission_denials=denials, working_tree_changed=False
+    )
+    assert result == outcome.BLOCKED
+    assert "WebFetch" in reason

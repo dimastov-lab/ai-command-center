@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from command_center import executors
 from command_center.runtime import db, scheduler, supervisor
 
 NOW = "2026-07-23T12:00:00"
@@ -40,11 +41,21 @@ def _item(task_id: str, workspace: str, **kw) -> scheduler.WorkItem:
 
 
 def test_default_registry_only_registers_available_executors():
+    """The invariant is the *filter*, not a fixed roster.
+
+    Availability is now a live capability probe (`executors.Executor.available`
+    -> `providers`), so which executors qualify depends on what is installed on
+    the host: Codex and Ollama register here when their CLI is present. Asserting
+    a hard-coded list would make this test pass or fail on the developer's
+    machine setup rather than on the behaviour it exists to protect."""
     reg = _registry()
+    registered = {a.agent_id for a in reg.all()}
+    available = {e.id for e in executors.EXECUTORS.values() if e.available}
+    assert registered == available
+    # Claude is always installed in this suite, and a permanently-unavailable
+    # executor must never be registered.
     assert reg.get("claude_code") is not None
-    # chatgpt/codex/gemini/human/remote_agent are all `available=False`.
     assert reg.get("chatgpt") is None
-    assert [a.agent_id for a in reg.all()] == ["claude_code"]
 
 
 def test_register_rejects_unknown_executor():
@@ -321,7 +332,10 @@ def test_classify_timeout_is_recoverable():
 
 
 def test_classify_blocked_is_terminal():
-    assert scheduler.classify_failure(state="FAILED", failure_reason="blocked:permission_denied") == scheduler.TERMINAL
+    # Uses a self-refusal rather than a permission denial: the latter is now a
+    # deliberate exception (environment policy changes between attempts, so a
+    # repeat is not an identical attempt), covered by its own test below.
+    assert scheduler.classify_failure(state="FAILED", failure_reason="blocked:final_response") == scheduler.TERMINAL
 
 
 def test_classify_cancelled_is_terminal():
@@ -776,3 +790,87 @@ def test_f6_known_priority_marked_recognized():
     reg = _registry()
     d = scheduler.plan([_item("t1", "/repo/a", priority="Critical")], registry=reg, now=NOW).decisions[0]
     assert d.priority_recognized is True
+
+
+def test_a_probe_failure_is_transient_not_structural(monkeypatch):
+    """`executor.available` is a live subprocess probe, so it can report False
+    for reasons unrelated to the executor existing — a loaded machine missing
+    the timeout, a daemon restarting.
+
+    Omitting such an executor made the planner answer `no_capable_agent`: a
+    *structural* verdict meaning "no agent can ever run this", which tells a
+    human to change configuration. The honest answer is `agent_unavailable` —
+    transient, and self-healing on the next tick."""
+    from command_center import executors
+
+    class _Down:
+        id = "claude_code"
+        availability_check = staticmethod(lambda: None)
+        available = False
+
+    monkeypatch.setattr(executors, "EXECUTORS", {"claude_code": _Down()})
+    registry = scheduler.default_registry()
+
+    assert registry.get("claude_code") is not None, "a down executor must still be registered"
+    plan = scheduler.plan(
+        [scheduler.WorkItem(task_id="t", workspace="/tmp/w")],
+        registry=registry,
+        now="2026-07-24T10:00:00",
+    )
+    decision = plan.decisions[0]
+    assert decision.action == scheduler.ACTION_DEFER
+    assert decision.reason_code == scheduler.REASON_AGENT_UNAVAILABLE
+
+
+def test_an_executor_with_no_provider_is_still_structurally_absent(monkeypatch):
+    """A stub with nothing behind it can never run anything, so its absence is
+    a genuine structural fact rather than a transient one."""
+    from command_center import executors
+
+    class _Stub:
+        id = "chatgpt"
+        availability_check = None
+        available = False
+
+    monkeypatch.setattr(executors, "EXECUTORS", {"chatgpt": _Stub()})
+    assert scheduler.default_registry().all() == []
+
+
+def test_a_permission_denial_is_recoverable_not_terminal():
+    """`blocked:` refusals are terminal because repeating an identical attempt
+    cannot change the agent's own judgement. A *permission* denial is different
+    in kind: it records the environment's tool policy at the moment of the run,
+    and that policy is exactly what an operator changes in response to seeing
+    the failure. Treating it as terminal left tasks permanently unrunnable
+    after their permissions were fixed."""
+    assert scheduler.classify_failure(
+        state="FAILED", failure_reason="blocked:permission_denied:Glob,Read"
+    ) == scheduler.RECOVERABLE
+
+
+def test_an_agent_self_refusal_stays_terminal():
+    """The distinction has to cut both ways, or it is just a blanket retry."""
+    assert scheduler.classify_failure(
+        state="FAILED", failure_reason="blocked:final_response:blocked by policy"
+    ) == scheduler.TERMINAL
+
+
+def test_a_recoverable_permission_denial_is_still_bounded_by_the_retry_budget():
+    """Recoverable does not mean unbounded — a genuinely mis-permissioned task
+    must still stop rather than retry forever."""
+    plan = scheduler.plan(
+        [
+            scheduler.WorkItem(
+                task_id="t",
+                workspace="/tmp/w",
+                attempts_made=3,
+                last_state="FAILED",
+                last_failure_reason="blocked:permission_denied:Bash",
+                last_completed_at="2026-07-01T00:00:00",
+            )
+        ],
+        registry=scheduler.default_registry(),
+        policy=scheduler.RetryPolicy(max_attempts=3),
+        now="2026-07-24T10:00:00",
+    )
+    assert plan.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from command_center import agent_runner
+from command_center.runtime import providers
 
 
 @dataclass(frozen=True)
@@ -39,8 +40,18 @@ class Executor:
     label: str
     kind: str  # "cli" | "chat" | "human" | "remote"
     supports_terminal_launch: bool
-    available: bool
+    availability_check: Callable[[], providers.ProviderAvailability] | None
     launch: Callable[..., ExecutorResult]
+
+    @property
+    def available(self) -> bool:
+        if self.availability_check is None:
+            return False
+        return self.availability_check().available
+
+    @property
+    def availability(self) -> providers.ProviderAvailability | None:
+        return self.availability_check() if self.availability_check is not None else None
 
 
 def _launch_claude_code(
@@ -79,13 +90,17 @@ def _not_implemented(executor_id: str, label: str) -> Callable[..., ExecutorResu
     return _launch
 
 
+def _v2_only(**_kwargs: object) -> ExecutorResult:
+    raise RuntimeError("Codex CLI is supported through the PID-tracked Execution Center launcher only.")
+
+
 EXECUTORS: dict[str, Executor] = {
     "claude_code": Executor(
         id="claude_code",
         label="Claude Code",
         kind="cli",
         supports_terminal_launch=True,
-        available=True,
+        availability_check=providers.get_provider("claude_code").availability,
         launch=_launch_claude_code,
     ),
     "chatgpt": Executor(
@@ -93,23 +108,31 @@ EXECUTORS: dict[str, Executor] = {
         label="ChatGPT",
         kind="chat",
         supports_terminal_launch=False,
-        available=False,
+        availability_check=None,
         launch=_not_implemented("chatgpt", "ChatGPT"),
     ),
     "codex": Executor(
         id="codex",
-        label="Codex",
+        label="Codex CLI",
         kind="cli",
         supports_terminal_launch=True,
-        available=False,
-        launch=_not_implemented("codex", "Codex"),
+        availability_check=providers.get_provider("codex").availability,
+        launch=_v2_only,
+    ),
+    "ollama": Executor(
+        id="ollama",
+        label="Ollama (local)",
+        kind="cli",
+        supports_terminal_launch=True,
+        availability_check=providers.get_provider("ollama").availability,
+        launch=_v2_only,
     ),
     "gemini": Executor(
         id="gemini",
         label="Gemini",
         kind="cli",
         supports_terminal_launch=True,
-        available=False,
+        availability_check=None,
         launch=_not_implemented("gemini", "Gemini"),
     ),
     "human": Executor(
@@ -117,7 +140,7 @@ EXECUTORS: dict[str, Executor] = {
         label="Инженер (человек)",
         kind="human",
         supports_terminal_launch=False,
-        available=False,
+        availability_check=None,
         launch=_not_implemented("human", "Human Engineer"),
     ),
     "remote_agent": Executor(
@@ -125,7 +148,7 @@ EXECUTORS: dict[str, Executor] = {
         label="Удалённый агент",
         kind="remote",
         supports_terminal_launch=False,
-        available=False,
+        availability_check=None,
         launch=_not_implemented("remote_agent", "Remote Agent"),
     ),
 }
@@ -134,7 +157,11 @@ EXECUTOR_IDS: list[str] = list(EXECUTORS.keys())
 
 
 def get_executor(executor_id: str | None) -> Executor:
-    return EXECUTORS.get(executor_id or "claude_code", EXECUTORS["claude_code"])
+    resolved = executor_id or "claude_code"
+    try:
+        return EXECUTORS[resolved]
+    except KeyError as exc:
+        raise ValueError(f"Unknown executor: {resolved!r}") from exc
 
 
 def available_executors() -> list[Executor]:

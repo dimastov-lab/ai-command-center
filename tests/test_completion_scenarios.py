@@ -182,11 +182,15 @@ def test_scenario_c_validation_failure(env):
 # ============================================================================
 # Completion-evidence: dirty tree / no commit (service level)
 # ============================================================================
-def test_dirty_worktree_requires_attention(env):
+def test_agent_uncommitted_work_is_committed_and_pipeline_proceeds(env):
+    """The agent runs sandboxed (no git-write), so it leaves its work
+    uncommitted in its own isolated worktree. The pipeline now COMMITS that work
+    on the task branch and proceeds — it no longer stalls forever at
+    UNCOMMITTED_CHANGES (the missing link that stopped every run reaching merge)."""
     db_path, remote, work, tmp = env
     branch = "task/aicc-dirty"
     make_task_branch(work, branch)
-    (work / "uncommitted.py").write_text("y = 2\n")  # leave the tree dirty
+    (work / "uncommitted.py").write_text("y = 2\n")  # the agent's uncommitted work
     run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
 
     orch = CompletionOrchestrator(db_path, github=FakeGitHubClient())
@@ -194,8 +198,15 @@ def test_dirty_worktree_requires_attention(env):
     orch.advance(run["id"], now=NOW)
 
     row = runtime_db.get_completion(db_path, run["id"])
-    assert row["completion_state"] == CompletionState.REQUIRES_ATTENTION
-    assert row["last_reason_code"] == "UNCOMMITTED_CHANGES"
+    # The pipeline committed the work and moved past the uncommitted gate.
+    assert row["completion_state"] != CompletionState.REQUIRES_ATTENTION
+    assert row["last_reason_code"] != "UNCOMMITTED_CHANGES"
+    # The agent's file is now a real commit — it no longer shows as an
+    # uncommitted change (build artifacts like __pycache__ may appear afterwards
+    # from validation; those are not the agent's work and don't matter here).
+    from command_center.runtime import git_ops
+    status = git_ops.run_git_write(work, ["status", "--porcelain"])
+    assert "uncommitted.py" not in (status.stdout or ""), "agent work should be committed"
 
 
 def test_no_task_commit_requires_attention(env):

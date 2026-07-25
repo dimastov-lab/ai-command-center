@@ -71,6 +71,79 @@ def test_migrate_is_idempotent(tmp_path):
     db.migrate(path)
     db.migrate(path)
     assert db.current_schema_version(path) == db.SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("historical_version", range(1, db.SCHEMA_VERSION))
+def test_upgrade_from_every_supported_historical_schema(
+    tmp_path, monkeypatch, historical_version
+):
+    path = tmp_path / f"runtime-v{historical_version}.db"
+    current_migrations = list(db.MIGRATIONS)
+    current_version = db.SCHEMA_VERSION
+    with monkeypatch.context() as historical:
+        historical.setattr(
+            db,
+            "MIGRATIONS",
+            [migration for migration in current_migrations if migration[0] <= historical_version],
+        )
+        historical.setattr(db, "SCHEMA_VERSION", historical_version)
+        db.migrate(path)
+        assert db.current_schema_version(path) == historical_version
+
+    # Pinned to the module constant, not a literal: hard-coding the number here
+    # made this test fail on every schema addition for a reason unrelated to
+    # what it verifies (that a historical database upgrades cleanly).
+    assert db.SCHEMA_VERSION == current_version
+    db.migrate(path)
+    db.migrate(path)
+    assert db.current_schema_version(path) == db.SCHEMA_VERSION
+    with db.connect(path) as conn:
+        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+    assert {"provider_id", "provider_metadata_json"} <= run_columns
+
+
+def test_v5_historical_runs_migrate_to_claude_provider_default(tmp_path, monkeypatch):
+    path = tmp_path / "runtime-v5-with-run.db"
+    current_migrations = list(db.MIGRATIONS)
+    with monkeypatch.context() as historical:
+        historical.setattr(db, "MIGRATIONS", current_migrations[:5])
+        historical.setattr(db, "SCHEMA_VERSION", 5)
+        db.migrate(path)
+        task = db.create_task(path, project="AIOS", title="historical", task_type="review")
+        session = db.create_session(
+            path, task_id=task["id"], project="AIOS", repository_path="/tmp/historical"
+        )
+        now = db.iso_now()
+        with db.connect(path) as conn:
+            with db.transaction(conn):
+                conn.execute(
+                    """INSERT INTO run (
+                           id, session_id, task_id, sequence, is_resume, state,
+                           project, task_type, repository_path, prompt,
+                           cancel_requested, version, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        "historical-run",
+                        session["id"],
+                        task["id"],
+                        1,
+                        0,
+                        "COMPLETED",
+                        "AIOS",
+                        "review",
+                        "/tmp/historical",
+                        "historical",
+                        0,
+                        0,
+                        now,
+                        now,
+                    ),
+                )
+
+    db.migrate(path)
+    historical_run = db.get_run(path, "historical-run")
+    assert historical_run["provider_id"] == "claude_code"
+    assert historical_run["provider_metadata_json"] is None
     with db.connect(path) as conn:
         rows = conn.execute("SELECT COUNT(*) AS c FROM schema_version").fetchone()
         # Only one row per migration actually applied, not one per migrate() call.

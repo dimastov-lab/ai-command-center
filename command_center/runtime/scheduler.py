@@ -116,6 +116,26 @@ TERMINAL = "terminal"
 _TERMINAL_STATES: frozenset[str] = frozenset({"CANCELLED"})
 _TERMINAL_REASON_PREFIXES: tuple[str, ...] = ("blocked:",)
 
+# Exceptions to `blocked:` being terminal.
+#
+# `blocked:` means the agent did not do the work, and most such refusals are
+# genuinely terminal: `blocked:final_response` is the agent's own judgement
+# that it cannot proceed, and repeating the identical attempt cannot change a
+# judgement.
+#
+# A *permission* denial is different in kind. It records the state of the
+# environment's tool policy at the moment of the run, not anything about the
+# task — and that policy is exactly the thing an operator changes in response
+# to seeing the failure. Treating it as terminal meant a task stayed
+# permanently unrunnable after its permissions were fixed, with no way to
+# retry short of editing run history. (Observed: eight runs blocked on
+# `permission_denied:Glob,Read`, all still refused after the allow rule was
+# added.)
+#
+# Recoverable does not mean unbounded: the retry budget and backoff still
+# apply, so a genuinely mis-permissioned task exhausts its attempts and stops.
+_RECOVERABLE_REASON_PREFIXES: tuple[str, ...] = ("blocked:permission_denied",)
+
 # Prior run states that mean "an attempt was made and did NOT succeed", so the
 # retry policy (budget + backoff + terminal classification) must apply whenever
 # `attempts_made > 0`. This gate is deliberately **state-driven, never
@@ -139,6 +159,11 @@ def classify_failure(*, state: str | None, failure_reason: str | None) -> str:
     if state in _TERMINAL_STATES:
         return TERMINAL
     reason = (failure_reason or "").strip()
+    # The recoverable exception is checked first: it is a narrower match than
+    # the `blocked:` prefix it lives under, and order is what makes it an
+    # exception rather than dead code.
+    if any(reason.startswith(prefix) for prefix in _RECOVERABLE_REASON_PREFIXES):
+        return RECOVERABLE
     if any(reason.startswith(prefix) for prefix in _TERMINAL_REASON_PREFIXES):
         return TERMINAL
     return RECOVERABLE
@@ -222,21 +247,33 @@ class AgentRegistry:
 
 
 def default_registry(*, max_concurrency: int = 2) -> AgentRegistry:
-    """A registry seeded from `executors.EXECUTORS`: every *available* executor
-    becomes a general-purpose (`CAP_ANY`) agent whose id equals its executor
-    id. Today that is just `claude_code`; the moment another executor is
-    marked `available` in `executors.py` it is scheduled here with no change
-    to this module."""
+    """A registry seeded from `executors.EXECUTORS`: every executor that has a
+    provider behind it becomes a general-purpose (`CAP_ANY`) agent whose id
+    equals its executor id.
+
+    Availability is carried on the `AgentSpec` rather than deciding membership,
+    and that distinction is the whole point. `executor.available` is a *live
+    capability probe* — it shells out to the provider CLI — so it can report
+    False for a reason that has nothing to do with the executor existing: a
+    machine under load missing the probe timeout, a local daemon restarting.
+    Omitting such an executor makes the planner answer `no_capable_agent`,
+    which is a **structural** verdict meaning "no agent can ever run this" and
+    which a human is told to resolve by changing configuration. Registering it
+    as present-but-unavailable yields `agent_unavailable` instead — transient,
+    self-healing on the next tick, and true.
+
+    An executor with no provider at all (`availability_check is None`) is a
+    genuine structural absence and is still omitted."""
     agents = [
         AgentSpec(
             agent_id=executor.id,
             executor_id=executor.id,
             capabilities=frozenset({CAP_ANY}),
             max_concurrency=max_concurrency,
-            available=True,
+            available=executor.available,
         )
         for executor in executors.EXECUTORS.values()
-        if executor.available
+        if executor.availability_check is not None
     ]
     return AgentRegistry(agents)
 

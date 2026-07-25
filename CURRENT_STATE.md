@@ -13,6 +13,9 @@ Current position:
   persisted autonomy-proposal lifecycle.
 - Execution Center provides process supervision, streaming events, cancellation, timeouts and
   restart reconciliation; live process handles remain owned by the hosting Python process.
+  Process-group supervision is fail-closed to POSIX `waitid(WNOWAIT)`, keeps the launch-time PGID
+  pinned until descendants are drained, and separates OS exit from terminal-state/report
+  finalization so slow persistence cannot cause a false timeout or late signal.
 - Normal task-v2 launches require explicit confirmation before any provisioning, may create an
   isolated worktree offline, and fail closed unless source repository, expected branch, worktree
   isolation and configured status policy verify before process launch.

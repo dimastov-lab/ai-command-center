@@ -113,8 +113,10 @@ def test_reconcile_leaves_verified_still_running_process_as_running_but_flags_or
 
         sup = supervisor.Supervisor(db_path)
         outcomes = sup.reconcile()
+        repeated = sup.reconcile()
 
         assert outcomes[0]["classification"] == "RUNNING"
+        assert repeated[0]["classification"] == "RUNNING"
         assert db.get_run(db_path, run["id"])["state"] == "RUNNING"
         # Still alive: reconciliation must not have signalled it.
         assert proc.poll() is None
@@ -123,7 +125,7 @@ def test_reconcile_leaves_verified_still_running_process_as_running_but_flags_or
 
         events = db.list_run_events(db_path, run["id"])
         lifecycles = [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
-        assert "reconciliation_orphaned" in lifecycles
+        assert lifecycles.count("reconciliation_orphaned") == 1
     finally:
         proc.terminate()
         proc.wait()
@@ -313,3 +315,32 @@ def test_reconcile_does_not_use_claude_agents_registry(tmp_path, monkeypatch):
     sup = supervisor.Supervisor(db_path)
     outcomes = sup.reconcile()  # no RUNNING rows at all — must not touch subprocess either
     assert outcomes == []
+
+
+def test_reconcile_continues_after_one_run_persistence_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    broken = _make_running_row(db_path, pid=None, process_start_identity=None)
+    healthy = _make_running_row(db_path, pid=None, process_start_identity=None)
+    real_update = db.update_run_state
+
+    def fail_one_run(db_path, run_id, *, expected_version, new_state, fields=None):
+        if run_id == broken["id"] and new_state in db.TERMINAL_STATES:
+            raise RuntimeError("injected one-run reconciliation failure")
+        return real_update(
+            db_path,
+            run_id,
+            expected_version=expected_version,
+            new_state=new_state,
+            fields=fields,
+        )
+
+    monkeypatch.setattr(supervisor.db, "update_run_state", fail_one_run)
+    sup = supervisor.Supervisor(db_path)
+    outcomes = sup.reconcile()
+
+    assert db.get_run(db_path, broken["id"])["state"] == "RUNNING"
+    assert db.get_run(db_path, healthy["id"])["state"] == "INTERRUPTED"
+    by_id = {item["run_id"]: item for item in outcomes}
+    assert by_id[broken["id"]]["classification"] == "ERROR"
+    assert by_id[healthy["id"]]["classification"] == "INTERRUPTED"
