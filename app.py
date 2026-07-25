@@ -39,6 +39,7 @@ from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
     autopilot_panel,
+    backlog_reconcile_panel,
     board_style,
     home_dashboard,
     live_board,
@@ -4084,6 +4085,11 @@ elif page_key == "kanban":
         upsert_tasks,
         project=project_filter,
         key_prefix="kanban_reco",
+    )
+    st.divider()
+
+    backlog_reconcile_panel.render_backlog_reconcile_panel(
+        tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
     )
     st.divider()
 
