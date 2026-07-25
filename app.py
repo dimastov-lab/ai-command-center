@@ -2871,15 +2871,6 @@ def _maybe_run_autopilot_tick(api: runtime_api.ExecutionCenterAPI):
     return _run_autopilot_tick(api)
 
 
-def _pipeline_tick_due() -> bool:
-    """Whether the throttled autopilot tick would run on this refresh — a cheap,
-    read-only time check (no mutation) so the caller can decide *before* the
-    work whether to show the "planning" spinner. Only the ~once-per-15s tick
-    refresh dims the board; the frequent light refreshes do not."""
-    last = st.session_state.get(_PIPELINE_TICK_AT_KEY)
-    return last is None or (time.monotonic() - last) >= _PIPELINE_TICK_MIN_INTERVAL_SECONDS
-
-
 def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     """One refresh tick's worth of work: reconcile+sync, then re-render the
     whole dashboard from freshly-read state. Called directly (no
@@ -2910,12 +2901,16 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # Streamlit dims the fragment while a spinner is open, so an always-on
     # spinner greys the board on every single refresh. The light reconcile+sync
     # below is ~100 ms and needs no spinner; it re-renders without dimming.
-    tick_due = _pipeline_tick_due()
-    if tick_due:
-        with st.spinner("Планирую следующую волну…"):
-            tick_result = _maybe_run_autopilot_tick(api)
-    else:
-        tick_result = None
+    # No st.spinner around the tick: st.spinner dims the fragment while it is
+    # open, and a dim on every throttled tick is exactly the "страница то
+    # активна, то сереет" flicker operators reported (it recurred even after the
+    # settings-revert fix). `_maybe_run_autopilot_tick` already self-throttles to
+    # at most once per _PIPELINE_TICK_MIN_INTERVAL_SECONDS and returns None
+    # (doing nothing) both when the tick is not yet due and when autopilot is not
+    # opted in — so the frequent light refreshes cost nothing and never dim, and
+    # the rare planning tick now runs silently in place instead of greying the
+    # board.
+    tick_result = _maybe_run_autopilot_tick(api)
 
     def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
         return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
@@ -3041,7 +3036,7 @@ def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: lis
         interval = st.selectbox(
             "Интервал (с)",
             [2, 3, 4, 5],
-            index=[2, 3, 4, 5].index(st.session_state.get("exec_center_refresh_interval", 3)),
+            index=[2, 3, 4, 5].index(st.session_state.get("exec_center_refresh_interval", 5)),
             key="exec_center_refresh_interval",
         )
     with header_cols[2]:
