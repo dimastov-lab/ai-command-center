@@ -167,6 +167,25 @@ class WorkspaceLockedError(Exception):
         )
 
 
+class GlobalConcurrencyLimitError(Exception):
+    """Raised by `create_run(..., max_global_concurrency=N)` when N runs are
+    already active (`EXECUTION_CENTER_ACTIVE_STATES`) across *all* workspaces.
+
+    Enforced inside `create_run`'s own `BEGIN IMMEDIATE` transaction (like the
+    workspace lock above), so the global cap is a true atomic invariant every
+    launch path shares — not an advisory pre-flight count that each entry point
+    (the scheduler, the queue's `launch_ready`, portfolio launches, the review
+    gate) has to remember to run and that a batch 'launch all READY' would race
+    straight past."""
+
+    def __init__(self, active_count: int, limit: int) -> None:
+        self.active_count = active_count
+        self.limit = limit
+        super().__init__(
+            f"Global concurrency limit reached ({active_count}/{limit} runs already active)."
+        )
+
+
 class UnknownRunFieldError(Exception):
     """Raised when `update_run_state`/`update_run_fields` is asked to set a
     column that isn't in `_UPDATABLE_RUN_FIELDS`."""
@@ -946,6 +965,7 @@ def create_run(
     provider_id: str = "claude_code",
     provider_metadata_json: str | None = None,
     enforce_workspace_lock: bool = False,
+    max_global_concurrency: int | None = None,
 ) -> dict:
     """`expected_branch`/`launch_source`/`prompt_version` are write-once, like
     `project`/`task_type`/`repository_path` above — resolved by the caller
@@ -976,6 +996,21 @@ def create_run(
                 ).fetchone()
                 if conflict is not None:
                     raise WorkspaceLockedError(_row_to_dict(conflict))
+
+            if max_global_concurrency is not None:
+                # Global cap as an atomic invariant, in the SAME transaction as
+                # the INSERT (like the workspace lock above): count every run
+                # currently active across all workspaces and refuse the launch if
+                # the cap is already met. Two concurrent launches serialize on the
+                # BEGIN IMMEDIATE write lock, so they cannot both slip past the
+                # count — the way per-caller pre-flight checks can.
+                placeholders = ", ".join("?" for _ in EXECUTION_CENTER_ACTIVE_STATES)
+                active_count = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM run WHERE state IN ({placeholders})",
+                    tuple(EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()["n"]
+                if active_count >= max_global_concurrency:
+                    raise GlobalConcurrencyLimitError(active_count, max_global_concurrency)
 
             row = conn.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM run WHERE session_id = ?",

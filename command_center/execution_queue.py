@@ -66,6 +66,7 @@ from command_center import (
     launch,
     launch_service,
     models,
+    pipeline_settings,
     project_config,
     storage,
     workspace_provisioning,
@@ -371,6 +372,8 @@ LAUNCH_SKIP_BLOCKED = "launch_blocked"
 LAUNCH_SKIP_NEEDS_CONFIRMATION = "needs_confirmation"
 LAUNCH_SKIP_DUPLICATE_ACTIVE = "duplicate_active_launch"
 LAUNCH_SKIP_WORKSPACE_VERIFICATION = "workspace_verification_failed"
+LAUNCH_SKIP_GLOBAL_AT_CAPACITY = "global_at_capacity"
+LAUNCH_SKIP_WORKSPACE_LOCKED = "workspace_locked"
 LAUNCH_SKIP_LAUNCH_ERROR = "launch_error"
 
 
@@ -465,6 +468,14 @@ def launch_ready(
     # lock — never holding the queue lock across an `execute_agent_launch_v2`
     # subprocess spawn.
     launched_patches: dict[str, dict] = {}
+
+    # Global concurrency cap (audit H3). launch_ready is a direct entry point
+    # (the queue's "launch all READY" button, portfolio launches) that bypasses
+    # the scheduler's cap, so a batch could spawn one agent per READY entry
+    # regardless of the limit. The cap is ultimately enforced atomically in
+    # db.create_run; passing it here just lets a batch stop cleanly at the limit
+    # with a clear per-entry reason instead of each spawn being rejected.
+    max_global = pipeline_settings.load_settings(root).max_global_concurrency
 
     for entry in targets:
         task_id = entry.get("task_id")
@@ -561,6 +572,7 @@ def launch_ready(
                 expected_branch=expected_branch,
                 base_branch=base_branch,
                 source_repository_path=source_repository_path,
+                max_global_concurrency=max_global,
             )
         except launch_service.DuplicateActiveLaunchError as exc:
             results.append(
@@ -594,6 +606,35 @@ def launch_ready(
                     message=f"workspace не прошёл проверку изоляции ({structured['failed_step']}): {reason}",
                     reason_code=LAUNCH_SKIP_WORKSPACE_VERIFICATION,
                     validation_report=structured,
+                )
+            )
+            continue
+        except runtime_db.GlobalConcurrencyLimitError as exc:
+            # Atomic global cap hit (audit H3). The rest of the batch will hit it
+            # too, but keep reporting per-entry rather than aborting so the
+            # operator sees exactly which tasks were held back.
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=f"глобальный лимит достигнут ({exc.active_count}/{exc.limit} активны)",
+                    reason_code=LAUNCH_SKIP_GLOBAL_AT_CAPACITY,
+                )
+            )
+            continue
+        except runtime_supervisor.WorkspaceLockedError as exc:
+            # Another run claimed this exact workspace between our snapshot and
+            # the atomic create_run insert (audit H4). Report it as the specific
+            # "workspace busy" outcome, not a generic launch error, so the loser
+            # of the race is described accurately.
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=str(exc),
+                    reason_code=LAUNCH_SKIP_WORKSPACE_LOCKED,
                 )
             )
             continue
