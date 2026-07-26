@@ -388,6 +388,7 @@ def execute_agent_launch_v2(
     status_policy: str = workspace_provisioning.STATUS_POLICY_ALLOW_DIRTY,
     provision_workspace: bool = True,
     on_task_state_changed: Callable[[], None] | None = None,
+    max_global_concurrency: int | None = None,
 ) -> dict:
     """Async counterpart to `execute_agent_launch` above — same pre-launch
     bookkeeping (`push_prompt_history`, `launch.begin_launch`), but instead
@@ -512,6 +513,7 @@ def execute_agent_launch_v2(
         expected_branch=expected_branch,
         launch_source="kanban_task" if task is not None else "execution_center_adhoc",
         prompt_version=(task or {}).get("prompt_version"),
+        max_global_concurrency=max_global_concurrency,
         # `repository_path` here is exactly the path `validation` was
         # computed against (the caller's contract — see `render_agent_
         # launcher`), already checked for existence/is-a-directory/is-a-

@@ -451,6 +451,7 @@ class Supervisor:
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
         executor_id: str = providers.CLAUDE_ID,
         canonical_repository_path: str | None = None,
+        max_global_concurrency: int | None = None,
     ) -> dict:
         """Prepare and launch a run from an already-final `prompt` string.
 
@@ -667,6 +668,7 @@ class Supervisor:
                     provider_id=executor_id,
                     provider_metadata_json=providers.audit_json(spec.audit_metadata),
                     enforce_workspace_lock=True,
+                    max_global_concurrency=max_global_concurrency,
                 )
                 self._launching.add(run["id"])
         except db.WorkspaceLockedError as exc:
