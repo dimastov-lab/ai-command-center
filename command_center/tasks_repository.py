@@ -69,7 +69,26 @@ def normalize_task(task: dict) -> dict:
     return task
 
 
-def load_tasks(root: Path, *, example_file: Path | None = None) -> list[dict]:
+def _decode_tasks(tasks_file: Path) -> list[dict]:
+    """Read and decode the tasks file, RAISING on an existing-but-corrupt or
+    unreadable file rather than masking it as empty."""
+    data = json.loads(tasks_file.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"tasks file is not a JSON list: {tasks_file}")
+    return [normalize_task(task) for task in data]
+
+
+def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = False) -> list[dict]:
+    """Load the task list. A missing file is created empty (or seeded from
+    `example_file`) and read back as `[]` — that is a legitimate fresh store.
+
+    `strict` controls what happens when the file *exists* but cannot be decoded
+    (transient `OSError`, a torn write, or non-JSON): the read-only default
+    returns `[]` so a single bad read does not crash the UI, but the
+    read-modify-write path (`mutate_tasks`) passes `strict=True` so a bad read
+    RAISES instead of returning `[]`. Returning `[]` there and then saving would
+    persist `[]` over the real list — the "one transient read error wipes
+    tasks.json" data-loss amplification the audit flagged."""
     data_dir = storage.resolve_data_dir(root)
     data_dir.mkdir(parents=True, exist_ok=True)
     tasks_file = tasks_file_path(root)
@@ -79,12 +98,11 @@ def load_tasks(root: Path, *, example_file: Path | None = None) -> list[dict]:
         else:
             save_tasks(root, [])
     try:
-        data = json.loads(tasks_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        return _decode_tasks(tasks_file)
+    except (json.JSONDecodeError, OSError, ValueError):
+        if strict:
+            raise
         return []
-    if not isinstance(data, list):
-        return []
-    return [normalize_task(task) for task in data]
 
 
 def save_tasks(root: Path, tasks: list[dict]) -> None:
@@ -143,7 +161,11 @@ def mutate_tasks(
     on this; so is `command_center.task_import.apply_task_package`.
     """
     with tasks_lock(root, timeout=timeout):
-        tasks = load_tasks(root)
+        # strict=True: if the existing file cannot be read/decoded, RAISE rather
+        # than proceed against a wrongly-empty list — persisting the mutator's
+        # result would then overwrite tasks.json with just the new record and
+        # drop every other task (the audit's data-loss amplification).
+        tasks = load_tasks(root, strict=True)
         result = mutator(tasks)
         if persist_if is None or persist_if(result):
             save_tasks(root, tasks)
