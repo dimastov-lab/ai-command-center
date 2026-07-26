@@ -47,6 +47,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from command_center import agent_runner, project_config, workspace_provisioning
@@ -2032,6 +2033,45 @@ class Supervisor:
 
         return db.get_run(self.db_path, run_id)
 
+    def _orphan_past_deadline(self, run: dict) -> bool:
+        """Whether an adopted orphan (a RUNNING row from a previous incarnation of
+        this app whose process is still alive) has run past
+        `started_at + timeout_seconds`. Conservative: if either field is missing
+        or unparseable, returns False, so an orphan with no recorded deadline is
+        never force-reaped — it stays adopted RUNNING, the prior behaviour."""
+        timeout_seconds = run.get("timeout_seconds")
+        started_at = run.get("started_at")
+        if not timeout_seconds or not started_at:
+            return False
+        try:
+            started = datetime.fromisoformat(started_at)
+        except (TypeError, ValueError):
+            return False
+        return datetime.now() >= started + timedelta(seconds=float(timeout_seconds))
+
+    def _sigkill_orphan_group(self, run_id: str, pid: int | None, recorded_identity: str | None) -> bool:
+        """SIGKILL the process group of a past-deadline adopted orphan. Re-verifies
+        the pid still belongs to *our* run immediately before signalling (never
+        signal a reused pid — the same guarantee reconcile's classification makes).
+        Returns True when the group was signalled or is already gone (safe to
+        terminalize the row), False when the pid no longer matches (leave the row
+        RUNNING for a later reconcile to reclassify)."""
+        if pid is None:
+            return True  # nothing to signal; safe to terminalize
+        current = identity.capture_identity(pid)
+        if current is None:
+            return True  # already gone; terminalize
+        if recorded_identity and current.as_string() != recorded_identity:
+            return False  # pid reused since classification — must not signal it
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # exited between the identity check and here — fine
+        except OSError:
+            logger.exception("Could not SIGKILL orphan process group for run %s (pid %s)", run_id, pid)
+            return False
+        return True
+
     def _timeout_watchdog(
         self,
         run_id: str,
@@ -2304,6 +2344,25 @@ class Supervisor:
                 # no longer needs a pending "gone" suspicion.
                 with self._suspected_gone_lock:
                     self._suspected_gone.pop(run_id, None)
+
+                if classification == "RUNNING" and self._orphan_past_deadline(run):
+                    # Adopted orphan (identity verified above) that has run past
+                    # its timeout. It is NOT re-registered in self._active, so its
+                    # timeout watchdog is gone; left alone it would run forever,
+                    # holding its workspace lock and a global-concurrency slot with
+                    # no way to reap it from the app (audit P0/H2). reconcile runs
+                    # periodically, so enforce the timeout here: SIGKILL its
+                    # (re-verified) process group and terminalize the row, which
+                    # releases the workspace lock and the global slot.
+                    if self._sigkill_orphan_group(run_id, pid, recorded_identity):
+                        self._append_lifecycle_event_best_effort(
+                            "reconciliation_orphan_timeout",
+                            run_id,
+                            pid=pid,
+                            detail="adopted orphan exceeded its timeout; process group killed",
+                        )
+                        classification = "INTERRUPTED"
+                        detail = "orphaned run exceeded its timeout; process group terminated"
 
                 persisted = self._persist_reconciliation_state(
                     run_id,

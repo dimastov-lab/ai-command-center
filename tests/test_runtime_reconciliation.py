@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from datetime import datetime
 
 from command_center.runtime import db, identity, supervisor
 
@@ -410,3 +411,91 @@ def test_reconcile_never_clobbers_a_run_that_resolves_during_grace(tmp_path):
 
     assert db.get_run(db_path, run["id"])["state"] == "COMPLETED"  # never clobbered
     assert run["id"] not in sup._suspected_gone  # suspicion pruned
+
+
+# --------------------------------------------------------------------------
+# Adopted-orphan timeout enforcement (audit P0/H2): a RUNNING row from a
+# previous incarnation of this app whose process is still alive is adopted (left
+# RUNNING) — but it is not re-registered, so its timeout watchdog is gone. Left
+# alone it runs forever, holding its workspace lock and a global slot. reconcile
+# enforces its timeout: past the deadline it SIGKILLs the (identity-verified)
+# process group and terminalizes the row, releasing the lock and slot.
+# --------------------------------------------------------------------------
+
+
+def _make_running_row_with_timeout(db_path, *, pid, process_start_identity, started_at, timeout_seconds):
+    task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    run = db.create_run(
+        db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/x", prompt="p", is_resume=False, timeout_seconds=timeout_seconds,
+    )
+    run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
+    run = db.update_run_state(
+        db_path, run["id"], expected_version=run["version"], new_state="RUNNING",
+        fields={"pid": pid, "process_start_identity": process_start_identity, "started_at": started_at},
+    )
+    return run
+
+
+def test_reconcile_reaps_an_orphan_past_its_timeout(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    # A real, own-session-group process so os.killpg(pid) targets exactly it.
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        recorded = identity.capture_identity(proc.pid).as_string()
+        run = _make_running_row_with_timeout(
+            db_path, pid=proc.pid, process_start_identity=recorded,
+            started_at="2020-01-01T00:00:00", timeout_seconds=1,  # long past its deadline
+        )
+        sup = supervisor.Supervisor(db_path)
+        sup.reconcile()
+
+        assert db.get_run(db_path, run["id"])["state"] == "INTERRUPTED"
+        proc.wait(timeout=5)  # its process group was killed
+        assert proc.poll() is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_reconcile_adopts_an_orphan_still_within_its_timeout(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        recorded = identity.capture_identity(proc.pid).as_string()
+        run = _make_running_row_with_timeout(
+            db_path, pid=proc.pid, process_start_identity=recorded,
+            started_at=datetime.now().isoformat(), timeout_seconds=3600,  # nowhere near deadline
+        )
+        sup = supervisor.Supervisor(db_path)
+        sup.reconcile()
+
+        assert db.get_run(db_path, run["id"])["state"] == "RUNNING"  # adopted, not reaped
+        assert proc.poll() is None  # never signalled
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_reconcile_never_reaps_an_orphan_with_no_recorded_timeout(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        recorded = identity.capture_identity(proc.pid).as_string()
+        run = _make_running_row_with_timeout(
+            db_path, pid=proc.pid, process_start_identity=recorded,
+            started_at="2020-01-01T00:00:00", timeout_seconds=None,  # no deadline -> conservative
+        )
+        sup = supervisor.Supervisor(db_path)
+        sup.reconcile()
+
+        assert db.get_run(db_path, run["id"])["state"] == "RUNNING"  # left adopted
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
