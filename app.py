@@ -1494,6 +1494,13 @@ def _build_execution_center_sessions(
     every currently-Running run as a side effect."""
     tasks_by_id = {t["id"]: t for t in tasks if t.get("id")}
     runs = api.list_runs(limit=200)
+    # Batch the three per-run reads into one query each (audit H5 N+1). This loop
+    # used to open ~3 fresh sqlite connections per run — up to ~600 per render —
+    # every 2-5s and on every Home render; now it is 3 queries for the whole board.
+    run_ids = [run["id"] for run in runs]
+    latest_by_run = log_tail.latest_events_for_runs(api.db_path, run_ids)
+    completion_by_run = api.get_completions_for_runs(run_ids)
+    report_by_run = api.get_reports_for_runs(run_ids)
     # Historical median duration per task_type, computed once for the whole
     # board — the realistic denominator for progress/"осталось" when a task
     # carries no explicit estimate. See `session_view.median_completed_run_seconds`.
@@ -1515,10 +1522,10 @@ def _build_execution_center_sessions(
     for run in runs:
         kanban_task = tasks_by_id.get(run.get("task_id"))
         project_cfg = project_config.get_project_config(run.get("project")) if run.get("project") else None
-        latest = log_tail.latest_event(api.db_path, run["id"])
+        latest = latest_by_run.get(run["id"])
         report_path = (kanban_task or {}).get("report_path")
         if not report_path:
-            report_row = api.get_report(run["id"])
+            report_row = report_by_run.get(run["id"])
             report_path = report_row["path"] if report_row else None
         # Probe liveness *before* deriving the display status, and key it off
         # the persisted `run.state` (RUNNING) rather than the derived display
@@ -1533,7 +1540,7 @@ def _build_execution_center_sessions(
         heartbeat_stale = run.get("state") == "RUNNING" and session_view.is_heartbeat_stale(
             _execution_center_heartbeat_probe_at(run["id"]), now
         )
-        completion = api.get_completion(run["id"])
+        completion = completion_by_run.get(run["id"])
         session = session_view.build_session_view(
             run,
             kanban_task=kanban_task,
@@ -5087,10 +5094,15 @@ elif page_key == "focus":
 
                 st.divider()
 
+                _focus_status = task.get("status", "Backlog")
                 new_status = st.selectbox(
                     "Статус",
                     KANBAN_COLUMNS,
-                    index=KANBAN_COLUMNS.index(task.get("status", "Backlog")),
+                    # Guard like the task card / Kanban do: a non-canonical status
+                    # (e.g. "Blocked", which the board treats as live but is not a
+                    # column) would make .index() raise ValueError and crash Focus
+                    # Mode (audit M1). Fall back to the first column instead.
+                    index=KANBAN_COLUMNS.index(_focus_status) if _focus_status in KANBAN_COLUMNS else 0,
                     key=f"focus_status_{task_id}",
                 )
                 if new_status != task.get("status"):

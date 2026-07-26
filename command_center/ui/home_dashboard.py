@@ -34,8 +34,6 @@ _ACCENTS = {
     "slate": "#64748b",
 }
 
-_STYLE_FLAG = "_aicc_home_style"
-
 
 def _pal(dark: bool) -> dict[str, str]:
     """Surface/border/text tokens for the card chrome. The design is dark; the
@@ -63,9 +61,11 @@ def _pal(dark: bool) -> dict[str, str]:
 
 
 def inject_css() -> None:
-    if st.session_state.get(_STYLE_FLAG):
-        return
-    st.session_state[_STYLE_FLAG] = True
+    # Emit on every run. Streamlit drops any st.markdown a rerun does not
+    # re-emit, so the old once-per-session guard left the entire landing
+    # (KPI tiles, gauges, .hx-* cards) unstyled after the first interaction or
+    # navigation (audit H6). inject_css is called once per render_home_dashboard,
+    # so re-emitting here is one style block per render, not per widget.
     try:
         dark = theme.current_theme_type() == "dark"
     except Exception:  # noqa: BLE001
