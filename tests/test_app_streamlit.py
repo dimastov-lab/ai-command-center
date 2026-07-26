@@ -434,6 +434,20 @@ def test_focus_project_filter_includes_display_name_task_under_canonical_lane():
     assert "FocusDisplayNameTask" not in rendered_other
 
 
+def test_focus_mode_does_not_crash_on_a_non_canonical_task_status():
+    """Regression (audit M1): Focus Mode's status selectbox did
+    `KANBAN_COLUMNS.index(task["status"])` with no guard, so a task in a status
+    that is live but not a Kanban column (e.g. "Blocked") raised ValueError and
+    crashed the whole page."""
+    _seed_tasks(
+        [{"id": "AICC-BLK-001", "project": "AICC", "title": "BlockedFocusTask", "status": "Blocked"}]
+    )
+    at = _at_on_page("focus", focus_project_filter="AICC")
+    assert not at.exception
+    rendered = "\n".join(n.value for n in at.markdown)
+    assert "BlockedFocusTask" in rendered
+
+
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
     """`disabled=` on the launch button is the primary gate, but
     `streamlit.testing.v1.AppTest.click()` does not itself respect

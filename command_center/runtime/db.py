@@ -1313,6 +1313,33 @@ def tail_run_events(db_path: Path, run_id: str, *, limit: int = 200) -> list[dic
         return events
 
 
+def latest_events_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """The single most recent event per run, keyed by run_id — one query for a
+    whole board instead of a `sqlite3.connect()` per run (audit H5 N+1). Same
+    shaping as `tail_run_events` (payload_json decoded into `payload`). Uses a
+    MAX(seq) join rather than a window function so it works on any SQLite the
+    rest of the module targets."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT e.run_id, e.seq, e.event_type, e.payload_json, e.created_at
+                FROM run_event e
+                JOIN (
+                    SELECT run_id, MAX(seq) AS mx FROM run_event
+                    WHERE run_id IN ({placeholders}) GROUP BY run_id
+                ) m ON e.run_id = m.run_id AND e.seq = m.mx""",
+            tuple(run_ids),
+        ).fetchall()
+    result: dict[str, dict] = {}
+    for row in rows:
+        event = dict(row)
+        event["payload"] = json.loads(event.pop("payload_json"))
+        result[event["run_id"]] = event
+    return result
+
+
 # --------------------------------------------------------------------------
 # Report (immutable, at most one per run)
 # --------------------------------------------------------------------------
@@ -1333,6 +1360,19 @@ def get_report(db_path: Path, run_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM report WHERE run_id = ?", (run_id,)).fetchone()
         return _row_to_dict(row)
+
+
+def get_reports_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `get_report` keyed by run_id — one query for a whole board
+    instead of a `sqlite3.connect()` per run (audit H5 N+1)."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM report WHERE run_id IN ({placeholders})", tuple(run_ids)
+        ).fetchall()
+    return {row["run_id"]: _row_to_dict(row) for row in rows}
 
 
 # --------------------------------------------------------------------------
@@ -1489,6 +1529,20 @@ def get_completion(db_path: Path, run_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM completion WHERE run_id = ?", (run_id,)).fetchone()
         return _row_to_dict(row)
+
+
+def get_completions_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `get_completion` keyed by run_id — one query for a whole board
+    of runs instead of one `sqlite3.connect()` per run (audit H5 N+1). Runs with
+    no completion row are simply absent from the result."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM completion WHERE run_id IN ({placeholders})", tuple(run_ids)
+        ).fetchall()
+    return {row["run_id"]: _row_to_dict(row) for row in rows}
 
 
 def get_completion_by_task(db_path: Path, task_id: str) -> dict | None:

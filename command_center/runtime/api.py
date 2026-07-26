@@ -152,12 +152,20 @@ class ExecutionCenterAPI:
     def get_report(self, run_id: str) -> dict | None:
         return db.get_report(self.db_path, run_id)
 
+    def get_reports_for_runs(self, run_ids: list[str]) -> dict[str, dict]:
+        """Batch of `get_report` — one query for a board of runs (audit H5)."""
+        return db.get_reports_for_runs(self.db_path, run_ids)
+
     # ------------------------------------------------------------------
     # Completion pipeline (read-only projections + bounded advance)
     # ------------------------------------------------------------------
 
     def get_completion(self, run_id: str) -> dict | None:
         return db.get_completion(self.db_path, run_id)
+
+    def get_completions_for_runs(self, run_ids: list[str]) -> dict[str, dict]:
+        """Batch of `get_completion` — one query for a board of runs (audit H5)."""
+        return db.get_completions_for_runs(self.db_path, run_ids)
 
     def get_completion_by_task(self, task_id: str) -> dict | None:
         return db.get_completion_by_task(self.db_path, task_id)
