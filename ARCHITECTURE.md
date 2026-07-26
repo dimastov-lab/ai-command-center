@@ -93,7 +93,9 @@ Important service groups are:
 - `runtime/scheduler.py`: deterministic, read-only `ASSIGN`/`DEFER`/`BLOCKED` decisions; it does
   not claim or launch work;
 - `runtime/autonomy.py` and `runtime/autonomy_service.py`: persisted, evidence-backed proposal,
-  approval, and dispatch-boundary contracts; they have no UI, background driver, or executor;
+  approval, and dispatch-boundary contracts. An operator approve/reject inbox
+  (`ui/proposals_panel.py`, surfaced in `app.py`) reads and decides them, but there is
+  no background driver or executor that acts on an approval automatically;
 - `runtime/task_sync.py`: runtime/completion projection into planning tasks;
 - `runtime/completion.py` and `runtime/completion_service.py`: completion state machine and
   side-effect orchestrator;
@@ -371,7 +373,7 @@ Git access is not globally read-only. Capabilities are separated:
 | Normal task-v2 workspace provisioning | Create or attach a worktree through `git worktree add` | Explicit confirmation precedes mutation; source repository, branch, isolation, and status are verified fail closed |
 | Portfolio worktree launcher | Create/attach branch and worktree | Exact repository validation, collision checks, explicit launch, bounded rollback |
 | Scheduling planner | Read-only planning | Snapshot-based advisory decisions; no claim, persistence, or launch |
-| Autonomy proposal service | Persist proposal decisions and return a dispatch plan | Closed default policy, evidence/action checks, approval gate; no UI, driver, or execution |
+| Autonomy proposal service | Persist proposal decisions and return a dispatch plan | Closed default policy, evidence/action checks, approval gate; operator approve/reject inbox, but no background driver or automatic execution |
 | Completion Git adapter | Push or recreate branch | Fixed argv, no force-push, policy and state-machine gates |
 | Completion GitHub adapter | Discover/create/optionally merge PR | Local authenticated `gh`, fixed argv, explicit project policy, manual merge default |
 | Validation adapter | Run configured checks | Executable allowlist, `shell=False`, timeout, captured bounded output |

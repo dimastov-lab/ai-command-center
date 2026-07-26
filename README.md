@@ -15,7 +15,7 @@ single-host control plane whose durable state is local to the machine running St
 | Classification | Capabilities |
 |---|---|
 | Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; current JSON/JSONL project-chat and activity stores; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; fail-closed task-workspace provisioning and verification; a persisted execution queue whose application-owned mutations are locked; Portfolio parsing, intelligence, and guarded worktree launch; completion-state seeding and read-only completion status |
-| Implemented service/API foundations, not autonomously driven | Deterministic read-only scheduling decisions through `ExecutionCenterAPI.plan_schedule`; persisted, evidence-backed autonomy proposals through the runtime API/domain layer. Neither capability has a Streamlit UI, background task driver, durable scheduling claim/lease, or automatic dispatcher |
+| Implemented service/API foundations, not autonomously driven | Deterministic read-only scheduling decisions through `ExecutionCenterAPI.plan_schedule`; persisted, evidence-backed autonomy proposals through the runtime API/domain layer, surfaced in an operator approve/reject inbox (`ui/proposals_panel.py`). Neither capability has a background task driver, durable scheduling claim/lease, or automatic dispatcher |
 | Implemented but opt-in | Completion autopilot through `AICC_COMPLETION_AUTOPILOT`; OpenAI project-chat provider when its package and environment variables are supplied; project-specific completion policies that permit automatic merge or recovery |
 | Legacy but still present | Synchronous Claude execution; `runs.jsonl` run journal; generated-task shell workflow |
 | Designed or planned, not implemented | Native PySide6 desktop client and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
@@ -277,7 +277,8 @@ repository settings must separately require the check if merges are to be blocke
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
   within-plan workspace decisions can change before the separate explicit launch; only exact
   workspace exclusion is enforced transactionally by the runtime launch path.
-- The autonomy proposal layer has no Streamlit UI, automated evidence collectors, per-project
+- The autonomy proposal layer has an operator approve/reject inbox (`ui/proposals_panel.py`), but no
+  automated evidence collectors, per-project
   policy resolver, background driver, or executor; dispatch records and returns a plan but does not
   perform it.
 - Fail-closed workspace verification is scoped to normal task-v2 paths that supply a

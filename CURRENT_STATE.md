@@ -23,9 +23,9 @@ Current position:
   the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
 - `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
   decisions. It creates no durable claim, queue entry or run and has no background driver.
-- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state,
-  but has no Streamlit UI, automated evidence collectors, project policy resolver, background
-  driver or executor.
+- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state.
+  An operator approve/reject inbox (`ui/proposals_panel.py`) surfaces and decides proposals, but
+  there are no automated evidence collectors, project policy resolver, background driver or executor.
 - Portfolio Execution and Portfolio Overview provide guarded worktree launch plus read-only
   dependency, health, capacity and recommendation views.
 - The persisted completion pipeline supports validation, push, pull-request and merge workflows;
