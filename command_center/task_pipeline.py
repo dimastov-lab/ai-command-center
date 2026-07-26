@@ -217,6 +217,15 @@ REMEDIATION_BY_REASON: dict[str, str] = {
         "Workspace не принадлежит репозиторию проекта или не на ожидаемой ветке — "
         "проверьте изоляцию worktree."
     ),
+    # `LAUNCH_SKIP_GLOBAL_AT_CAPACITY` aliases `scheduler.REASON_GLOBAL_AT_CAPACITY`
+    # (same string) and is already covered by its entry above — the launch-time
+    # and admission-time views of one fact. `LAUNCH_SKIP_WORKSPACE_LOCKED` is the
+    # launch-time race where another run claimed the workspace between the queue
+    # snapshot and the atomic create_run insert.
+    execution_queue.LAUNCH_SKIP_WORKSPACE_LOCKED: (
+        "Другой прогон занял этот workspace в момент запуска (гонка) — "
+        "дождитесь его завершения и повторите."
+    ),
     execution_queue.LAUNCH_SKIP_LAUNCH_ERROR: "Запуск завершился ошибкой — см. сообщение.",
     # Provider-reported causes (see `providers.*.classify_failure`). These
     # arrive as a run's `failure_reason`, and the wave shows them verbatim, so
@@ -1145,6 +1154,7 @@ def advance_reviews(api, tasks_by_id: dict[str, dict], *, settings: PipelineSett
                 title=f"Независимая проверка: {task.get('title') or row.get('task_id')}",
                 launch_source="autopilot_review",
                 repository_already_validated=True,
+                max_global_concurrency=settings.max_global_concurrency,
             )
         except Exception as exc:  # noqa: BLE001 — one failed reviewer must not stop the rest
             records.append(
