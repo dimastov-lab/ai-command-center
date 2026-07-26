@@ -99,6 +99,15 @@ _CANCEL_CAS_MAX_ATTEMPTS = 5
 # cancel-side CAS above.
 _TERMINAL_CAS_MAX_ATTEMPTS = 5
 
+# How long a run must keep *looking* gone (pid still None, or its pid no longer
+# resolves) before reconcile() from a NON-owning process terminalizes it to
+# INTERRUPTED. This debounces the two cross-process race windows the audit
+# flagged: a peer between `create_run` and `Popen` (pid still None), and a peer
+# whose process exited but is still in its finalization window (about to CAS
+# COMPLETED). A single-observation terminalization there silently INTERRUPTs a
+# succeeding run out from under its owner and frees its workspace lock.
+_RECONCILE_ABSENCE_GRACE_SECONDS = 5.0
+
 # Bounds on the diagnostic output a provider may attach to a run, so a
 # misbehaving CLI cannot flood the event log.
 MAX_PROVIDER_DIAGNOSTIC_EVENTS = 64
@@ -360,6 +369,15 @@ class Supervisor:
         # its "don't touch this, it's mine" guard, not just `self._active`.
         self._launching: set[str] = set()
         self._active_lock = threading.Lock()
+        # Cross-process reconcile debounce (audit P0). A run can *look* gone not
+        # because it died but because another process owns it and is in-flight
+        # (pid still None between create_run and Popen, or exited-but-finalizing).
+        # We require the "gone" observation to persist across
+        # `_reconcile_absence_grace` seconds (per-instance, monotonic) before a
+        # non-owning reconcile() terminalizes it. run_id -> first-seen monotonic.
+        self._suspected_gone: dict[str, float] = {}
+        self._suspected_gone_lock = threading.Lock()
+        self._reconcile_absence_grace = _RECONCILE_ABSENCE_GRACE_SECONDS
         self._autopilot_thread: threading.Thread | None = None
         self._autopilot_stop: threading.Event | None = None
         # Opt-in: an env flag auto-starts the completion autopilot for a
@@ -2230,6 +2248,13 @@ class Supervisor:
             # ownership registration is not yet visible — exactly the state the
             # comment above says reconciliation must never observe.
             active_rows = db.list_runs(self.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+        # Forget "gone" suspicions for any run that is no longer active — it
+        # either reached a terminal state (its owner CAS'd it) or is now
+        # supervised, so it must not carry a stale suspicion into a later pass.
+        active_ids = {run["id"] for run in active_rows}
+        with self._suspected_gone_lock:
+            for stale in [rid for rid in self._suspected_gone if rid not in active_ids]:
+                self._suspected_gone.pop(stale, None)
         for run in active_rows:
             run_id = run["id"]
             if run_id in actively_supervised_ids:
@@ -2238,13 +2263,14 @@ class Supervisor:
                 pid = run.get("pid")
                 recorded_identity = run.get("process_start_identity")
 
+                looks_gone = False
                 if pid is None:
-                    classification = "INTERRUPTED"
+                    looks_gone = True
                     detail = "no pid recorded for this run"
                 else:
                     current_identity = identity.capture_identity(pid)
                     if current_identity is None:
-                        classification = "INTERRUPTED"
+                        looks_gone = True
                         detail = "pid no longer exists"
                     elif not recorded_identity:
                         classification = "UNKNOWN"
@@ -2255,6 +2281,29 @@ class Supervisor:
                     else:
                         classification = "INTERRUPTED"
                         detail = "pid exists but identity does not match recorded identity (pid reuse)"
+
+                if looks_gone:
+                    # Debounce (audit P0): another process may own this row and be
+                    # mid-launch (pid still None until Popen) or mid-finalization
+                    # (its process exited but it is about to CAS COMPLETED). Only
+                    # terminalize once the "gone" observation has persisted across
+                    # the grace window; otherwise wait and re-check on a later
+                    # reconcile, so a peer's succeeding run is never INTERRUPTED
+                    # out from under it (which would lose its work and free its
+                    # workspace lock). A row that resolves in the meantime — the
+                    # owner CAS'd it terminal — simply leaves the active set and is
+                    # pruned above, so it is never falsely interrupted.
+                    now = time.monotonic()
+                    with self._suspected_gone_lock:
+                        first_seen = self._suspected_gone.setdefault(run_id, now)
+                    if (now - first_seen) < self._reconcile_absence_grace:
+                        continue
+                    classification = "INTERRUPTED"
+
+                # Resolved, or now confirmed gone past the grace window: this run
+                # no longer needs a pending "gone" suspicion.
+                with self._suspected_gone_lock:
+                    self._suspected_gone.pop(run_id, None)
 
                 persisted = self._persist_reconciliation_state(
                     run_id,
