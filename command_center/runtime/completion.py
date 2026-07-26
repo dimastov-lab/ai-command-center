@@ -711,12 +711,33 @@ class CompletionEvaluator:
                 evidence=evidence,
                 **common,
             )
-        if policy.requires_review_for_merge and not pr.review_satisfied:
+        # Nothing verified this change (audit M7). `checks_state` is NONE — the
+        # repo has no CI — *and* local validation was not required, so an
+        # auto-merge here would rest on no evidence at all. When validation ran —
+        # the normal case — NONE checks are fine: this phase is only reached after
+        # validation passed, so validation is the "successful check".
+        if not pr.checks_passing and not policy.validation_required:
+            return CompletionAssessment(
+                status=CompletionState.MERGE_BLOCKED,
+                action=CompletionAction.WAIT,
+                reason_code=ReasonCode.CHECKS_FAILING,
+                recommended_action=(
+                    "No CI checks and no local validation verified this change; "
+                    "will not auto-merge. Merge manually."
+                ),
+                requires_human=True,
+                evidence=evidence,
+                **common,
+            )
+        # A required review must be an *explicit* approval (audit M7): a missing
+        # review (review_decision is None) is not the same as an approved one, so
+        # `auto_after_checks_and_review` must not merge a PR nobody reviewed.
+        if policy.requires_review_for_merge and pr.review_decision != "APPROVED":
             return CompletionAssessment(
                 status=CompletionState.MERGE_BLOCKED,
                 action=CompletionAction.WAIT,
                 reason_code=ReasonCode.REVIEW_REQUIRED,
-                recommended_action="Required review is not satisfied; will not merge without approval.",
+                recommended_action="Required review is not an explicit approval; will not merge without it.",
                 evidence=evidence,
                 **common,
             )
@@ -727,6 +748,18 @@ class CompletionEvaluator:
                 reason_code=ReasonCode.PR_CONFLICTING,
                 recommended_action="Pull request has conflicts and is not mergeable. Resolve conflicts.",
                 requires_human=True,
+                evidence=evidence,
+                **common,
+            )
+        # Mergeability not yet confirmed (audit M8): GitHub returns UNKNOWN
+        # transiently on a fresh PR. Wait and re-check rather than attempting a
+        # merge we cannot prove is safe; a later tick sees MERGEABLE and proceeds.
+        if pr.mergeable != "MERGEABLE":
+            return CompletionAssessment(
+                status=CompletionState.AWAITING_MERGE,
+                action=CompletionAction.WAIT,
+                reason_code=ReasonCode.CHECKS_PENDING,
+                recommended_action="Mergeability is not yet confirmed (UNKNOWN); waiting to re-check before merging.",
                 evidence=evidence,
                 **common,
             )

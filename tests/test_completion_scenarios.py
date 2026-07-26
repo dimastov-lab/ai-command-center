@@ -15,7 +15,7 @@ import pytest
 from command_center.runtime import db as runtime_db
 from command_center.runtime.completion import CompletionState
 from command_center.runtime.completion_service import CompletionOrchestrator
-from command_center.runtime.github import STATE_CLOSED, FakeGitHubClient, GitHubError, PullRequestState
+from command_center.runtime.github import STATE_CLOSED, STATE_OPEN, FakeGitHubClient, GitHubError, PullRequestState
 from tests.completion_helpers import (
     build_repo,
     make_task_branch,
@@ -132,6 +132,43 @@ def test_scenario_b_closed_pr_recovery(env):
     assert "PR_CLOSED_UNMERGED" in events
     assert "REMOTE_BRANCH_RECREATED" in events
     assert "REPLACEMENT_PR_CREATED" in events
+
+
+def test_open_pull_request_adopts_a_pr_opened_in_the_race_window(env):
+    """Audit M6: two advancers can both see no PR at discovery (step_pull_request)
+    and both reach _open_pull_request. The re-discovery just before `create` must
+    adopt the PR a peer opened in between rather than creating a duplicate (which
+    `gh pr create` would reject anyway, erroring the loser)."""
+    db_path, remote, work, tmp = env
+    branch = "task/aicc-m6-race"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    class _RaceGitHub(FakeGitHubClient):
+        # First discovery (the evaluator's, at step_pull_request) sees no PR; the
+        # second (inside _open_pull_request, just before create) sees the peer's.
+        def __init__(self, race_pr):
+            super().__init__()
+            self._race_pr = race_pr
+            self._discovers = 0
+
+        def discover_pull_request(self, repo, *, branch, base=None):
+            self._discovers += 1
+            return None if self._discovers == 1 else self._race_pr
+
+    race_pr = PullRequestState(
+        number=99, url="https://x/pull/99", state=STATE_OPEN,
+        mergeable="MERGEABLE", head_ref=branch, base_ref="main",
+    )
+    gh = _RaceGitHub(race_pr)
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg={"default_branch": "main"})
+    for _ in range(6):
+        orch.advance(run["id"], now=NOW)
+
+    row = runtime_db.get_completion(db_path, run["id"])
+    assert row["pull_request_number"] == 99  # adopted the peer's PR
+    assert gh.created == []  # never created a duplicate
 
 
 def test_scenario_b_recovery_disabled_requires_attention(env):
