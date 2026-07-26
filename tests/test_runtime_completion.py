@@ -261,6 +261,65 @@ def test_auto_merge_blocked_when_review_required():
     assert a.reason_code == ReasonCode.REVIEW_REQUIRED
 
 
+def test_auto_merge_blocked_when_review_required_but_none_exists():
+    """Audit M7: a *missing* review (review_decision None) is not an approval, so
+    auto_after_checks_and_review must not merge a PR that nobody reviewed."""
+    a = EVAL.evaluate(
+        None,
+        COMPLETED_RUN,
+        _repo(),
+        _pr(number=7, state="OPEN", checks_state="PASSING", mergeable="MERGEABLE", review_decision=None),
+        validation=_validation(True),
+        policy=CompletionPolicy(merge_mode=C.MERGE_AUTO_AFTER_CHECKS_AND_REVIEW),
+    )
+    assert a.status == CompletionState.MERGE_BLOCKED
+    assert a.reason_code == ReasonCode.REVIEW_REQUIRED
+
+
+def test_auto_merge_blocked_when_no_ci_checks_and_no_local_validation():
+    """Audit M7: NONE checks (no CI) *and* validation not required means nothing
+    verified the change — do not auto-merge on no evidence."""
+    a = EVAL.evaluate(
+        None,
+        COMPLETED_RUN,
+        _repo(),
+        _pr(number=7, state="OPEN", mergeable="MERGEABLE"),  # checks_state defaults to NONE
+        validation=None,
+        policy=CompletionPolicy(merge_mode=C.MERGE_AUTO_AFTER_CHECKS, validation_required=False),
+    )
+    assert a.status == CompletionState.MERGE_BLOCKED
+    assert a.requires_human
+
+
+def test_auto_merge_allowed_with_no_ci_once_local_validation_passed():
+    """The local-validation-first model: no GitHub CI is fine once local
+    validation ran (this phase is only reached after validation passed)."""
+    a = EVAL.evaluate(
+        None,
+        COMPLETED_RUN,
+        _repo(),
+        _pr(number=7, state="OPEN", mergeable="MERGEABLE"),  # checks_state NONE
+        validation=_validation(True),
+        policy=CompletionPolicy(merge_mode=C.MERGE_AUTO_AFTER_CHECKS),
+    )
+    assert a.action == C.CompletionAction.MERGE
+
+
+def test_auto_merge_waits_when_mergeability_is_unknown():
+    """Audit M8: UNKNOWN mergeability (GitHub's transient answer on a fresh PR) is
+    not proof of safety — wait and re-check rather than merging blind."""
+    a = EVAL.evaluate(
+        None,
+        COMPLETED_RUN,
+        _repo(),
+        _pr(number=7, state="OPEN", checks_state="PASSING", mergeable="UNKNOWN"),
+        validation=_validation(True),
+        policy=CompletionPolicy(merge_mode=C.MERGE_AUTO_AFTER_CHECKS),
+    )
+    assert a.status == CompletionState.AWAITING_MERGE
+    assert a.action == C.CompletionAction.WAIT
+
+
 def test_no_pr_yet_prepares_pull_request():
     a = EVAL.evaluate(None, COMPLETED_RUN, _repo(), None, validation=_validation(True), policy=CompletionPolicy())
     assert a.status == CompletionState.PREPARING_PULL_REQUEST

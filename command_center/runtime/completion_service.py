@@ -648,12 +648,26 @@ class CompletionOrchestrator:
             self.db_path, row["run_id"], EV_REMOTE_BRANCH_PUBLISHED, reason_code=ReasonCode.PR_MISSING,
             message=f"Pushed branch {branch!r} to {remote}.",
         )
-        title, body = _pr_content(task, row, rstate, base_branch=base_branch, branch=branch)
-        pr = self.github.create_pull_request(repo, base=base_branch, head=branch, title=title, body=body)
-        runtime_db.append_completion_event(
-            self.db_path, row["run_id"], EV_PR_CREATED, reason_code=ReasonCode.PR_OPEN,
-            message=f"Opened pull request #{pr.number}.", metadata={"url": pr.url, "number": pr.number},
-        )
+        # Re-check for an existing PR immediately before creating one (audit M6).
+        # Two advancers (the optional autopilot thread plus an on-demand advance,
+        # or two processes) can both have seen no PR at discovery time and both
+        # reach here; without this they race on `gh pr create`, which refuses a
+        # second PR for the same head+base and errors the loser instead of
+        # adopting the PR that already exists. Discover-then-adopt collapses that.
+        pr = self._discover_pr(repo, branch=branch, base=base_branch)
+        if pr is not None:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_PR_CREATED, reason_code=ReasonCode.PR_OPEN,
+                message=f"Pull request #{pr.number} already open for {branch!r}; adopting it.",
+                metadata={"url": pr.url, "number": pr.number},
+            )
+        else:
+            title, body = _pr_content(task, row, rstate, base_branch=base_branch, branch=branch)
+            pr = self.github.create_pull_request(repo, base=base_branch, head=branch, title=title, body=body)
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_PR_CREATED, reason_code=ReasonCode.PR_OPEN,
+                message=f"Opened pull request #{pr.number}.", metadata={"url": pr.url, "number": pr.number},
+            )
         self._transition(
             row,
             state=CompletionState.PULL_REQUEST_OPEN,
