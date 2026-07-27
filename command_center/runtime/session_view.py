@@ -201,17 +201,35 @@ def median_completed_run_seconds(runs: list[dict], *, task_type: str | None = No
     return (durations[mid - 1] + durations[mid]) / 2
 
 
+# Per-render cache: many runs share the same workspace, so `get_status` only
+# needs to run once per unique path per page load. Cleared by
+# `clear_git_status_cache()` at the start of each render cycle.
+_git_status_cache: dict[str, dict[str, Any] | None] = {}
+
+
+def clear_git_status_cache() -> None:
+    """Clear the per-render git-status cache. Call once at the start of each
+    dashboard render so stale results from the previous render are discarded."""
+    _git_status_cache.clear()
+
+
 def live_git_status(workspace_path: str | None) -> dict[str, Any] | None:
     """Read-only, best-effort: never switches branches, never mutates the
     workspace. Returns `None` if the path is missing, not a directory, or not
-    a git repo — callers render "—" rather than crashing."""
+    a git repo — callers render "—" rather than crashing. Results are cached
+    per `workspace_path` within a single render cycle for deduplication."""
     if not workspace_path:
         return None
+    if workspace_path in _git_status_cache:
+        return _git_status_cache[workspace_path]
     path = Path(workspace_path).expanduser()
     if not path.is_dir():
+        _git_status_cache[workspace_path] = None
         return None
     status = git_info.get_status(path)
-    return status if status.get("is_repo") else None
+    result = status if status.get("is_repo") else None
+    _git_status_cache[workspace_path] = result
+    return result
 
 
 def _summarize_event(event: dict | None) -> dict | None:

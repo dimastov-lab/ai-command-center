@@ -1494,6 +1494,9 @@ def _build_execution_center_sessions(
     this is just the join. Also performs the read-only heartbeat probe for
     every currently-Running run as a side effect."""
     tasks_by_id = {t["id"]: t for t in tasks if t.get("id")}
+    # Clear per-render git-status cache so stale results from the previous
+    # page load are discarded (many runs share the same workspace path).
+    session_view.clear_git_status_cache()
     runs = api.list_runs(limit=200)
     # Batch the three per-run reads into one query each (audit H5 N+1). This loop
     # used to open ~3 fresh sqlite connections per run — up to ~600 per render —

@@ -227,6 +227,10 @@ REMEDIATION_BY_REASON: dict[str, str] = {
         "дождитесь его завершения и повторите."
     ),
     execution_queue.LAUNCH_SKIP_LAUNCH_ERROR: "Запуск завершился ошибкой — см. сообщение.",
+    execution_queue.LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR: (
+        "Ни один из разрешённых исполнителей не доступен — "
+        "проверьте установку и авторизацию агентов (claude, copilot, ollama)."
+    ),
     # Provider-reported causes (see `providers.*.classify_failure`). These
     # arrive as a run's `failure_reason`, and the wave shows them verbatim, so
     # each needs the one action that actually resolves it.
@@ -1964,6 +1968,31 @@ def _locked_tick(
 
     _advance("advance_post")
     tasks = _sync()
+
+    # 6b. Re-enqueue tasks sent back to "Ready" by the executor-fallback
+    #     auto-retry (AICC-DESKTOP-017). `sync_task_from_run` records the dead
+    #     executor in `failed_executors` and flips `launch_status` to "Ready"
+    #     when a run died on startup (no output, e.g. expired OAuth). The queue
+    #     entry for that run is still `launched`, so without a re-enqueue the
+    #     planner would never see the task again. `enqueue_and_persist` is
+    #     idempotent — it only creates a new entry when no open one exists.
+    reenqueued: list[str] = []
+    try:
+        tasks_by_id_sync = {t["id"]: t for t in tasks if t.get("id")}
+        for task in tasks:
+            if (
+                task.get("failed_executors")
+                and task.get("launch_status") == "Ready"
+                and task.get("status") != "Done"
+            ):
+                execution_queue.enqueue_and_persist(
+                    root, task, tasks_by_id_sync
+                )
+                reenqueued.append(task["id"])
+    except Exception as exc:  # noqa: BLE001
+        _record(exc, "reenqueue_executor_retry")
+    if reenqueued:
+        tasks = tasks_repository.load_tasks(root)
 
     # 7. Verified merge -> Kanban Done -> dependents become eligible.
     completed_task_ids: list[str] = []

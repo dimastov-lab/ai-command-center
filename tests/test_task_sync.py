@@ -142,16 +142,46 @@ def test_sync_task_from_run_failed_sets_launch_status_failed(tmp_path):
     assert task["timeline"][0]["type"] == "launch_requires_attention"
 
 
-def test_sync_task_from_run_interrupted_and_unknown_map_to_requires_attention(tmp_path):
-    for state in ("INTERRUPTED", "UNKNOWN"):
-        db_path = tmp_path / f"runtime-{state}.db"
-        db.migrate(db_path)
-        run = _make_run(db_path, state=state, completed_at="2026-01-01T00:01:00")
-        task = _make_task()
+def test_sync_task_from_run_interrupted_with_no_output_auto_retries(tmp_path):
+    """An INTERRUPTED run that never produced output (startup failure — e.g.
+    expired OAuth) records the dead executor and flips back to "Ready" so the
+    next launch tries the next agent in the chain (AICC-DESKTOP-017)."""
+    db_path = tmp_path / "runtime-INTERRUPTED.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="INTERRUPTED", completed_at="2026-01-01T00:01:00")
+    task = _make_task()
 
-        task_sync.sync_task_from_run(task, run, db_path=db_path)
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
 
-        assert task["launch_status"] == "Requires Attention", state
+    assert task["launch_status"] == "Ready"
+    assert "claude_code" in (task.get("failed_executors") or [])
+
+
+def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp_path):
+    """An INTERRUPTED run that *did* produce output before dying is a genuine
+    mid-execution failure — not a startup failure — so it stays "Requires
+    Attention" and does not record a failed executor."""
+    db_path = tmp_path / "runtime-INTERRUPTED-output.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="INTERRUPTED", completed_at="2026-01-01T00:01:00")
+    run = db.update_run_fields(db_path, run["id"], expected_version=run["version"], fields={"first_output_at": "2026-01-01T00:00:30"})
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Requires Attention"
+    assert not task.get("failed_executors")
+
+
+def test_sync_task_from_run_unknown_maps_to_requires_attention(tmp_path):
+    db_path = tmp_path / "runtime-UNKNOWN.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="UNKNOWN", completed_at="2026-01-01T00:01:00")
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Requires Attention"
 
 
 def test_sync_task_from_run_cancelled_maps_to_failed_launch_status(tmp_path):
@@ -292,7 +322,11 @@ def test_reconcile_and_sync_skips_tasks_without_current_run_id(tmp_path):
     assert tasks[0]["launch_status"] == "Ready"
 
 
-def test_reconcile_and_sync_reconciles_dead_process_and_marks_task_requires_attention(tmp_path):
+def test_reconcile_and_sync_reconciles_dead_process_and_marks_task_ready_for_retry(tmp_path):
+    """A dead process that never produced output is a startup failure (e.g.
+    expired OAuth). The executor is recorded in `failed_executors` and the task
+    is sent back to "Ready" for auto-retry with the next available agent
+    (AICC-DESKTOP-017)."""
     api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
     run = _make_run(api.db_path, state="RUNNING")
 
@@ -306,7 +340,8 @@ def test_reconcile_and_sync_reconciles_dead_process_and_marks_task_requires_atte
     mutated = task_sync.reconcile_and_sync(api, tasks)
 
     assert mutated == [task]
-    assert task["launch_status"] == "Requires Attention"
+    assert task["launch_status"] == "Ready"
+    assert "claude_code" in (task.get("failed_executors") or [])
     reconciled_run = db.get_run(api.db_path, run["id"])
     assert reconciled_run["state"] == "INTERRUPTED"
 

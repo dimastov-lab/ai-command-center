@@ -168,6 +168,47 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         mutated = True
 
     target_launch_status = _resolve_target_launch_status(status, task)
+
+    # --- Executor fallback auto-retry (AICC-DESKTOP-017) -----------------
+    # A run that died on startup (INTERRUPTED, never produced output) is a
+    # strong signal the executor itself is broken — e.g. an expired OAuth
+    # token that `provider.availability()` (which only probes `--version`)
+    # cannot detect. Instead of stranding the task as "Requires Attention",
+    # record the failed executor and flip the task back to "Ready" so the
+    # next launch automatically tries the next available agent in the chain
+    # (see `execution_queue.select_available_executor`). The task only
+    # reaches "Requires Attention" when *every* allowed executor has failed.
+    if (
+        run.get("state") == "INTERRUPTED"
+        and not run.get("first_output_at")
+        and not already_finalized_for_this_run
+    ):
+        failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
+        failed_list = list(task.get("failed_executors") or [])
+        if failed_executor not in failed_list:
+            failed_list.append(failed_executor)
+            task["failed_executors"] = failed_list
+            mutated = True
+        # Keep the task re-launchable so the next `launch_ready` picks up the
+        # next executor in the chain. Only strand it as "Requires Attention"
+        # when there are no more agents to try.
+        if target_launch_status == "Requires Attention":
+            target_launch_status = "Ready"
+            models.append_timeline_event(
+                task,
+                "executor_failed",
+                f"Исполнитель «{failed_executor}» не запустился (нет вывода). "
+                "Задача возвращена в очередь для повтора другим агентом.",
+            )
+            mutated = True
+
+    # On a clean completion, clear any accumulated executor failures — the
+    # chain is healthy again and a future re-launch should try the configured
+    # executor from scratch.
+    if status == session_view.STATUS_COMPLETED and task.get("failed_executors"):
+        task.pop("failed_executors", None)
+        mutated = True
+
     if task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
         mutated = True

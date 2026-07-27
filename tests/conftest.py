@@ -407,6 +407,23 @@ def fake_codex(monkeypatch, tmp_path):
     return executable
 
 
+FAKE_COPILOT_SCRIPT = Path(__file__).parent / "fixtures" / "fake_copilot.py"
+
+
+@pytest.fixture
+def fake_copilot(monkeypatch, tmp_path):
+    """Install an isolated executable Copilot CLI double and route every probe/run to it."""
+    from command_center import project_config
+
+    executable = tmp_path / "copilot"
+    shutil.copyfile(FAKE_COPILOT_SCRIPT, executable)
+    executable.chmod(0o700)
+    monkeypatch.setenv("AICC_COPILOT_BINARY", str(executable))
+    monkeypatch.setenv("FAKE_COPILOT_TOUCH_FILE", "fake_copilot_default_touch.txt")
+    project_config.save_allowed_agents("AIOS", ["claude_code", "copilot_cli"])
+    return executable
+
+
 FAKE_CLAUDE_TREE_SCRIPT = Path(__file__).parent / "fixtures" / "fake_claude_tree.py"
 
 
