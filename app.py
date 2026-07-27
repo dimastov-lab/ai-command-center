@@ -35,7 +35,7 @@ from command_center import (
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
 from command_center.runtime import db as runtime_db
-from command_center.runtime import log_tail, project_overview, scheduler, session_view, task_sync
+from command_center.runtime import log_tail, project_overview, runs_read, scheduler, session_view, task_sync
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
@@ -1220,11 +1220,15 @@ def render_task_card(
                 st.rerun()
 
 
-def render_next_task_callout(tasks: list[dict], project: str | None = None) -> None:
+def render_next_task_callout(tasks: list[dict], project: str | None = None, *, active_runs: list[dict] | None = None) -> None:
     """Non-invasive '➡ Next Task' recommendation, always with an explanation
     of *why* — see `command_center.recommend.recommend_next_task`. Never
-    creates, launches, or modifies anything; purely advisory."""
-    recommendation = recommend.recommend_next_task(tasks, project=project)
+    creates, launches, or modifies anything; purely advisory.
+
+    ``active_runs`` (runtime.db runs filtered to active states) makes the
+    "исполнитель занят" reason agree with the Launch Gate instead of the
+    lagging Kanban ``launch_status``; see ``recommend._score_candidates``."""
+    recommendation = recommend.recommend_next_task(tasks, project=project, active_runs=active_runs)
     if recommendation is None:
         st.info("➡ Следующая задача: нет открытых незаблокированных задач.")
         return
@@ -3427,6 +3431,74 @@ def _runs_per_day(runs: list[dict], days: int = 7) -> tuple[int, ...]:
     return tuple(buckets)
 
 
+def _run_started_date(run: dict) -> datetime | None:
+    """Parse a run's ``started_at`` ISO timestamp to a date, or ``None``."""
+    started = run.get("started_at")
+    if not started:
+        return None
+    try:
+        return datetime.fromisoformat(started)
+    except (ValueError, TypeError):
+        return None
+
+
+# Windowed (sprint) run health — the honest denominator for the dashboard's
+# "Здоровье проекта" gauge. The cumulative `len(runs)` denominator used before
+# mixed a 200-run cap with all-time history and produced a number that drifted
+# away from "how are we doing *lately*". A 7-day window tracks recent execution
+# quality and is always well inside the Live Board's `limit=200` fetch.
+HEALTH_WINDOW_DAYS = 7
+
+
+def _window_terminal_runs(runs: list[dict], *, days: int = HEALTH_WINDOW_DAYS) -> list[dict]:
+    today = datetime.now().date()
+    out = []
+    for r in runs:
+        if r.get("state") not in runtime_db.TERMINAL_STATES:
+            continue
+        started = r.get("started_at")
+        if not started:
+            continue
+        try:
+            d = datetime.fromisoformat(started).date()
+        except (ValueError, TypeError):
+            continue
+        if 0 <= (today - d).days < days:
+            out.append(r)
+    return out
+
+
+def _window_success_rate(runs: list[dict], *, days: int = HEALTH_WINDOW_DAYS) -> int | None:
+    """Success rate over terminal runs started in the last `days`. Returns
+    `None` when there are no windowed terminal runs — the caller renders an
+    explicit "Нет данных" empty state instead of a misleading 0%."""
+    window = _window_terminal_runs(runs, days=days)
+    if not window:
+        return None
+    completed = sum(1 for r in window if r.get("state") == "COMPLETED")
+    return int(round(100 * completed / len(window)))
+
+
+# Human-readable labels for the v1.2 activity log event types — the dashboard's
+# "Последняя активность" card renders real lifecycle events (run_started,
+# report_saved, …) instead of bare file mtimes from `gather_activity`, which
+# exposed internal path names rather than anything the user did.
+_ACTIVITY_LABELS: dict[str, str] = {
+    "run_started": "Запущен агент",
+    "run_completed": "Прогон завершён",
+    "run_failed": "Прогон завершён с ошибкой",
+    "run_queued": "Задача в очереди",
+    "report_saved": "Сохранён отчёт",
+    "task_created_from_message": "Создана задача",
+    "task_moved_to_remediation": "Задача → remediation",
+    "next_task_created": "Создана следующая задача",
+    "manual_field_correction": "Ручная правка",
+    "conversation_created": "Новый разговор",
+    "message_added": "Новое сообщение",
+    "verdict_extracted": "Извлечён вердикт",
+}
+
+
 def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     """The Home dashboard from the approved design — KPI tiles, execution queue,
     project health, recent activity, a Kanban overview and quick actions, with an
@@ -3434,7 +3506,10 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
     `command_center.ui.home_dashboard`; every number is real."""
     home_dashboard.inject_css()
     now = datetime.now()
-    owner = "Artyom"
+    # Operator name is configurable via the AICC_OPERATOR env var — never a
+    # hardcoded person. Unset → a neutral greeting with no name, so a fresh
+    # install does not greet "Artyom".
+    owner = os.environ.get("AICC_OPERATOR", "").strip()
 
     runs = api.list_runs(limit=200)
     sessions, tasks_by_id = _build_execution_center_sessions(api, tasks, now=now)
@@ -3449,18 +3524,83 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
     projects_with_tasks = {t.get("project") for t in active if t.get("project")}
     attention = board[live_board.BUCKET_ATTENTION]
 
-    st.markdown(f"### {_home_greeting()} {owner}")
+    greeting = f"{_home_greeting()} {owner}" if owner else _home_greeting()
+    st.markdown(f"### {greeting}")
     st.caption("Вот что происходит с вашими проектами сегодня.")
 
-    spark = _runs_per_day(runs)
+    # Next-action hero (UX-2b): the one thing an operator opens the dashboard
+    # for — "what should I do next" — promoted above the KPI row. The callout is
+    # advisory (never creates/launches); a deep-link button jumps to the task.
+    recommendation = recommend.recommend_next_task(
+        tasks, active_runs=[r for r in runs if r.get("state") in runtime_db.EXECUTION_CENTER_ACTIVE_STATES]
+    )
+    if recommendation is not None:
+        hero_task = recommendation.task
+        with st.container(border=True):
+            st.markdown(f"##### ➡ Следующая задача: {hero_task.get('title') or 'Без названия'}")
+            st.caption(
+                f"{hero_task.get('project')} · {hero_task.get('status')} · "
+                f"приоритет {hero_task.get('priority', 'Medium')}"
+            )
+            st.caption("Почему: " + "; ".join(recommendation.reasons))
+            hero_cols = st.columns([1, 1, 1, 1])
+            with hero_cols[0]:
+                if st.button("Открыть задачу", key="home_hero_open_task", icon=":material/task_alt:", width="stretch"):
+                    st.session_state.pending_nav = "kanban"
+                    st.rerun()
+            with hero_cols[1]:
+                if st.button("Запустить", key="home_hero_launch", icon=":material/play_arrow:", type="primary", width="stretch"):
+                    st.session_state.pending_nav = "execution_center"
+                    st.session_state.pending_exec_center_project = hero_task.get("project")
+                    st.rerun()
+    else:
+        st.info("➡ Нет открытых незаблокированных задач — создайте новую.")
+
+    # Real 24h run delta (UX-2b): runs started today vs yesterday, so the
+    # "Агенты" KPI carries an honest day-over-day trend instead of a static
+    # count. Both windows read from the already-loaded `runs` (limit=200).
+    today = now.date()
+    runs_today = sum(1 for r in runs if _run_started_date(r) and _run_started_date(r).date() == today)
+    runs_yesterday = sum(
+        1 for r in runs
+        if _run_started_date(r) and _run_started_date(r).date().toordinal() == today.toordinal() - 1
+    )
+    if runs_yesterday:
+        delta = runs_today - runs_yesterday
+        runs_delta_txt = f"сегодня {runs_today} ({'+' if delta >= 0 else ''}{delta} к вчера)"
+    else:
+        runs_delta_txt = f"сегодня {runs_today}"
+
+    # KPI sparklines removed: the four KPIs (Проекты/Агенты/Задачи/Ревью) measure
+    # different things, but the old code fed the *same* `_runs_per_day` series to
+    # all four — an identical trend under every tile that falsely implied each
+    # metric had its own history. None of these KPIs has a genuine per-day series
+    # derivable from the loaded runs, so the honest choice is no sparkline rather
+    # than a duplicated, misleading one.
     home_dashboard.kpi_tiles([
         home_dashboard.Kpi("Проекты", len(projects_with_tasks),
                            "все активны" if not attention else f"{len(attention)} требуют внимания",
-                           "📁", "violet", spark),
-        home_dashboard.Kpi("Агенты", len(running), f"{len(running)} выполняется", "🤖", "blue", spark),
-        home_dashboard.Kpi("Задачи", len(active), f"{len(done)} завершено", "✓", "green", spark),
-        home_dashboard.Kpi("Ревью", len(needs_review), f"{len(needs_review)} ожидают", "★", "amber", spark),
+                           "📁", "violet", ()),
+        home_dashboard.Kpi("Агенты", len(running), runs_delta_txt, "🤖", "blue", ()),
+        home_dashboard.Kpi("Задачи", len(active), f"{len(done)} завершено", "✓", "green", ()),
+        home_dashboard.Kpi("Ревью", len(needs_review), f"{len(needs_review)} ожидают", "★", "amber", ()),
     ])
+
+    # Clickable KPI deep-links (UX-2b): the inert HTML tiles above cannot host
+    # Streamlit click handlers, so a matching row of buttons gives every KPI a
+    # real destination. Each navigates via the existing `pending_*` mechanism.
+    kpi_btns = st.columns(4)
+    _kpi_targets = [
+        ("📁 Проекты", "projects", "home_kpi_projects"),
+        ("🤖 Execution Center", "execution_center", "home_kpi_agents"),
+        ("✓ Kanban", "kanban", "home_kpi_tasks"),
+        ("★ Ревью (Kanban)", "kanban", "home_kpi_review"),
+    ]
+    for i, (label, nav, key) in enumerate(_kpi_targets):
+        with kpi_btns[i]:
+            if st.button(label, key=key, width="stretch", icon=":material/arrow_forward:"):
+                st.session_state.pending_nav = nav
+                st.rerun()
 
     main, side = st.columns([3, 1.2], gap="large")
 
@@ -3480,10 +3620,26 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
                 })
             if rows:
                 home_dashboard.queue_rows(rows)
+                # Clickable queue rows (UX-2b): a button per running/waiting
+                # session deep-links to the Live Execution Center with that run
+                # highlighted via the existing `pending_exec_center_run`.
+                qbtns = st.columns(min(len(rows), 5)) if rows else None
+                for i, s in enumerate((running + board[live_board.BUCKET_WAITING])[:5]):
+                    if qbtns is not None:
+                        with qbtns[i % len(qbtns)]:
+                            if st.button(
+                                f"→ {(s.get('task_title') or '—')[:14]}",
+                                key=f"home_queue_open_{s['run_id']}",
+                                width="stretch",
+                                help="Открыть прогон в Execution Center",
+                            ):
+                                st.session_state.pending_nav = "execution_center"
+                                st.session_state.pending_exec_center_run = s["run_id"]
+                                st.rerun()
             else:
-                st.caption("Сейчас ничего не выполняется.")
+                st.caption("Сейчас ничего не выполняется — запустите агента из Execution Center.")
             home_dashboard.queue_footer(
-                len(sessions), len(running), len(board[live_board.BUCKET_DONE]), len(board[live_board.BUCKET_ATTENTION])
+                api.count_runs(), len(running), len(board[live_board.BUCKET_DONE]), len(board[live_board.BUCKET_ATTENTION])
             )
             home_dashboard.card_close()
             if st.button("Открыть Execution Center", key="home_open_exec", type="primary", width="stretch"):
@@ -3492,30 +3648,43 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
 
         with col_h:
             home_dashboard.card_open("Здоровье проекта", "Детали")
-            # Real overall score: share of runs that completed, blended with task done-ratio.
-            completed_runs = sum(1 for r in runs if r.get("state") == "COMPLETED")
-            run_ratio = int(100 * completed_runs / len(runs)) if runs else 0
+            # Windowed health: success rate over terminal runs started in the
+            # last 7 days (sprint window), not a cumulative blend over a
+            # 200-capped run list. The old `len(running)*20` / `len(attention)*10`
+            # multipliers were magic numbers dressing up counts as percentages.
+            window_success = _window_success_rate(runs)
             task_ratio = int(100 * len(done) / len(tasks)) if tasks else 0
-            overall = round((run_ratio + task_ratio) / 2) if (runs or tasks) else 0
-            grade = "Отлично" if overall >= 85 else "Хорошо" if overall >= 60 else "Требует внимания"
-            home_dashboard.health_gauge(overall, grade)
+            if window_success is None:
+                home_dashboard.health_gauge(0, "Нет данных за неделю", accent="slate")
+            else:
+                grade = "Отлично" if window_success >= 85 else "Хорошо" if window_success >= 60 else "Требует внимания"
+                accent = "green" if window_success >= 85 else "blue" if window_success >= 60 else "amber"
+                home_dashboard.health_gauge(window_success, grade, accent=accent)
             home_dashboard.metric_list([
                 ("Задачи завершены", task_ratio, "green"),
-                ("Прогоны успешны", run_ratio, "blue"),
-                ("Выполняется сейчас", min(100, len(running) * 20), "violet"),
-                ("Требуют внимания", min(100, len(attention) * 10), "amber"),
+                ("Прогоны успешны (7д)", window_success if window_success is not None else 0, "blue"),
             ])
             home_dashboard.card_close()
 
         col_a, col_k = st.columns(2, gap="medium")
         with col_a:
             home_dashboard.card_open("Последняя активность")
+            # Real lifecycle events from the append-only activity log
+            # (run_started / report_saved / manual_field_correction …) instead
+            # of `gather_activity` file mtimes, which surfaced internal path
+            # names rather than anything the user or agents actually did.
             act_rows = []
-            for path, mtime in gather_activity(6):
-                act_rows.append({
-                    "icon": "•", "name": path.name,
-                    "meta": datetime.fromtimestamp(mtime).strftime("%d.%m %H:%M"),
-                })
+            for event in activity_log.load_activity(limit=6):
+                label = _ACTIVITY_LABELS.get(event.get("type", ""), event.get("type", "Событие"))
+                ts = event.get("ts") or ""
+                when = ""
+                if ts:
+                    try:
+                        when = datetime.fromisoformat(ts).strftime("%d.%m %H:%M")
+                    except (ValueError, TypeError):
+                        when = ts[:16]
+                meta = " · ".join(p for p in (event.get("project"), when) if p)
+                act_rows.append({"icon": "•", "name": label, "meta": meta or "—"})
             if act_rows:
                 home_dashboard.simple_rows(act_rows)
             else:
@@ -3531,6 +3700,20 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
                 cols.append((lane, n, accents[i % len(accents)]))
             home_dashboard.kanban_overview(cols)
             home_dashboard.card_close()
+            # Clickable Kanban columns (UX-2b): each lane count deep-links to the
+            # Kanban board (the page-level filter defaults to "Все", so the
+            # operator lands on the full board and can filter further).
+            kbtns = st.columns(len(models.KANBAN_STATUSES))
+            for i, lane in enumerate(models.KANBAN_STATUSES):
+                with kbtns[i]:
+                    if st.button(
+                        f"→ {lane}",
+                        key=f"home_kanban_{lane}",
+                        width="stretch",
+                        help="Открыть Kanban",
+                    ):
+                        st.session_state.pending_nav = "kanban"
+                        st.rerun()
 
         home_dashboard.card_open("Быстрые действия")
         qa = st.columns(5)
@@ -3547,10 +3730,22 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
 
     with side:
         settings = task_pipeline.pipeline_settings.load_settings(ROOT)
-        overall = 100 if settings.enabled else 0
+        # Supervisor status reflects real run state, not a hardcoded 94%/"Active".
+        # The gauge shows the same windowed health as the project-health card; the
+        # status pill and caption describe what the supervisor is actually doing.
+        window_success = _window_success_rate(runs)
+        if attention:
+            sup_status, sup_accent = "Требует внимания", "amber"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(attention)} прогонов требуют внимания"
+        elif running:
+            sup_status, sup_accent = "В работе", "green"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(running)} прогонов выполняется"
+        else:
+            sup_status, sup_accent = "Ожидает", "slate"
+            sup_label = "Автопилот включён — ожидает задач" if settings.enabled else "Автопилот выключен"
+        sup_percent = window_success if window_success is not None else 0
         home_dashboard.supervisor_status(
-            94 if settings.enabled else 0,
-            "Автопилот включён" if settings.enabled else "Автопилот выключен",
+            sup_percent, sup_label, status=sup_status, accent=sup_accent,
         )
         home_dashboard.card_open("Проекты")
         proj_rows = []
@@ -3563,6 +3758,16 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
             })
         home_dashboard.simple_rows(proj_rows or [{"icon": "▪", "name": "Нет активных проектов", "meta": ""}])
         home_dashboard.card_close()
+        # Clickable project rows (UX-2b): a button per project opens it in the
+        # Projects view via the existing `pending_project_browser` mechanism.
+        if projects_with_tasks:
+            pbtns = st.columns(min(len(sorted(projects_with_tasks)), 3))
+            for i, p in enumerate(sorted(projects_with_tasks)):
+                with pbtns[i % len(pbtns)]:
+                    if st.button(f"→ {p}", key=f"home_proj_{p}", width="stretch", help="Открыть проект"):
+                        st.session_state.pending_nav = "projects"
+                        st.session_state.pending_project_browser = p
+                        st.rerun()
 
         home_dashboard.card_open("Активные агенты")
         agent_rows = []
@@ -3827,7 +4032,10 @@ elif page_key == "workspace_home":
 elif page_key == "executive":
     st.subheader("Исполнительная панель")
 
-    render_next_task_callout(tasks)
+    render_next_task_callout(
+        tasks,
+        active_runs=get_execution_center_api().list_runs(states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES),
+    )
 
     active_tasks = [task for task in tasks if task.get("status") != "Done"]
     completed_tasks = [task for task in tasks if task.get("status") == "Done"]
@@ -3909,7 +4117,12 @@ elif page_key == "executive":
     st.divider()
     st.markdown("#### Метрики запусков агентов")
 
-    exec_runs = agent_runner.load_runs()
+    # Unified runs: v2 runtime.db (canonical) + legacy v1.2 journal merged —
+    # the old `agent_runner.load_runs()` read only the v1.2 journal, which is
+    # empty on installs that launch through the Execution Center, so every
+    # metric below was always zero. See `command_center.runtime.runs_read`.
+    exec_api = get_execution_center_api()
+    exec_runs = runs_read.list_unified_runs(exec_api.db_path, root=ROOT)
     today = datetime.now().date()
     runs_today = [
         run
@@ -4361,7 +4574,11 @@ elif page_key == "execution_center":
 elif page_key == "runs":
     st.subheader("Журнал запусков")
 
-    all_runs = agent_runner.load_runs()
+    # Unified runs (v2 runtime.db + legacy v1.2 journal) — the old
+    # `agent_runner.load_runs()` read only the v1.2 journal, which is empty on
+    # installs that launch through the Execution Center, so the whole page was
+    # blank. See `command_center.runtime.runs_read`.
+    all_runs = runs_read.list_unified_runs(get_execution_center_api().db_path, root=ROOT)
 
     filter_cols = st.columns(4)
     with filter_cols[0]:
@@ -4482,29 +4699,37 @@ elif page_key == "runs":
                 if run.get("next_task_id"):
                     st.success(f"Следующая задача уже создана: `{run['next_task_id']}`")
 
-                st.markdown("**Ручная корректировка полей**")
-                correction_cols = st.columns([1, 2, 1])
-                with correction_cols[0]:
-                    correction_field = st.selectbox(
-                        "Поле", report_parser.CORRECTABLE_FIELDS, key=f"run_correct_field_{run['id']}"
-                    )
-                with correction_cols[1]:
-                    correction_value = st.text_input("Значение", key=f"run_correct_value_{run['id']}")
-                with correction_cols[2]:
-                    st.write("")
-                    if st.button("Сохранить", key=f"run_correct_btn_{run['id']}"):
-                        if correction_value.strip():
-                            corrected_parsed = report_parser.set_manual_correction(
-                                parsed, correction_field, correction_value.strip()
-                            )
-                            run["parsed"] = corrected_parsed
-                            agent_runner.append_run(run)
-                            activity_log.log_event(
-                                "manual_field_correction", project=run.get("project"), task_id=run.get("task_id"),
-                                run_id=run["id"], message=f"{correction_field} -> {correction_value.strip()[:80]}",
-                            )
-                            st.success("Сохранено.")
-                            st.rerun()
+                # Manual field correction write-back is a v1.2-journal feature
+                # (it appends to runs.jsonl). v2 runs live in runtime.db and are
+                # read-only here — persisting a correction would require a v2
+                # correction store that does not exist yet, so we surface that
+                # honestly rather than silently writing a stale v1.2 snapshot.
+                if run.get("source") == "v1.2":
+                    st.markdown("**Ручная корректировка полей**")
+                    correction_cols = st.columns([1, 2, 1])
+                    with correction_cols[0]:
+                        correction_field = st.selectbox(
+                            "Поле", report_parser.CORRECTABLE_FIELDS, key=f"run_correct_field_{run['id']}"
+                        )
+                    with correction_cols[1]:
+                        correction_value = st.text_input("Значение", key=f"run_correct_value_{run['id']}")
+                    with correction_cols[2]:
+                        st.write("")
+                        if st.button("Сохранить", key=f"run_correct_btn_{run['id']}"):
+                            if correction_value.strip():
+                                corrected_parsed = report_parser.set_manual_correction(
+                                    parsed, correction_field, correction_value.strip()
+                                )
+                                run["parsed"] = corrected_parsed
+                                agent_runner.append_run(run)
+                                activity_log.log_event(
+                                    "manual_field_correction", project=run.get("project"), task_id=run.get("task_id"),
+                                    run_id=run["id"], message=f"{correction_field} -> {correction_value.strip()[:80]}",
+                                )
+                                st.success("Сохранено.")
+                                st.rerun()
+                else:
+                    st.caption("Ручная корректировка полей доступна только для записей из журнала v1.2; этот прогон хранится в runtime.db и доступен только для чтения.")
 
             render_create_next_task_widget(run, tasks, key_prefix=f"runs_page_{run['id']}")
 
@@ -4519,7 +4744,8 @@ elif page_key == "timeline":
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="timeline_project_filter")
 
     events = build_timeline_events(
-        tasks, runs=agent_runner.load_runs(), activity_events=activity_log.load_activity(limit=200), limit=200
+        tasks, runs=runs_read.list_unified_runs(get_execution_center_api().db_path, root=ROOT),
+        activity_events=activity_log.load_activity(limit=200), limit=200,
     )
     if project_filter != "Все":
         # Canonical-id match (shared helper): task-sourced timeline events carry
@@ -4923,8 +5149,13 @@ elif page_key == "reports":
         st.info("Файлы отчётов не найдены.")
     else:
         st.caption(f"Найдено файлов: {len(filtered_files)} (новые сверху)")
+        # Unified runs (v2 runtime.db + legacy v1.2) so a report file is joined
+        # to its run regardless of which source produced it; the old
+        # `agent_runner.load_runs()` only knew about v1.2 runs.
         runs_by_report_path = {
-            run["report_path"]: run for run in agent_runner.load_runs() if run.get("report_path")
+            run["report_path"]: run
+            for run in runs_read.list_unified_runs(get_execution_center_api().db_path, root=ROOT)
+            if run.get("report_path")
         }
         for path in filtered_files:
             rel = path.relative_to(REPORTS_DIR)
@@ -4963,64 +5194,106 @@ elif page_key == "context":
 elif page_key == "git_center":
     st.subheader("Git Center")
 
-    repo_status = get_git_status()
+    # Multi-repo: the portfolio spans several configured repositories, not just
+    # the app's own cwd. Surface every project's configured repository_path
+    # (plus the app itself) so an operator can inspect any of them from one
+    # place instead of only ever seeing AICC here.
+    repos: list[tuple[str, Path]] = []
+    if (ROOT / ".git").is_dir():
+        repos.append(("AICC (app)", ROOT))
+    for pid in models.PROJECT_IDS:
+        cfg = project_configs.get(pid, {})
+        repo_str = cfg.get("repository_path") or cfg.get("default_workspace_path")
+        if not repo_str:
+            continue
+        repo_path = Path(repo_str).expanduser()
+        if repo_path.is_dir() and repo_path not in [p for _, p in repos]:
+            label = f"{cfg.get('display_name') or pid} ({pid})"
+            repos.append((label, repo_path))
 
-    if not repo_status.get("is_repo"):
-        st.info("Текущая директория не является git-репозиторием.")
+    if not repos:
+        st.info("Не найдено ни одного настроенного git-репозитория.")
     else:
-        with st.container(horizontal=True):
-            st.metric("Ветка", repo_status["branch"], border=True)
-            st.metric("Статус", "Изменения есть" if repo_status["dirty"] else "Чисто", border=True)
-            st.metric("Изменено файлов", repo_status["modified_count"], border=True)
-            st.metric("Неотслеживаемых файлов", repo_status["untracked_count"], border=True)
-
-        st.caption(f"Корень репозитория: `{repo_status['root']}`")
-        st.caption(f"Последний коммит: `{repo_status['last_commit_hash']}` — {repo_status['last_commit_subject']}")
-
-        tab_files, tab_log, tab_diff, tab_branches, tab_remotes = st.tabs(
-            ["Изменённые файлы", "История коммитов", "Diff", "Ветки", "Remotes"]
-        )
-
-        with tab_files:
-            status_lines = repo_status.get("status_lines", [])
-            if not status_lines:
-                st.success("Нет изменений — рабочее дерево чистое.")
+        # Per-repo summary table — one glance at the whole portfolio's git state.
+        summary_rows = []
+        for label, repo_path in repos:
+            st_row = git_info.get_status(repo_path)
+            if not st_row.get("is_repo"):
+                summary_rows.append({"Проект": label, "Ветка": "—", "Статус": "не репозиторий",
+                                     "Изменено": "—", "Неотслеж.": "—", "Коммит": "—"})
             else:
-                for line in status_lines:
-                    st.caption(f"`{line[:2]}`  {line[3:]}")
+                summary_rows.append({
+                    "Проект": label,
+                    "Ветка": st_row.get("branch", "—"),
+                    "Статус": "Изменения есть" if st_row.get("dirty") else "Чисто",
+                    "Изменено": st_row.get("modified_count", 0),
+                    "Неотслеж.": st_row.get("untracked_count", 0),
+                    "Коммит": f"{st_row.get('last_commit_hash', '—')} {st_row.get('last_commit_subject', '')[:40]}",
+                })
+        st.dataframe(summary_rows, use_container_width=True, hide_index=True)
 
-        with tab_log:
-            commits = get_git_log(20)
-            if not commits:
-                st.info("История коммитов недоступна.")
-            else:
-                for commit in commits:
-                    with st.container(border=True):
-                        st.markdown(f"**{commit['subject']}**")
-                        st.caption(f"`{commit['hash']}` · {commit['author']} · {commit['date']}")
+        st.divider()
+        repo_label = st.selectbox("Репозиторий для детального просмотра",
+                                  [label for label, _ in repos], key="git_center_repo_select")
+        repo_path = next(p for lbl, p in repos if lbl == repo_label)
+        repo_status = git_info.get_status(repo_path)
 
-        with tab_diff:
-            st.markdown("**Незафиксированные изменения (unstaged)**")
-            st.code(get_git_diff_stat(staged=False) or "Нет изменений.", language=None)
-            st.markdown("**Подготовленные изменения (staged)**")
-            st.code(get_git_diff_stat(staged=True) or "Нет изменений.", language=None)
+        if not repo_status.get("is_repo"):
+            st.info(f"«{repo_label}» не является git-репозиторием.")
+        else:
+            with st.container(horizontal=True):
+                st.metric("Ветка", repo_status["branch"], border=True)
+                st.metric("Статус", "Изменения есть" if repo_status["dirty"] else "Чисто", border=True)
+                st.metric("Изменено файлов", repo_status["modified_count"], border=True)
+                st.metric("Неотслеживаемых файлов", repo_status["untracked_count"], border=True)
 
-        with tab_branches:
-            branches = get_git_branches()
-            if not branches:
-                st.info("Ветки не найдены.")
-            else:
-                for branch in branches:
-                    marker = "→ " if branch == repo_status["branch"] else "  "
-                    st.caption(f"{marker}{branch}")
+            st.caption(f"Корень репозитория: `{repo_status['root']}`")
+            st.caption(f"Последний коммит: `{repo_status['last_commit_hash']}` — {repo_status['last_commit_subject']}")
 
-        with tab_remotes:
-            remotes = get_git_remotes()
-            if not remotes:
-                st.info("Удалённые репозитории не настроены.")
-            else:
-                for name, url in remotes:
-                    st.caption(f"**{name}** — {url}")
+            tab_files, tab_log, tab_diff, tab_branches, tab_remotes = st.tabs(
+                ["Изменённые файлы", "История коммитов", "Diff", "Ветки", "Remotes"]
+            )
+
+            with tab_files:
+                status_lines = repo_status.get("status_lines", [])
+                if not status_lines:
+                    st.success("Нет изменений — рабочее дерево чистое.")
+                else:
+                    for line in status_lines:
+                        st.caption(f"`{line[:2]}`  {line[3:]}")
+
+            with tab_log:
+                commits = git_info.get_log(repo_path, 20)
+                if not commits:
+                    st.info("История коммитов недоступна.")
+                else:
+                    for commit in commits:
+                        with st.container(border=True):
+                            st.markdown(f"**{commit['subject']}**")
+                            st.caption(f"`{commit['hash']}` · {commit['author']} · {commit['date']}")
+
+            with tab_diff:
+                st.markdown("**Незафиксированные изменения (unstaged)**")
+                st.code(git_info.get_diff_stat(repo_path, staged=False) or "Нет изменений.", language=None)
+                st.markdown("**Подготовленные изменения (staged)**")
+                st.code(git_info.get_diff_stat(repo_path, staged=True) or "Нет изменений.", language=None)
+
+            with tab_branches:
+                branches = git_info.get_branches(repo_path)
+                if not branches:
+                    st.info("Ветки не найдены.")
+                else:
+                    for branch in branches:
+                        marker = "→ " if branch == repo_status["branch"] else "  "
+                        st.caption(f"{marker}{branch}")
+
+            with tab_remotes:
+                remotes = git_info.get_remotes(repo_path)
+                if not remotes:
+                    st.info("Удалённые репозитории не настроены.")
+                else:
+                    for name, url in remotes:
+                        st.caption(f"**{name}** — {url}")
 
 
 # --------------------------------------------------------------------------

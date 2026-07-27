@@ -143,6 +143,12 @@ class ExecutionCenterAPI:
             limit=limit,
         )
 
+    def count_runs(self, *, states: Iterable[str] | None = None) -> int:
+        """Authoritative total run count without materializing rows (see
+        `db.count_runs`). Use this for dashboard totals/denominators so the
+        Live Board's `limit=200` window never silently under-counts."""
+        return db.count_runs(self.db_path, states=states)
+
     def get_run(self, run_id: str) -> dict | None:
         return db.get_run(self.db_path, run_id)
 

@@ -34,6 +34,7 @@ def build_recommendation_views(
     project: str | None = None,
     queue_entries: list[dict] | None = None,
     limit: int = 3,
+    active_runs: list[dict] | None = None,
 ) -> list[dict]:
     """One view dict per recommendation, best-first:
 
@@ -53,7 +54,7 @@ def build_recommendation_views(
       instead of offering to queue it again.
     """
     all_tasks_by_id = tasks_by_id or {task["id"]: task for task in tasks if task.get("id")}
-    recommendations = recommend.list_recommendations(tasks, project=project, limit=limit)
+    recommendations = recommend.list_recommendations(tasks, project=project, limit=limit, active_runs=active_runs)
 
     views: list[dict] = []
     for rec in recommendations:

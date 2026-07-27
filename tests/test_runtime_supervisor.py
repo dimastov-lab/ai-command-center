@@ -1846,6 +1846,31 @@ def test_exit_zero_with_blocked_final_response_is_blocked_not_completed(git_repo
     assert final["failure_reason"].startswith("blocked:final_response:")
 
 
+def test_classify_ok_when_working_tree_changed_via_head_advanced(
+    git_repo, configure_project_repo, fake_claude
+):
+    """The commit-detection fix: an agent that commits its work leaves the
+    working tree *clean* (porcelain unchanged) but advances HEAD. The
+    supervisor ORs `head_advanced` into `working_tree_changed`, so the outcome
+    classifier sees working_tree_changed=True and the run completes — no more
+    false `incomplete:working_tree_unchanged`."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = ""  # no working-tree dirt
+    fake_claude["FAKE_CLAUDE_COMMIT"] = "implement feature X"  # but commit -> HEAD advances
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["exit_code"] == 0
+    assert final["working_tree_changed"] == 1, "a HEAD-advancing commit must count as a tree change"
+    assert final["state"] == "COMPLETED"
+    assert final["failure_reason"] is None
+
+
 def test_exit_zero_with_unchanged_working_tree_is_incomplete_not_completed(
     git_repo, configure_project_repo, fake_claude
 ):

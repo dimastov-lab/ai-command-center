@@ -685,12 +685,20 @@ class Supervisor:
                     )["payload"],
                 )
             run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
-            pre_run_status = agent_runner.git_snapshot(repo_path).get("status_summary")
+            pre_run_snapshot = agent_runner.git_snapshot(repo_path)
+            pre_run_status = pre_run_snapshot.get("status_summary")
             run = db.update_run_fields(
                 self.db_path,
                 run["id"],
                 expected_version=run["version"],
-                fields={"pre_run_git_status": pre_run_status},
+                fields={
+                    "pre_run_git_status": pre_run_status,
+                    # Short HEAD at launch. A committed change leaves the working
+                    # tree clean, so the porcelain diff alone cannot tell "agent
+                    # committed" from "agent did nothing"; comparing pre/post HEAD
+                    # can. See `outcome.classify_process_result`.
+                    "pre_run_head": pre_run_snapshot.get("head"),
+                },
             )
         except Exception:
             # `_launch_process` (which owns clearing `self._launching` on
@@ -1741,9 +1749,20 @@ class Supervisor:
             if run is None:
                 raise KeyError(f"No such run: {run_id!r}")
 
-            post_status = agent_runner.git_snapshot(repo_path).get("status_summary")
+            post_snapshot = agent_runner.git_snapshot(repo_path)
+            post_status = post_snapshot.get("status_summary")
+            post_head = post_snapshot.get("head")
             pre_status = run.get("pre_run_git_status")
+            pre_head = run.get("pre_run_head")
             working_tree_changed = pre_status is not None and post_status != pre_status
+            # A committed change leaves the working tree clean, so a clean pre/
+            # post diff does NOT mean "nothing happened" — the agent may have
+            # committed. If HEAD advanced during the run, count that as work
+            # produced so the run is not mis-classified
+            # `incomplete:working_tree_unchanged` (AICC-DESKTOP-017: copilot_cli
+            # and claude_code routinely commit their work).
+            if pre_head and post_head and pre_head != post_head:
+                working_tree_changed = True
             result_payload = self._final_result_payload(run_id) if exit_code == 0 else None
 
             for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):

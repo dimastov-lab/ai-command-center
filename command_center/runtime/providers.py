@@ -28,6 +28,37 @@ CODEX_ID = "codex"
 OLLAMA_ID = "ollama"
 COPILOT_ID = "copilot_cli"
 
+# Failure reasons that mean the *executor itself* is unavailable — the provider
+# cannot run this task at all right now, as opposed to the task being too hard
+# or the agent refusing for content/policy reasons. When a run ends with one of
+# these, the autopilot records the dead executor in
+# ``task["failed_executors"]`` (task_sync) and lets the scheduler fall through
+# to the next available agent (see ``execution_queue.select_available_executor``)
+# instead of stranding the task or burning the retry budget retrying the same
+# dead provider.
+#
+# Deliberately *excludes*:
+#   ``incomplete:working_tree_unchanged``  — task content, not the provider;
+#   ``blocked:permission_denied:*``        — environment policy, identical on
+#                                            every executor, so switching helps
+#                                            no one;
+#   ``blocked:final_response:*``           — the agent judged the task blocked;
+#   ``timeout`` / "process killed manually" — ambiguous: could be the task,
+#                                            the machine, or the provider, so
+#                                            retry budget (not failover) governs.
+PROVIDER_UNAVAILABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "session_expired",
+        "authentication_failed",
+        "quota_limit",
+        "provider_api_error",
+        "provider_exit_nonzero",
+        "provider_launch_failed",
+        "executable_missing",
+        "network_error",
+    }
+)
+
 MAX_PERSISTED_EVENT_CHARS = 65_536
 MAX_CODEX_PROMPT_CHARS = 100_000
 

@@ -20,7 +20,7 @@ def _make_task(**overrides) -> dict:
     return task
 
 
-def _make_run(db_path, *, state: str, task_id: str = "task-1", **fields) -> dict:
+def _make_run(db_path, *, state: str, task_id: str = "task-1", provider_id: str = "claude_code", **fields) -> dict:
     task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation", task_id=task_id)
     session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
     run = db.create_run(
@@ -32,6 +32,7 @@ def _make_run(db_path, *, state: str, task_id: str = "task-1", **fields) -> dict
         repository_path="/tmp/x",
         prompt="p",
         is_resume=False,
+        provider_id=provider_id,
     )
     if state != "PREPARED":
         run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
@@ -170,6 +171,146 @@ def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp
     task_sync.sync_task_from_run(task, run, db_path=db_path)
 
     assert task["launch_status"] == "Requires Attention"
+    assert not task.get("failed_executors")
+
+
+def test_sync_task_from_run_session_expired_triggers_executor_failover(tmp_path):
+    """A FAILED run whose `failure_reason` names a provider-unavailable cause
+    (here `session_expired`, the real-world claude_code OAuth-expiry case) must
+    record the dead executor and flip the task back to "Ready" so the next
+    launch tries the next agent — even though the run produced output (the
+    synthetic auth-error message) and so is state=FAILED, not INTERRUPTED.
+    This is the gap AICC-DESKTOP-017 originally missed: it only fired for
+    INTERRUPTED-with-no-output, so provider failures with `first_output_at`
+    set never populated `failed_executors` and the task kept relaunching on
+    the same dead provider (or stranded once the retry budget ran out)."""
+    db_path = tmp_path / "runtime-session-expired.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="FAILED", completed_at="2026-01-01T00:01:00",
+        failure_reason="session_expired", provider_id="claude_code",
+    )
+    run = db.update_run_fields(
+        db_path, run["id"], expected_version=run["version"],
+        fields={"first_output_at": "2026-01-01T00:00:30"},
+    )
+    task = _make_task(executor="claude_code")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Ready"
+    assert task.get("failed_executors") == ["claude_code"]
+    assert task["timeline"][-1]["type"] == "executor_failed"
+
+
+def test_sync_task_from_run_quota_limit_triggers_executor_failover(tmp_path):
+    """Any provider-unavailable reason — not just `session_expired` — flips the
+    task to failover. `quota_limit` is the other common claude_code cause."""
+    db_path = tmp_path / "runtime-quota.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="FAILED", completed_at="2026-01-01T00:01:00",
+        failure_reason="quota_limit", provider_id="claude_code",
+    )
+    task = _make_task(executor="claude_code")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Ready"
+    assert task.get("failed_executors") == ["claude_code"]
+
+
+def test_sync_task_from_run_permission_denied_does_not_trigger_failover(tmp_path):
+    """A `blocked:permission_denied:*` failure is environment policy, identical
+    on every executor, so switching agents cannot help — it must NOT populate
+    `failed_executors` and must stay on the task's configured executor."""
+    db_path = tmp_path / "runtime-perm.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="FAILED", completed_at="2026-01-01T00:01:00",
+        failure_reason="blocked:permission_denied:Write", provider_id="claude_code",
+    )
+    task = _make_task(executor="claude_code")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Blocked"
+    assert not task.get("failed_executors")
+
+
+def test_sync_task_from_run_incomplete_does_not_trigger_failover(tmp_path):
+    """`incomplete:working_tree_unchanged` is task content, not provider
+    unavailability — failover would only send the same too-hard task to another
+    agent. It must stay "Incomplete" on its configured executor."""
+    db_path = tmp_path / "runtime-incomplete.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="FAILED", completed_at="2026-01-01T00:01:00",
+        failure_reason="incomplete:working_tree_unchanged", provider_id="copilot_cli",
+    )
+    task = _make_task(executor="copilot_cli")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Incomplete"
+    assert not task.get("failed_executors")
+
+
+def test_sync_task_from_run_failed_executors_accumulate_across_providers(tmp_path):
+    """Two distinct provider-unavailable failures (claude_code then copilot_cli)
+    accumulate into `failed_executors` so the chain advances through every
+    allowed agent before the task strands."""
+    db_path = tmp_path / "runtime-accumulate.db"
+    db.migrate(db_path)
+    task = _make_task(executor="claude_code")
+
+    run1 = _make_run(
+        db_path, state="FAILED", completed_at="2026-01-01T00:01:00",
+        failure_reason="session_expired", task_id="task-1", provider_id="claude_code",
+    )
+    run1 = db.update_run_fields(
+        db_path, run1["id"], expected_version=run1["version"],
+        fields={"first_output_at": "2026-01-01T00:00:30"},
+    )
+    task_sync.sync_task_from_run(task, run1, db_path=db_path)
+    assert task.get("failed_executors") == ["claude_code"]
+
+    # Second run on copilot_cli also fails for a provider reason. Reuse the
+    # task/session created by the first `_make_run` (a fresh create_task would
+    # hit the task-id unique constraint).
+    session = db.list_sessions(db_path, task_id="task-1")[0]
+    run2 = db.create_run(
+        db_path, session_id=session["id"], task_id="task-1", project="AIOS",
+        task_type="implementation", repository_path="/tmp/x", prompt="p",
+        is_resume=False, provider_id="copilot_cli",
+    )
+    run2 = db.update_run_state(
+        db_path, run2["id"], expected_version=run2["version"], new_state="QUEUED",
+    )
+    run2 = db.update_run_state(
+        db_path, run2["id"], expected_version=run2["version"], new_state="RUNNING",
+    )
+    run2 = db.update_run_state(
+        db_path, run2["id"], expected_version=run2["version"], new_state="FAILED",
+        fields={"failure_reason": "provider_api_error", "completed_at": "2026-01-01T00:02:00"},
+    )
+    task_sync.sync_task_from_run(task, run2, db_path=db_path)
+
+    assert task.get("failed_executors") == ["claude_code", "copilot_cli"]
+
+
+def test_sync_task_from_run_completed_clears_failed_executors(tmp_path):
+    """A clean completion resets the chain so a future re-launch tries the
+    configured executor from scratch (existing behaviour, now also reached via
+    provider failover)."""
+    db_path = tmp_path / "runtime-clear.db"
+    db.migrate(db_path)
+    task = _make_task(executor="claude_code", failed_executors=["claude_code"])
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00")
+    db.append_run_event(db_path, run["id"], "result", {"result": "Verdict: APPROVED FOR COMMIT"})
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
     assert not task.get("failed_executors")
 
 
