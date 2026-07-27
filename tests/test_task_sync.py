@@ -562,3 +562,44 @@ def test_reconcile_and_sync_ignores_missing_run(tmp_path):
     mutated = task_sync.reconcile_and_sync(api, [task])
 
     assert mutated == []
+
+
+def test_reconcile_and_sync_recovers_stale_current_run_id_pointer(tmp_path):
+    """Self-heal for the lost-update bug: a launch's `upsert_task` was clobbered
+    by a concurrent full-list `save_tasks`, so `current_run_id` still points at
+    an old INTERRUPTED run while a newer FAILED run (here session_expired) exists
+    in the DB. `sync_tasks` must fall back to the actually-newest run for the
+    task so the FAILED run is synced and executor failover fires — instead of
+    stranding the task on the stale run's status forever."""
+    db_path = tmp_path / "runtime-stale.db"
+    db.migrate(db_path)
+    old_run = _make_run(db_path, state="INTERRUPTED", provider_id="claude_code")
+    # A newer run for the same task, failing with a provider-unavailable cause.
+    # Reuse the task/session created by the first `_make_run` (a fresh
+    # `create_task` would hit the task-id unique constraint).
+    session = db.list_sessions(db_path, task_id="task-1")[0]
+    new_run = db.create_run(
+        db_path, session_id=session["id"], task_id="task-1", project="AIOS",
+        task_type="implementation", repository_path="/tmp/x", prompt="p",
+        is_resume=False, provider_id="claude_code",
+    )
+    new_run = db.update_run_state(db_path, new_run["id"], expected_version=new_run["version"], new_state="QUEUED")
+    new_run = db.update_run_state(db_path, new_run["id"], expected_version=new_run["version"], new_state="RUNNING")
+    new_run = db.update_run_state(
+        db_path, new_run["id"], expected_version=new_run["version"], new_state="FAILED",
+        fields={"failure_reason": "session_expired", "completed_at": "2026-01-01T00:02:00"},
+    )
+    new_run = db.update_run_fields(
+        db_path, new_run["id"], expected_version=new_run["version"],
+        fields={"first_output_at": "2026-01-01T00:01:30"},
+    )
+    api = runtime_api.ExecutionCenterAPI(db_path=db_path)
+    # Task pointer is frozen on the OLD run — the orphaned state.
+    task = _make_task(current_run_id=old_run["id"], executor="claude_code")
+
+    mutated = task_sync.reconcile_and_sync(api, [task])
+
+    assert task in mutated
+    assert task["current_run_id"] == new_run["id"]
+    assert task["launch_status"] == "Ready"
+    assert task.get("failed_executors") == ["claude_code"]
