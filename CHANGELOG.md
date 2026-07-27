@@ -37,14 +37,14 @@ functional application milestones of `app.py`.
   can trigger reconciliation; confirmation precedes worktree mutation; remote-tracking branches,
   persisted provisioning outcomes, active task IDs, deterministic agent tie-breaking, and corrupt
   retry state now fail safely.
-- **Autonomy authority (schema 7)**: migration 7 adds canonical immutable
+- **Autonomy authority (schema 11)**: migration 7 adds canonical immutable
   `proposal.parameters_json`; malformed policies close completely; proposal authority and evidence
   freeze at assessment; CAS is checked before lifecycle guards; plans carry an exact action digest;
   dispatch rechecks policy, kind, payload, evidence digest, blockers, and staleness; confirmations
   must bind to a matching persisted result. Only TASK_CREATION and TASK_EXECUTION are currently
   dispatchable; priority, dependency, and merge plans remain advisory.
 - **Runtime documentation**: README, current-state, architecture, changelog, and ADR 0005 are
-  reconciled with schema 7, queue locking, workspace provisioning, scheduler and autonomy
+  reconciled with schema 11, queue locking, workspace provisioning, scheduler and autonomy
   boundaries, and CI.
 
 ### Portfolio Execution and Intelligence

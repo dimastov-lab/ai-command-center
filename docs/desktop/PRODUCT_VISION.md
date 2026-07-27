@@ -1,9 +1,10 @@
 # AI Command Center — Desktop Product Vision
 
-Status: **D0 — approved for implementation planning.** This document defines the product
+Status: **Approved; implementation underway (D1 shipped).** This document defines the product
 purpose and boundary for the native desktop application described by the rest of
-`docs/desktop/`. It does not describe code that exists yet — see `DESKTOP_INCREMENT_1.md` for
-what Desktop Increment 1 actually ships.
+`docs/desktop/`. Desktop Increment 1's native shell has shipped in `command_center.desktop`; the
+data-wiring, platform, and packaging increments remain ahead — see `DESKTOP_INCREMENT_1.md` for
+what Desktop Increment 1 ships and what is still outstanding.
 
 ## 1. Product purpose
 

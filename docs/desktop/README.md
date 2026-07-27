@@ -1,10 +1,14 @@
 # AI Command Center — Desktop Documentation
 
-**Current status: D0 — documentation only.** No desktop production code exists yet. Nothing
-under `command_center.desktop`, `command_center.application`, or `command_center.platform` has
-been implemented — every package name in this documentation set is target structure, clearly
-marked as such in each document. **Next implementation stage: D1A** (dependency and package
-skeleton — see `IMPLEMENTATION_ROADMAP.md`).
+**Current status: Desktop Increment 1 (D1) — Native Shell Prototype — shipped.** The
+`command_center.desktop` package is a working native PySide6/Qt Widgets shell (main window,
+sidebar, top bar, navigation, placeholder Home/Projects/Settings pages, theme switching, and
+settings/window-geometry persistence), launchable with `python -m command_center.desktop` and
+covered by an offscreen pytest-qt suite (`tests/desktop/`). It is a pure shell — no real data
+wiring. The `command_center.application` (data-adapter) and `command_center.platform` layers are
+not implemented yet; those package names remain target structure, clearly marked as such in each
+document. **Next implementation stage: D2 — Native Workspace Home** (see
+`IMPLEMENTATION_ROADMAP.md`).
 
 This directory converts the reviewed Lightweight Cross-Platform Desktop Architecture and Design
 into a canonical, implementation-ready documentation set for a native PySide6/Qt Widgets desktop

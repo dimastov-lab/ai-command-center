@@ -4,8 +4,9 @@ AI Command Center is a local engineering control application for planning work, 
 observing AI-assisted engineering runs, coordinating Portfolio tasks, and completing guarded
 GitHub delivery workflows. The implemented user interface is a Streamlit application served by
 `app.py`; the native PySide6 desktop client described under
-[`docs/desktop/`](docs/desktop/README.md) is a planned architecture, not an implemented or
-packaged product.
+[`docs/desktop/`](docs/desktop/README.md) has shipped its first increment (Desktop Increment 1 — a
+navigable, themeable shell in `command_center.desktop`), but is not yet a data-wired or packaged
+product.
 
 This repository is not a production, distributed, or remote-worker execution platform. It is a
 single-host control plane whose durable state is local to the machine running Streamlit.
@@ -18,7 +19,8 @@ single-host control plane whose durable state is local to the machine running St
 | Implemented service/API foundations, not autonomously driven | Deterministic read-only scheduling decisions through `ExecutionCenterAPI.plan_schedule`; persisted, evidence-backed autonomy proposals through the runtime API/domain layer, surfaced in an operator approve/reject inbox (`ui/proposals_panel.py`). Neither capability has a background task driver, durable scheduling claim/lease, or automatic dispatcher |
 | Implemented but opt-in | Completion autopilot through `AICC_COMPLETION_AUTOPILOT`; OpenAI project-chat provider when its package and environment variables are supplied; project-specific completion policies that permit automatic merge or recovery |
 | Legacy but still present | Synchronous Claude execution; `runs.jsonl` run journal; generated-task shell workflow |
-| Designed or planned, not implemented | Native PySide6 desktop client and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
+| Partially implemented | Native PySide6 desktop client: Desktop Increment 1 (the `command_center.desktop` shell — navigation, theming, settings/geometry persistence, pytest-qt tested) has shipped; its data-adapter, platform-abstraction, and native-packaging increments have not |
+| Designed or planned, not implemented | Native desktop data wiring and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
 
 Normal task launches require an explicit user action and confirmation. The scheduling API can
 return advisory `ASSIGN`, `DEFER`, or `BLOCKED` decisions from a point-in-time snapshot, but it
@@ -83,10 +85,12 @@ There is no application authentication layer.
 - [`tests/`](tests/) contains unit, integration, concurrency, subprocess, Git/worktree, Portfolio,
   completion, and Streamlit `AppTest` coverage.
 
-The current Streamlit navigation has 19 destinations: Dashboard, Workspace Home, Executive,
-Create Task, Project Chat, Kanban, AI Agents, Live Execution Center, Run Journal, Timeline,
-Projects, Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode,
-Portfolio Execution, and Portfolio Overview.
+The Streamlit navigation registers 20 page handlers: Dashboard, Workspace Home, Executive,
+Create Task, Project Chat, Kanban, Волны (Waves), AI Agents, Live Execution Center, Run Journal,
+Timeline, Projects, Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode,
+Portfolio Execution, and Portfolio Overview. The sidebar shows 16 of them: Project Chat, Generated
+Files, Reports, and Context are no longer standalone sidebar entries — they open inside the project
+view — though every handler stays reachable by deep link and the command palette.
 
 ## Persistence and sources of truth
 
@@ -95,7 +99,7 @@ AI Command Center deliberately has more than one persistence authority:
 | Store | Role |
 |---|---|
 | `data/tasks.json` | Planning and Kanban task store |
-| `data/runtime.db` | Authoritative SQLite schema 10 state for runtime tasks, sessions, runs, run events, reports, completion, and autonomy proposals/evidence/events |
+| `data/runtime.db` | Authoritative SQLite schema 11 state for runtime tasks, sessions, runs, run events, reports, completion, and autonomy proposals/evidence/events |
 | `data/execution_queue.json`, `data/execution_queue.lock` | Separate persisted planning/execution queue plus its same-host cooperative OS advisory lock |
 | `data/runs.jsonl` | Legacy append-only synchronous run journal |
 | `data/chats.json`, `data/activity.jsonl` | Currently used project-chat and activity stores, separate from SQLite |
@@ -106,10 +110,11 @@ AI Command Center deliberately has more than one persistence authority:
 | `generated/<PROJECT>/` | Generated legacy task artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative
-for execution, completion, and the autonomy-proposal lifecycle. Schema 10 contains the application
+for execution, completion, and the autonomy-proposal lifecycle. Schema 11 contains the application
 tables `task`, `session`, `run`, `run_event`, and `report`; the three completion tables; and
-`proposal`, `proposal_evidence`, and `proposal_event`; `schema_version` tracks migrations. It does
-not contain the execution queue or scheduler claims. The legacy `runs.jsonl` journal and the
+`proposal`, `proposal_evidence`, and `proposal_event`; `schema_version` tracks migrations. It also
+holds a `queue_entry` mirror table (ADR 0007 dual-write), but `execution_queue.json` stays the
+authoritative queue, and there is no scheduler-claim table. The legacy `runs.jsonl` journal and the
 current JSON/JSONL project-chat and activity stores coexist with SQLite, while
 `execution_queue.json` and Portfolio registries, reports, and generated artifacts are additional
 persisted boundaries. Reconciliation is therefore required: Execution Center refreshes project

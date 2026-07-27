@@ -177,7 +177,7 @@ PRIORITIES: list[str] = models.TASK_PRIORITIES
 PRIORITY_COLORS: dict[str, str] = tokens.PRIORITY_COLORS
 LAUNCH_STATUS_COLORS: dict[str, str] = tokens.LAUNCH_STATUS_COLORS
 
-GLOBAL_FILES: list[str] = ["CURRENT_STATE.md", "DECISIONS.md", "INBOX.md"]
+GLOBAL_FILES: list[str] = ["CURRENT_STATE.md"]
 
 IGNORED_FILE_NAMES = {".DS_Store", ".gitkeep"}
 

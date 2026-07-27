@@ -1,8 +1,10 @@
 # AI Command Center — Desktop Design System
 
-Status: **D0 — implementation-ready tokens and component contracts** for the Professional
-Control Plane direction (`DESIGN_DIRECTIONS.md`). Values here are binding for Desktop Increment
-1 and later increments unless a specific increment's acceptance criteria say otherwise. Terms
+Status: **Implementation-ready tokens and component contracts** for the Professional
+Control Plane direction (`DESIGN_DIRECTIONS.md`). The shipped D1 shell consumes an initial subset
+(`command_center/desktop/tokens.py`, `theme.py`); the remaining values stay binding for later
+increments. Values here are binding for Desktop Increment 1 and later increments unless a specific
+increment's acceptance criteria say otherwise. Terms
 follow Qt/PySide6 vocabulary (`QWidget`, `QAbstractItemView`, accessible name/description, focus
 policy) rather than web terminology, per binding decision — this is a Qt Widgets application,
 not a web page.
