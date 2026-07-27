@@ -316,7 +316,15 @@ def git_repo(tmp_path):
     """A real, throwaway git repository — never one of the user's real projects."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    # Pin the initial branch to ``main`` explicitly: the launch path's
+    # workspace gate (workspace_provisioning.verify_workspace, step
+    # ``base_branch_exists``) checks ``base_branch`` (defaults to ``main`` when
+    # the project config omits it) resolves to a commit. On runners whose git
+    # has no global ``init.defaultBranch=main`` (e.g. ubuntu-latest), a bare
+    # ``git init`` creates ``master`` and that gate fails — diverging from local
+    # runs where git defaults to ``main``. ``-b`` needs git >= 2.28, which every
+    # supported runner ships.
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
     (repo / "f.txt").write_text("hello\n")
