@@ -423,6 +423,20 @@ def sync_tasks(
         if not run_id:
             continue
         run = api.get_run(run_id)
+        # Self-heal a stale or dangling `current_run_id`. A lost update can
+        # clobber the launch's single-task `upsert_task` with a stale full-list
+        # `save_tasks`, freezing the pointer on an old run while a newer run
+        # exists in the DB (the old run is usually still present, so a plain
+        # `get_run` does NOT return None here). Prefer the actually-newest run
+        # for the task so a fresh FAILED run is still synced (and its executor
+        # failover still fires) instead of stranding the task on the old run's
+        # status forever. When the pointer is current, `latest` equals `run` and
+        # nothing changes; when no runs exist, both stay None and we skip.
+        task_id = task.get("id")
+        if task_id:
+            latest = api.get_latest_run_for_task(task_id)
+            if latest is not None and (run is None or latest["id"] != run_id):
+                run = latest
         if run is None:
             continue
         changed = sync_task_from_run(task, run, db_path=api.db_path)
