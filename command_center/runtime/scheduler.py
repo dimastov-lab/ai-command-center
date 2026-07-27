@@ -66,6 +66,7 @@ from typing import Mapping
 
 from command_center import agent_runner, executors, models
 from command_center.runtime import db
+from command_center.runtime import providers as runtime_providers
 
 # --------------------------------------------------------------------------
 # Actions & reason codes (the vocabulary of an explainable decision)
@@ -687,7 +688,21 @@ def plan(
                 )
                 continue
             # RECOVERABLE from here — budget first, then backoff timing.
-            if item.attempts_made >= policy.max_attempts:
+            #
+            # Provider-unavailable failures (expired OAuth, exhausted quota,
+            # 5xx outage, startup crash, …) are *not* a signal about the task —
+            # they mean this executor cannot run it right now. `task_sync` has
+            # already recorded the dead provider in `failed_executors` and the
+            # next launch's `select_available_executor` will pick a live one, so
+            # the prior attempt carries no information about the next executor.
+            # Such an attempt must NOT consume the retry budget (otherwise a
+            # `max_run_attempts=1` config strands the task before failover can
+            # happen) and needs no backoff (a different agent is tried, not the
+            # same one). Fall through to normal assignment. Bounded by
+            # `failed_executors`: once every allowed executor has failed, the
+            # launch layer strands the task at LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR.
+            provider_unavailable = item.last_failure_reason in runtime_providers.PROVIDER_UNAVAILABLE_REASONS
+            if not provider_unavailable and item.attempts_made >= policy.max_attempts:
                 decisions.append(
                     SchedulingDecision(
                         action=ACTION_BLOCKED,
@@ -701,45 +716,48 @@ def plan(
                     )
                 )
                 continue
-            backoff = policy.backoff_seconds(item.attempts_made)
-            last_epoch = _to_epoch(item.last_completed_at)
-            if last_epoch is None or now_epoch is None:
-                # F4: recoverable, but the backoff deadline cannot be computed
-                # (missing/unparseable last_completed_at, or unparseable now).
-                # Fail safe — DEFER; never assign immediately, never fabricate
-                # a next_eligible_at.
-                decisions.append(
-                    SchedulingDecision(
-                        action=ACTION_DEFER,
-                        reason_code=REASON_RETRY_TIMING_UNKNOWN,
-                        explanation=(
-                            f"recoverable failure after attempt {item.attempts_made}, but the completion "
-                            "time is unknown so the backoff deadline cannot be computed; deferring rather "
-                            "than retrying immediately"
-                        ),
-                        failure_classification=RECOVERABLE,
-                        next_eligible_at=None,
-                        **base,
+            if not provider_unavailable:
+                backoff = policy.backoff_seconds(item.attempts_made)
+                last_epoch = _to_epoch(item.last_completed_at)
+                if last_epoch is None or now_epoch is None:
+                    # F4: recoverable, but the backoff deadline cannot be computed
+                    # (missing/unparseable last_completed_at, or unparseable now).
+                    # Fail safe — DEFER; never assign immediately, never fabricate
+                    # a next_eligible_at.
+                    decisions.append(
+                        SchedulingDecision(
+                            action=ACTION_DEFER,
+                            reason_code=REASON_RETRY_TIMING_UNKNOWN,
+                            explanation=(
+                                f"recoverable failure after attempt {item.attempts_made}, but the completion "
+                                "time is unknown so the backoff deadline cannot be computed; deferring rather "
+                                "than retrying immediately"
+                            ),
+                            failure_classification=RECOVERABLE,
+                            next_eligible_at=None,
+                            **base,
+                        )
                     )
-                )
-                continue
-            if now_epoch < last_epoch + backoff:
-                decisions.append(
-                    SchedulingDecision(
-                        action=ACTION_DEFER,
-                        reason_code=REASON_BACKOFF,
-                        explanation=(
-                            f"recoverable failure; backing off {backoff:.0f}s after attempt "
-                            f"{item.attempts_made} before the next attempt"
-                        ),
-                        failure_classification=RECOVERABLE,
-                        next_eligible_at=_iso_add(item.last_completed_at, backoff),
-                        **base,
+                    continue
+                if now_epoch < last_epoch + backoff:
+                    decisions.append(
+                        SchedulingDecision(
+                            action=ACTION_DEFER,
+                            reason_code=REASON_BACKOFF,
+                            explanation=(
+                                f"recoverable failure; backing off {backoff:.0f}s after attempt "
+                                f"{item.attempts_made} before the next attempt"
+                            ),
+                            failure_classification=RECOVERABLE,
+                            next_eligible_at=_iso_add(item.last_completed_at, backoff),
+                            **base,
+                        )
                     )
-                )
-                continue
+                    continue
             # else: backoff already elapsed — fall through to normal assignment
-            # as a fresh attempt (attempt number attempts_made + 1).
+            # as a fresh attempt (attempt number attempts_made + 1). For a
+            # provider-unavailable failure, fall through immediately (no budget,
+            # no backoff) so the next available executor is tried right away.
 
         # 4) Capability match — structural. No capable agent is BLOCKED.
         if item.preferred_agent is not None:

@@ -432,6 +432,59 @@ def test_retry_budget_exhausted_is_blocked():
     assert result.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED
 
 
+def test_provider_unavailable_failure_skips_retry_budget_and_assigns():
+    """A provider-unavailable failure (expired OAuth, exhausted quota, …) is
+    not a signal about the task — the configured executor cannot run it right
+    now. `task_sync` has already moved that executor to `failed_executors` and
+    the launch layer's `select_available_executor` will pick the next one, so
+    the prior attempt must NOT consume the retry budget: even at
+    attempts_made >= max_attempts the scheduler falls through to assignment
+    instead of blocking with `retry_exhausted`. Otherwise a `max_run_attempts=1`
+    config would strand the task before failover ever happens."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=1)
+    item = _item(
+        "t1", "/repo/a", attempts_made=3, last_state="FAILED",
+        last_failure_reason="session_expired",
+        last_completed_at=_iso(NOW, seconds=-10000),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    d = result.assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+
+
+def test_provider_unavailable_failure_skips_backoff_and_assigns_immediately():
+    """Provider failover also needs no backoff — a *different* executor is
+    tried, not the same one, so the prior failure carries no timing signal
+    about it. The task assigns immediately even within the backoff window."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(base_backoff_seconds=30, multiplier=2)
+    # Completed 1s ago; backoff 30s would normally defer — but a provider
+    # failure bypasses backoff and assigns now.
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED",
+        last_failure_reason="quota_limit", last_completed_at=_iso(NOW, seconds=-1),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    d = result.assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+
+
+def test_non_provider_recoverable_failure_still_respects_budget():
+    """Sanity: a recoverable failure that is NOT provider-unavailable (e.g.
+    `timeout`) must still hit the retry budget and block — the exemption is
+    narrow to provider-unavailability reasons only."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=1)
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED",
+        last_failure_reason="timeout", last_completed_at=_iso(NOW, seconds=-10000),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    assert result.decisions[0].action == scheduler.ACTION_BLOCKED
+    assert result.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED
+
+
 # --------------------------------------------------------------------------
 # Dependencies
 # --------------------------------------------------------------------------

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from command_center import models, project_config, report_parser
 from command_center.runtime import completion as completion_states
-from command_center.runtime import db, reports, session_view
+from command_center.runtime import db, providers, reports, session_view
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.runtime.completion_service import CompletionOrchestrator
 
@@ -58,6 +58,12 @@ _LAUNCH_STATUS_BY_DISPLAY_STATUS: dict[str, str] = {
 }
 
 _TERMINAL_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review", "Failed", "Blocked", "Incomplete"})
+
+# Launch statuses that mean "this run stranded the task; nothing will auto-
+# advance it." An executor-availability failure (AICC-DESKTOP-017) flips any of
+# these back to "Ready" so the next available agent in the chain is tried,
+# instead of leaving the task parked on a dead provider.
+_STRANDED_LAUNCH_STATUSES = frozenset({"Failed", "Requires Attention", "Blocked", "Incomplete"})
 
 
 def _resolve_target_launch_status(status: str, task: dict) -> str:
@@ -188,37 +194,54 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     target_launch_status = _resolve_target_launch_status(status, task)
 
     # --- Executor fallback auto-retry (AICC-DESKTOP-017) -----------------
-    # A run that died on startup (INTERRUPTED, never produced output) is a
-    # strong signal the executor itself is broken — e.g. an expired OAuth
-    # token that `provider.availability()` (which only probes `--version`)
-    # cannot detect. Instead of stranding the task as "Requires Attention",
-    # record the failed executor and flip the task back to "Ready" so the
-    # next launch automatically tries the next available agent in the chain
-    # (see `execution_queue.select_available_executor`). The task only
-    # reaches "Requires Attention" when *every* allowed executor has failed.
-    if (
-        run.get("state") == "INTERRUPTED"
-        and not run.get("first_output_at")
-        and not already_finalized_for_this_run
-    ):
-        failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
-        failed_list = list(task.get("failed_executors") or [])
-        if failed_executor not in failed_list:
-            failed_list.append(failed_executor)
-            task["failed_executors"] = failed_list
-            mutated = True
-        # Keep the task re-launchable so the next `launch_ready` picks up the
-        # next executor in the chain. Only strand it as "Requires Attention"
-        # when there are no more agents to try.
-        if target_launch_status == "Requires Attention":
-            target_launch_status = "Ready"
-            models.append_timeline_event(
-                task,
-                "executor_failed",
-                f"Исполнитель «{failed_executor}» не запустился (нет вывода). "
-                "Задача возвращена в очередь для повтора другим агентом.",
-            )
-            mutated = True
+    # A run that died because the *executor itself* is unavailable is a strong
+    # signal the configured provider cannot run this task right now — e.g. an
+    # expired OAuth token (`session_expired`), an exhausted quota
+    # (`quota_limit`), a 5xx API outage (`provider_api_error`), or a startup
+    # crash with no output (INTERRUPTED). `provider.availability()` only probes
+    # `--version`, so it cannot detect any of these; the only honest signal is
+    # the run's own `failure_reason`. Instead of stranding the task as
+    # "Failed"/"Requires Attention" (or retrying the same dead provider until
+    # the retry budget is gone), record the failed executor and flip the task
+    # back to "Ready" so the next launch automatically tries the next available
+    # agent in the chain (see `execution_queue.select_available_executor`). The
+    # task only stays stranded when *every* allowed executor has failed (the
+    # launch layer then reports `LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`).
+    if not already_finalized_for_this_run:
+        reason = run.get("failure_reason")
+        died_on_startup = (
+            run.get("state") == "INTERRUPTED" and not run.get("first_output_at")
+        )
+        provider_unavailable = reason in providers.PROVIDER_UNAVAILABLE_REASONS
+        if died_on_startup or provider_unavailable:
+            failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
+            failed_list = list(task.get("failed_executors") or [])
+            if failed_executor not in failed_list:
+                failed_list.append(failed_executor)
+                task["failed_executors"] = failed_list
+                mutated = True
+            # Flip any "stranded, won't auto-relaunch" status back to "Ready" so
+            # the next `launch_ready` picks up the next executor in the chain.
+            # `died_on_startup` (INTERRUPTED, no output) resolves to "Requires
+            # Attention"; a classified provider failure (state=FAILED) resolves to
+            # "Failed" — both are stranded statuses, so both are re-queued. A
+            # non-provider failure (`incomplete:working_tree_unchanged`,
+            # `blocked:permission_denied:*`) never reaches here, so its
+            # "Incomplete"/"Blocked" status is preserved.
+            if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                target_launch_status = "Ready"
+                detail = (
+                    f"Исполнитель «{failed_executor}» недоступен ({reason or 'нет вывода'})."
+                    if provider_unavailable
+                    else f"Исполнитель «{failed_executor}» не запустился (нет вывода)."
+                )
+                models.append_timeline_event(
+                    task,
+                    "executor_failed",
+                    detail
+                    + " Задача возвращена в очередь для повтора другим агентом.",
+                )
+                mutated = True
 
     # On a clean completion, clear any accumulated executor failures — the
     # chain is healthy again and a future re-launch should try the configured
