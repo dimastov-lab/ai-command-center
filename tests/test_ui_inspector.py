@@ -106,3 +106,35 @@ def test_top_bar_live_status_glyph_aggregates_counts():
 def test_top_bar_glyph_empty_when_no_api():
     from command_center.ui import top_bar
     assert top_bar._live_status_glyph(None) == ""
+
+
+def test_run_detail_renders_real_run_columns():
+    """_render_run_detail must surface the actual `run` columns — `provider_id`
+    and `expected_branch` — not the nonexistent `executor`/`branch` keys, which
+    would silently render a permanent em-dash for every run."""
+
+    def _script():
+        from command_center.ui import inspector as _insp
+
+        _insp._render_run_detail(
+            None,
+            {
+                "id": "run-abcdef123456",
+                "project": "AIOS",
+                "task_type": "implementation",
+                "provider_id": "claude_code",
+                "expected_branch": "feat/ux-2c",
+                "state": "FAILED",
+                "started_at": "2026-01-01T00:00:00",
+                "completed_at": "2026-01-01T00:02:00",
+                "exit_code": 1,
+                "failure_reason": "session_expired",
+                "task_id": "AIOS-1",
+            },
+        )
+
+    at = AppTest.from_function(_script, default_timeout=30).run()
+    assert not at.exception, at.exception
+    captions = " | ".join(c.value for c in at.caption)
+    assert "claude_code" in captions, f"provider_id not rendered (got: {captions})"
+    assert "feat/ux-2c" in captions, f"expected_branch not rendered (got: {captions})"

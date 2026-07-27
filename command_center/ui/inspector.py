@@ -136,7 +136,7 @@ def _render_task_detail(task: dict, tasks_by_id: dict[str, dict]) -> None:
 def _render_run_detail(api, run: dict) -> None:
     run_id = run.get("id")
     st.markdown(f"##### Прогон `{str(run_id)[:8]}`")
-    st.caption(f"{run.get('project') or '—'} · {run.get('task_type') or '—'} · Executor: `{run.get('executor') or '—'}`")
+    st.caption(f"{run.get('project') or '—'} · {run.get('task_type') or '—'} · Executor: `{run.get('provider_id') or '—'}`")
 
     with st.container(horizontal=True):
         state = run.get("state") or "—"
@@ -146,7 +146,7 @@ def _render_run_detail(api, run: dict) -> None:
     for label, value in [
         ("Запущен", run.get("started_at") or "—"),
         ("Завершён", run.get("completed_at") or "—"),
-        ("Ветка", run.get("branch") or "—"),
+        ("Ветка", run.get("expected_branch") or "—"),
         ("Exit code", str(run.get("exit_code")) if run.get("exit_code") is not None else "—"),
     ]:
         st.caption(f"{label}: `{value}`")
