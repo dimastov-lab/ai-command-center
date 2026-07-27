@@ -10,7 +10,7 @@ from typing import Callable
 
 import streamlit as st
 
-from command_center.ui import sidebar, top_bar
+from command_center.ui import sidebar, theme, top_bar
 
 
 def render_shell(
@@ -34,6 +34,10 @@ def render_shell(
         layout="wide",
         initial_sidebar_state="collapsed" if sidebar_collapsed else "expanded",
     )
+
+    # App-wide CSS (UX-2a): fragment fade-in + card hover transitions. Emitted
+    # every run so it survives reruns (see theme.inject_global_css docstring).
+    theme.inject_global_css()
 
     top_bar.render_top_bar(title, caption)
 
