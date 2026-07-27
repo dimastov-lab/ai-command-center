@@ -80,7 +80,18 @@ def commit_all(repo: Path, *, message: str) -> subprocess.CompletedProcess | Non
         raise GitOpsError(["add", "-A"], add.returncode, add.stderr or "")
     # `--no-verify` so a repo's own pre-commit hooks (lint/format) cannot block
     # the pipeline from capturing the agent's work; validation runs separately.
-    return run_git_write(repo, ["commit", "--no-verify", "-m", message])
+    # An explicit identity keeps the commit self-contained on hosts with no
+    # global git identity (e.g. CI runners), where a bare `git commit` would
+    # otherwise fail with "Author identity unknown" and stall the pipeline at
+    # REQUIRES_ATTENTION.
+    return run_git_write(
+        repo,
+        [
+            "-c", "user.email=aicc-pipeline@local",
+            "-c", "user.name=AI Command Center Pipeline",
+            "commit", "--no-verify", "-m", message,
+        ],
+    )
 
 
 def push_branch(

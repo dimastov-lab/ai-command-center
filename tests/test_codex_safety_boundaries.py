@@ -367,7 +367,11 @@ def test_codex_oversized_stdout_line_is_bounded_not_crashing(fake_codex, git_rep
     """A single pathologically long stdout line is truncated into a bounded
     malformed event rather than persisted whole or crashing the reader."""
     worktree = _add_worktree(git_repo, tmp_path / "worktree")
-    giant = "A" * (providers.MAX_PERSISTED_EVENT_CHARS * 3)
+    # Exceed the persistence bound without overflowing Linux's single env-string
+    # limit (MAX_ARG_STRLEN, 128 KB): the lines reach fake_codex via the
+    # FAKE_CODEX_LINES env var, so the oversized payload must stay under that
+    # ceiling to remain exec-able on the CI runner while still proving truncation.
+    giant = "A" * (providers.MAX_PERSISTED_EVENT_CHARS + 4096)
     lines = [
         json.dumps({"type": "thread.started", "thread_id": "fake"}),
         json.dumps({"type": "turn.started"}),
