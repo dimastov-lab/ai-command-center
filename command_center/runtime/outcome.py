@@ -120,6 +120,12 @@ _COMPLETION_EVIDENCE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\ball\s+\d+\s+tests?\s+pass(?:ed)?\b", re.I),
     re.compile(r"\b\d+\s+tests?\s+pass(?:ed)?\b", re.I),
     re.compile(r"\b\d+\s+passed\b", re.I),
+    # Count-less test-pass summaries: a run that ran the suite and every test
+    # passed, but the agent's final message phrases it without a digit ("all
+    # tests passed", "tests passed"). Still positive test-pass evidence — the
+    # failure-evidence guard below refuses the upgrade if anything failed.
+    re.compile(r"\ball\s+tests?\s+pass(?:ed)?\b", re.I),
+    re.compile(r"\btests?\s+pass(?:ed)?\b", re.I),
 ]
 
 # Failure evidence — if *any* of these appear in the final message, the

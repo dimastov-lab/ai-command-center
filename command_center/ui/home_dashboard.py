@@ -315,15 +315,15 @@ def metric_list(metrics: list[tuple[str, int, str]]) -> None:
     st.markdown(rows, unsafe_allow_html=True)
 
 
-def supervisor_status(percent: int, label: str) -> None:
+def supervisor_status(percent: int, label: str, *, status: str = "Active", accent: str = "green") -> None:
     st.markdown(
         f"<div class='hx-card'><div class='hx-card-head'>"
         f"<span class='hx-card-title'>AI Supervisor</span>"
-        f"<span class='hx-status' style='--hx-accent:var(--hx-green)'><span class='hx-dot'></span>Active</span></div>"
+        f"<span class='hx-status' style='--hx-accent:var(--hx-{accent})'><span class='hx-dot'></span>{_esc(status)}</span></div>"
         f"<div style='display:flex; justify-content:space-between; align-items:baseline;'>"
         f"<span class='hx-meta'>Общий статус</span>"
         f"<span class='hx-health-num' style='font-size:1.6rem'>{int(percent)}%</span></div>"
-        f"{_bar(percent, 'green')}"
+        f"{_bar(percent, accent)}"
         f"<div class='hx-meta' style='margin-top:6px'>{_esc(label)}</div></div>",
         unsafe_allow_html=True,
     )

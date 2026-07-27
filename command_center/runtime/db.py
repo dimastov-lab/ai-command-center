@@ -231,6 +231,12 @@ _UPDATABLE_RUN_FIELDS: frozenset[str] = frozenset(
         # here as a defense-in-depth allowlist entry like every other column.
         "commit_hash",
         "pull_request_url",
+        # Migration 11: short HEAD captured at launch so the post-run classifier
+        # can tell "the agent committed" (HEAD advanced) from "the agent left the
+        # tree clean without doing anything" — a committed change leaves the
+        # working tree clean, so the porcelain-status diff alone under-counts
+        # completed work (see `supervisor._supervise` and `outcome.classify_`).
+        "pre_run_head",
     }
 )
 
@@ -246,7 +252,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -407,6 +413,22 @@ def _migration_9_add_execution_provider_fields(conn: sqlite3.Connection) -> None
             conn.execute("ALTER TABLE run ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'claude_code'")
         if "provider_metadata_json" not in existing:
             conn.execute("ALTER TABLE run ADD COLUMN provider_metadata_json TEXT")
+
+
+def _migration_11_add_pre_run_head(conn: sqlite3.Connection) -> None:
+    """Capture the short HEAD at launch so the post-run outcome classifier can
+    distinguish "agent committed its work" (HEAD advanced, tree clean) from
+    "agent did nothing" (HEAD unchanged, tree clean). Without this, any agent
+    that commits — copilot_cli, claude_code — is mis-classified
+    `incomplete:working_tree_unchanged` and re-run forever (AICC-DESKTOP-017).
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2,
+    3, 4, 9 — safe to re-run and safe under concurrent first-application via
+    the `BEGIN IMMEDIATE` transaction in `migrate()`."""
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "pre_run_head" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN pre_run_head TEXT")
 
 
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
@@ -659,6 +681,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     # finds the columns present.
     (9, _migration_9_add_execution_provider_fields),
     (10, _SCHEMA_V10),
+    (11, _migration_11_add_pre_run_head),
 ]
 
 
@@ -1200,6 +1223,34 @@ def list_runs(
             f"SELECT * FROM run {where} ORDER BY created_at DESC{limit_clause}", params
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_runs(
+    db_path: Path,
+    *,
+    states: Iterable[str] | None = None,
+) -> int:
+    """Cheap `COUNT(*)` over `run` — the authoritative total run count without
+    materializing any rows. Used by the dashboard footer/health so "Всего" and
+    success-rate denominators are not silently truncated by the Live Board's
+    `limit=200` window (`list_runs(limit=200)` only ever sees the 200 newest
+    runs, which under-counts on busy installs). Accepts the same `states`
+    filter as `list_runs` for windowed counts (e.g. terminal runs in the last
+    sprint); `None` counts every run regardless of state."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if states is not None:
+        states_list = list(states)
+        if states_list:
+            placeholders = ", ".join("?" for _ in states_list)
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(states_list)
+        else:
+            clauses.append("0")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect(db_path) as conn:
+        (n,) = conn.execute(f"SELECT COUNT(*) FROM run {where}", params).fetchone()
+        return int(n)
 
 
 def update_run_state(

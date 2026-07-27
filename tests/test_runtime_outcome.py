@@ -108,6 +108,17 @@ def test_detect_completion_evidence_matches_explicit_test_pass():
     assert outcome.detect_completion_evidence("===== 2029 passed in 12.3s =====") is not None
 
 
+def test_detect_completion_evidence_matches_countless_test_pass():
+    """A final message that reports tests passing *without* a numeric count
+    (e.g. 'all tests passed', 'tests passed') is still positive completion
+    evidence — the agent verified its work against the suite."""
+    assert outcome.detect_completion_evidence("All tests passed. The fix is complete.") is not None
+    assert outcome.detect_completion_evidence("Tests passed after applying the patch.") is not None
+    assert outcome.detect_completion_evidence("all tests pass on my machine") is not None
+    # still refused when a failure signal is present in the same text
+    assert outcome.detect_completion_evidence("All tests passed but 3 failed later") is None
+
+
 def test_detect_completion_evidence_none_for_bare_done_verdict():
     """A bare 'done'/'approved' verdict carries no proof the work was
     verified — it must NOT upgrade an unchanged-tree run to OK."""
