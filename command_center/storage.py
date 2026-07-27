@@ -70,6 +70,26 @@ def atomic_write_json(path: Path, data: Any) -> None:
         raise
 
 
+def atomic_write_text(path: Path, content: str) -> None:
+    """Durably write text (e.g. a markdown report) via temp + flush + fsync + os.replace.
+
+    Same crash-atomicity discipline as `atomic_write_json`, for non-JSON artifacts
+    (report markdown). The temp file lives next to the target so the rename is
+    atomic on the same filesystem.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default

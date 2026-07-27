@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from command_center.models import iso_now
+from command_center.storage import atomic_write_text
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 # `AICC_REPORTS_ROOT` mirrors `storage.resolve_data_dir`'s `AICC_DATA_DIR` override,
@@ -170,9 +171,6 @@ def render_report_markdown(run: dict, events: list[dict]) -> str:
 
 def save_report(run: dict, events: list[dict]) -> Path:
     path = report_path_for(run)
-    path.parent.mkdir(parents=True, exist_ok=True)
     content = render_report_markdown(run, events)
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
+    atomic_write_text(path, content)
     return path

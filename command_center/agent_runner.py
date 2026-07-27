@@ -558,11 +558,8 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 
 def save_report(run: dict, parsed: dict) -> Path:
     path = report_path_for(run)
-    path.parent.mkdir(parents=True, exist_ok=True)
     content = render_report_markdown(run, parsed)
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
+    storage.atomic_write_text(path, content)
     return path
 
 
