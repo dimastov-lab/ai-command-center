@@ -23,6 +23,8 @@ def render_shell(
     nav: dict[str, tuple[str, str]],
     project_count: int,
     on_open_palette: Callable[[], None],
+    tasks_by_id: dict[str, dict] | None = None,
+    api=None,
 ) -> str:
     """Render page config, the top command bar, and the sidebar.
 
@@ -39,6 +41,6 @@ def render_shell(
     # every run so it survives reruns (see theme.inject_global_css docstring).
     theme.inject_global_css()
 
-    top_bar.render_top_bar(title, caption)
+    top_bar.render_top_bar(title, caption, tasks_by_id=tasks_by_id, api=api)
 
     return sidebar.render_sidebar(nav, project_count=project_count, on_open_palette=on_open_palette)
