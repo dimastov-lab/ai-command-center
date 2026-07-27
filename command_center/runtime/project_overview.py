@@ -40,7 +40,12 @@ def build_project_overview(
     currently stale (see `session_view.is_heartbeat_stale`) — passed in
     rather than recomputed here, since heartbeat state is intentionally kept
     out of this pure module."""
-    running = [s for s in sessions if s["status"] == session_view.STATUS_RUNNING]
+    # A `Starting` (spawned, awaiting first output) or `Stale` (spawned, probe
+    # momentarily old) run has a live OS process just like a plain `Running`
+    # one — all three count toward "running" here, never toward failed/attention
+    # on their own. Staleness feeds `health` below via `stale_running`, not by
+    # inflating a degraded count.
+    running = [s for s in sessions if s["status"] in session_view.LIVE_PROCESS_DISPLAY_STATUSES]
     waiting = [s for s in sessions if s["status"] in (session_view.STATUS_WAITING, session_view.STATUS_REQUIRES_ATTENTION)]
     failed = [s for s in sessions if s["status"] == session_view.STATUS_FAILED]
     requires_attention = [s for s in sessions if s["status"] == session_view.STATUS_REQUIRES_ATTENTION]
@@ -59,7 +64,9 @@ def build_project_overview(
     )
     current_branch = (most_recent_active or {}).get("actual_branch") or cfg.get("default_branch")
 
-    stale_running = any(s["run_id"] in stale_run_ids for s in running)
+    stale_running = any(
+        s["run_id"] in stale_run_ids or s["status"] == session_view.STATUS_STALE for s in running
+    )
 
     if failed or requires_attention:
         health = HEALTH_DEGRADED

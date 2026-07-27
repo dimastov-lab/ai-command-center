@@ -1,0 +1,38 @@
+{
+  "schema_version": "1",
+  "package_id": "founder-audit-example-001",
+  "tasks": [
+    {
+      "id": "AICC-EXAMPLE-001",
+      "title": "Harden task-package import pipeline",
+      "goal": "Add strict validation, dry-run preview and atomic apply to the task importer.",
+      "prompt": "Implement parse -> validate -> preview -> apply for imported task packages.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/you/Projects/ai-command-center",
+      "workspace_path": "/Users/you/Projects/ai-command-center",
+      "branch": "feature/task-import",
+      "source": "Founder Functional Audit",
+      "parallel_group": "WAVE-1"
+    },
+    {
+      "id": "AICC-EXAMPLE-002",
+      "title": "Review the import pipeline",
+      "goal": "Independently review the importer for data-loss and race-condition risks.",
+      "prompt": "Review AICC-EXAMPLE-001 for atomicity and rollback correctness.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "review",
+      "project": "AICC",
+      "depends_on": ["AICC-EXAMPLE-001"],
+      "repository_path": "/Users/you/Projects/ai-command-center",
+      "workspace_path": "/Users/you/Projects/ai-command-center",
+      "branch": "feature/task-import",
+      "source": "Founder Functional Audit",
+      "target_version": "v1.3"
+    }
+  ]
+}

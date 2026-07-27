@@ -169,6 +169,65 @@ def test_implementation_and_remediation_do_not_block_edit_or_write(task_type):
     assert "Write" not in disallowed
 
 
+# --------------------------------------------------------------------------
+# Execution profiles (Required fix 1): named, testable read_only vs.
+# trusted_development, and the permission-mode fix (Required fix 3).
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
+def test_profile_for_task_type_read_only(task_type):
+    assert agent_runner.profile_for_task_type(task_type) == agent_runner.PROFILE_READ_ONLY
+
+
+@pytest.mark.parametrize("task_type", ["implementation", "remediation"])
+def test_profile_for_task_type_trusted_development(task_type):
+    assert agent_runner.profile_for_task_type(task_type) == agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+
+
+def test_profile_for_unknown_task_type_defaults_to_trusted_development():
+    """Unknown/future task types are not silently read-only-restricted —
+    they fall to whichever profile the caller's own `task_type in
+    READ_ONLY_TASK_TYPES` check already applied to "everything else"; making
+    this explicit here pins that this never flips to read-only by accident."""
+    assert agent_runner.profile_for_task_type("some_future_task_type") == agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+
+
+def test_trusted_development_profile_permits_read_search_edit_write_bash():
+    """Required regression test 3: trusted-development profile must contain
+    the Claude Code equivalents of Read, Glob, Grep, Edit, Write, Bash. This
+    profile never passes `--tools` at all (see `build_command`), which means
+    the full built-in tool set — including every one of these — stays
+    available; only specific git-write Bash subcommands are denied."""
+    command = agent_runner.build_command("implement this", task_type="implementation")
+    assert "--tools" not in command, "trusted_development must not be tool-set-restricted"
+    disallowed = _disallowed_tools_argument(command)
+    for tool in ("Read", "Glob", "Grep", "Edit", "Write", "Bash"):
+        assert tool not in disallowed, f"{tool} must remain available to trusted_development"
+
+
+def test_read_only_profile_has_no_write_or_shell_permissions():
+    """Required regression test 4: read-only profile must not contain write
+    or shell permissions."""
+    command = agent_runner.build_command("review this", task_type="review")
+    tools = _tools_argument(command)
+    assert "Bash" not in tools
+    assert "Write" not in tools
+    assert "Edit" not in tools
+    assert set(tools) == {"Read", "Grep", "Glob"}
+
+
+@pytest.mark.parametrize("task_type", ["review", "final_gate", "architecture_review", "implementation", "remediation"])
+def test_build_command_always_sets_permission_mode(task_type):
+    """The v1 executor already did this; pinned here so it can never silently
+    regress the way `runtime.supervisor.build_claude_command` had (missing
+    `--permission-mode` entirely) until this remediation."""
+    command = agent_runner.build_command("x", task_type=task_type)
+    assert "--permission-mode" in command
+    profile = agent_runner.profile_for_task_type(task_type)
+    assert command[command.index("--permission-mode") + 1] == agent_runner.PERMISSION_MODE_BY_PROFILE[profile]
+
+
 def test_build_command_includes_model_only_when_given():
     without_model = agent_runner.build_command("x", task_type="review")
     assert "--model" not in without_model
@@ -364,3 +423,16 @@ def test_resolve_report_path_rejects_absolute_escape(tmp_path, monkeypatch):
 def test_resolve_report_path_returns_none_when_missing():
     assert agent_runner.resolve_report_path({}) is None
     assert agent_runner.resolve_report_path({"report_path": None}) is None
+
+
+def test_timeout_for_task_is_200pct_of_estimate():
+    from command_center import agent_runner
+    # 0.5h estimate → 200% = 1h = 3600s (also the max cap)
+    assert agent_runner.timeout_for_task({"estimate_hours": 0.5}) == 3600
+    # 0.1h = 6min → 200% = 12min = 720s
+    assert agent_runner.timeout_for_task({"estimate_hours": 0.1}) == 720
+    # no estimate → default
+    assert agent_runner.timeout_for_task({}) == agent_runner.DEFAULT_TIMEOUT_SECONDS
+    assert agent_runner.timeout_for_task(None) == agent_runner.DEFAULT_TIMEOUT_SECONDS
+    # huge estimate clamps to the max
+    assert agent_runner.timeout_for_task({"estimate_hours": 10}) == agent_runner.MAX_TIMEOUT_SECONDS

@@ -1,0 +1,44 @@
+# UX-1 theme engine: native Streamlit theming (no custom CSS), values kept
+# in line with command_center/ui/tokens.py's semantic status tones. Both
+# [theme.light] and [theme.dark] are defined so the built-in app-settings
+# menu can switch between them; there is no separate Python "engine" beyond
+# this file plus command_center/ui/theme.py's st.context.theme helper.
+
+[client]
+# Hide Streamlit's own developer toolbar — "Deploy", "Stop", the hamburger
+# menu and the accessibility affordance it carries. This is a local desktop
+# operator console launched by double-clicking a .command file: none of those
+# controls do anything meaningful here, and they read as part of our UI (the
+# accessibility glyph in particular was mistaken for one of our own icons).
+# "minimal" keeps genuinely necessary notices, such as a rerun prompt.
+toolbarMode = "minimal"
+
+[theme]
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "medium"
+buttonRadius = "medium"
+
+[theme.light]
+primaryColor = "#0969da"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f8fa"
+textColor = "#1f2328"
+borderColor = "#d0d7de"
+greenColor = "#1a7f37"
+orangeColor = "#bf8700"
+redColor = "#cf222e"
+blueColor = "#0969da"
+grayColor = "#57606a"
+
+[theme.dark]
+primaryColor = "#58a6ff"
+backgroundColor = "#0d1117"
+secondaryBackgroundColor = "#161b22"
+textColor = "#e6edf3"
+borderColor = "#30363d"
+greenColor = "#3fb950"
+orangeColor = "#d29922"
+redColor = "#f85149"
+blueColor = "#58a6ff"
+grayColor = "#8b949e"

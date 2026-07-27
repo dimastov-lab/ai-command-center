@@ -12,6 +12,7 @@ from pathlib import Path
 import streamlit as st
 
 from command_center import execution_queue, recommendation_service
+from command_center.ui.launch_feedback import render_skipped_launch
 
 _QUEUED_STATE_LABELS: dict[str, str] = {
     execution_queue.STATE_WAITING: "В очереди · ожидает",
@@ -37,6 +38,28 @@ def render_recommendations_panel(
     )
 
     st.markdown("#### Рекомендованные задачи")
+
+    # See `queue_panel.render_execution_queue_panel`'s identical comment: a
+    # message rendered here and immediately followed by `st.rerun()` (as the
+    # "Запустить" button below used to do) is discarded by that rerun before
+    # the browser ever shows it — this is what made a *blocked* launch (e.g.
+    # the AIOS repository's normal dirty working tree) look like the button
+    # did nothing at all. Stashing the outcome in `session_state` and
+    # rendering it on the next run, before the (possibly now-empty, if the
+    # task launched and dropped off this list) `views`, keeps it visible.
+    flash_key = f"{key_prefix}_launch_flash"
+    flash = st.session_state.pop(flash_key, None)
+    if flash:
+        if flash["launched"]:
+            st.success(f"Запуск начат: `{flash['run_id']}`.")
+        else:
+            render_skipped_launch(
+                "Не удалось запустить сразу",
+                message=flash["message"],
+                warnings=flash["warnings"],
+                validation_report=flash["validation_report"],
+            )
+
     if not views:
         st.info("Нет рекомендованных незаблокированных задач.")
         return
@@ -78,8 +101,11 @@ def render_recommendations_panel(
                     width="stretch",
                 ):
                     task = tasks_by_id.get(view["task_id"])
-                    updated = execution_queue.enqueue(queue_entries, task, tasks_by_id)
-                    execution_queue.save_queue(root, updated)
+                    # Lost-update-safe: re-read and persist under `queue_lock`
+                    # rather than saving back the `queue_entries` snapshot loaded
+                    # earlier this render, which a concurrent writer may have
+                    # since superseded (see execution_queue.enqueue_and_persist).
+                    execution_queue.enqueue_and_persist(root, task, tasks_by_id)
                     st.rerun()
 
             with action_cols[1]:
@@ -90,7 +116,7 @@ def render_recommendations_panel(
                     width="stretch",
                 ):
                     task = tasks_by_id.get(view["task_id"])
-                    working_entries = execution_queue.enqueue(queue_entries, task, tasks_by_id)
+                    working_entries = execution_queue.enqueue_and_persist(root, task, tasks_by_id)
                     new_entry = next(
                         e
                         for e in working_entries
@@ -107,8 +133,11 @@ def render_recommendations_panel(
                     )
                     save_tasks_fn(tasks)
                     result = results[0] if results else None
-                    if result and result.launched:
-                        st.success(f"Запуск начат: `{result.run_id}`.")
-                    elif result:
-                        st.warning(f"Не удалось запустить сразу: {result.message}")
+                    st.session_state[flash_key] = {
+                        "launched": bool(result and result.launched),
+                        "run_id": result.run_id if result else None,
+                        "message": (result.message if result else "запуск не выполнен"),
+                        "warnings": list(result.warnings) if result else [],
+                        "validation_report": result.validation_report if result else None,
+                    }
                     st.rerun()

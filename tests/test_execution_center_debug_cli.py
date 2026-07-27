@@ -40,8 +40,25 @@ def _extract_last_json_object(stdout: str) -> dict:
 
 
 def _cli_env(**overrides) -> dict:
+    """Inherits `AICC_DATA_DIR` from this test process's own env (already isolated by
+    `tests/conftest.py`), and additionally sets `AICC_REPORTS_ROOT` — `AICC_DATA_DIR`
+    alone is not enough, because `command_center.runtime.reports.REPORTS_ROOT` is not
+    derived from it (reports live at `<repo>/reports/`, not under `data/`; see that
+    module's comment). Without this, every subprocess launched by this file's tests
+    wrote a real report into the developer's actual `reports/AIOS/` directory on every
+    `pytest` run — the CLI subprocess re-imports `reports.py` fresh, so the in-process
+    `isolated_reports_dir` monkeypatch in conftest.py can never reach it."""
     env = dict(os.environ)
     env["AICC_CLAUDE_BINARY"] = str(FAKE_CLAUDE_SCRIPT)
+    if "AICC_DATA_DIR" in env:
+        env["AICC_REPORTS_ROOT"] = str(Path(env["AICC_DATA_DIR"]) / "reports")
+    # Same default as `tests/conftest.py`'s `fake_claude` fixture: a plain
+    # "implementation"-type fake run genuinely touches the working tree, so
+    # `runtime.outcome.classify_process_result` classifies it `COMPLETED`
+    # rather than `INCOMPLETE` (`REQUIRES_CHANGES_TASK_TYPES` + an unchanged
+    # tree). A test exercising the unchanged-tree path overrides this back
+    # to `""` via `overrides`.
+    env["FAKE_CLAUDE_TOUCH_FILE"] = "fake_claude_default_touch.txt"
     env.update(overrides)
     return env
 

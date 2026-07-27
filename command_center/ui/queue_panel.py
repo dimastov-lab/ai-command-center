@@ -13,7 +13,8 @@ from pathlib import Path
 
 import streamlit as st
 
-from command_center import execution_queue, recommend
+from command_center import execution_queue, project_config, recommend
+from command_center.ui.launch_feedback import render_skipped_launch
 
 
 def _pick_next(ready_entries: list[dict], tasks_by_id: dict[str, dict]) -> dict | None:
@@ -43,12 +44,42 @@ def render_execution_queue_panel(
 ) -> None:
     entries = execution_queue.reevaluate_and_persist(root, tasks_by_id)
     if project:
-        entries = [e for e in entries if e.get("project") == project]
+        # A queue entry copies its task's raw `project` (which may be a display
+        # name), while `project` here is the canonical id emitted by the Kanban
+        # selector — match on canonical ids (shared helper) so the queue on the
+        # Kanban page shows the same project's tasks the lane above it does.
+        entries = [e for e in entries if project_config.project_matches(e.get("project"), project)]
 
     waiting = execution_queue.waiting_entries(entries)
     ready = execution_queue.ready_entries(entries)
 
     st.markdown("#### Очередь запуска")
+
+    # `launch_ready` runs synchronously right before the `st.rerun()` below,
+    # in the *same* script pass as the button click — so a plain `st.success`/
+    # `st.warning` call here would be created and then immediately discarded
+    # by that rerun before ever reaching the browser (this was the actual
+    # root cause of "launch button does nothing": every entry whose
+    # `launch.validate_launch` reported a warning — e.g. a dirty working tree,
+    # which is the AIOS repository's normal day-to-day state — was silently
+    # skipped, and the message explaining *why* never survived long enough
+    # to be seen). Stashing it in `session_state` and rendering it on the
+    # *next* run (right here, before anything else) is what makes it durable
+    # across that rerun.
+    flash_key = f"{key_prefix}_launch_flash"
+    flash = st.session_state.pop(flash_key, None)
+    if flash:
+        if flash["launched_count"]:
+            st.success(f"Запущено: {flash['launched_count']}.")
+        for skipped in flash["skipped"]:
+            render_skipped_launch(
+                f"Не запущено — {skipped['task_id']}",
+                message=skipped["message"],
+                warnings=skipped["warnings"],
+                validation_report=skipped["validation_report"],
+                details_label=skipped["task_id"],
+            )
+
     if not waiting and not ready:
         st.caption("Очередь пуста. Добавьте задачу из рекомендаций или карточки Kanban.")
         return
@@ -81,12 +112,18 @@ def render_execution_queue_panel(
         save_tasks_fn(tasks)
         launched = [r for r in results if r.launched]
         skipped = [r for r in results if not r.launched]
-        if launched:
-            st.success(f"Запущено: {len(launched)}.")
-        if skipped:
-            with st.expander(f"Пропущено: {len(skipped)}", icon=":material/info:"):
-                for result in skipped:
-                    st.caption(f"{result.task_id}: {result.message}")
+        st.session_state[flash_key] = {
+            "launched_count": len(launched),
+            "skipped": [
+                {
+                    "task_id": r.task_id,
+                    "message": r.message,
+                    "warnings": list(r.warnings),
+                    "validation_report": r.validation_report,
+                }
+                for r in skipped
+            ],
+        }
         st.rerun()
 
     if ready:
@@ -96,7 +133,7 @@ def render_execution_queue_panel(
             row = st.columns([4, 1])
             row[0].caption(f"🟢 {task.get('title', entry.get('task_id'))} — {task.get('project', '—')}")
             if row[1].button("Убрать", key=f"{key_prefix}_remove_{entry['id']}"):
-                execution_queue.save_queue(root, execution_queue.dequeue(entries, entry["id"]))
+                execution_queue.dequeue_and_persist(root, entry["id"])
                 st.rerun()
 
     if waiting:
@@ -106,5 +143,5 @@ def render_execution_queue_panel(
             row = st.columns([4, 1])
             row[0].caption(f"🟡 {task.get('title', entry.get('task_id'))} — {entry.get('reason') or '—'}")
             if row[1].button("Убрать", key=f"{key_prefix}_remove_{entry['id']}"):
-                execution_queue.save_queue(root, execution_queue.dequeue(entries, entry["id"]))
+                execution_queue.dequeue_and_persist(root, entry["id"])
                 st.rerun()

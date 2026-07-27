@@ -38,6 +38,7 @@ OVERRIDABLE_FIELDS: list[str] = [
     "default_branch",
     "default_executor",
     "default_prompt",
+    "allowed_agents",
     "description",
     "status",
     "priority",
@@ -45,9 +46,26 @@ OVERRIDABLE_FIELDS: list[str] = [
     "current_sprint",
     "current_milestone",
     "owner",
+    # Autonomous completion pipeline policy (AICC-AUTONOMY-001). All optional;
+    # a project config that omits them keeps the conservative defaults below.
+    "merge_mode",
+    "merge_method",
+    "allow_pr_recovery",
+    "requires_pull_request",
+    "allow_local_only",
+    "validation_required",
+    "validation_commands",
+    "max_retries",
 ]
 
 PROJECT_STATUSES: list[str] = ["Planning", "Active", "Paused", "Blocked", "Done"]
+
+# Merge mode/method vocabulary the completion pipeline understands (mirrors
+# `command_center.runtime.completion`, kept independent so a `command_center`
+# module never imports a `runtime` one). Defaults are deliberately conservative:
+# manual merge, squash method, no automatic PR recovery.
+MERGE_MODES: list[str] = ["manual", "auto_after_checks", "auto_after_checks_and_review"]
+MERGE_METHODS: list[str] = ["squash", "merge", "rebase"]
 
 # Same value set as `app.py`'s task-level `PRIORITIES` — kept as an independent
 # constant here (rather than imported from `app.py`, which must never be
@@ -57,8 +75,11 @@ PROJECT_STATUSES: list[str] = ["Planning", "Active", "Paused", "Blocked", "Done"
 PROJECT_PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
 
 DISPLAY_NAMES: dict[str, str] = {
+    "AICC": "AI Command Center",
     "AIOS": "AIOS",
     "AICOS": "AICOS",
+    "PRODUCT": "AIOS Product",
+    "ECOSYSTEM": "Ecosystem",
     "BANK": "Bank Strategy",
     "LEGAL": "Legal",
     "BUSINESS": "Business",
@@ -69,16 +90,19 @@ DISPLAY_NAMES: dict[str, str] = {
 # handles that gracefully rather than failing, matching the v1.1 behavior.
 #
 # Every key in `models.PROJECT_IDS` must appear here, even if the file doesn't
-# exist on disk yet (AICOS has none today) — this dict is consulted with
-# `.get(project_id, ...)` everywhere, so a missing *entry* silently degrades to
-# a generic guess instead of surfacing the gap. Omitting AICOS entirely was
-# the root cause of a real bug: `app.py` used to keep its own second,
+# exist on disk yet (AICC/AICOS/PRODUCT/ECOSYSTEM have none today) — this dict is
+# consulted with `.get(project_id, ...)` everywhere, so a missing *entry* silently
+# degrades to a generic guess instead of surfacing the gap. Omitting AICOS entirely
+# was the root cause of a real bug: `app.py` used to keep its own second,
 # hand-maintained project dict (not this one) that dropped AICOS from every
 # project selector/filter in the app. See `models.PROJECT_IDS` for the single
 # canonical id list `app.py` must iterate instead.
 PROJECT_STATUS_FILES: dict[str, str] = {
+    "AICC": "projects/AICC.md",
     "AIOS": "projects/AIOS.md",
     "AICOS": "projects/AICOS.md",
+    "PRODUCT": "projects/PRODUCT.md",
+    "ECOSYSTEM": "projects/ECOSYSTEM.md",
     "BANK": "projects/BANK_STRATEGY.md",
     "LEGAL": "projects/LEGAL.md",
     "BUSINESS": "projects/BUSINESS.md",
@@ -94,6 +118,11 @@ CONTEXT_FILES: dict[str, str] = {
 GLOBAL_CONTEXT_FILES: list[str] = ["CURRENT_STATE.md", "DECISIONS.md"]
 
 DEFAULT_ALLOWED_AGENTS: list[str] = ["claude_code"]
+EXECUTION_PROVIDER_IDS: frozenset[str] = frozenset({"claude_code", "codex", "ollama", "copilot_cli"})
+
+
+class ProviderAuthorizationError(ValueError):
+    """The selected execution provider is not authorized for the project."""
 
 
 def default_project_config(project_id: str) -> dict:
@@ -132,6 +161,19 @@ def default_project_config(project_id: str) -> dict:
         "context_file_paths": context_paths,
         "reports_dir": f"reports/{project_id}",
         "generated_dir": f"generated/{project_id}",
+        # Autonomous completion pipeline policy — conservative defaults. The
+        # pipeline never auto-merges and never auto-recovers a closed PR unless
+        # a project explicitly opts in via `project_config.json`. `merge_method`
+        # governs how an auto-merge (when enabled) is performed; `validation_
+        # commands=None` uses the safe built-in default (byte-compile).
+        "merge_mode": "manual",
+        "merge_method": "squash",
+        "allow_pr_recovery": False,
+        "requires_pull_request": True,
+        "allow_local_only": False,
+        "validation_required": True,
+        "validation_commands": None,
+        "max_retries": 20,
     }
 
 
@@ -176,6 +218,58 @@ def get_project_config(project_id: str) -> dict:
     return load_project_configs().get(project_id, default_project_config(project_id))
 
 
+def allowed_execution_providers(project_id: str) -> tuple[str, ...]:
+    """Return the project's explicitly authorized execution providers.
+
+    Missing policy is the legacy-safe Claude-only default. Malformed policy
+    and unknown identifiers fail closed instead of silently broadening access.
+    """
+    cfg = get_project_config(project_id)
+    raw = cfg.get("allowed_agents")
+    if raw is None:
+        return ("claude_code",)
+    if not isinstance(raw, list) or not raw or any(not isinstance(item, str) or not item for item in raw):
+        raise ProviderAuthorizationError(
+            f"Project {project_id!r} has malformed allowed_agents policy; execution is disabled."
+        )
+    unknown = sorted(set(raw) - EXECUTION_PROVIDER_IDS)
+    if unknown:
+        raise ProviderAuthorizationError(
+            f"Project {project_id!r} authorizes unknown execution provider(s): {unknown!r}."
+        )
+    return tuple(dict.fromkeys(raw))
+
+
+def require_execution_provider_allowed(project_id: str, provider_id: str) -> None:
+    allowed = allowed_execution_providers(project_id)
+    if provider_id not in allowed:
+        raise ProviderAuthorizationError(
+            f"Execution provider {provider_id!r} is not authorized for project {project_id!r}."
+        )
+
+
+def save_allowed_agents(project_id: str, allowed_agents: list[str]) -> None:
+    """Persist an explicit provider allow-list after validating it fail-closed."""
+    if project_id not in models.PROJECT_IDS:
+        raise ValueError(f"Unknown project: {project_id!r}")
+    if (
+        not isinstance(allowed_agents, list)
+        or not allowed_agents
+        or any(not isinstance(item, str) or not item for item in allowed_agents)
+    ):
+        raise ProviderAuthorizationError("allowed_agents must be a non-empty list of provider identifiers.")
+    unknown = sorted(set(allowed_agents) - EXECUTION_PROVIDER_IDS)
+    if unknown:
+        raise ProviderAuthorizationError(f"Unknown execution provider(s): {unknown!r}.")
+    overrides = _read_overrides()
+    project_override = overrides.get(project_id)
+    if not isinstance(project_override, dict):
+        project_override = {}
+    project_override["allowed_agents"] = list(dict.fromkeys(allowed_agents))
+    overrides[project_id] = project_override
+    storage.atomic_write_json(CONFIG_FILE, overrides)
+
+
 def validate_repository_path(path_str: str) -> tuple[bool, str]:
     """Validate a candidate path before it may be saved as a project's repository path."""
     if not path_str or not path_str.strip():
@@ -206,6 +300,129 @@ def save_repository_path(project_id: str, repository_path: str | None) -> None:
 
 def is_sensitive(project_id: str) -> bool:
     return project_id in models.SENSITIVE_PROJECT_IDS
+
+
+# --------------------------------------------------------------------------
+# Project name normalization (task import)
+# --------------------------------------------------------------------------
+
+# Founder-authored task packages (see `command_center.task_import`) refer to
+# projects by free-text names, not by `models.PROJECT_IDS`. `PROJECT_NAME_ALIASES`
+# (built just below from `DISPLAY_NAMES`) maps every name a package is allowed to
+# use onto a canonical id — deliberately not a fallback/default: a name absent
+# from it fails validation in `task_import.validate_task_package` rather than
+# being silently assigned to a guessed project.
+#
+# Founder Review (AICC-AUDIT-001 remediation) established the invariant that no
+# two distinct entities may fold into one id ("AI Command Center"/"Ecosystem"
+# must NOT collapse into AICOS, "AIOS Product" must NOT collapse into AIOS).
+# Deriving the table straight from `DISPLAY_NAMES` preserves that by
+# construction: each display name maps to its own id and to nothing else.
+def _alias_key(name: str) -> str:
+    """The single case/whitespace-insensitive normalization applied to both
+    every alias-table key and every lookup in `normalize_project_id`, so the
+    two can never disagree about how a name is matched."""
+    return " ".join(name.strip().lower().split())
+
+
+# Extra names founder task packages are historically allowed to use that are
+# NOT a project's display name — merged on top of the auto-derived table below.
+# Kept deliberately tiny: the display-name reverse mapping and the bare
+# canonical id are derived automatically in `_build_project_name_aliases`, so
+# this dict only ever needs a truly *aliased* spelling. (Empty today — every
+# supported name is either a display name or a bare id — but preserved as the
+# explicit merge point the module contract promises.)
+_EXPLICIT_PROJECT_ALIASES: dict[str, str] = {}
+
+
+def _build_project_name_aliases() -> dict[str, str]:
+    """Derive the free-text-name -> canonical-id table from `DISPLAY_NAMES`
+    (the single source of truth for a project's human name) rather than hand-
+    maintaining a second, drift-prone list. For every `models.PROJECT_IDS`
+    entry this registers both its display name (`"AI Command Center"` ->
+    `AICC`, `"Bank Strategy"` -> `BANK`) and its bare id (`"aicc"` -> `AICC`),
+    then merges `_EXPLICIT_PROJECT_ALIASES`. Guarantees every project — not
+    just the five that used to be listed — resolves from its display name, so
+    `canonical_project_id`'s "a display name matches its canonical id" promise
+    holds for all nine projects, not a subset."""
+    aliases: dict[str, str] = {}
+    for project_id in models.PROJECT_IDS:
+        aliases[_alias_key(DISPLAY_NAMES.get(project_id, project_id))] = project_id
+        aliases[_alias_key(project_id)] = project_id
+    for name, project_id in _EXPLICIT_PROJECT_ALIASES.items():
+        aliases[_alias_key(name)] = project_id
+    return aliases
+
+
+# Founder-authored task packages (see `command_center.task_import`) refer to
+# projects by free-text names, not by `models.PROJECT_IDS`. This table maps
+# every name a package is allowed to use onto a canonical id already registered
+# in `models.PROJECT_IDS` — it is deliberately not a fallback/default: a name
+# absent from this table fails validation in `task_import.validate_task_package`
+# rather than being silently assigned to a guessed project. It is *derived* from
+# `DISPLAY_NAMES` (see `_build_project_name_aliases`) so it can never drift out
+# of sync with the display names the UI renders.
+#
+# Every name maps to its OWN canonical id, never folding distinct entities into
+# one — the invariant Founder Review (AICC-AUDIT-001 remediation) established:
+#   "AI Command Center" -> AICC   "AIOS Product" -> PRODUCT   "Ecosystem" -> ECOSYSTEM
+#   "Bank Strategy" -> BANK        "Legal" -> LEGAL            "Business" -> BUSINESS ...
+PROJECT_NAME_ALIASES: dict[str, str] = _build_project_name_aliases()
+
+
+def normalize_project_id(raw: str | None) -> str | None:
+    """Resolve a task package's free-text `project` field to a canonical
+    `models.PROJECT_IDS` entry, or `None` if it cannot be resolved.
+
+    Already-canonical ids pass through unchanged; every other supported name
+    is looked up case/whitespace-insensitively in `PROJECT_NAME_ALIASES`.
+    Returning `None` on a miss (rather than guessing a default project) is
+    deliberate — see the module-level note above.
+    """
+    if not raw or not raw.strip():
+        return None
+    if raw in models.PROJECT_IDS:
+        return raw
+    return PROJECT_NAME_ALIASES.get(_alias_key(raw))
+
+
+def canonical_project_id(value: str | None) -> str | None:
+    """The single canonical-id function every project-scoped filter, counter,
+    ranking, and grouping in the app must use to compare a task's/run's stored
+    `project` against a selected project id.
+
+    It is `normalize_project_id` with a raw-value fallback: a resolvable name
+    (canonical id, display name, or alias — `"AICC"`, `"AI Command Center"`,
+    `"ai command center"`) collapses to its canonical `models.PROJECT_IDS` id,
+    while a genuinely unknown value falls back to itself so it still matches
+    only itself exactly and is never silently broadened onto a real lane.
+
+    Crucially this is the identity on already-canonical ids, so applying it at
+    a comparison site that already only ever saw canonical ids changes nothing
+    there — it only *additionally* makes display-name/alias values line up.
+    That is why it can be dropped in at every project comparison uniformly.
+
+    Root cause it fixes (AICC-UI-001): eight tasks store a display name
+    (`AICC-CI-001` -> `"AI Command Center"`) while the project selector emits
+    the canonical id (`"AICC"`). Comparing raw strings dropped those tasks from
+    their own project lane, undercounted every per-project pill/metric, and
+    excluded them from recommendations — present in `tasks.json`, invisible to
+    anyone working inside their project. Normalizing both sides of every such
+    comparison through this one helper keeps the Kanban lane, the pill count,
+    the project-intelligence strip, and the recommendation inputs in exact
+    agreement.
+    """
+    return normalize_project_id(value) or value
+
+
+def project_matches(stored: str | None, selected: str | None) -> bool:
+    """Whether a task/run whose stored `project` is `stored` belongs to the
+    `selected` project filter. `selected is None` means "all projects" and
+    always matches. Otherwise both sides are compared on canonical ids via
+    `canonical_project_id`, so a display name matches its canonical id."""
+    if selected is None:
+        return True
+    return canonical_project_id(stored) == canonical_project_id(selected)
 
 
 def save_project_settings(project_id: str, **fields: object) -> None:

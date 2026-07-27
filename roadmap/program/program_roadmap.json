@@ -1,0 +1,1514 @@
+{
+  "schema_version": "1.0",
+  "name": "Global AI Platform Program Roadmap",
+  "generated_for": "AI Command Center",
+  "planning_horizon": "Foundation to Global Platform",
+  "projects": [
+    "AIOS",
+    "AICOS",
+    "AI_COMMAND_CENTER",
+    "AIOS_PRODUCT",
+    "PORTFOLIO",
+    "PLATFORM"
+  ],
+  "task_count": 47,
+  "tasks": [
+    {
+      "id": "AICC-LAUNCH-001",
+      "title": "Worktree-aware Agent Launcher",
+      "goal": "Исправить Launcher AI Command Center так, чтобы задача запускалась в заданном workspace_path, а проверка ветки, чистоты Git и запуск Claude Code выполнялись внутри этого worktree, а не в основном repository_path.",
+      "prompt": "Ты работаешь над задачей AICC-LAUNCH-001 — Worktree-aware Agent Launcher.\n\nРепозиторий:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nЦелевая ветка:\n  fix/worktree-aware-launcher\n\nИзолированный worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-worktree-aware-launcher\n\nПроблема воспроизведена в живом UI:\nзадача содержит корректный workspace_path отдельного Git worktree, но Launcher\nпроверяет ветку в основном repository_path. Поэтому запуск блокируется сообщением,\nчто текущая ветка основного репозитория отличается от ожидаемой ветки задачи.\n\nЦель:\nСделать workspace_path канонической рабочей директорией запуска, когда он задан.\n\nОбязательное поведение:\n\n1. Разрешение рабочей директории:\n   - если workspace_path задан — использовать его;\n   - иначе использовать repository_path;\n   - путь должен существовать и быть каталогом;\n   - путь должен быть Git worktree или корнем Git-репозитория;\n   - не выполнять silent fallback, если заданный workspace_path неверен.\n\n2. Все Git-проверки выполнять в разрешённом workspace:\n   - текущая ветка;\n   - HEAD;\n   - git status;\n   - чистота рабочего дерева;\n   - принадлежность репозиторию;\n   - detached HEAD;\n   - соответствие ожидаемой branch.\n\n3. Агент должен запускаться с cwd=workspace_path.\n\n4. repository_path остаётся идентификатором основного репозитория и используется\n   для проверки, что workspace принадлежит ожидаемому Git common directory.\n\n5. Безопасность:\n   - запрет запуска из постороннего репозитория;\n   - понятная ошибка для отсутствующего workspace;\n   - понятная ошибка для неверной ветки именно внутри workspace;\n   - не переключать ветку основного репозитория;\n   - не создавать и не удалять worktree автоматически в этой задаче;\n   - не обходить проверку грязного рабочего дерева.\n\n6. Обновить все пути запуска:\n   - карточка рекомендованной задачи;\n   - Kanban action;\n   - очередь;\n   - Live Execution Center;\n   - повторный запуск, если он использует тот же launcher service.\n\n7. Устранить дублирование:\n   выбор эффективного workspace и preflight-проверки должны находиться в одном\n   service/domain-модуле, а не отдельно в Streamlit UI.\n\nОбязательные тесты:\n\n- workspace_path используется вместо repository_path;\n- ветка проверяется внутри workspace_path;\n- основной репозиторий может находиться на другой ветке и не блокирует запуск;\n- cwd процесса равен workspace_path;\n- отсутствующий workspace блокирует запуск;\n- workspace не является Git-репозиторием;\n- workspace принадлежит другому репозиторию;\n- detached HEAD;\n- неверная ветка в workspace;\n- грязный workspace;\n- fallback на repository_path при отсутствии workspace_path;\n- regression test для живого дефекта:\n  main repo = fix/task-package-json-import,\n  task workspace = feature/d1-task-import,\n  запуск должен пройти preflight.\n\nПеред изменениями:\n- зафиксировать HEAD, status, worktree list и архитектуру launcher;\n- найти все call sites;\n- не изменять data/tasks.json и runtime-файлы;\n- не смешивать исправление с реализацией Program Management.\n\nВалидация:\n- полный pytest;\n- ruff;\n- compileall;\n- целевые launcher/UI tests;\n- ручная проверка запуска задачи из отдельного worktree.\n\nФинальный отчёт:\n- root cause;\n- изменённые модули;\n- единая модель разрешения workspace;\n- результаты тестов;\n- ручное воспроизведение до/после;\n- commit SHA;\n- готовность к независимому review.",
+      "project": "AICC",
+      "priority": "Critical",
+      "status": "Backlog",
+      "task_type": "remediation",
+      "stream": "Execution",
+      "level": 0,
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktree-aware-launcher",
+      "branch": "fix/worktree-aware-launcher",
+      "depends_on": [],
+      "blocks": [
+        "AICC-D1-001",
+        "AICC-D1-002",
+        "AICC-D1-003",
+        "AICC-D1-004",
+        "AICC-D2-001",
+        "AICC-INT-001"
+      ],
+      "parallel_group": "L0-LAUNCHER-BLOCKER",
+      "required_capabilities": [
+        "python",
+        "git_worktree",
+        "process_management",
+        "testing"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "ready_to_start": true,
+      "created_at": "2026-07-21T10:32:22.789851+00:00",
+      "updated_at": "2026-07-21T10:32:22.789851+00:00"
+    },
+    {
+      "id": "AIOS-RECON-001",
+      "project": "AIOS",
+      "stream": "Foundation",
+      "level": 0,
+      "title": "AIOS main reconciliation",
+      "goal": "Establish the canonical AIOS baseline across origin/main, audit branches, orphan commits, local worktrees, CI, packaging, API, identity, auth, memory and CLI.",
+      "task_type": "final_gate",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "audit/main-reconciliation-2026-07",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-main-reconciliation",
+      "depends_on": [],
+      "blocks": [
+        "AIOS-REL-001",
+        "AIOS-IDENT-001",
+        "AIOS-API-001",
+        "AIOS-SDK-001",
+        "AIOS-WS-001",
+        "AIOS-MEM-001"
+      ],
+      "parallel_group": "L0-A",
+      "required_capabilities": [
+        "git",
+        "architecture_review",
+        "testing"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Backlog",
+      "ready_to_start": true,
+      "prompt": "You are executing task AIOS-RECON-001: AIOS main reconciliation.\n\nProject: AIOS\nStream: Foundation\nGoal: Establish the canonical AIOS baseline across origin/main, audit branches, orphan commits, local worktrees, CI, packaging, API, identity, auth, memory and CLI.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  audit/main-reconciliation-2026-07\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-main-reconciliation\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-RECON-001",
+      "project": "AICOS",
+      "stream": "Foundation",
+      "level": 0,
+      "title": "AICOS Wave 4 and Portfolio reconciliation",
+      "goal": "Identify the canonical Wave 4 implementation/specification and reconcile Git history, Portfolio records, roadmap status and acceptance evidence.",
+      "task_type": "final_gate",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs",
+      "branch": "audit/wave4-portfolio-reconciliation",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-wave4-reconciliation",
+      "depends_on": [],
+      "blocks": [
+        "AICOS-W5-001",
+        "PORTFOLIO-CTRL-001"
+      ],
+      "parallel_group": "L0-A",
+      "required_capabilities": [
+        "git",
+        "architecture_review",
+        "traceability"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Backlog",
+      "ready_to_start": true,
+      "prompt": "You are executing task AICOS-RECON-001: AICOS Wave 4 and Portfolio reconciliation.\n\nProject: AICOS\nStream: Foundation\nGoal: Identify the canonical Wave 4 implementation/specification and reconcile Git history, Portfolio records, roadmap status and acceptance evidence.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs\n\nRequired branch:\n  audit/wave4-portfolio-reconciliation\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-wave4-reconciliation\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-ARCH-001",
+      "project": "AICOS",
+      "stream": "Foundation",
+      "level": 0,
+      "title": "Tenant isolation enforcement architecture",
+      "goal": "Replace the gap between the accepted ADR and actual enforcement with a precise tenant isolation model, enforcement points, invariants and implementation requirements for AIOS.",
+      "task_type": "architecture_review",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs",
+      "branch": "feature/tenant-isolation-enforcement-spec",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-tenant-isolation",
+      "depends_on": [],
+      "blocks": [
+        "AIOS-IDENT-001",
+        "AICOS-RUNTIME-001"
+      ],
+      "parallel_group": "L0-A",
+      "required_capabilities": [
+        "architecture",
+        "security",
+        "multi_tenancy"
+      ],
+      "conflicts_with": [
+        "AICOS-RECON-001"
+      ],
+      "critical_path": true,
+      "status": "Backlog",
+      "ready_to_start": true,
+      "prompt": "You are executing task AICOS-ARCH-001: Tenant isolation enforcement architecture.\n\nProject: AICOS\nStream: Foundation\nGoal: Replace the gap between the accepted ADR and actual enforcement with a precise tenant isolation model, enforcement points, invariants and implementation requirements for AIOS.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs\n\nRequired branch:\n  feature/tenant-isolation-enforcement-spec\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-tenant-isolation\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D1-001",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Desktop",
+      "level": 0,
+      "title": "Desktop shell and Workspace Home",
+      "goal": "Deliver the first real PySide6 desktop entrypoint and Workspace Home without Streamlit, browser launch or HTTP listener.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d1-desktop-shell",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-d1-shell",
+      "depends_on": [
+        "AICC-LAUNCH-001"
+      ],
+      "blocks": [
+        "AICC-D2-001",
+        "AICC-D2-002",
+        "AICC-INT-001"
+      ],
+      "parallel_group": "L0-B",
+      "required_capabilities": [
+        "python",
+        "pyside6",
+        "desktop_ui"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D1-001: Desktop shell and Workspace Home.\n\nProject: AI_COMMAND_CENTER\nStream: Desktop\nGoal: Deliver the first real PySide6 desktop entrypoint and Workspace Home without Streamlit, browser launch or HTTP listener.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d1-desktop-shell\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-d1-shell\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D1-002",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Task Management",
+      "level": 0,
+      "title": "Task import and upload pipeline",
+      "goal": "Implement safe import of Markdown, text, JSON and YAML tasks with preview, validation, duplicate protection, atomic persistence and rollback.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d1-task-import",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-task-import",
+      "depends_on": [
+        "AICC-LAUNCH-001"
+      ],
+      "blocks": [
+        "AICC-D2-001",
+        "PORTFOLIO-CTRL-001"
+      ],
+      "parallel_group": "L0-B",
+      "required_capabilities": [
+        "python",
+        "parsing",
+        "validation"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D1-002: Task import and upload pipeline.\n\nProject: AI_COMMAND_CENTER\nStream: Task Management\nGoal: Implement safe import of Markdown, text, JSON and YAML tasks with preview, validation, duplicate protection, atomic persistence and rollback.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d1-task-import\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-task-import\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D1-003",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Execution",
+      "level": 0,
+      "title": "Reliable execution queue",
+      "goal": "Build a persistent, thread-safe execution queue with atomic updates, duplicate launch prevention, lifecycle states, cancellation and recovery.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d1-execution-queue",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-execution-queue",
+      "depends_on": [
+        "AICC-LAUNCH-001"
+      ],
+      "blocks": [
+        "AICC-D2-001",
+        "AICC-D2-003",
+        "AICC-INT-001"
+      ],
+      "parallel_group": "L0-B",
+      "required_capabilities": [
+        "python",
+        "concurrency",
+        "process_management"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D1-003: Reliable execution queue.\n\nProject: AI_COMMAND_CENTER\nStream: Execution\nGoal: Build a persistent, thread-safe execution queue with atomic updates, duplicate launch prevention, lifecycle states, cancellation and recovery.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d1-execution-queue\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-execution-queue\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D1-004",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Intelligence",
+      "level": 0,
+      "title": "Project intelligence and recommendations",
+      "goal": "Create service-layer project intelligence and recommendation engines isolated from UI and ready for desktop integration.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d1-project-intelligence",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-project-intelligence",
+      "depends_on": [
+        "AICC-LAUNCH-001"
+      ],
+      "blocks": [
+        "AICC-D2-004",
+        "AICC-SELF-001"
+      ],
+      "parallel_group": "L0-B",
+      "required_capabilities": [
+        "python",
+        "analysis",
+        "recommendation_systems"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D1-004: Project intelligence and recommendations.\n\nProject: AI_COMMAND_CENTER\nStream: Intelligence\nGoal: Create service-layer project intelligence and recommendation engines isolated from UI and ready for desktop integration.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d1-project-intelligence\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-project-intelligence\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-POS-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Product",
+      "level": 0,
+      "title": "Complete Product Positioning",
+      "goal": "Finalize product positioning for AIOS, AICOS, deployment models, target segments, platform differentiation, federation and self-development principles.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/product-positioning",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-positioning",
+      "depends_on": [],
+      "blocks": [
+        "PRODUCT-WEB-001",
+        "PRODUCT-README-001",
+        "PRODUCT-LIC-001",
+        "PRODUCT-DOCS-001"
+      ],
+      "parallel_group": "L0-C",
+      "required_capabilities": [
+        "product_strategy",
+        "technical_writing"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Backlog",
+      "ready_to_start": true,
+      "prompt": "You are executing task PRODUCT-POS-001: Complete Product Positioning.\n\nProject: AIOS_PRODUCT\nStream: Product\nGoal: Finalize product positioning for AIOS, AICOS, deployment models, target segments, platform differentiation, federation and self-development principles.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/product-positioning\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-positioning\n\nDependencies:\n  None. This task is ready to start.\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-REL-001",
+      "project": "AIOS",
+      "stream": "Release Engineering",
+      "level": 1,
+      "title": "Packaging and CI baseline",
+      "goal": "Make AIOS installable and verifiable from a clean environment with working entrypoints, build, CI, tests and smoke checks.",
+      "task_type": "remediation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "fix/packaging-and-ci-baseline",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-packaging-ci",
+      "depends_on": [
+        "AIOS-RECON-001"
+      ],
+      "blocks": [
+        "AIOS-SDK-001",
+        "AIOS-INT-001"
+      ],
+      "parallel_group": "L1-AIOS",
+      "required_capabilities": [
+        "python_packaging",
+        "github_actions",
+        "testing"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-REL-001: Packaging and CI baseline.\n\nProject: AIOS\nStream: Release Engineering\nGoal: Make AIOS installable and verifiable from a clean environment with working entrypoints, build, CI, tests and smoke checks.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  fix/packaging-and-ci-baseline\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-packaging-ci\n\nDependencies:\n  AIOS-RECON-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-IDENT-001",
+      "project": "AIOS",
+      "stream": "Identity",
+      "level": 1,
+      "title": "Identity and tenant foundation",
+      "goal": "Implement the canonical identity, workspace and tenant isolation foundation aligned with the AICOS enforcement architecture.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "feature/identity-tenant-foundation",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-identity-tenant",
+      "depends_on": [
+        "AIOS-RECON-001",
+        "AICOS-ARCH-001"
+      ],
+      "blocks": [
+        "AIOS-API-001",
+        "AICOS-RUNTIME-001",
+        "AIOS-ENT-001"
+      ],
+      "parallel_group": "L1-AIOS",
+      "required_capabilities": [
+        "python",
+        "identity",
+        "authorization"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-IDENT-001: Identity and tenant foundation.\n\nProject: AIOS\nStream: Identity\nGoal: Implement the canonical identity, workspace and tenant isolation foundation aligned with the AICOS enforcement architecture.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  feature/identity-tenant-foundation\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-identity-tenant\n\nDependencies:\n  AIOS-RECON-001, AICOS-ARCH-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-API-001",
+      "project": "AIOS",
+      "stream": "API",
+      "level": 1,
+      "title": "Public API stabilization",
+      "goal": "Stabilize the public API contract, auth boundaries, error models, pagination and workspace/global memory endpoints.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "feature/public-api-stabilization",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-api-stabilization",
+      "depends_on": [
+        "AIOS-RECON-001",
+        "AIOS-IDENT-001"
+      ],
+      "blocks": [
+        "AIOS-SDK-001",
+        "AICOS-RUNTIME-001",
+        "AIOS-INT-001"
+      ],
+      "parallel_group": "L1-AIOS-B",
+      "required_capabilities": [
+        "fastapi",
+        "openapi",
+        "authorization"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-API-001: Public API stabilization.\n\nProject: AIOS\nStream: API\nGoal: Stabilize the public API contract, auth boundaries, error models, pagination and workspace/global memory endpoints.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  feature/public-api-stabilization\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-api-stabilization\n\nDependencies:\n  AIOS-RECON-001, AIOS-IDENT-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-WS-001",
+      "project": "AIOS",
+      "stream": "Workspace",
+      "level": 1,
+      "title": "Workspace lifecycle",
+      "goal": "Complete workspace create, list, show, state transitions, isolation and lifecycle invariants.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "feature/workspace-lifecycle",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-workspace-lifecycle",
+      "depends_on": [
+        "AIOS-RECON-001",
+        "AIOS-IDENT-001"
+      ],
+      "blocks": [
+        "AICOS-RUNTIME-001",
+        "AIOS-INT-001"
+      ],
+      "parallel_group": "L1-AIOS-B",
+      "required_capabilities": [
+        "python",
+        "domain_modeling"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-WS-001: Workspace lifecycle.\n\nProject: AIOS\nStream: Workspace\nGoal: Complete workspace create, list, show, state transitions, isolation and lifecycle invariants.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  feature/workspace-lifecycle\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-workspace-lifecycle\n\nDependencies:\n  AIOS-RECON-001, AIOS-IDENT-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-MEM-001",
+      "project": "AIOS",
+      "stream": "Memory",
+      "level": 1,
+      "title": "Memory API and reconciliation cleanup",
+      "goal": "Consolidate memory APIs, reconciliation, cursor integrity, lifecycle behavior and remove obsolete or duplicated implementations.",
+      "task_type": "remediation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "fix/memory-api-cleanup",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-memory-cleanup",
+      "depends_on": [
+        "AIOS-RECON-001"
+      ],
+      "blocks": [
+        "AICOS-RUNTIME-001",
+        "AIOS-INT-001"
+      ],
+      "parallel_group": "L1-AIOS",
+      "required_capabilities": [
+        "python",
+        "data_consistency",
+        "api"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-MEM-001: Memory API and reconciliation cleanup.\n\nProject: AIOS\nStream: Memory\nGoal: Consolidate memory APIs, reconciliation, cursor integrity, lifecycle behavior and remove obsolete or duplicated implementations.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  fix/memory-api-cleanup\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-memory-cleanup\n\nDependencies:\n  AIOS-RECON-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-SDK-001",
+      "project": "AIOS",
+      "stream": "SDK",
+      "level": 1,
+      "title": "SDK baseline",
+      "goal": "Create a stable Python SDK for public AIOS APIs with typed models, auth, retries, pagination and examples.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "feature/sdk-baseline",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-sdk",
+      "depends_on": [
+        "AIOS-REL-001",
+        "AIOS-API-001"
+      ],
+      "blocks": [
+        "AICOS-RUNTIME-001",
+        "AICC-INT-001",
+        "PRODUCT-DOCS-001"
+      ],
+      "parallel_group": "L1-AIOS-C",
+      "required_capabilities": [
+        "python",
+        "sdk_design"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-SDK-001: SDK baseline.\n\nProject: AIOS\nStream: SDK\nGoal: Create a stable Python SDK for public AIOS APIs with typed models, auth, retries, pagination and examples.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  feature/sdk-baseline\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-sdk\n\nDependencies:\n  AIOS-REL-001, AIOS-API-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-W5-001",
+      "project": "AICOS",
+      "stream": "Functional Architecture",
+      "level": 1,
+      "title": "Functional Architecture Wave 5",
+      "goal": "Define the next functional architecture wave after canonical Wave 4, with traceability to business architecture and enforcement constraints.",
+      "task_type": "architecture_review",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs",
+      "branch": "feature/functional-architecture-wave-5",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-wave5",
+      "depends_on": [
+        "AICOS-RECON-001"
+      ],
+      "blocks": [
+        "AICOS-RUNTIME-001",
+        "AICOS-AML-001",
+        "AICOS-RULES-001",
+        "AICOS-XAI-001"
+      ],
+      "parallel_group": "L1-AICOS",
+      "required_capabilities": [
+        "aml",
+        "architecture",
+        "traceability"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICOS-W5-001: Functional Architecture Wave 5.\n\nProject: AICOS\nStream: Functional Architecture\nGoal: Define the next functional architecture wave after canonical Wave 4, with traceability to business architecture and enforcement constraints.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs\n\nRequired branch:\n  feature/functional-architecture-wave-5\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-wave5\n\nDependencies:\n  AICOS-RECON-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D2-001",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Execution",
+      "level": 1,
+      "title": "Parallel execution supervisor",
+      "goal": "Schedule multiple independent tasks, allocate worktrees, enforce concurrency limits and prevent repository/workspace conflicts.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d2-parallel-supervisor",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-supervisor",
+      "depends_on": [
+        "AICC-LAUNCH-001",
+        "AICC-D1-001",
+        "AICC-D1-002",
+        "AICC-D1-003"
+      ],
+      "blocks": [
+        "AICC-INT-001",
+        "AICC-DIST-001"
+      ],
+      "parallel_group": "L1-AICC",
+      "required_capabilities": [
+        "scheduler",
+        "process_management",
+        "git_worktree"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D2-001: Parallel execution supervisor.\n\nProject: AI_COMMAND_CENTER\nStream: Execution\nGoal: Schedule multiple independent tasks, allocate worktrees, enforce concurrency limits and prevent repository/workspace conflicts.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d2-parallel-supervisor\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-supervisor\n\nDependencies:\n  AICC-D1-001, AICC-D1-002, AICC-D1-003\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D2-002",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Workspace",
+      "level": 1,
+      "title": "Universal Workspace Manager",
+      "goal": "Manage project discovery, repository validation, worktree creation, branch allocation and workspace lifecycle.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d2-workspace-manager",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-workspace-manager",
+      "depends_on": [
+        "AICC-D1-001"
+      ],
+      "blocks": [
+        "AICC-D2-001",
+        "AICC-GIT-001",
+        "AICC-INT-001"
+      ],
+      "parallel_group": "L1-AICC",
+      "required_capabilities": [
+        "git",
+        "filesystem",
+        "desktop_ui"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D2-002: Universal Workspace Manager.\n\nProject: AI_COMMAND_CENTER\nStream: Workspace\nGoal: Manage project discovery, repository validation, worktree creation, branch allocation and workspace lifecycle.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d2-workspace-manager\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-workspace-manager\n\nDependencies:\n  AICC-D1-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D2-003",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Agents",
+      "level": 1,
+      "title": "AI Agent Registry",
+      "goal": "Define and implement agent profiles, capabilities, launch adapters, permissions and health state.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d2-agent-registry",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-agent-registry",
+      "depends_on": [
+        "AICC-D1-003"
+      ],
+      "blocks": [
+        "AICC-D2-001",
+        "AICC-DIST-001",
+        "AICC-SELF-001"
+      ],
+      "parallel_group": "L1-AICC",
+      "required_capabilities": [
+        "agent_systems",
+        "process_management"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D2-003: AI Agent Registry.\n\nProject: AI_COMMAND_CENTER\nStream: Agents\nGoal: Define and implement agent profiles, capabilities, launch adapters, permissions and health state.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d2-agent-registry\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-agent-registry\n\nDependencies:\n  AICC-D1-003\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-D2-004",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Intelligence",
+      "level": 1,
+      "title": "Program dependency engine",
+      "goal": "Compute readiness, blocked reasons, parallel groups, conflicts and critical path from the roadmap graph.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/d2-dependency-engine",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-dependency-engine",
+      "depends_on": [
+        "AICC-D1-004"
+      ],
+      "blocks": [
+        "PORTFOLIO-CTRL-001",
+        "AICC-D2-001",
+        "AICC-SELF-001"
+      ],
+      "parallel_group": "L1-AICC",
+      "required_capabilities": [
+        "graph_algorithms",
+        "project_management"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-D2-004: Program dependency engine.\n\nProject: AI_COMMAND_CENTER\nStream: Intelligence\nGoal: Compute readiness, blocked reasons, parallel groups, conflicts and critical path from the roadmap graph.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/d2-dependency-engine\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-dependency-engine\n\nDependencies:\n  AICC-D1-004\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-WEB-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Website",
+      "level": 1,
+      "title": "Website information architecture",
+      "goal": "Define the website structure, audiences, journeys, pages and conversion paths based on accepted product positioning.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/website-information-architecture",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-website-ia",
+      "depends_on": [
+        "PRODUCT-POS-001"
+      ],
+      "blocks": [
+        "PRODUCT-WEB-002"
+      ],
+      "parallel_group": "L1-PRODUCT",
+      "required_capabilities": [
+        "product_marketing",
+        "information_architecture"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-WEB-001: Website information architecture.\n\nProject: AIOS_PRODUCT\nStream: Website\nGoal: Define the website structure, audiences, journeys, pages and conversion paths based on accepted product positioning.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/website-information-architecture\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-website-ia\n\nDependencies:\n  PRODUCT-POS-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-README-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Documentation",
+      "level": 1,
+      "title": "Canonical README standards and repository messaging",
+      "goal": "Create consistent READMEs for AIOS, AICOS and AI Command Center aligned to product positioning and actual repository state.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/canonical-readmes",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-readmes",
+      "depends_on": [
+        "PRODUCT-POS-001",
+        "AIOS-RECON-001",
+        "AICOS-RECON-001"
+      ],
+      "blocks": [
+        "PRODUCT-DOCS-001"
+      ],
+      "parallel_group": "L1-PRODUCT",
+      "required_capabilities": [
+        "technical_writing",
+        "developer_experience"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-README-001: Canonical README standards and repository messaging.\n\nProject: AIOS_PRODUCT\nStream: Documentation\nGoal: Create consistent READMEs for AIOS, AICOS and AI Command Center aligned to product positioning and actual repository state.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/canonical-readmes\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-readmes\n\nDependencies:\n  PRODUCT-POS-001, AIOS-RECON-001, AICOS-RECON-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-LIC-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Commercial",
+      "level": 1,
+      "title": "Licensing and packaging policy",
+      "goal": "Define open-source, commercial, enterprise, managed cloud and marketplace licensing boundaries.",
+      "task_type": "architecture_review",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/licensing-policy",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-licensing",
+      "depends_on": [
+        "PRODUCT-POS-001"
+      ],
+      "blocks": [
+        "PRODUCT-PRICE-001",
+        "PRODUCT-SALES-001"
+      ],
+      "parallel_group": "L1-PRODUCT",
+      "required_capabilities": [
+        "licensing",
+        "commercial_strategy"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-LIC-001: Licensing and packaging policy.\n\nProject: AIOS_PRODUCT\nStream: Commercial\nGoal: Define open-source, commercial, enterprise, managed cloud and marketplace licensing boundaries.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/licensing-policy\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-licensing\n\nDependencies:\n  PRODUCT-POS-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-AML-001",
+      "project": "AICOS",
+      "stream": "AML",
+      "level": 2,
+      "title": "Canonical AML object model",
+      "goal": "Finalize canonical Alert, Case, Investigation, Decision, Evidence and successor-object models.",
+      "task_type": "architecture_review",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs",
+      "branch": "feature/canonical-aml-object-model",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-aml-model",
+      "depends_on": [
+        "AICOS-W5-001"
+      ],
+      "blocks": [
+        "AICOS-RUNTIME-001"
+      ],
+      "parallel_group": "L2-AICOS",
+      "required_capabilities": [
+        "aml",
+        "domain_modeling"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICOS-AML-001: Canonical AML object model.\n\nProject: AICOS\nStream: AML\nGoal: Finalize canonical Alert, Case, Investigation, Decision, Evidence and successor-object models.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs\n\nRequired branch:\n  feature/canonical-aml-object-model\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-aml-model\n\nDependencies:\n  AICOS-W5-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-RULES-001",
+      "project": "AICOS",
+      "stream": "Rules",
+      "level": 2,
+      "title": "Rule engine specification",
+      "goal": "Specify no-code rules, versioning, approvals, execution, explainability and jurisdiction overlays.",
+      "task_type": "architecture_review",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs",
+      "branch": "feature/rule-engine-spec",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-rule-engine",
+      "depends_on": [
+        "AICOS-W5-001"
+      ],
+      "blocks": [
+        "AICOS-RUNTIME-001"
+      ],
+      "parallel_group": "L2-AICOS",
+      "required_capabilities": [
+        "rules_engines",
+        "aml",
+        "architecture"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICOS-RULES-001: Rule engine specification.\n\nProject: AICOS\nStream: Rules\nGoal: Specify no-code rules, versioning, approvals, execution, explainability and jurisdiction overlays.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs\n\nRequired branch:\n  feature/rule-engine-spec\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-rule-engine\n\nDependencies:\n  AICOS-W5-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-XAI-001",
+      "project": "AICOS",
+      "stream": "Explainability",
+      "level": 2,
+      "title": "Explainability layer specification",
+      "goal": "Define explanation contracts, evidence lineage, reason codes, model/rule attribution and auditability.",
+      "task_type": "architecture_review",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs",
+      "branch": "feature/explainability-layer",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-explainability",
+      "depends_on": [
+        "AICOS-W5-001"
+      ],
+      "blocks": [
+        "AICOS-RUNTIME-001"
+      ],
+      "parallel_group": "L2-AICOS",
+      "required_capabilities": [
+        "explainable_ai",
+        "auditability"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICOS-XAI-001: Explainability layer specification.\n\nProject: AICOS\nStream: Explainability\nGoal: Define explanation contracts, evidence lineage, reason codes, model/rule attribution and auditability.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS/specs/aicos-specs\n\nRequired branch:\n  feature/explainability-layer\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-explainability\n\nDependencies:\n  AICOS-W5-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-RUNTIME-001",
+      "project": "AICOS",
+      "stream": "Runtime",
+      "level": 2,
+      "title": "AICOS runtime integration baseline",
+      "goal": "Implement the first AICOS runtime slice on AIOS using identity, workspace, memory, API and SDK contracts.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS",
+      "branch": "feature/runtime-integration-baseline",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-runtime",
+      "depends_on": [
+        "AIOS-IDENT-001",
+        "AIOS-API-001",
+        "AIOS-WS-001",
+        "AIOS-MEM-001",
+        "AIOS-SDK-001",
+        "AICOS-AML-001",
+        "AICOS-RULES-001",
+        "AICOS-XAI-001"
+      ],
+      "blocks": [
+        "AICOS-MVP-001",
+        "AICC-INT-001"
+      ],
+      "parallel_group": "L2-INTEGRATION",
+      "required_capabilities": [
+        "python",
+        "aios_sdk",
+        "aml"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICOS-RUNTIME-001: AICOS runtime integration baseline.\n\nProject: AICOS\nStream: Runtime\nGoal: Implement the first AICOS runtime slice on AIOS using identity, workspace, memory, API and SDK contracts.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS\n\nRequired branch:\n  feature/runtime-integration-baseline\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-runtime\n\nDependencies:\n  AIOS-IDENT-001, AIOS-API-001, AIOS-WS-001, AIOS-MEM-001, AIOS-SDK-001, AICOS-AML-001, AICOS-RULES-001, AICOS-XAI-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-GIT-001",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Git Center",
+      "level": 2,
+      "title": "Git Center",
+      "goal": "Deliver repository status, branch/worktree management, diff/review visibility and safe merge preparation in desktop UI.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/git-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-git-center",
+      "depends_on": [
+        "AICC-D2-002"
+      ],
+      "blocks": [
+        "AICC-INT-001",
+        "AICC-SELF-001"
+      ],
+      "parallel_group": "L2-AICC",
+      "required_capabilities": [
+        "git",
+        "desktop_ui"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-GIT-001: Git Center.\n\nProject: AI_COMMAND_CENTER\nStream: Git Center\nGoal: Deliver repository status, branch/worktree management, diff/review visibility and safe merge preparation in desktop UI.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/git-center\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-git-center\n\nDependencies:\n  AICC-D2-002\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PORTFOLIO-CTRL-001",
+      "project": "PORTFOLIO",
+      "stream": "Governance",
+      "level": 2,
+      "title": "Canonical project status register",
+      "goal": "Create the single source of truth for repositories, branches, worktrees, tasks, PRs, status evidence, blockers and orphan detection.",
+      "task_type": "remediation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/portfolio",
+      "branch": "fix/canonical-project-status-register",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/portfolio-canonical-register",
+      "depends_on": [
+        "AICOS-RECON-001",
+        "AICC-D1-002",
+        "AICC-D2-004"
+      ],
+      "blocks": [
+        "AICC-INT-001",
+        "AICC-SELF-001"
+      ],
+      "parallel_group": "L2-GOV",
+      "required_capabilities": [
+        "project_governance",
+        "git",
+        "data_modeling"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PORTFOLIO-CTRL-001: Canonical project status register.\n\nProject: PORTFOLIO\nStream: Governance\nGoal: Create the single source of truth for repositories, branches, worktrees, tasks, PRs, status evidence, blockers and orphan detection.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/portfolio\n\nRequired branch:\n  fix/canonical-project-status-register\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/portfolio-canonical-register\n\nDependencies:\n  AICOS-RECON-001, AICC-D1-002, AICC-D2-004\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-INT-001",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Integration",
+      "level": 2,
+      "title": "Cross-project integration center",
+      "goal": "Connect AIOS, AICOS, Product and Portfolio into one desktop control plane with live state, task execution and evidence.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/cross-project-integration",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-integration",
+      "depends_on": [
+        "AICC-LAUNCH-001",
+        "AICC-D2-001",
+        "AICC-D2-002",
+        "AICC-GIT-001",
+        "AIOS-SDK-001",
+        "AICOS-RUNTIME-001",
+        "PORTFOLIO-CTRL-001"
+      ],
+      "blocks": [
+        "AICC-DIST-001",
+        "AICC-SELF-001",
+        "AICC-ENT-001"
+      ],
+      "parallel_group": "L2-INTEGRATION",
+      "required_capabilities": [
+        "integration",
+        "desktop_ui",
+        "sdk"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-INT-001: Cross-project integration center.\n\nProject: AI_COMMAND_CENTER\nStream: Integration\nGoal: Connect AIOS, AICOS, Product and Portfolio into one desktop control plane with live state, task execution and evidence.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/cross-project-integration\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-integration\n\nDependencies:\n  AICC-D2-001, AICC-D2-002, AICC-GIT-001, AIOS-SDK-001, AICOS-RUNTIME-001, PORTFOLIO-CTRL-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-DOCS-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Documentation",
+      "level": 2,
+      "title": "Documentation portal baseline",
+      "goal": "Create the docs information architecture and baseline content for AIOS, SDK, deployment, AICOS and Command Center.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/documentation-portal",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-docs",
+      "depends_on": [
+        "PRODUCT-README-001",
+        "AIOS-SDK-001"
+      ],
+      "blocks": [
+        "PRODUCT-WEB-002",
+        "PRODUCT-LAUNCH-001"
+      ],
+      "parallel_group": "L2-PRODUCT",
+      "required_capabilities": [
+        "technical_writing",
+        "developer_docs"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-DOCS-001: Documentation portal baseline.\n\nProject: AIOS_PRODUCT\nStream: Documentation\nGoal: Create the docs information architecture and baseline content for AIOS, SDK, deployment, AICOS and Command Center.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/documentation-portal\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-docs\n\nDependencies:\n  PRODUCT-README-001, AIOS-SDK-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-PRICE-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Commercial",
+      "level": 2,
+      "title": "Pricing architecture",
+      "goal": "Define pricing metrics and plans for self-hosted, managed cloud, enterprise, marketplace and federation capacity.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/pricing-architecture",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-pricing",
+      "depends_on": [
+        "PRODUCT-LIC-001"
+      ],
+      "blocks": [
+        "PRODUCT-SALES-001",
+        "PRODUCT-WEB-002"
+      ],
+      "parallel_group": "L2-PRODUCT",
+      "required_capabilities": [
+        "pricing",
+        "commercial_strategy"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-PRICE-001: Pricing architecture.\n\nProject: AIOS_PRODUCT\nStream: Commercial\nGoal: Define pricing metrics and plans for self-hosted, managed cloud, enterprise, marketplace and federation capacity.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/pricing-architecture\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-pricing\n\nDependencies:\n  PRODUCT-LIC-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-DIST-001",
+      "project": "AIOS",
+      "stream": "Distributed Runtime",
+      "level": 3,
+      "title": "Distributed runtime and remote workers",
+      "goal": "Define and implement remote worker registration, execution protocol, leases, retries, heartbeats and failure recovery.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "feature/distributed-runtime",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-distributed-runtime",
+      "depends_on": [
+        "AIOS-INT-001"
+      ],
+      "blocks": [
+        "AICC-DIST-001",
+        "FED-001"
+      ],
+      "parallel_group": "L3-DIST",
+      "required_capabilities": [
+        "distributed_systems",
+        "python"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-DIST-001: Distributed runtime and remote workers.\n\nProject: AIOS\nStream: Distributed Runtime\nGoal: Define and implement remote worker registration, execution protocol, leases, retries, heartbeats and failure recovery.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  feature/distributed-runtime\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-distributed-runtime\n\nDependencies:\n  AIOS-INT-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-INT-001",
+      "project": "AIOS",
+      "stream": "Integration Gate",
+      "level": 3,
+      "title": "AIOS platform integration gate",
+      "goal": "Validate packaging, identity, API, workspace, memory and SDK as one supported platform baseline.",
+      "task_type": "final_gate",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "audit/platform-integration-gate",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-platform-gate",
+      "depends_on": [
+        "AIOS-REL-001",
+        "AIOS-IDENT-001",
+        "AIOS-API-001",
+        "AIOS-WS-001",
+        "AIOS-MEM-001",
+        "AIOS-SDK-001"
+      ],
+      "blocks": [
+        "AIOS-DIST-001",
+        "AICOS-MVP-001",
+        "AIOS-ENT-001"
+      ],
+      "parallel_group": "L3-GATES",
+      "required_capabilities": [
+        "testing",
+        "architecture_review",
+        "release_engineering"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-INT-001: AIOS platform integration gate.\n\nProject: AIOS\nStream: Integration Gate\nGoal: Validate packaging, identity, API, workspace, memory and SDK as one supported platform baseline.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  audit/platform-integration-gate\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-platform-gate\n\nDependencies:\n  AIOS-REL-001, AIOS-IDENT-001, AIOS-API-001, AIOS-WS-001, AIOS-MEM-001, AIOS-SDK-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-MVP-001",
+      "project": "AICOS",
+      "stream": "Product Runtime",
+      "level": 3,
+      "title": "AICOS first deployable AML slice",
+      "goal": "Deliver a deployable end-to-end AML slice on AIOS covering ingestion, detection, alert, case, decision, evidence and audit.",
+      "task_type": "implementation",
+      "priority": "P0",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS",
+      "branch": "feature/first-deployable-aml-slice",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-mvp",
+      "depends_on": [
+        "AICOS-RUNTIME-001",
+        "AIOS-INT-001"
+      ],
+      "blocks": [
+        "AICOS-ENT-001",
+        "PRODUCT-LAUNCH-001"
+      ],
+      "parallel_group": "L3-MVP",
+      "required_capabilities": [
+        "aml",
+        "python",
+        "integration_testing"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICOS-MVP-001: AICOS first deployable AML slice.\n\nProject: AICOS\nStream: Product Runtime\nGoal: Deliver a deployable end-to-end AML slice on AIOS covering ingestion, detection, alert, case, decision, evidence and audit.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS\n\nRequired branch:\n  feature/first-deployable-aml-slice\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-mvp\n\nDependencies:\n  AICOS-RUNTIME-001, AIOS-INT-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-DIST-001",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Distributed Execution",
+      "level": 3,
+      "title": "Distributed scheduler and capacity planner",
+      "goal": "Schedule tasks across local and remote workers using capacity, capability, budget, policy and dependency constraints.",
+      "task_type": "implementation",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/distributed-scheduler",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-distributed",
+      "depends_on": [
+        "AICC-INT-001",
+        "AIOS-DIST-001"
+      ],
+      "blocks": [
+        "FED-001",
+        "AICC-SELF-001"
+      ],
+      "parallel_group": "L3-DIST",
+      "required_capabilities": [
+        "scheduling",
+        "distributed_systems",
+        "optimization"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-DIST-001: Distributed scheduler and capacity planner.\n\nProject: AI_COMMAND_CENTER\nStream: Distributed Execution\nGoal: Schedule tasks across local and remote workers using capacity, capability, budget, policy and dependency constraints.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/distributed-scheduler\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-distributed\n\nDependencies:\n  AICC-INT-001, AIOS-DIST-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "FED-001",
+      "project": "PLATFORM",
+      "stream": "Federation",
+      "level": 4,
+      "title": "Federation protocol and trust model",
+      "goal": "Define trusted cross-organization capacity pools, identity, policy, execution boundaries, accounting and audit.",
+      "task_type": "architecture_review",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/platform-specs",
+      "branch": "feature/federation-protocol",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/platform-federation",
+      "depends_on": [
+        "AIOS-DIST-001",
+        "AICC-DIST-001"
+      ],
+      "blocks": [
+        "FED-002",
+        "AICC-SELF-001"
+      ],
+      "parallel_group": "L4-FED",
+      "required_capabilities": [
+        "distributed_systems",
+        "security",
+        "economics"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task FED-001: Federation protocol and trust model.\n\nProject: PLATFORM\nStream: Federation\nGoal: Define trusted cross-organization capacity pools, identity, policy, execution boundaries, accounting and audit.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/platform-specs\n\nRequired branch:\n  feature/federation-protocol\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/platform-federation\n\nDependencies:\n  AIOS-DIST-001, AICC-DIST-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "FED-002",
+      "project": "PLATFORM",
+      "stream": "Federation",
+      "level": 4,
+      "title": "Federated capacity execution",
+      "goal": "Implement trusted capacity sharing, task decomposition, routing, settlement, quotas and cross-organization evidence.",
+      "task_type": "implementation",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/platform",
+      "branch": "feature/federated-capacity",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/platform-federated-capacity",
+      "depends_on": [
+        "FED-001"
+      ],
+      "blocks": [
+        "AICC-SELF-001",
+        "MARKET-001"
+      ],
+      "parallel_group": "L4-FED",
+      "required_capabilities": [
+        "distributed_systems",
+        "security",
+        "billing"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task FED-002: Federated capacity execution.\n\nProject: PLATFORM\nStream: Federation\nGoal: Implement trusted capacity sharing, task decomposition, routing, settlement, quotas and cross-organization evidence.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/platform\n\nRequired branch:\n  feature/federated-capacity\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/platform-federated-capacity\n\nDependencies:\n  FED-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-SELF-001",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Self Development",
+      "level": 5,
+      "title": "Self-development planning engine",
+      "goal": "Analyze platform state, detect gaps and technical debt, generate and prioritize roadmap tasks, select agents and propose controlled execution.",
+      "task_type": "implementation",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/self-development-engine",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-self-development",
+      "depends_on": [
+        "AICC-INT-001",
+        "AICC-D2-004",
+        "AICC-GIT-001",
+        "PORTFOLIO-CTRL-001",
+        "FED-002"
+      ],
+      "blocks": [
+        "MARKET-001",
+        "GLOBAL-001"
+      ],
+      "parallel_group": "L5-SELF",
+      "required_capabilities": [
+        "planning",
+        "agent_systems",
+        "governance"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-SELF-001: Self-development planning engine.\n\nProject: AI_COMMAND_CENTER\nStream: Self Development\nGoal: Analyze platform state, detect gaps and technical debt, generate and prioritize roadmap tasks, select agents and propose controlled execution.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/self-development-engine\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-self-development\n\nDependencies:\n  AICC-INT-001, AICC-D2-004, AICC-GIT-001, PORTFOLIO-CTRL-001, FED-002\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "MARKET-001",
+      "project": "PLATFORM",
+      "stream": "Ecosystem",
+      "level": 6,
+      "title": "Marketplace and plugin SDK",
+      "goal": "Create extension, agent, module and template distribution with trust, compatibility, licensing and revenue sharing.",
+      "task_type": "architecture_review",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/platform-specs",
+      "branch": "feature/marketplace-plugin-sdk",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/platform-marketplace",
+      "depends_on": [
+        "FED-002",
+        "AICC-SELF-001"
+      ],
+      "blocks": [
+        "GLOBAL-001"
+      ],
+      "parallel_group": "L6-ECOSYSTEM",
+      "required_capabilities": [
+        "platform_ecosystem",
+        "sdk_design",
+        "security"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task MARKET-001: Marketplace and plugin SDK.\n\nProject: PLATFORM\nStream: Ecosystem\nGoal: Create extension, agent, module and template distribution with trust, compatibility, licensing and revenue sharing.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/platform-specs\n\nRequired branch:\n  feature/marketplace-plugin-sdk\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/platform-marketplace\n\nDependencies:\n  FED-002, AICC-SELF-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-WEB-002",
+      "project": "AIOS_PRODUCT",
+      "stream": "Website",
+      "level": 6,
+      "title": "Public website and product pages",
+      "goal": "Build production-ready website content and structure for AIOS, AICOS, Command Center, enterprise, cloud and marketplace.",
+      "task_type": "implementation",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/public-website",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-public-website",
+      "depends_on": [
+        "PRODUCT-WEB-001",
+        "PRODUCT-DOCS-001",
+        "PRODUCT-PRICE-001"
+      ],
+      "blocks": [
+        "PRODUCT-LAUNCH-001"
+      ],
+      "parallel_group": "L6-PRODUCT",
+      "required_capabilities": [
+        "product_marketing",
+        "web_content"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-WEB-002: Public website and product pages.\n\nProject: AIOS_PRODUCT\nStream: Website\nGoal: Build production-ready website content and structure for AIOS, AICOS, Command Center, enterprise, cloud and marketplace.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/public-website\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-public-website\n\nDependencies:\n  PRODUCT-WEB-001, PRODUCT-DOCS-001, PRODUCT-PRICE-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-SALES-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Sales",
+      "level": 6,
+      "title": "Enterprise sales kit",
+      "goal": "Create enterprise decks, solution briefs, security package, ROI model, deployment options and procurement materials.",
+      "task_type": "implementation",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "feature/enterprise-sales-kit",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-sales-kit",
+      "depends_on": [
+        "PRODUCT-LIC-001",
+        "PRODUCT-PRICE-001",
+        "AICOS-MVP-001"
+      ],
+      "blocks": [
+        "PRODUCT-LAUNCH-001"
+      ],
+      "parallel_group": "L6-PRODUCT",
+      "required_capabilities": [
+        "enterprise_sales",
+        "product_marketing"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-SALES-001: Enterprise sales kit.\n\nProject: AIOS_PRODUCT\nStream: Sales\nGoal: Create enterprise decks, solution briefs, security package, ROI model, deployment options and procurement materials.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  feature/enterprise-sales-kit\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-sales-kit\n\nDependencies:\n  PRODUCT-LIC-001, PRODUCT-PRICE-001, AICOS-MVP-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AIOS-ENT-001",
+      "project": "AIOS",
+      "stream": "Enterprise",
+      "level": 7,
+      "title": "Enterprise platform baseline",
+      "goal": "Deliver RBAC, SSO, audit, HA, backup, observability, policy administration and deployment controls.",
+      "task_type": "implementation",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios",
+      "branch": "feature/enterprise-baseline",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-enterprise",
+      "depends_on": [
+        "AIOS-INT-001",
+        "AIOS-IDENT-001"
+      ],
+      "blocks": [
+        "AICC-ENT-001",
+        "AICOS-ENT-001",
+        "GLOBAL-001"
+      ],
+      "parallel_group": "L7-ENTERPRISE",
+      "required_capabilities": [
+        "enterprise_architecture",
+        "security",
+        "operations"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AIOS-ENT-001: Enterprise platform baseline.\n\nProject: AIOS\nStream: Enterprise\nGoal: Deliver RBAC, SSO, audit, HA, backup, observability, policy administration and deployment controls.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios\n\nRequired branch:\n  feature/enterprise-baseline\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-enterprise\n\nDependencies:\n  AIOS-INT-001, AIOS-IDENT-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICOS-ENT-001",
+      "project": "AICOS",
+      "stream": "Enterprise",
+      "level": 7,
+      "title": "AICOS enterprise controls",
+      "goal": "Add jurisdiction management, model/rule governance, audit packages, segregation of duties, reporting and scalable deployment.",
+      "task_type": "implementation",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/AICOS",
+      "branch": "feature/enterprise-controls",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/AICOS/aicos-enterprise",
+      "depends_on": [
+        "AICOS-MVP-001",
+        "AIOS-ENT-001"
+      ],
+      "blocks": [
+        "GLOBAL-001"
+      ],
+      "parallel_group": "L7-ENTERPRISE",
+      "required_capabilities": [
+        "aml",
+        "enterprise_architecture",
+        "governance"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICOS-ENT-001: AICOS enterprise controls.\n\nProject: AICOS\nStream: Enterprise\nGoal: Add jurisdiction management, model/rule governance, audit packages, segregation of duties, reporting and scalable deployment.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/AICOS\n\nRequired branch:\n  feature/enterprise-controls\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/AICOS/aicos-enterprise\n\nDependencies:\n  AICOS-MVP-001, AIOS-ENT-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "AICC-ENT-001",
+      "project": "AI_COMMAND_CENTER",
+      "stream": "Enterprise",
+      "level": 7,
+      "title": "Command Center enterprise operations",
+      "goal": "Add organizational RBAC, approvals, audit, policy controls, cluster operations, monitoring and administrative workflows.",
+      "task_type": "implementation",
+      "priority": "P2",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "feature/enterprise-operations",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-enterprise",
+      "depends_on": [
+        "AICC-INT-001",
+        "AIOS-ENT-001"
+      ],
+      "blocks": [
+        "GLOBAL-001"
+      ],
+      "parallel_group": "L7-ENTERPRISE",
+      "required_capabilities": [
+        "enterprise_architecture",
+        "desktop_ui",
+        "operations"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task AICC-ENT-001: Command Center enterprise operations.\n\nProject: AI_COMMAND_CENTER\nStream: Enterprise\nGoal: Add organizational RBAC, approvals, audit, policy controls, cluster operations, monitoring and administrative workflows.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/ai-command-center\n\nRequired branch:\n  feature/enterprise-operations\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/ai-command-center-enterprise\n\nDependencies:\n  AICC-INT-001, AIOS-ENT-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "PRODUCT-LAUNCH-001",
+      "project": "AIOS_PRODUCT",
+      "stream": "Launch",
+      "level": 8,
+      "title": "Platform launch readiness",
+      "goal": "Validate documentation, website, pricing, sales kit, deployable AICOS slice, support model and launch operations.",
+      "task_type": "final_gate",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/aios/specs/aios-product",
+      "branch": "audit/platform-launch-readiness",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/aios-product-launch",
+      "depends_on": [
+        "PRODUCT-DOCS-001",
+        "PRODUCT-WEB-002",
+        "PRODUCT-SALES-001",
+        "AICOS-MVP-001"
+      ],
+      "blocks": [
+        "GLOBAL-001"
+      ],
+      "parallel_group": "L8-GATES",
+      "required_capabilities": [
+        "product_launch",
+        "final_gate"
+      ],
+      "conflicts_with": [],
+      "critical_path": false,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task PRODUCT-LAUNCH-001: Platform launch readiness.\n\nProject: AIOS_PRODUCT\nStream: Launch\nGoal: Validate documentation, website, pricing, sales kit, deployable AICOS slice, support model and launch operations.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/aios/specs/aios-product\n\nRequired branch:\n  audit/platform-launch-readiness\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/aios-product-launch\n\nDependencies:\n  PRODUCT-DOCS-001, PRODUCT-WEB-002, PRODUCT-SALES-001, AICOS-MVP-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    },
+    {
+      "id": "GLOBAL-001",
+      "project": "PLATFORM",
+      "stream": "Global Platform",
+      "level": 8,
+      "title": "Global AI Platform founder gate",
+      "goal": "Validate AIOS, AICOS, AI Command Center, federation, marketplace, enterprise and product launch as one coherent platform.",
+      "task_type": "final_gate",
+      "priority": "P1",
+      "repository_path": "/Users/dmitrijcernikov/Projects/platform-specs",
+      "branch": "audit/global-platform-founder-gate",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/platform-global-gate",
+      "depends_on": [
+        "AICC-SELF-001",
+        "MARKET-001",
+        "AIOS-ENT-001",
+        "AICOS-ENT-001",
+        "AICC-ENT-001",
+        "PRODUCT-LAUNCH-001"
+      ],
+      "blocks": [],
+      "parallel_group": "L8-GATES",
+      "required_capabilities": [
+        "architecture_review",
+        "product_strategy",
+        "final_gate"
+      ],
+      "conflicts_with": [],
+      "critical_path": true,
+      "status": "Blocked",
+      "ready_to_start": false,
+      "prompt": "You are executing task GLOBAL-001: Global AI Platform founder gate.\n\nProject: PLATFORM\nStream: Global Platform\nGoal: Validate AIOS, AICOS, AI Command Center, federation, marketplace, enterprise and product launch as one coherent platform.\n\nRepository:\n  /Users/dmitrijcernikov/Projects/platform-specs\n\nRequired branch:\n  audit/global-platform-founder-gate\n\nRequired isolated worktree:\n  /Users/dmitrijcernikov/Projects/platform-global-gate\n\nDependencies:\n  AICC-SELF-001, MARKET-001, AIOS-ENT-001, AICOS-ENT-001, AICC-ENT-001, PRODUCT-LAUNCH-001\n\nExecution rules:\n1. Start by recording repository root, current branch, HEAD, origin/main, worktree list and git status.\n2. Create or use only the dedicated worktree and branch above.\n3. Do not modify another task's worktree or branch.\n4. Preserve all pre-existing untracked and modified files.\n5. Read the relevant architecture, roadmap, ADR, tests and source files fully before editing.\n6. Treat claims as untrusted until verified in code, Git history or tests.\n7. Add regression tests for every corrected defect.\n8. Run the repository's complete required validation suite.\n9. Do not merge. Commit only when the implementation and validation are complete.\n10. Produce a final report containing baseline, changes, tests, risks, commit SHA,\n    dependency impact and readiness for independent review.\n\nAcceptance:\n- The stated goal is demonstrably complete.\n- All dependency assumptions are documented.\n- No unrelated files are changed.\n- The worktree is clean after commit.\n- The result can be independently reviewed and merged without hidden local state."
+    }
+  ]
+}

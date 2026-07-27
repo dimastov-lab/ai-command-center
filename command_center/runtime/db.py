@@ -29,15 +29,19 @@ event write before it goes back to reading the next line of subprocess output.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 from command_center import storage
 from command_center.models import iso_now, new_id
+from command_center.runtime import autonomy as autonomy_domain
+from command_center.runtime import completion as completion_domain
 
 
 def _new_session_id() -> str:
@@ -85,9 +89,17 @@ EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED"
 # by `update_run_state` before it ever reaches SQL — in particular, no terminal
 # state can transition anywhere, so a terminal run can never be silently moved
 # back to RUNNING (or anywhere else).
+#
+# PREPARED/QUEUED both also allow INTERRUPTED/UNKNOWN — the same crash-
+# recovery targets RUNNING already allowed — because `Supervisor.reconcile()`
+# now inspects every `EXECUTION_CENTER_ACTIVE_STATES` row at startup, not just
+# RUNNING ones: a Supervisor process can crash between `create_run` (PREPARED)
+# or the QUEUED transition and the process actually being launched, leaving a
+# row that would otherwise sit stuck "active" forever (and, since Sprint
+# 2's workspace lock, forever blocking that workspace).
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "PREPARED": frozenset({"QUEUED", "CANCELLED", "FAILED"}),
-    "QUEUED": frozenset({"RUNNING", "CANCELLED", "FAILED"}),
+    "PREPARED": frozenset({"QUEUED", "CANCELLED", "FAILED", "INTERRUPTED", "UNKNOWN"}),
+    "QUEUED": frozenset({"RUNNING", "CANCELLED", "FAILED", "INTERRUPTED", "UNKNOWN"}),
     "RUNNING": frozenset({"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "UNKNOWN"}),
     "COMPLETED": frozenset(),
     "FAILED": frozenset(),
@@ -107,8 +119,73 @@ class InvalidTransitionError(Exception):
     """Raised when a run-state transition is not in `ALLOWED_TRANSITIONS`."""
 
 
+class InvalidCompletionTransitionError(Exception):
+    """Raised when an `update_completion` call would move `completion_state`
+    along an illegal edge (a backward jump, or any move out of a terminal
+    state) — see `runtime.completion.COMPLETION_TRANSITIONS`. Same-state updates
+    (retry metadata / evidence enrichment) are always permitted. This is the
+    completion-pipeline analogue of `InvalidTransitionError` for `run.state`."""
+
+
+class InvalidProposalTransitionError(Exception):
+    """Raised when an `update_proposal` call would move `state` along an illegal
+    edge (a backward jump, or any move out of a terminal state) — see
+    `runtime.autonomy.PROPOSAL_TRANSITIONS`. This is the autonomy-proposal
+    analogue of `InvalidCompletionTransitionError`."""
+
+
+class ProposalFieldFrozenError(Exception):
+    """Raised when proposal fields are mutated outside the lifecycle states in
+    which they are authoritative. In particular, the action, policy, evidence
+    digest, eligibility verdict, and execution plan are frozen after assessment."""
+
+
+class ProposalEvidenceFrozenError(Exception):
+    """Raised when evidence is appended after proposal assessment has begun."""
+
+
 class LostUpdateError(Exception):
     """Raised when a compare-and-set update loses the race (version mismatch)."""
+
+
+class WorkspaceLockedError(Exception):
+    """Raised by `create_run(..., enforce_workspace_lock=True)` when another
+    run is already active (`EXECUTION_CENTER_ACTIVE_STATES`) against the same
+    `repository_path`. Carries the conflicting run so the caller can report
+    it (id, state, task_id, ...) rather than just a message.
+
+    The check-then-insert this guards against is done inside the *same*
+    `BEGIN IMMEDIATE` transaction as the new row's `INSERT` (see
+    `create_run`), not as a separate query beforehand — `BEGIN IMMEDIATE`
+    takes SQLite's write lock up front, so two concurrent callers targeting
+    the same workspace serialize here instead of racing: whichever commits
+    first makes the row the second one's own conflict check will see."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Workspace {conflicting_run['repository_path']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r})."
+        )
+
+
+class GlobalConcurrencyLimitError(Exception):
+    """Raised by `create_run(..., max_global_concurrency=N)` when N runs are
+    already active (`EXECUTION_CENTER_ACTIVE_STATES`) across *all* workspaces.
+
+    Enforced inside `create_run`'s own `BEGIN IMMEDIATE` transaction (like the
+    workspace lock above), so the global cap is a true atomic invariant every
+    launch path shares — not an advisory pre-flight count that each entry point
+    (the scheduler, the queue's `launch_ready`, portfolio launches, the review
+    gate) has to remember to run and that a batch 'launch all READY' would race
+    straight past."""
+
+    def __init__(self, active_count: int, limit: int) -> None:
+        self.active_count = active_count
+        self.limit = limit
+        super().__init__(
+            f"Global concurrency limit reached ({active_count}/{limit} runs already active)."
+        )
 
 
 class UnknownRunFieldError(Exception):
@@ -140,6 +217,12 @@ _UPDATABLE_RUN_FIELDS: frozenset[str] = frozenset(
         "started_at",
         "completed_at",
         "failure_reason",
+        # First moment the spawned process produced any output on stdout/
+        # stderr — the "Claude startup/handshake" milestone, distinct from
+        # `started_at` (the moment `Popen` returned a live PID). Written once,
+        # best-effort, by the stdout/stderr reader threads (see
+        # `supervisor._record_handshake`); its absence never fails a run.
+        "first_output_at",
         # v2 Live Execution Center fields (migration 3) — commit_hash/
         # pull_request_url are the only ones ever set post-create (once, at
         # terminal-state task sync, via `set_run_result_fields`);
@@ -163,7 +246,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 10
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -291,6 +374,272 @@ def _migration_3_add_live_execution_center_v2_fields(conn: sqlite3.Connection) -
             conn.execute("ALTER TABLE run ADD COLUMN prompt_version INTEGER")
 
 
+def _migration_4_add_first_output_at(conn: sqlite3.Connection) -> None:
+    """Adds `run.first_output_at` (ISO timestamp of the first stdout/stderr
+    line the spawned process produced — the "Claude startup/handshake"
+    milestone, recorded once, best-effort, by the supervisor's reader
+    threads; see `supervisor._record_handshake`).
+
+    This column is the persisted signal that lets the display layer
+    distinguish a run that has *spawned but not yet spoken* (a valid PID, no
+    output yet — `session_view.STATUS_STARTING`) from one that is genuinely
+    streaming output (`STATUS_RUNNING`), so a slow-to-handshake but perfectly
+    healthy run is never surfaced as a failure. Its absence is never itself a
+    failure — a run that exits cleanly having produced no stdout at all still
+    leaves this NULL and is classified purely on its exit facts.
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2
+    and 3 — safe to re-run against a db where this migration was already
+    (fully or partially) applied, and safe under genuine concurrent execution
+    via the same `BEGIN IMMEDIATE` transaction.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "first_output_at" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN first_output_at TEXT")
+
+
+def _migration_9_add_execution_provider_fields(conn: sqlite3.Connection) -> None:
+    """Persist the selected provider and its redacted, deterministic launch metadata."""
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "provider_id" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'claude_code'")
+        if "provider_metadata_json" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_metadata_json TEXT")
+
+
+# Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
+# run drives a *separate* state machine — the post-execution "is the engineering
+# task actually merged into the target branch" lifecycle — distinct from and
+# additive to the `run` row's execution state machine (which stays terminal once
+# a process exits). It is a mutable current-state row, guarded by the same
+# `version` compare-and-set column pattern as `run`. `completion_validation`
+# records one row per validation command per attempt (bounded stdout/stderr
+# summaries, never unbounded logs). `completion_event` is an append-only audit
+# trail of the completion lifecycle (PR created, closed-unmerged, merged,
+# target-branch verified, ...), ordered by a per-run monotonic `seq`, mirroring
+# `run_event`.
+_SCHEMA_V5 = """
+CREATE TABLE IF NOT EXISTS completion (
+    run_id TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES session(id) ON DELETE CASCADE,
+    project TEXT NOT NULL,
+    repository_path TEXT NOT NULL,
+    branch TEXT,
+    base_branch TEXT,
+    head_commit TEXT,
+    remote TEXT,
+    remote_branch TEXT,
+    pull_request_number INTEGER,
+    pull_request_url TEXT,
+    pull_request_state TEXT,
+    replaced_pull_request_number INTEGER,
+    replaced_pull_request_url TEXT,
+    merge_commit TEXT,
+    merge_mode TEXT,
+    merge_method TEXT,
+    completion_state TEXT NOT NULL,
+    last_reason_code TEXT,
+    requires_human INTEGER NOT NULL DEFAULT 0,
+    is_recoverable INTEGER NOT NULL DEFAULT 0,
+    recommended_action TEXT,
+    validation_summary TEXT,
+    policy_json TEXT,
+    last_checked_at TEXT,
+    next_retry_at TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    recovery_count INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_task_id ON completion(task_id);
+CREATE INDEX IF NOT EXISTS idx_completion_state ON completion(completion_state);
+
+CREATE TABLE IF NOT EXISTS completion_validation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL,
+    command TEXT NOT NULL,
+    exit_code INTEGER,
+    started_at TEXT,
+    finished_at TEXT,
+    stdout_summary TEXT,
+    stderr_summary TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_validation_run_id ON completion_validation(run_id);
+
+CREATE TABLE IF NOT EXISTS completion_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    reason_code TEXT,
+    message TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_event_run_id ON completion_event(run_id);
+"""
+
+
+# Autonomy proposal foundation (AICC-AUTONOMY-002). The pre-execution decision
+# layer: a proposal is an evidence-backed, risk-classified suggestion that moves
+# through the `runtime.autonomy` state machine under an explicit policy. It never
+# executes anything itself — `dispatched_run_id`/`dispatched_task_id` only ever
+# *record* an execution the caller performed through the existing routes.
+#
+#   proposal          -- one mutable current-state row per proposal, guarded by
+#                        a `version` column (compare-and-set) and the
+#                        `autonomy.is_valid_proposal_transition` structural guard.
+#   proposal_evidence -- append-only, immutable. The observations a decision was
+#                        made on; never updated, so the audit trail cannot be
+#                        rewritten after the fact.
+#   proposal_event    -- append-only audit trail, ordered by per-proposal `seq`.
+_SCHEMA_V6 = """
+CREATE TABLE IF NOT EXISTS proposal (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    project TEXT NOT NULL,
+    task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    state TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    policy_json TEXT,
+    eligibility_json TEXT,
+    plan_json TEXT,
+    evidence_digest TEXT,
+    requires_human INTEGER NOT NULL DEFAULT 1,
+    last_reason_code TEXT,
+    decided_by TEXT,
+    decision_reason TEXT,
+    dispatched_run_id TEXT REFERENCES run(id) ON DELETE SET NULL,
+    dispatched_task_id TEXT REFERENCES task(id) ON DELETE SET NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_state ON proposal(state);
+CREATE INDEX IF NOT EXISTS idx_proposal_project ON proposal(project);
+CREATE INDEX IF NOT EXISTS idx_proposal_task_id ON proposal(task_id);
+
+CREATE TABLE IF NOT EXISTS proposal_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id TEXT NOT NULL REFERENCES proposal(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    summary TEXT,
+    observed_at TEXT NOT NULL,
+    is_blocker INTEGER NOT NULL DEFAULT 0,
+    data_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(proposal_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_evidence_proposal_id ON proposal_evidence(proposal_id);
+
+CREATE TABLE IF NOT EXISTS proposal_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id TEXT NOT NULL REFERENCES proposal(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT,
+    actor TEXT,
+    reason_code TEXT,
+    message TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(proposal_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_event_proposal_id ON proposal_event(proposal_id);
+"""
+
+
+def _migration_7_add_proposal_parameters_json(conn: sqlite3.Connection) -> None:
+    """Add the immutable, canonical action payload approved by a proposal.
+
+    Existing schema-6 databases contain proposals without a structured action
+    payload. Backfill those rows with the empty-object sentinel rather than
+    NULL so every caller can safely parse `parameters_json` after migration.
+    The check-and-add runs under the same write lock used by earlier callable
+    migrations, making concurrent and repeated migration attempts safe.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(proposal)").fetchall()}
+        if "parameters_json" not in existing:
+            conn.execute(
+                "ALTER TABLE proposal "
+                "ADD COLUMN parameters_json TEXT NOT NULL DEFAULT '{}'"
+            )
+
+
+def _migration_8_add_independent_review_fields(conn: sqlite3.Connection) -> None:
+    """Add the independent-review verdict to `completion`.
+
+    The blocking review gate needs three facts per completion: which run
+    produced the verdict, what the verdict was, and the reviewer's reasoning.
+    They live on the completion row rather than in a side table because there is
+    exactly one review outcome per completion and it is read on the same access
+    path as every other completion field.
+
+    Existing schema-7 databases keep NULLs, which read as "no verdict yet" — the
+    same thing a brand-new row means. That is the safe direction: with the gate
+    enabled, no verdict means *wait*, never *proceed*. The check-and-add runs
+    under the same write lock as the earlier callable migrations, so concurrent
+    and repeated migration attempts are safe.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(completion)").fetchall()}
+        for column in ("review_verdict", "review_run_id", "review_summary"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE completion ADD COLUMN {column} TEXT")
+
+
+_SCHEMA_V10 = """
+-- ADR 0007 step 1: the execution queue's home in the execution-state store.
+--
+-- Mirrors `data/execution_queue.json`'s entry shape exactly, field for field,
+-- because during the dual-write phases the two must be comparable without any
+-- translation — a divergence check that had to normalise shapes first would be
+-- checking its own translation as much as the data.
+--
+-- `task_id` is deliberately NOT a foreign key. The task lives in tasks.json,
+-- which stays a human-editable file (see the ADR); the queue's reference to it
+-- is advisory, and an entry whose task has vanished resolves to `cancelled`
+-- with a reason, exactly as `evaluate_readiness` already does today.
+CREATE TABLE IF NOT EXISTS queue_entry (
+    id            TEXT PRIMARY KEY,
+    task_id       TEXT,
+    project       TEXT,
+    state         TEXT NOT NULL,
+    reason        TEXT,
+    run_id        TEXT,
+    added_at      TEXT,
+    evaluated_at  TEXT,
+    launched_at   TEXT,
+    -- Preserves the JSON file's list order, which is load-bearing: the queue is
+    -- displayed and planned in insertion order, and a set-shaped table would
+    -- silently reorder it.
+    position      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_entry_state ON queue_entry(state);
+CREATE INDEX IF NOT EXISTS idx_queue_entry_task ON queue_entry(task_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -298,6 +647,18 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (1, _SCHEMA_V1),
     (2, _migration_2_add_failure_reason),
     (3, _migration_3_add_live_execution_center_v2_fields),
+    (4, _migration_4_add_first_output_at),
+    (5, _SCHEMA_V5),
+    (6, _SCHEMA_V6),
+    (7, _migration_7_add_proposal_parameters_json),
+    (8, _migration_8_add_independent_review_fields),
+    # Renumbered from 6 on integration: the execution-provider branch and the
+    # autonomy/review work both grew migrations from a shared base of 5, so this
+    # one moves to the end of the sequence. Its content is unchanged and it is
+    # idempotent, so a database that already ran it under the old number simply
+    # finds the columns present.
+    (9, _migration_9_add_execution_provider_fields),
+    (10, _SCHEMA_V10),
 ]
 
 
@@ -467,6 +828,79 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
+    # Optional, operator-opted-in retention: run after the migration connection
+    # above has closed so VACUUM (if enabled) does not contend with it. See
+    # `apply_runtime_retention`.
+    maybe_apply_runtime_retention(db_path)
+
+
+def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
+    """Delete `run_event` rows (and orphaned `report` rows) for runs that have
+    been terminal for longer than `retention_days`, returning the number of
+    `run_event` rows removed.
+
+    Bounded and conservative:
+      * only *terminal* runs are eligible (their events are historical audit
+        trail, not live state);
+      * the cutoff is computed in Python with the same naive-local ISO
+        convention every other timestamp in this app uses (`models.iso_now`),
+        so it never disagrees with `completed_at` by a UTC offset;
+      * the run row itself is kept (its `state`/`completed_at` remain visible
+        in the Execution Center and to reconciliation); only the bulky
+        per-output-event history is pruned;
+      * runs with a NULL `completed_at` are left untouched.
+
+    Does not VACUUM here — reclaiming disk is a separate, heavier, lock-holding
+    operation the operator should run deliberately (see `maybe_apply_runtime_retention`).
+    """
+    if retention_days <= 0:
+        return 0
+    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in TERMINAL_STATES)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            cur = conn.execute(
+                f"""
+                DELETE FROM run_event
+                 WHERE run_id IN (
+                    SELECT id FROM run
+                     WHERE state IN ({placeholders})
+                       AND completed_at IS NOT NULL
+                       AND completed_at < ?
+                 )
+                """,
+                (*TERMINAL_STATES, cutoff),
+            )
+            removed = cur.rowcount
+        # `report` rows cascade-delete with `run` via FK, but a terminal run's
+        # report file on disk is also historical; leave the DB row (the path is
+        # small) — only events are bulky.
+    return removed
+
+
+def maybe_apply_runtime_retention(db_path: Path) -> None:
+    """Apply retention iff the operator set `AICC_RUNTIME_RETENTION_DAYS` to a
+    positive integer. Default (unset / <= 0) is a no-op, so this never changes
+    behavior for existing installs or the test suite.
+
+    A companion `AICC_RUNTIME_VACUUM_ON_START=1` runs `VACUUM` after pruning to
+    reclaim disk. VACUUM rewrites the whole database under an exclusive lock, so
+    it is opt-in and should only be enabled on a single-host install that can
+    pause other writers briefly.
+    """
+    raw = os.environ.get("AICC_RUNTIME_RETENTION_DAYS")
+    if not raw:
+        return
+    try:
+        retention_days = int(raw)
+    except ValueError:
+        return
+    if retention_days <= 0:
+        return
+    apply_runtime_retention(db_path, retention_days=retention_days)
+    if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
+        with connect(db_path) as conn:
+            conn.execute("VACUUM")
 
 
 def current_schema_version(db_path: Path) -> int:
@@ -603,13 +1037,56 @@ def create_run(
     expected_branch: str | None = None,
     launch_source: str | None = None,
     prompt_version: int | None = None,
+    provider_id: str = "claude_code",
+    provider_metadata_json: str | None = None,
+    enforce_workspace_lock: bool = False,
+    max_global_concurrency: int | None = None,
 ) -> dict:
     """`expected_branch`/`launch_source`/`prompt_version` are write-once, like
     `project`/`task_type`/`repository_path` above — resolved by the caller
     once at launch time and never recomputed or overwritten afterward (they
-    are deliberately absent from `_UPDATABLE_RUN_FIELDS`)."""
+    are deliberately absent from `_UPDATABLE_RUN_FIELDS`).
+
+    `enforce_workspace_lock`, default `False`, preserves this function's
+    original behavior for every direct/low-level caller (including this
+    module's own test suite, which routinely creates several concurrently-
+    "active" `run` rows against the same throwaway `repository_path` purely
+    to exercise persistence mechanics, with no process ever actually
+    running). Only `Supervisor.start_raw` — the one path that actually spawns
+    a subprocess against `repository_path` — passes `True`. When it does, the
+    conflict check (any other row already in `EXECUTION_CENTER_ACTIVE_STATES`
+    for this exact `repository_path`) runs inside this same `BEGIN IMMEDIATE`
+    transaction as the `INSERT`, so it cannot lose a race against a second,
+    concurrent `create_run(..., enforce_workspace_lock=True)` call for the
+    same workspace the way a separate pre-flight query (e.g. `launch_service.
+    find_active_run_conflict`) can — raises `WorkspaceLockedError` instead of
+    inserting."""
     with connect(db_path) as conn:
         with transaction(conn):
+            if enforce_workspace_lock:
+                placeholders = ", ".join("?" for _ in EXECUTION_CENTER_ACTIVE_STATES)
+                conflict = conn.execute(
+                    f"SELECT * FROM run WHERE repository_path = ? AND state IN ({placeholders})",
+                    (repository_path, *EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()
+                if conflict is not None:
+                    raise WorkspaceLockedError(_row_to_dict(conflict))
+
+            if max_global_concurrency is not None:
+                # Global cap as an atomic invariant, in the SAME transaction as
+                # the INSERT (like the workspace lock above): count every run
+                # currently active across all workspaces and refuse the launch if
+                # the cap is already met. Two concurrent launches serialize on the
+                # BEGIN IMMEDIATE write lock, so they cannot both slip past the
+                # count — the way per-caller pre-flight checks can.
+                placeholders = ", ".join("?" for _ in EXECUTION_CENTER_ACTIVE_STATES)
+                active_count = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM run WHERE state IN ({placeholders})",
+                    tuple(EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()["n"]
+                if active_count >= max_global_concurrency:
+                    raise GlobalConcurrencyLimitError(active_count, max_global_concurrency)
+
             row = conn.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM run WHERE session_id = ?",
                 (session_id,),
@@ -642,28 +1119,25 @@ def create_run(
                 "expected_branch": expected_branch,
                 "launch_source": launch_source,
                 "prompt_version": prompt_version,
+                "provider_id": provider_id,
+                "provider_metadata_json": provider_metadata_json,
                 "commit_hash": None,
                 "pull_request_url": None,
                 "version": 0,
                 "created_at": now,
                 "updated_at": now,
             }
+            # Build the column list from the table as it exists rather than
+            # from a fixed literal. A database migrated only part-way — which
+            # is exactly what the historical-schema migration tests construct —
+            # has no `provider_*` columns yet, and naming them unconditionally
+            # would make `create_run` unusable against any schema older than
+            # the one that introduced them.
+            table_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+            insert_columns = [name for name in record if name in table_columns]
             conn.execute(
-                """INSERT INTO run (
-                    id, session_id, task_id, sequence, is_resume, state, project, task_type,
-                    repository_path, prompt, command_json, timeout_seconds, pid,
-                    process_start_identity, pre_run_git_status, post_run_git_status,
-                    working_tree_changed, exit_code, cancel_requested, cancel_requested_at,
-                    started_at, completed_at, expected_branch, launch_source, prompt_version,
-                    commit_hash, pull_request_url, version, created_at, updated_at
-                ) VALUES (
-                    :id, :session_id, :task_id, :sequence, :is_resume, :state, :project, :task_type,
-                    :repository_path, :prompt, :command_json, :timeout_seconds, :pid,
-                    :process_start_identity, :pre_run_git_status, :post_run_git_status,
-                    :working_tree_changed, :exit_code, :cancel_requested, :cancel_requested_at,
-                    :started_at, :completed_at, :expected_branch, :launch_source, :prompt_version,
-                    :commit_hash, :pull_request_url, :version, :created_at, :updated_at
-                )""",
+                f"""INSERT INTO run ({", ".join(insert_columns)})
+                    VALUES ({", ".join(f":{name}" for name in insert_columns)})""",
                 record,
             )
     return record
@@ -914,6 +1388,33 @@ def tail_run_events(db_path: Path, run_id: str, *, limit: int = 200) -> list[dic
         return events
 
 
+def latest_events_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """The single most recent event per run, keyed by run_id — one query for a
+    whole board instead of a `sqlite3.connect()` per run (audit H5 N+1). Same
+    shaping as `tail_run_events` (payload_json decoded into `payload`). Uses a
+    MAX(seq) join rather than a window function so it works on any SQLite the
+    rest of the module targets."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT e.run_id, e.seq, e.event_type, e.payload_json, e.created_at
+                FROM run_event e
+                JOIN (
+                    SELECT run_id, MAX(seq) AS mx FROM run_event
+                    WHERE run_id IN ({placeholders}) GROUP BY run_id
+                ) m ON e.run_id = m.run_id AND e.seq = m.mx""",
+            tuple(run_ids),
+        ).fetchall()
+    result: dict[str, dict] = {}
+    for row in rows:
+        event = dict(row)
+        event["payload"] = json.loads(event.pop("payload_json"))
+        result[event["run_id"]] = event
+    return result
+
+
 # --------------------------------------------------------------------------
 # Report (immutable, at most one per run)
 # --------------------------------------------------------------------------
@@ -934,3 +1435,1118 @@ def get_report(db_path: Path, run_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM report WHERE run_id = ?", (run_id,)).fetchone()
         return _row_to_dict(row)
+
+
+def get_reports_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `get_report` keyed by run_id — one query for a whole board
+    instead of a `sqlite3.connect()` per run (audit H5 N+1)."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM report WHERE run_id IN ({placeholders})", tuple(run_ids)
+        ).fetchall()
+    return {row["run_id"]: _row_to_dict(row) for row in rows}
+
+
+# --------------------------------------------------------------------------
+# Completion pipeline (AICC-AUTONOMY-001)
+#
+# One `completion` row per run. Like `run`, it is a mutable current-state row
+# updated only through a compare-and-set (`update_completion`) that bumps
+# `version`; the set of columns that update may touch is the allowlist below
+# (write-once identity columns — run_id/task_id/project/created_at — are
+# deliberately absent). The completion *state* string is validated by the
+# domain layer (`runtime.completion`), not here, so this module stays agnostic
+# to the lifecycle vocabulary.
+# --------------------------------------------------------------------------
+
+_UPDATABLE_COMPLETION_FIELDS: frozenset[str] = frozenset(
+    {
+        "session_id",
+        "branch",
+        "base_branch",
+        "head_commit",
+        "remote",
+        "remote_branch",
+        "pull_request_number",
+        "pull_request_url",
+        "pull_request_state",
+        "replaced_pull_request_number",
+        "replaced_pull_request_url",
+        "merge_commit",
+        "merge_mode",
+        "merge_method",
+        "completion_state",
+        "last_reason_code",
+        "requires_human",
+        "is_recoverable",
+        "recommended_action",
+        "validation_summary",
+        "review_verdict",
+        "review_run_id",
+        "review_summary",
+        "policy_json",
+        "last_checked_at",
+        "next_retry_at",
+        "retry_count",
+        "recovery_count",
+    }
+)
+
+
+def _validate_updatable_completion_fields(fields: dict) -> None:
+    unknown = set(fields) - _UPDATABLE_COMPLETION_FIELDS
+    if unknown:
+        raise UnknownRunFieldError(f"Not an updatable completion field: {sorted(unknown)}")
+
+
+_COMPLETION_INSERT_COLUMNS: tuple[str, ...] = (
+    "run_id",
+    "task_id",
+    "session_id",
+    "project",
+    "repository_path",
+    "branch",
+    "base_branch",
+    "head_commit",
+    "remote",
+    "remote_branch",
+    "pull_request_number",
+    "pull_request_url",
+    "pull_request_state",
+    "replaced_pull_request_number",
+    "replaced_pull_request_url",
+    "merge_commit",
+    "merge_mode",
+    "merge_method",
+    "completion_state",
+    "last_reason_code",
+    "requires_human",
+    "is_recoverable",
+    "recommended_action",
+    "validation_summary",
+    "policy_json",
+    "last_checked_at",
+    "next_retry_at",
+    "retry_count",
+    "recovery_count",
+    "version",
+    "created_at",
+    "updated_at",
+)
+
+
+def create_completion(
+    db_path: Path,
+    *,
+    run_id: str,
+    task_id: str,
+    project: str,
+    repository_path: str,
+    completion_state: str,
+    session_id: str | None = None,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    head_commit: str | None = None,
+    remote: str | None = None,
+    remote_branch: str | None = None,
+    merge_mode: str | None = None,
+    merge_method: str | None = None,
+    policy_json: str | None = None,
+    last_reason_code: str | None = None,
+) -> dict:
+    """Create the single `completion` row for a run.
+
+    Raises `sqlite3.IntegrityError` if a completion row already exists for the
+    run (the PRIMARY KEY on `run_id`) — this is the pipeline's restart-safe
+    idempotency guard: callers (`runtime.completion_service.begin_completion`)
+    check `get_completion` first, so a re-processed terminal run never gets a
+    second completion row (and therefore never a duplicate PR)."""
+    now = iso_now()
+    record = {name: None for name in _COMPLETION_INSERT_COLUMNS}
+    record.update(
+        {
+            "run_id": run_id,
+            "task_id": task_id,
+            "session_id": session_id,
+            "project": project,
+            "repository_path": repository_path,
+            "branch": branch,
+            "base_branch": base_branch,
+            "head_commit": head_commit,
+            "remote": remote,
+            "remote_branch": remote_branch,
+            "merge_mode": merge_mode,
+            "merge_method": merge_method,
+            "completion_state": completion_state,
+            "last_reason_code": last_reason_code,
+            "requires_human": 0,
+            "is_recoverable": 0,
+            "policy_json": policy_json,
+            "retry_count": 0,
+            "recovery_count": 0,
+            "version": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    columns = ", ".join(_COMPLETION_INSERT_COLUMNS)
+    placeholders = ", ".join(f":{name}" for name in _COMPLETION_INSERT_COLUMNS)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(f"INSERT INTO completion ({columns}) VALUES ({placeholders})", record)
+    return record
+
+
+def get_completion(db_path: Path, run_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM completion WHERE run_id = ?", (run_id,)).fetchone()
+        return _row_to_dict(row)
+
+
+def get_completions_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `get_completion` keyed by run_id — one query for a whole board
+    of runs instead of one `sqlite3.connect()` per run (audit H5 N+1). Runs with
+    no completion row are simply absent from the result."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM completion WHERE run_id IN ({placeholders})", tuple(run_ids)
+        ).fetchall()
+    return {row["run_id"]: _row_to_dict(row) for row in rows}
+
+
+def get_completion_by_task(db_path: Path, task_id: str) -> dict | None:
+    """The most recently created completion row for a task (there is one per
+    run, and a task may have several runs over time).
+
+    `created_at` is an ISO timestamp at *second* resolution, so two completions
+    for the same task created within the same second tie, and a bare
+    `ORDER BY created_at DESC` would return an arbitrary one of them. That is
+    not hypothetical: an automatic rework relaunches a task as soon as its
+    failure is observed, so several completions per task is the normal case, and
+    a caller reading the stale row would act on a failure that has already been
+    superseded. `rowid` — monotonic per insert — breaks the tie in true
+    insertion order."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def list_completions(
+    db_path: Path,
+    *,
+    states: Iterable[str] | None = None,
+    due_before: str | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """List completion rows, optionally restricted to a set of
+    `completion_state` values and to rows whose `next_retry_at` is due
+    (NULL, i.e. never scheduled, or `<= due_before`). Used by the bounded
+    completion poller to find work without scanning terminal rows."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    states = list(states) if states is not None else None
+    if states is not None:
+        if not states:
+            return []
+        placeholders = ", ".join("?" for _ in states)
+        clauses.append(f"completion_state IN ({placeholders})")
+        params.extend(states)
+    if due_before is not None:
+        clauses.append("(next_retry_at IS NULL OR next_retry_at <= ?)")
+        params.append(due_before)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    if limit < 0:
+        raise ValueError(f"limit must be non-negative, got {limit}")
+    params.append(limit)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM completion{where} ORDER BY created_at ASC LIMIT ?", params
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_completion(db_path: Path, run_id: str, *, expected_version: int, fields: dict) -> dict:
+    """Compare-and-set update of a `completion` row, mirroring
+    `update_run_fields`: validates `fields` against
+    `_UPDATABLE_COMPLETION_FIELDS`, bumps `version`, sets `updated_at`, and
+    raises `LostUpdateError` if `expected_version` no longer matches."""
+    fields = dict(fields)
+    fields.pop("version", None)
+    fields.pop("created_at", None)
+    _validate_updatable_completion_fields(fields)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT completion_state, version FROM completion WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No such completion: {run_id!r}")
+            # Compare-and-set FIRST: a caller whose `expected_version` no longer
+            # matches has read a stale row, so it must lose with `LostUpdateError`
+            # *before* we judge its intended transition against a state it never
+            # saw. Evaluating the transition guard first would let a stale loser
+            # be reported as an `InvalidCompletionTransitionError` (its stale
+            # target measured against the winner's newer state) — misclassifying
+            # benign concurrency as a hard state-machine violation. See
+            # AICC-AUTONOMY-002.
+            if row["version"] != expected_version:
+                raise LostUpdateError(
+                    f"Completion {run_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
+                )
+            # Structural transition guard (mirrors `update_run_state`): once the
+            # caller is confirmed to be operating on the current row version,
+            # reject an illegal completion-state move (a backward jump or a move
+            # out of a terminal state). A same-state / metadata-only update (no
+            # `completion_state` in `fields`) is always allowed.
+            new_state = fields.get("completion_state")
+            if new_state is not None and not completion_domain.is_valid_completion_transition(
+                row["completion_state"], new_state
+            ):
+                raise InvalidCompletionTransitionError(
+                    f"Completion {run_id!r} cannot transition {row['completion_state']!r} -> {new_state!r}"
+                )
+            fields["updated_at"] = iso_now()
+            set_clause = ", ".join(f"{key} = :{key}" for key in fields)
+            params = dict(fields)
+            params["run_id"] = run_id
+            params["expected_version"] = expected_version
+            cur = conn.execute(
+                f"""UPDATE completion SET {set_clause}, version = version + 1
+                    WHERE run_id = :run_id AND version = :expected_version""",
+                params,
+            )
+            if cur.rowcount != 1:
+                raise LostUpdateError(f"Completion {run_id!r} update affected {cur.rowcount} rows")
+            updated = conn.execute("SELECT * FROM completion WHERE run_id = ?", (run_id,)).fetchone()
+            return dict(updated)
+
+
+def append_completion_event(
+    db_path: Path,
+    run_id: str,
+    event_type: str,
+    *,
+    reason_code: str | None = None,
+    message: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    """Append one completion audit event and return its per-run sequence
+    number. `metadata` is JSON-encoded; callers must never place credentials,
+    tokens, or environment dumps in it (see `runtime.completion_service`)."""
+    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM completion_event WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            seq = row["next_seq"]
+            conn.execute(
+                """INSERT INTO completion_event
+                       (run_id, seq, event_type, reason_code, message, metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, seq, event_type, reason_code, message, metadata_json, now),
+            )
+            return seq
+
+
+def list_completion_events(db_path: Path, run_id: str, *, limit: int = 500) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT run_id, seq, event_type, reason_code, message, metadata_json, created_at
+               FROM completion_event WHERE run_id = ? ORDER BY seq ASC LIMIT ?""",
+            (run_id, limit),
+        ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            raw = event.pop("metadata_json")
+            event["metadata"] = json.loads(raw) if raw else None
+            events.append(event)
+        return events
+
+
+def record_validation_result(
+    db_path: Path,
+    run_id: str,
+    *,
+    attempt: int,
+    command: str,
+    exit_code: int | None,
+    started_at: str | None,
+    finished_at: str | None,
+    stdout_summary: str | None,
+    stderr_summary: str | None,
+) -> dict:
+    """Record one validation-command result. `stdout_summary`/`stderr_summary`
+    must already be bounded by the caller (`runtime.validation`) — this table
+    never stores unlimited logs."""
+    now = iso_now()
+    record = {
+        "run_id": run_id,
+        "attempt": attempt,
+        "command": command,
+        "exit_code": exit_code,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "stdout_summary": stdout_summary,
+        "stderr_summary": stderr_summary,
+        "created_at": now,
+    }
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(
+                """INSERT INTO completion_validation
+                       (run_id, attempt, command, exit_code, started_at, finished_at,
+                        stdout_summary, stderr_summary, created_at)
+                   VALUES (:run_id, :attempt, :command, :exit_code, :started_at, :finished_at,
+                           :stdout_summary, :stderr_summary, :created_at)""",
+                record,
+            )
+    return record
+
+
+def list_validation_results(db_path: Path, run_id: str, *, attempt: int | None = None) -> list[dict]:
+    with connect(db_path) as conn:
+        if attempt is not None:
+            rows = conn.execute(
+                "SELECT * FROM completion_validation WHERE run_id = ? AND attempt = ? ORDER BY id ASC",
+                (run_id, attempt),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM completion_validation WHERE run_id = ? ORDER BY id ASC",
+                (run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------
+# Autonomy proposals (schema 7) — the pre-execution decision layer.
+#
+# Mirrors the completion-row idioms: a `create_proposal` write-once insert, a
+# compare-and-set `update_proposal` guarded by both a lifecycle-scoped field
+# allowlist and the `autonomy.is_valid_proposal_transition` structural guard,
+# evidence that is append-only until assessment and frozen afterward, and an
+# append-only `append_proposal_event` audit trail. Identity columns
+# (id/kind/project/created_at) are write-once and deliberately absent from the
+# updatable allowlist below.
+# --------------------------------------------------------------------------
+
+_UPDATABLE_PROPOSAL_FIELDS: frozenset[str] = frozenset(
+    {
+        "task_id",
+        "title",
+        "rationale",
+        "state",
+        "risk_level",
+        "policy_json",
+        "eligibility_json",
+        "plan_json",
+        "parameters_json",
+        "evidence_digest",
+        "requires_human",
+        "last_reason_code",
+        "decided_by",
+        "decision_reason",
+        "dispatched_run_id",
+        "dispatched_task_id",
+    }
+)
+
+
+_PROPOSAL_AUTHORITY_FIELDS: frozenset[str] = frozenset(
+    {
+        "task_id",
+        "title",
+        "rationale",
+        "risk_level",
+        "policy_json",
+        "eligibility_json",
+        "plan_json",
+        "parameters_json",
+        "evidence_digest",
+    }
+)
+
+_PROPOSAL_DECISION_FIELDS: frozenset[str] = frozenset(
+    {
+        "state",
+        "requires_human",
+        "last_reason_code",
+        "decided_by",
+        "decision_reason",
+    }
+)
+
+_PROPOSAL_FIELDS_BY_STATE: dict[str, frozenset[str]] = {
+    # Assessment may start from either DRAFT or PROPOSED. These are the only
+    # states in which authority-bearing fields may be written.
+    autonomy_domain.ProposalState.DRAFT: _PROPOSAL_AUTHORITY_FIELDS | _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.PROPOSED: _PROPOSAL_AUTHORITY_FIELDS | _PROPOSAL_DECISION_FIELDS,
+    # From this point onward, policy, evidence digest, action parameters,
+    # eligibility, risk, and plan are immutable. Lifecycle decisions may still
+    # advance the row and record the responsible actor/reason.
+    autonomy_domain.ProposalState.ELIGIBLE: _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.BLOCKED: _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.AWAITING_APPROVAL: _PROPOSAL_DECISION_FIELDS,
+    autonomy_domain.ProposalState.APPROVED: _PROPOSAL_DECISION_FIELDS,
+    # Result links are legal only while confirming a dispatched action.
+    autonomy_domain.ProposalState.DISPATCHED: frozenset(
+        {"state", "last_reason_code", "dispatched_run_id", "dispatched_task_id"}
+    ),
+    # Terminal rows permit only an idempotent same-state CAS; their authority
+    # and decision attribution cannot be rewritten.
+    autonomy_domain.ProposalState.REJECTED: frozenset({"state"}),
+    autonomy_domain.ProposalState.EXECUTED: frozenset({"state"}),
+    autonomy_domain.ProposalState.WITHDRAWN: frozenset({"state"}),
+}
+
+
+def _validate_updatable_proposal_fields(fields: dict) -> None:
+    unknown = set(fields) - _UPDATABLE_PROPOSAL_FIELDS
+    if unknown:
+        raise UnknownRunFieldError(f"Not an updatable proposal field: {sorted(unknown)}")
+
+
+def _validate_proposal_fields_for_state(
+    state: str,
+    fields: dict,
+    *,
+    assessment_persisted: bool,
+) -> None:
+    allowed = _PROPOSAL_FIELDS_BY_STATE.get(state, frozenset())
+    # Assessment is normally persisted and routed onward in one transaction,
+    # so callers never observe a DRAFT/PROPOSED row with a verdict. Keep the DB
+    # boundary safe even if a lower-level caller writes the verdict without its
+    # transitions: once the marker exists, authority is frozen immediately.
+    if (
+        assessment_persisted
+        and state
+        in {
+            autonomy_domain.ProposalState.DRAFT,
+            autonomy_domain.ProposalState.PROPOSED,
+        }
+    ):
+        allowed = _PROPOSAL_DECISION_FIELDS
+    forbidden = set(fields) - allowed
+    if forbidden:
+        raise ProposalFieldFrozenError(
+            f"Proposal fields {sorted(forbidden)} cannot be updated in state {state!r}"
+        )
+
+
+def _canonical_proposal_parameters_json(raw: str) -> str:
+    """Validate and canonicalize the structured action payload.
+
+    A proposal approves a named parameter object, never an arbitrary JSON
+    scalar/list. Canonical serialization makes the persisted authority stable
+    for hashing, comparison, and later execution binding.
+    """
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("proposal.parameters_json must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("proposal.parameters_json must encode a JSON object")
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+_PROPOSAL_INSERT_COLUMNS: tuple[str, ...] = (
+    "id",
+    "kind",
+    "project",
+    "task_id",
+    "title",
+    "rationale",
+    "state",
+    "risk_level",
+    "policy_json",
+    "eligibility_json",
+    "plan_json",
+    "parameters_json",
+    "evidence_digest",
+    "requires_human",
+    "last_reason_code",
+    "decided_by",
+    "decision_reason",
+    "dispatched_run_id",
+    "dispatched_task_id",
+    "version",
+    "created_at",
+    "updated_at",
+)
+
+
+def create_proposal(
+    db_path: Path,
+    *,
+    kind: str,
+    project: str,
+    title: str,
+    rationale: str,
+    state: str,
+    risk_level: str,
+    proposal_id: str | None = None,
+    task_id: str | None = None,
+    policy_json: str | None = None,
+    parameters_json: str = "{}",
+    requires_human: bool = True,
+) -> dict:
+    """Create one `proposal` row in its initial state.
+
+    `rationale` is required and never blank — a proposal that cannot explain why
+    it exists is rejected here, enforcing the "all proposals must explain why
+    they were created" rule at the persistence boundary."""
+    if not rationale or not str(rationale).strip():
+        raise ValueError("proposal.rationale must be non-empty — every proposal must explain itself")
+    parameters_json = _canonical_proposal_parameters_json(parameters_json)
+    now = iso_now()
+    record = {name: None for name in _PROPOSAL_INSERT_COLUMNS}
+    record.update(
+        {
+            "id": proposal_id or new_id(),
+            "kind": kind,
+            "project": project,
+            "task_id": task_id,
+            "title": title,
+            "rationale": rationale,
+            "state": state,
+            "risk_level": risk_level,
+            "policy_json": policy_json,
+            "parameters_json": parameters_json,
+            "requires_human": 1 if requires_human else 0,
+            "version": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    columns = ", ".join(_PROPOSAL_INSERT_COLUMNS)
+    placeholders = ", ".join(f":{name}" for name in _PROPOSAL_INSERT_COLUMNS)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+    return record
+
+
+def get_proposal(db_path: Path, proposal_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+        return _row_to_dict(row)
+
+
+def list_proposals(
+    db_path: Path,
+    *,
+    project: str | None = None,
+    states: Iterable[str] | None = None,
+    kind: str | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """List proposal rows, newest first, optionally filtered by project, a set
+    of lifecycle `states`, and/or `kind`."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if project is not None:
+        clauses.append("project = ?")
+        params.append(project)
+    if kind is not None:
+        clauses.append("kind = ?")
+        params.append(kind)
+    states = list(states) if states is not None else None
+    if states is not None:
+        if not states:
+            return []
+        placeholders = ", ".join("?" for _ in states)
+        clauses.append(f"state IN ({placeholders})")
+        params.extend(states)
+    if limit < 0:
+        raise ValueError(f"limit must be non-negative, got {limit}")
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM proposal{where} ORDER BY created_at DESC, id DESC LIMIT ?", params
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------
+# Connection-level primitives (single-transaction building blocks). Each
+# operates on an already-open connection inside a caller-managed transaction,
+# so several can be composed into ONE atomic unit — see `create_proposal_atomic`
+# / `apply_assessment_atomic` / `transition_proposal_atomic`. The public
+# wrappers below open their own `connect()`/`transaction()` and delegate to a
+# single primitive. Atomicity is NEVER composed by nesting public functions
+# (each of which would open and commit its own connection).
+# --------------------------------------------------------------------------
+
+
+def _proposal_next_seq(conn: sqlite3.Connection, table: str, proposal_id: str) -> int:
+    row = conn.execute(
+        f"SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM {table} WHERE proposal_id = ?",
+        (proposal_id,),
+    ).fetchone()
+    return row["next_seq"]
+
+
+def _proposal_evidence_insert(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    *,
+    kind: str,
+    source: str,
+    summary: str | None,
+    observed_at: str,
+    is_blocker: bool,
+    data: dict | None,
+    now: str,
+) -> int:
+    seq = _proposal_next_seq(conn, "proposal_evidence", proposal_id)
+    data_json = json.dumps(data, ensure_ascii=False) if data is not None else None
+    conn.execute(
+        """INSERT INTO proposal_evidence
+               (proposal_id, seq, kind, source, summary, observed_at, is_blocker, data_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (proposal_id, seq, kind, source, summary, observed_at, 1 if is_blocker else 0, data_json, now),
+    )
+    return seq
+
+
+def _proposal_event_insert(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    event_type: str,
+    *,
+    now: str,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    actor: str | None = None,
+    reason_code: str | None = None,
+    message: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    seq = _proposal_next_seq(conn, "proposal_event", proposal_id)
+    metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
+    conn.execute(
+        """INSERT INTO proposal_event
+               (proposal_id, seq, event_type, from_state, to_state, actor,
+                reason_code, message, metadata_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (proposal_id, seq, event_type, from_state, to_state, actor,
+         reason_code, message, metadata_json, now),
+    )
+    return seq
+
+
+def _proposal_event_from_spec(conn: sqlite3.Connection, proposal_id: str, spec: dict, *, now: str) -> int:
+    """Append one audit event from a spec dict (`append_proposal_event` kwargs;
+    `event_type` key optional). Used by the atomic composers so callers can pass
+    plain dicts."""
+    spec = dict(spec)
+    return _proposal_event_insert(
+        conn,
+        proposal_id,
+        spec.pop("event_type", "transition"),
+        now=now,
+        from_state=spec.get("from_state"),
+        to_state=spec.get("to_state"),
+        actor=spec.get("actor"),
+        reason_code=spec.get("reason_code"),
+        message=spec.get("message"),
+        metadata=spec.get("metadata"),
+    )
+
+
+def _proposal_update(
+    conn: sqlite3.Connection,
+    proposal_id: str,
+    *,
+    expected_version: int,
+    fields: dict,
+    now: str,
+) -> tuple[int, str]:
+    """CAS + transition-guarded UPDATE inside an open transaction. Returns
+    (new_version, resulting_state). Validates `fields` against the allowlist,
+    checks the caller's version before interpreting its requested mutation,
+    enforces the lifecycle-scoped field allowlist, then refuses an illegal
+    `state` transition (via `is_valid_proposal_transition`). Bumps `version`
+    and sets `updated_at`. Raises `KeyError`/`LostUpdateError`/
+    `ProposalFieldFrozenError`/`InvalidProposalTransitionError` as appropriate."""
+    fields = dict(fields)
+    fields.pop("version", None)
+    fields.pop("created_at", None)
+    _validate_updatable_proposal_fields(fields)
+    row = conn.execute(
+        "SELECT state, version, eligibility_json FROM proposal WHERE id = ?",
+        (proposal_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"No such proposal: {proposal_id!r}")
+    # CAS is deliberately checked before the state-aware mutation/transition
+    # guards. A stale writer must always lose as a stale writer; otherwise a
+    # winner's newer state could make the loser's old request look like a hard
+    # policy/transition violation and misclassify benign concurrency.
+    if row["version"] != expected_version:
+        raise LostUpdateError(
+            f"Proposal {proposal_id!r} version mismatch: expected {expected_version}, actual {row['version']}"
+        )
+    _validate_proposal_fields_for_state(
+        row["state"],
+        fields,
+        assessment_persisted=row["eligibility_json"] is not None,
+    )
+    if "requires_human" in fields and isinstance(fields["requires_human"], bool):
+        fields["requires_human"] = 1 if fields["requires_human"] else 0
+    if "parameters_json" in fields:
+        fields["parameters_json"] = _canonical_proposal_parameters_json(fields["parameters_json"])
+    new_state = fields.get("state")
+    if new_state is not None and not autonomy_domain.is_valid_proposal_transition(row["state"], new_state):
+        raise InvalidProposalTransitionError(
+            f"Proposal {proposal_id!r} cannot transition {row['state']!r} -> {new_state!r}"
+        )
+    fields["updated_at"] = now
+    set_clause = ", ".join(f"{key} = :{key}" for key in fields)
+    params = dict(fields)
+    params["proposal_id"] = proposal_id
+    params["expected_version"] = expected_version
+    cur = conn.execute(
+        f"""UPDATE proposal SET {set_clause}, version = version + 1
+            WHERE id = :proposal_id AND version = :expected_version""",
+        params,
+    )
+    if cur.rowcount != 1:
+        raise LostUpdateError(f"Proposal {proposal_id!r} update affected {cur.rowcount} rows")
+    return expected_version + 1, (new_state if new_state is not None else row["state"])
+
+
+def update_proposal(db_path: Path, proposal_id: str, *, expected_version: int, fields: dict) -> dict:
+    """Compare-and-set update of a `proposal` row, mirroring `update_completion`:
+    validates the global field vocabulary, checks CAS first, enforces the
+    lifecycle-scoped allowlist, then validates any state transition. Authority
+    fields (policy/evidence digest/action parameters/verdict/plan) are mutable
+    only before assessment. `requires_human` is coerced to 0/1 if supplied as
+    a bool."""
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            _proposal_update(conn, proposal_id, expected_version=expected_version, fields=fields, now=now)
+            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            return dict(updated)
+
+
+def append_proposal_evidence(
+    db_path: Path,
+    proposal_id: str,
+    *,
+    kind: str,
+    source: str,
+    summary: str | None = None,
+    observed_at: str,
+    is_blocker: bool = False,
+    data: dict | None = None,
+) -> int:
+    """Append one immutable evidence row and return its per-proposal `seq`.
+    Evidence may be enriched only before assessment (DRAFT/PROPOSED with no
+    persisted verdict). Once assessment has begun, the set is frozen so the
+    stored digest and verdict remain reproducible."""
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT state, eligibility_json FROM proposal WHERE id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No such proposal: {proposal_id!r}")
+            if (
+                row["state"] not in {
+                    autonomy_domain.ProposalState.DRAFT,
+                    autonomy_domain.ProposalState.PROPOSED,
+                }
+                or row["eligibility_json"] is not None
+            ):
+                raise ProposalEvidenceFrozenError(
+                    f"Proposal {proposal_id!r} evidence is frozen in state {row['state']!r}"
+                )
+            return _proposal_evidence_insert(
+                conn, proposal_id, kind=kind, source=source, summary=summary,
+                observed_at=observed_at, is_blocker=is_blocker, data=data, now=now,
+            )
+
+
+def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM proposal_evidence WHERE proposal_id = ? ORDER BY seq ASC",
+            (proposal_id,),
+        ).fetchall()
+        events = []
+        for row in rows:
+            item = dict(row)
+            raw = item.pop("data_json")
+            item["data"] = json.loads(raw) if raw else None
+            item["is_blocker"] = bool(item["is_blocker"])
+            events.append(item)
+        return events
+
+
+def append_proposal_event(
+    db_path: Path,
+    proposal_id: str,
+    event_type: str,
+    *,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    actor: str | None = None,
+    reason_code: str | None = None,
+    message: str | None = None,
+    metadata: dict | None = None,
+) -> int:
+    """Append one proposal audit event and return its per-proposal `seq`.
+    `metadata` is JSON-encoded; callers must never place credentials, tokens, or
+    environment dumps in it."""
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            return _proposal_event_insert(
+                conn, proposal_id, event_type, now=now, from_state=from_state,
+                to_state=to_state, actor=actor, reason_code=reason_code,
+                message=message, metadata=metadata,
+            )
+
+
+def list_proposal_events(db_path: Path, proposal_id: str, *, limit: int = 500) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT proposal_id, seq, event_type, from_state, to_state, actor,
+                      reason_code, message, metadata_json, created_at
+               FROM proposal_event WHERE proposal_id = ? ORDER BY seq ASC LIMIT ?""",
+            (proposal_id, limit),
+        ).fetchall()
+        events = []
+        for row in rows:
+            event = dict(row)
+            raw = event.pop("metadata_json")
+            event["metadata"] = json.loads(raw) if raw else None
+            events.append(event)
+        return events
+
+
+# --------------------------------------------------------------------------
+# Atomic proposal composers — each owns its whole multi-row sequence in ONE
+# connection and ONE transaction, so either all rows commit or none do. This is
+# the F2 remediation: a crash can never leave a proposal without its required
+# evidence/digest/creation-event, nor a verdict without its state transition and
+# ASSESSED event, nor a lifecycle move without its audit event.
+# --------------------------------------------------------------------------
+
+
+def create_proposal_atomic(
+    db_path: Path,
+    *,
+    kind: str,
+    project: str,
+    title: str,
+    rationale: str,
+    state: str,
+    risk_level: str,
+    proposal_id: str | None = None,
+    task_id: str | None = None,
+    policy_json: str | None = None,
+    parameters_json: str = "{}",
+    requires_human: bool = True,
+    evidence_digest: str | None = None,
+    evidence: list[dict] | None = None,
+    created_event: dict | None = None,
+) -> dict:
+    """Create a proposal row, its (immutable) evidence rows, its evidence digest,
+    and its CREATED audit event in ONE transaction. Either all commit or none do
+    — there is never a persisted proposal without its rationale (rejected here if
+    blank), evidence, digest, and creation event. `evidence` is a list of dicts
+    (kind/source/summary/observed_at/is_blocker/data); `created_event` is a dict
+    of `append_proposal_event` kwargs (`event_type` defaults to 'created').
+    Returns the persisted proposal row. Idempotency is by `proposal_id`: a retry
+    with the same id hits the PRIMARY KEY (IntegrityError) rather than creating a
+    duplicate; a retry after a rolled-back attempt succeeds cleanly."""
+    if not rationale or not str(rationale).strip():
+        raise ValueError("proposal.rationale must be non-empty — every proposal must explain itself")
+    parameters_json = _canonical_proposal_parameters_json(parameters_json)
+    now = iso_now()
+    pid = proposal_id or new_id()
+    record = {name: None for name in _PROPOSAL_INSERT_COLUMNS}
+    record.update(
+        {
+            "id": pid,
+            "kind": kind,
+            "project": project,
+            "task_id": task_id,
+            "title": title,
+            "rationale": rationale,
+            "state": state,
+            "risk_level": risk_level,
+            "policy_json": policy_json,
+            "parameters_json": parameters_json,
+            "evidence_digest": evidence_digest,
+            "requires_human": 1 if requires_human else 0,
+            "version": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    columns = ", ".join(_PROPOSAL_INSERT_COLUMNS)
+    placeholders = ", ".join(f":{name}" for name in _PROPOSAL_INSERT_COLUMNS)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+            for e in evidence or []:
+                _proposal_evidence_insert(
+                    conn, pid, kind=e["kind"], source=e["source"], summary=e.get("summary"),
+                    observed_at=e["observed_at"], is_blocker=bool(e.get("is_blocker", False)),
+                    data=e.get("data"), now=now,
+                )
+            if created_event is not None:
+                _proposal_event_from_spec(conn, pid, created_event, now=now)
+            stored = conn.execute("SELECT * FROM proposal WHERE id = ?", (pid,)).fetchone()
+            return dict(stored)
+
+
+def apply_assessment_atomic(
+    db_path: Path,
+    proposal_id: str,
+    *,
+    expected_version: int,
+    verdict_fields: dict,
+    assessed_event: dict,
+    transitions: list[dict],
+) -> dict:
+    """Persist an assessment verdict, its ASSESSED audit event, and the resulting
+    ordered state transitions (each with its own audit event) in ONE transaction.
+
+    A single CAS on `expected_version` guards the whole unit: a stale/concurrent
+    assessor loses with `LostUpdateError` and writes nothing. Guarantees: no
+    verdict without its transitions/events (and vice versa); the audit sequence
+    stays monotonic; and — because the caller only invokes this while the
+    proposal is still in a pre-assessment state — exactly one ASSESSED event per
+    committed assessment. `transitions` is an ordered list of
+    ``{"new_state": str, "event": {<append_proposal_event kwargs>},
+    "extra_fields": {<optional proposal columns>}}``; each transition's version
+    is chained from the previous update within the same locked transaction."""
+    now = iso_now()
+    with connect(db_path) as conn:
+        with transaction(conn):
+            version, _state = _proposal_update(
+                conn, proposal_id, expected_version=expected_version,
+                fields=dict(verdict_fields), now=now,
+            )
+            _proposal_event_from_spec(conn, proposal_id, {"event_type": "assessed", **assessed_event}, now=now)
+            for t in transitions:
+                fields = dict(t.get("extra_fields") or {})
+                fields["state"] = t["new_state"]
+                event_spec = dict(t["event"])
+                reason_code = event_spec.get("reason_code")
+                if reason_code is not None and "last_reason_code" not in fields:
+                    fields["last_reason_code"] = reason_code
+                version, _state = _proposal_update(
+                    conn, proposal_id, expected_version=version, fields=fields, now=now,
+                )
+                _proposal_event_from_spec(conn, proposal_id, event_spec, now=now)
+            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            return dict(updated)
+
+
+def transition_proposal_atomic(
+    db_path: Path,
+    proposal_id: str,
+    *,
+    expected_version: int,
+    new_state: str,
+    event: dict,
+    fields: dict | None = None,
+) -> dict:
+    """Apply one state transition and its audit event atomically (CAS update +
+    event in one transaction), so a lifecycle move can never persist a state
+    change without its audit event, or an audit event without the state change."""
+    now = iso_now()
+    upd_fields = dict(fields or {})
+    upd_fields["state"] = new_state
+    with connect(db_path) as conn:
+        with transaction(conn):
+            _proposal_update(conn, proposal_id, expected_version=expected_version, fields=upd_fields, now=now)
+            _proposal_event_from_spec(conn, proposal_id, event, now=now)
+            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            return dict(updated)
+
+
+# --------------------------------------------------------------------------
+# Execution queue (ADR 0007) — the SQLite home of `execution_queue.json`
+#
+# These are storage primitives only. Every rule about *what* a queue entry may
+# contain, when it becomes ready, and what launching it means stays in
+# `command_center.execution_queue`; this layer just stores and returns rows.
+# During the dual-write phases the JSON file remains authoritative, so nothing
+# here may raise on data the JSON store would have accepted.
+# --------------------------------------------------------------------------
+
+_QUEUE_ENTRY_COLUMNS: tuple[str, ...] = (
+    "id",
+    "task_id",
+    "project",
+    "state",
+    "reason",
+    "run_id",
+    "added_at",
+    "evaluated_at",
+    "launched_at",
+)
+
+
+def replace_queue_entries(db_path: Path, entries: list[dict]) -> None:
+    """Persist `entries` as the complete queue, in the given order.
+
+    Whole-list replacement rather than per-entry upsert, deliberately: that is
+    exactly the semantics `execution_queue.save_queue` has today, so during
+    dual-write the two stores cannot drift through a difference in *how* they
+    are written. `position` preserves list order, which the queue's display and
+    planning both depend on.
+
+    Unknown keys on an entry are ignored rather than rejected — the JSON store
+    accepts them, and a dual-write phase where SQLite is stricter than the
+    authoritative store would fail on data that is, by definition, valid."""
+    rows = [
+        {
+            **{column: entry.get(column) for column in _QUEUE_ENTRY_COLUMNS},
+            "position": index,
+        }
+        for index, entry in enumerate(entries)
+    ]
+    columns = ", ".join((*_QUEUE_ENTRY_COLUMNS, "position"))
+    placeholders = ", ".join(f":{name}" for name in (*_QUEUE_ENTRY_COLUMNS, "position"))
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute("DELETE FROM queue_entry")
+            if rows:
+                conn.executemany(
+                    f"INSERT INTO queue_entry ({columns}) VALUES ({placeholders})", rows
+                )
+
+
+def list_queue_entries(db_path: Path) -> list[dict]:
+    """Every queue entry in stored order, shaped exactly like a JSON entry so a
+    divergence check can compare the two directly, with no translation step of
+    its own to be wrong about."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(_QUEUE_ENTRY_COLUMNS)} FROM queue_entry ORDER BY position ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]

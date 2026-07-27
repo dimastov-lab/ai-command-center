@@ -13,7 +13,67 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from command_center import git_info, models
+from command_center import git_info, models, project_config
+
+
+DEFAULT_TASK_PRIORITY = "Medium"
+
+
+def kanban_priority_options(tasks: list[dict]) -> list[str]:
+    """The priority values the Kanban priority filter must offer as options.
+
+    Returns the canonical `models.TASK_PRIORITIES` in their canonical order,
+    followed by any *other* priority value actually present on a task (e.g. a
+    task imported with a `P0`/`P1` scheme that isn't in the canonical set),
+    de-duplicated, order-preserved.
+
+    Why this exists: the filter used to offer only `models.TASK_PRIORITIES`
+    and keep a task iff `task["priority"] in selection`. A task whose priority
+    was outside that set (`AICC-CI-001`, priority `"P0"`) was therefore never
+    an option *and* never matched the default all-selected filter, so it was
+    silently dropped from every lane — present in `tasks.json`, invisible in
+    the UI. Sourcing the options from the tasks themselves means an unknown
+    priority is always shown and stays user-toggleable, instead of vanishing.
+    """
+    options = list(models.TASK_PRIORITIES)
+    seen = set(options)
+    for task in tasks:
+        priority = task.get("priority", DEFAULT_TASK_PRIORITY)
+        if priority not in seen:
+            seen.add(priority)
+            options.append(priority)
+    return options
+
+
+def filter_kanban_tasks(
+    tasks: list[dict],
+    *,
+    project: str | None,
+    priorities: list[str],
+) -> list[dict]:
+    """Tasks visible on the Kanban board for the given project and selected
+    priorities. `project=None` means "all projects". Pure — the exact
+    predicate `app.py` applies, extracted so it is regression-testable
+    without Streamlit.
+
+    The project comparison is done on canonical project ids, not raw strings:
+    the Kanban project selector emits canonical `models.PROJECT_IDS` values
+    (e.g. `"AICC"`), but a task's stored `project` may be a display name or
+    alias (`AICC-CI-001` carries `"AI Command Center"`). Comparing the raw
+    strings dropped every such task the moment a project was selected —
+    present in `tasks.json`, rendered on the "all projects" board, yet
+    invisible under its own project lane (AICC-UI-001). Normalizing both
+    sides via `project_config.normalize_project_id` makes id, display name,
+    and alias all resolve to the same lane. The canonicalization lives in the
+    single shared `project_config.project_matches` helper every project-scoped
+    filter/counter/ranking in the app now routes through, so they can never
+    drift apart again."""
+    return [
+        task
+        for task in tasks
+        if project_config.project_matches(task.get("project"), project)
+        and task.get("priority", DEFAULT_TASK_PRIORITY) in priorities
+    ]
 
 
 def cached_git_status(workspace_path: str | None, cache: dict[str, dict]) -> dict:

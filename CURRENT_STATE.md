@@ -1,6 +1,58 @@
 # AI Command Center — Current State
 
-Updated: 2026-07-15
+Updated: 2026-07-27
+
+## 0. AI Command Center platform
+
+Status: Active, local Streamlit implementation
+
+Current position:
+- `app.py` hosts the implemented 19-destination Streamlit control application.
+- `data/tasks.json` remains the planning and Kanban store.
+- `data/runtime.db` schema 10 is authoritative for asynchronous execution, completion, the
+  persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
+  verdict, and the `queue_entry` mirror (ADR 0007 dual-write).
+- Execution Center provides process supervision, streaming events, cancellation, timeouts and
+  restart reconciliation; live process handles remain owned by the hosting Python process.
+  Process-group supervision is fail-closed to POSIX `waitid(WNOWAIT)`, keeps the launch-time PGID
+  pinned until descendants are drained, and separates OS exit from terminal-state/report
+  finalization so slow persistence cannot cause a false timeout or late signal.
+- Normal task-v2 launches require explicit confirmation before any provisioning, may create an
+  isolated worktree offline, and fail closed unless source repository, expected branch, worktree
+  isolation and configured status policy verify before process launch.
+- Application-owned execution-queue mutations hold a same-host cooperative OS advisory lock across
+  the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
+- `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
+  decisions. It creates no durable claim, queue entry or run and has no background driver.
+- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state.
+  An operator approve/reject inbox (`ui/proposals_panel.py`) surfaces and decides proposals, but
+  there are no automated evidence collectors, project policy resolver, background driver or executor.
+- Portfolio Execution and Portfolio Overview provide guarded worktree launch plus read-only
+  dependency, health, capacity and recommendation views.
+- The persisted completion pipeline supports validation, push, pull-request and merge workflows;
+  completion autopilot and automatic merge policies are opt-in and disabled by conservative
+  defaults.
+- Checked-in CI validates committed-diff whitespace, Ruff, byte compilation and pytest on Python
+  3.14. Informational, non-blocking `mypy` and coverage steps run alongside the deterministic
+  quartet but do not gate the merge.
+- Runtime history retention is **off by default**: `AICC_RUNTIME_RETENTION_DAYS=<N>` prunes
+  `run_event` rows for terminal runs older than `N` days on startup, and
+  `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
+- `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
+  legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
+
+Current boundaries:
+- Normal task launches require explicit user action. Scheduler `ASSIGN` results are point-in-time
+  advice, not persisted claims; task-id/capacity decisions may race before the separate launch, and
+  only exact-workspace exclusion is enforced transactionally by the runtime launch path.
+- Fail-closed workspace verification is scoped to normal task-v2 callers that supply
+  `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
+- The current private-repository plan does not expose branch protection/rulesets, so CI is
+  automatic but required-check enforcement remains an operator merge discipline.
+- Git worktree creation, push, pull-request creation and merge are privileged capabilities with
+  confirmation or policy safeguards.
+- The native PySide6 desktop client remains documentation and design work only.
+- The runtime is local and process-hosted, not a distributed or production-ready worker platform.
 
 ## 1. AIOS
 
@@ -81,7 +133,7 @@ Use for:
 1. One project must not be mixed with another project.
 2. One agent = one task = one branch = one worktree.
 3. Every technical implementation requires independent review.
-4. No push or merge without explicit approval.
+4. No commit, push, pull-request creation or merge without explicit authorization.
 5. Every task must have a measurable Definition of Done.
 6. Closed architectural decisions must not be reconsidered without new evidence.
 7. Current-state files are the primary source of project context.

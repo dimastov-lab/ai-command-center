@@ -85,8 +85,28 @@ def test_execution_center_page_renders_and_nav_entry_exists():
     assert not at.exception
     assert at.subheader[0].value == "Live Execution Center"
 
-    nav_options = at.radio(key="nav_page").options
-    assert any("Live Execution Center" in option for option in nav_options)
+    # Nav is grouped buttons now, not one flat radio.
+    assert any(b.key == "nav_btn_execution_center" for b in at.sidebar.button)
+
+
+def test_execution_center_provider_selector_defaults_to_claude_only():
+    """Fail-closed: a project with no explicit allow-list offers Claude only,
+    never Codex, even though the Codex provider exists in the registry."""
+    at = _at_on_page("execution_center")
+    selector = at.selectbox(key="exec_center_launch_executor")
+    assert selector.options == ["Claude Code"]
+    assert selector.value == "claude_code"
+
+
+def test_execution_center_provider_selector_exposes_codex_only_when_authorized(fake_codex):
+    from command_center import models, project_config
+
+    # The launch form defaults to the first project id; authorize Codex there.
+    project_config.save_allowed_agents(models.PROJECT_IDS[0], ["claude_code", "codex"])
+    at = _at_on_page("execution_center")
+    selector = at.selectbox(key="exec_center_launch_executor")
+    assert selector.options == ["Claude Code", "Codex CLI"]
+    assert selector.value == "claude_code"
 
 
 def _assert_execution_center_page_rendered(at: AppTest) -> None:
@@ -232,7 +252,9 @@ def test_launch_is_nonblocking_and_running_status_is_displayed(git_repo, configu
 
 
 def test_cancel_requires_confirmation_before_calling_api(monkeypatch, git_repo, configure_project_repo, fake_claude):
-    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    hold_file = git_repo.parent / "fake-claude.hold"
+    hold_file.touch()
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold_file)
     configure_project_repo("AIOS", git_repo)
 
     cancel_calls: list[tuple] = []
@@ -244,19 +266,26 @@ def test_cancel_requires_confirmation_before_calling_api(monkeypatch, git_repo, 
 
     monkeypatch.setattr(runtime_api.ExecutionCenterAPI, "request_cancel", spy_cancel)
 
-    at = _at_on_page("execution_center")
-    at = _launch_via_ui(at)
-    run_id = _most_recent_run_id(runtime_db.resolve_db_path())
-    cancel_btn_key = f"exec_card_cancel_btn_{run_id}"
+    run_id = None
+    db_path = runtime_db.resolve_db_path()
+    try:
+        at = _at_on_page("execution_center")
+        at = _launch_via_ui(at)
+        run_id = _most_recent_run_id(db_path)
+        cancel_btn_key = f"exec_card_cancel_btn_{run_id}"
 
-    at = at.button(key=cancel_btn_key).click().run()
-    assert not cancel_calls, "request_cancel must not be called before the cancel checkbox is confirmed"
+        at = at.button(key=cancel_btn_key).click().run()
+        assert not cancel_calls, "request_cancel must not be called before the cancel checkbox is confirmed"
 
-    at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
-    at = at.button(key=cancel_btn_key).click().run()
-    assert cancel_calls == [(run_id, {"confirmed": True})]
-
-    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+        at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
+        at = at.button(key=cancel_btn_key).click().run()
+        assert cancel_calls == [(run_id, {"confirmed": True})]
+    finally:
+        # On an assertion failure, releasing the hold lets the fake process
+        # exit naturally instead of leaking a background Supervisor thread.
+        hold_file.unlink(missing_ok=True)
+        if run_id is not None:
+            _wait_for_report(db_path, run_id)
 
 
 @pytest.mark.parametrize("state", ["PREPARED", "QUEUED"])
@@ -314,15 +343,15 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
 
     at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
     at = at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
-    assert any("отправлен" in s.value for s in at.success) or any(
-        f"Статус: **{session_view.STATUS_CANCELLED}**" in c.value for c in at.caption
+    assert any("отправлен" in s.value for s in at.success) or _shows_status(
+        at, session_view.STATUS_CANCELLED
     )
 
     deadline = time.monotonic() + 10
     displayed_cancelled = False
     while time.monotonic() < deadline:
         at = at.run()
-        if any(f"Статус: **{session_view.STATUS_CANCELLED}**" in c.value for c in at.caption):
+        if _shows_status(at, session_view.STATUS_CANCELLED):
             displayed_cancelled = True
             break
         time.sleep(0.2)
@@ -351,7 +380,7 @@ def test_terminal_status_persists_across_page_revisit(git_repo, configure_projec
 
     at2 = _at_on_page("execution_center")
     assert not at2.exception
-    assert any(f"Статус: **{session_view.STATUS_COMPLETED}**" in c.value for c in at2.caption)
+    assert _shows_status(at2, session_view.STATUS_COMPLETED)
 
 
 # --------------------------------------------------------------------------
@@ -378,8 +407,8 @@ def test_failed_status_displays_last_error(git_repo, configure_project_repo, fak
 
     at = _at_on_page("execution_center")
     assert not at.exception
-    assert any(f"Статус: **{session_view.STATUS_FAILED}**" in c.value for c in at.caption)
-    assert any("timeout" in e.value for e in at.error)
+    assert _shows_status(at, session_view.STATUS_FAILED)
+    assert _shows_reason(at, "timeout")
 
 
 # --------------------------------------------------------------------------
@@ -401,7 +430,8 @@ def test_existing_pages_still_render_without_exception():
 
 
 def _make_run_row(
-    db_path, *, state: str, cancel_requested: bool = False, failure_reason: str | None = None, pid: int | None = None
+    db_path, *, state: str, cancel_requested: bool = False, failure_reason: str | None = None,
+    pid: int | None = None, first_output_at: str | None = "2026-01-01T00:00:01",
 ) -> dict:
     """`pid=None` (the default) is correct for every terminal state — only a
     hand-built `RUNNING` row needs a *real, currently-alive* pid (see the
@@ -427,6 +457,11 @@ def _make_run_row(
         run = runtime_db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     if state not in ("PREPARED", "QUEUED"):
         running_fields = {"started_at": "2026-01-01T00:00:00"}
+        # A handshaked running run (first output already received) displays as
+        # `Running`; passing `first_output_at=None` leaves it in the
+        # awaiting-handshake window, which displays as `Starting`.
+        if first_output_at is not None:
+            running_fields["first_output_at"] = first_output_at
         if pid is not None:
             running_fields["pid"] = pid
             recorded_identity = identity.capture_identity(pid)
@@ -442,6 +477,26 @@ def _make_run_row(
             fields["failure_reason"] = failure_reason
         run = runtime_db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state=state, fields=fields)
     return run
+
+
+
+def _shows_status(at, status: str) -> bool:
+    """Whether a run with `status` is visible, however it is rendered.
+
+    Live runs render as cards with a status caption; finished ones render in a
+    collapsed table, because a wall of stacked cards for finished work buries
+    the runs that actually need attention. Both satisfy what these tests are
+    about — the run is classified and shown."""
+    if any(f"Статус: **{status}**" in c.value for c in at.caption):
+        return True
+    return any(status in element.value.to_string() for element in at.dataframe)
+
+
+def _shows_reason(at, fragment: str) -> bool:
+    """Whether a failure reason is visible, as an error box or a table cell."""
+    if any(fragment in e.value for e in at.error):
+        return True
+    return any(fragment in element.value.to_string() for element in at.dataframe)
 
 
 @pytest.mark.parametrize(
@@ -464,11 +519,37 @@ def test_dashboard_renders_each_status_bucket(state, cancel_requested, expected_
 
         at = _at_on_page("execution_center")
         assert not at.exception
-        assert any(f"Статус: **{expected_caption}**" in c.value for c in at.caption)
+        # Live runs render as cards (with a status caption); finished ones now
+        # render in a collapsed table, because thirty-four stacked cards of
+        # finished work is a wall to scroll past rather than information. The
+        # property under test is the same either way: the run is classified
+        # into its bucket and shown.
+        assert _shows_status(at, expected_caption), (
+            f"прогон {expected_caption} не показан ни карточкой, ни в таблице"
+        )
     finally:
         if proc is not None:
             proc.terminate()
             proc.wait()
+
+
+def test_dashboard_renders_spawned_but_silent_run_as_starting_not_failed():
+    """A RUNNING run with a live PID but no first output yet must render as
+    `Starting` (a warning), never `Failed` — the direct UI counterpart of the
+    reported defect (a live process shown as timeout/failed)."""
+    api = runtime_api.ExecutionCenterAPI()
+    proc = subprocess.Popen(["sleep", "5"])
+    try:
+        _make_run_row(api.db_path, state="RUNNING", pid=proc.pid, first_output_at=None)
+
+        at = _at_on_page("execution_center")
+        assert not at.exception
+        captions = [c.value for c in at.caption]
+        assert any(f"Статус: **{session_view.STATUS_STARTING}**" in c for c in captions)
+        assert not any(f"Статус: **{session_view.STATUS_FAILED}**" in c for c in captions)
+    finally:
+        proc.terminate()
+        proc.wait()
 
 
 # --------------------------------------------------------------------------
@@ -493,3 +574,96 @@ def test_auto_refresh_does_not_duplicate_runs_or_task_mutations(git_repo, config
 
     all_runs = runtime_db.list_runs(api.db_path, limit=100)
     assert len(all_runs) == 1, "repeated refreshes must never create a new run"
+
+
+# --------------------------------------------------------------------------
+# 14. The rebuilt board: running-first order, summary, console actions,
+#     compact attention rows, and the project dependency tree.
+# --------------------------------------------------------------------------
+
+from command_center import tasks_repository  # noqa: E402
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_board_summary_and_console_actions_render():
+    """The console leads with a state summary and an action bar — create a
+    task, waves, reports — instead of the planner's wave and a project grid."""
+    api = runtime_api.ExecutionCenterAPI()  # constructs + migrates the isolated db
+    _make_run_row(api.db_path, state="RUNNING", pid=None)  # -> Requires Attention (no live pid)
+    at = _at_on_page("execution_center")
+    assert not at.exception
+
+    # The summary is rendered as `board_style`'s tinted HTML tiles (not
+    # `st.metric`), so it appears in the markdown stream.
+    markdown = " ".join(str(m.value) for m in at.markdown)
+    assert "Выполняется" in markdown
+    assert "Требуют внимания" in markdown
+
+    button_labels = [b.label for b in at.button]
+    assert "Создать задачу" in button_labels
+    assert "Волны" in button_labels
+    assert "Отчёты" in button_labels
+
+
+def test_console_create_task_panel_opens_and_creates_a_task():
+    at = _at_on_page("execution_center", exec_board_open_panel="create")
+    assert not at.exception
+
+    at.selectbox(key="console_create_project").select("AICC").run()
+    at.text_input(key="console_create_title").set_value("Задача из консоли").run()
+    # The submit lives inside an st.form; drive it through the form button.
+    form_submit = next(b for b in at.button if b.label == "Создать")
+    at = form_submit.click().run()
+    assert not at.exception
+
+    titles = [t.get("title") for t in tasks_repository.load_tasks(APP_ROOT)]
+    assert "Задача из консоли" in titles
+
+
+def test_attention_row_shows_reason_without_expanding():
+    """A failed run's reason must be readable on the row itself — collapsing it
+    behind the toggle would trade one unusable screen for another."""
+    api = runtime_api.ExecutionCenterAPI()
+    _make_run_row(api.db_path, state="FAILED", failure_reason="boom: the thing broke")
+    at = _at_on_page("execution_center")
+    assert not at.exception
+
+    errors = " ".join(e.value for e in at.error)
+    assert "boom: the thing broke" in errors
+
+
+def _seed_task(project: str, title: str, *, status: str = "Backlog", **fields) -> dict:
+    return tasks_repository.create_task(APP_ROOT, project, title, "review", status, **fields)
+
+
+def test_project_tree_renders_levels_when_a_project_is_selected():
+    """Selecting a project opens its plan as dependency levels in the main
+    column, coloured by state, with the next task to start flagged."""
+    # A run gives the project a card in the side strip; the tree itself is
+    # built from the Kanban tasks.
+    api = runtime_api.ExecutionCenterAPI()
+    _make_run_row(api.db_path, state="RUNNING", pid=None)
+    root = _seed_task("AICC", "Корневая задача", status="Done")
+    _seed_task("AICC", "Следующая задача", depends_on=[root["id"]])
+
+    at = _at_on_page("execution_center", exec_board_project_tree="AICC")
+    assert not at.exception
+
+    markdown = " ".join(str(m.value) for m in at.markdown)
+    assert "дерево задач" in markdown
+    assert "Уровень 0" in markdown
+    assert "Уровень 1" in markdown
+
+
+def test_project_tree_flags_the_next_task_to_launch():
+    api = runtime_api.ExecutionCenterAPI()
+    _make_run_row(api.db_path, state="RUNNING", pid=None)
+    done = _seed_task("AICC", "Уже сделано", status="Done")
+    _seed_task("AICC", "Пора запускать", depends_on=[done["id"]])
+
+    at = _at_on_page("execution_center", exec_board_project_tree="AICC")
+    assert not at.exception
+
+    captions = " ".join(c.value for c in at.caption)
+    assert "Следующая по плану" in captions

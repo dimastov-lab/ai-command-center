@@ -33,14 +33,20 @@ def run_git_command(cwd: Path, args: list[str], timeout: int = 5) -> subprocess.
 
 
 def get_status(cwd: Path) -> dict[str, object]:
-    toplevel = run_git_command(cwd, ["rev-parse", "--show-toplevel"])
-    if toplevel is None or toplevel.returncode != 0:
+    # Combine the "is_repo" probe and branch discovery into a single call.
+    # `--abbrev-ref HEAD` returns the branch name or "HEAD" for detached HEAD.
+    probe = run_git_command(cwd, ["rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"])
+    if probe is None or probe.returncode != 0:
         return {"is_repo": False}
 
-    branch = run_git_command(cwd, ["branch", "--show-current"])
+    probe_lines = probe.stdout.splitlines()
+    root = probe_lines[0].strip() if probe_lines else ""
+    branch_raw = probe_lines[1].strip() if len(probe_lines) > 1 else ""
+    branch = branch_raw if branch_raw and branch_raw != "HEAD" else "(detached HEAD)"
+
     status = run_git_command(cwd, ["status", "--porcelain"])
-    head_hash = run_git_command(cwd, ["rev-parse", "--short", "HEAD"])
-    head_subject = run_git_command(cwd, ["log", "-1", "--pretty=%s"])
+    # Get short hash AND commit subject in a single call (tab-separated).
+    head = run_git_command(cwd, ["log", "-1", "--pretty=%h%x1f%s"])
 
     status_lines = [
         line
@@ -50,15 +56,22 @@ def get_status(cwd: Path) -> dict[str, object]:
     untracked_count = sum(1 for line in status_lines if line.startswith("??"))
     modified_count = len(status_lines) - untracked_count
 
+    head_hash = "—"
+    head_subject = "—"
+    if head and head.returncode == 0 and head.stdout.strip():
+        parts = head.stdout.strip().split("\x1f", 1)
+        head_hash = parts[0] if parts[0] else "—"
+        head_subject = parts[1].strip() if len(parts) > 1 else "—"
+
     return {
         "is_repo": True,
-        "root": toplevel.stdout.strip(),
-        "branch": branch.stdout.strip() if branch and branch.stdout.strip() else "(detached HEAD)",
+        "root": root,
+        "branch": branch,
         "dirty": bool(status_lines),
         "modified_count": modified_count,
         "untracked_count": untracked_count,
-        "last_commit_hash": head_hash.stdout.strip() if head_hash and head_hash.returncode == 0 else "—",
-        "last_commit_subject": head_subject.stdout.strip() if head_subject and head_subject.returncode == 0 else "—",
+        "last_commit_hash": head_hash,
+        "last_commit_subject": head_subject,
         "status_lines": status_lines,
     }
 

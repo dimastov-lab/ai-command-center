@@ -1,0 +1,414 @@
+{
+  "schema_version": "1",
+  "package_id": "aicc-desktop-autopilot-waves-a-e",
+  "tasks": [
+    {
+      "id": "AICC-DESKTOP-001",
+      "title": "Streamlit-free task_pipeline с одним ограниченным тиком",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Streamlit-free task_pipeline с одним ограниченным тиком. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна A.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "A",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-002",
+      "title": "Адаптация READY-записей очереди в scheduler.WorkItem",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Адаптация READY-записей очереди в scheduler.WorkItem. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна A.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "A",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-003",
+      "title": "Отображение решений планировщика на id записей очереди (PipelineTickResult)",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-002"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Отображение решений планировщика на id записей очереди (PipelineTickResult). См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна A.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "A",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-004",
+      "title": "Постоянные явные настройки автопилота",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Постоянные явные настройки автопилота. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна A.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "A",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-005",
+      "title": "Сериализация plan-and-dispatch хостовой advisory-блокировкой",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-001",
+        "AICC-DESKTOP-003",
+        "AICC-DESKTOP-004"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Сериализация plan-and-dispatch хостовой advisory-блокировкой. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна B.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "B",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-006",
+      "title": "Запуск только ASSIGN-решений через execution_queue.launch_ready",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-005"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Запуск только ASSIGN-решений через execution_queue.launch_ready. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна B.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "B",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-007",
+      "title": "Идемпотентность повторных и конкурентных тиков",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-005"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Идемпотентность повторных и конкурентных тиков. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна B.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "B",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-008",
+      "title": "Изоляция одного неудачного запуска внутри волны",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-001",
+        "AICC-DESKTOP-003",
+        "AICC-DESKTOP-004"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Изоляция одного неудачного запуска внутри волны. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна B.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "B",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-009",
+      "title": "Продвижение completion до и после синхронизации задач",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-006",
+        "AICC-DESKTOP-007"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Продвижение completion до и после синхронизации задач. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна C.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "C",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-010",
+      "title": "Auto-merge только по явному сохранённому opt-in",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-006",
+        "AICC-DESKTOP-007"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Auto-merge только по явному сохранённому opt-in. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна C.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "C",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-011",
+      "title": "Проекция подтверждённого merge в Kanban Done и пересчёт волны",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-009",
+        "AICC-DESKTOP-010",
+        "AICC-DESKTOP-012"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Проекция подтверждённого merge в Kanban Done и пересчёт волны. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна C.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "C",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-012",
+      "title": "Backoff при временных сбоях GitHub/git без блокировки прочих задач",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-006",
+        "AICC-DESKTOP-007"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Backoff при временных сбоях GitHub/git без блокировки прочих задач. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна C.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "C",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-013",
+      "title": "Показ следующей параллельной волны с приоритетом, агентом, workspace и обоснованием",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-011"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Показ следующей параллельной волны с приоритетом, агентом, workspace и обоснованием. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна D.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "D",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-014",
+      "title": "Показ кодов DEFER/BLOCKED и рекомендаций по устранению",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-011"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Показ кодов DEFER/BLOCKED и рекомендаций по устранению. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна D.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "D",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-015",
+      "title": "Явные постоянные переключатели автопилота и auto-merge (по умолчанию выключены)",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-011"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Явные постоянные переключатели автопилота и auto-merge (по умолчанию выключены). См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна D.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "D",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-016",
+      "title": "Запуск ограниченного тика из существующего refresh-пути ExecutionCenterAPI",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-013",
+        "AICC-DESKTOP-014",
+        "AICC-DESKTOP-015"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Запуск ограниченного тика из существующего refresh-пути ExecutionCenterAPI. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна D.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "D",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-017",
+      "title": "Долговечный flash/audit-вывод запусков, пропусков, прогресса и merge",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-013",
+        "AICC-DESKTOP-014",
+        "AICC-DESKTOP-015"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Долговечный flash/audit-вывод запусков, пропусков, прогресса и merge. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна D.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "D",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-018",
+      "title": "Юнит-тесты адаптации, порядка, ёмкости, истории повторов и маппинга решений",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-016",
+        "AICC-DESKTOP-017"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Юнит-тесты адаптации, порядка, ёмкости, истории повторов и маппинга решений. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна E.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "E",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-019",
+      "title": "Тесты конкурентности: дублирующие тики и исключительность задачи/workspace",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-016",
+        "AICC-DESKTOP-017"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Тесты конкурентности: дублирующие тики и исключительность задачи/workspace. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна E.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "E",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-020",
+      "title": "Сквозной сценарий на fake-Claude: волна → параллельный запуск → completion → merge → следующая волна",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-018",
+        "AICC-DESKTOP-019",
+        "AICC-DESKTOP-021"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Сквозной сценарий на fake-Claude: волна → параллельный запуск → completion → merge → следующая волна. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна E.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "E",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-021",
+      "title": "Smoke-тест рабочего стола и операторская документация",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-016",
+        "AICC-DESKTOP-017"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Smoke-тест рабочего стола и операторская документация. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна E.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "E",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    },
+    {
+      "id": "AICC-DESKTOP-022",
+      "title": "Валидированный пакет импорта задач роадмапа и импорт через канонический CLI",
+      "project": "AICC",
+      "task_type": "implementation",
+      "status": "Review",
+      "priority": "High",
+      "depends_on": [
+        "AICC-DESKTOP-020"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-pr34-remediation",
+      "branch": "codex/pr34-lifecycle-remediation",
+      "goal": "Валидированный пакет импорта задач роадмапа и импорт через канонический CLI. См. docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md, волна E.",
+      "source": "docs/roadmap/DESKTOP_AUTOPILOT_HANDOFF.md",
+      "wave": "E",
+      "implemented_in": "codex/pr34-lifecycle-remediation"
+    }
+  ]
+}

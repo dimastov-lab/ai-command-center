@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import git_info, models
+from command_center import git_info, models, project_config
 
 PRIORITY_WEIGHT: dict[str, int] = {"Critical": 3, "High": 2, "Medium": 1, "Low": 0}
 
@@ -61,7 +61,11 @@ def _score_candidates(tasks: list[dict], project: str | None = None) -> list[Rec
 
     candidates: list[Recommendation] = []
     for task in tasks:
-        if project and task.get("project") != project:
+        # Match on canonical ids (shared `project_config.project_matches`): a
+        # task storing a display name ("AI Command Center") must still be a
+        # recommendation candidate when its canonical project ("AICC") is
+        # selected, in agreement with the Kanban lane it is shown beside.
+        if not project_config.project_matches(task.get("project"), project):
             continue
         if task.get("status") == "Done":
             continue
