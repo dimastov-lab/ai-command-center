@@ -39,7 +39,11 @@ class GitOpsError(Exception):
 
 def _assert_not_force(args: list[str]) -> None:
     for token in args:
-        if token in _FORCE_TOKENS or token.startswith("+"):
+        # `token in _FORCE_TOKENS` catches the bare `-f`; `startswith("--force")`
+        # additionally catches the equals-forms the tuple cannot enumerate
+        # (`--force-with-lease=<ref>`, `--force-if-includes`); a leading `+`
+        # forces a single ref inside a refspec.
+        if token in _FORCE_TOKENS or token.startswith("--force") or token.startswith("+"):
             raise GitOpsError(args, None, f"force-push is forbidden (offending token: {token!r})")
 
 

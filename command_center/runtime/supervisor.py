@@ -778,7 +778,10 @@ class Supervisor:
                 stdin=subprocess.PIPE if spec.stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=spec.environment,
+                # Strip Git/GitHub push/merge credentials from the agent's
+                # environment (H1): the pipeline, never the launched agent, owns
+                # remote writes. See agent_runner.scrub_vcs_credentials.
+                env=agent_runner.scrub_vcs_credentials(spec.environment),
                 text=True,
                 bufsize=1,
                 shell=False,
