@@ -1172,6 +1172,25 @@ def get_run(db_path: Path, run_id: str) -> dict | None:
         return _row_to_dict(row)
 
 
+def get_latest_run_for_task(db_path: Path, task_id: str) -> dict | None:
+    """Newest run row for `task_id`, or None if the task has no runs.
+
+    Distinct from `list_runs(task_id=..., limit=1)`: that path orders only by
+    `created_at DESC`, and `created_at` is second-granularity (`iso_now()`),
+    so two runs created in the same second tie and SQLite returns them in
+    unspecified rowid order. We add `rowid DESC` as a stable tiebreak — rowid
+    is insertion order, so the higher rowid is the newer row — guaranteeing
+    the actually-newest run is returned. Used by `task_sync.sync_tasks` to
+    self-heal tasks whose `current_run_id` was orphaned by a lost update.
+    """
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM run WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
 def list_runs(
     db_path: Path,
     *,

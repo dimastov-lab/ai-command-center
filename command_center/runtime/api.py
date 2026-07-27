@@ -152,6 +152,9 @@ class ExecutionCenterAPI:
     def get_run(self, run_id: str) -> dict | None:
         return db.get_run(self.db_path, run_id)
 
+    def get_latest_run_for_task(self, task_id: str) -> dict | None:
+        return db.get_latest_run_for_task(self.db_path, task_id)
+
     def get_events(self, run_id: str, *, after_seq: int = 0, limit: int = 1000) -> list[dict]:
         return db.list_run_events(self.db_path, run_id, after_seq=after_seq, limit=limit)
 
