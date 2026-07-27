@@ -1,5 +1,11 @@
 """Autonomy proposal foundation — the pre-execution decision layer.
 
+Experimental foundation (AICC-AUTONOMY-002). Persisted, evidence-backed proposal
+lifecycle only — no UI, no automated evidence collectors, no policy resolver, no
+background driver, no executor. `dispatch` returns a dry-run plan the caller must
+run explicitly. Do not extend without first deciding whether to complete or retire
+this layer; see `docs/adr/0005-autonomy-proposal-foundation.md`.
+
 This module is the domain core of AICC-AUTONOMY-002. Where the *completion*
 pipeline (AICC-AUTONOMY-001, `completion.py`) governs the **post-execution**
 lifecycle of a run (validate -> PR -> merge), this module governs the
