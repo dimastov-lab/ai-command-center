@@ -39,6 +39,7 @@ from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
     autopilot_panel,
+    backlog_proposals,
     board_style,
     home_dashboard,
     live_board,
@@ -3681,6 +3682,30 @@ def render_project_chat(project: str, tasks: list[dict], tasks_by_id: dict[str, 
         )
 
 
+def _project_audit_prompt(project: str) -> str:
+    """The read-only audit brief. It must end with a machine-parsable section so
+    `backlog_proposals.parse_candidate_tasks` can turn the report into tasks."""
+    return (
+        f"Проведи READ-ONLY аудит проекта {project} по четырём осям: архитектура, "
+        "соблюдение правил/конвенций, качество кода и тестов, UX. Ничего в коде НЕ меняй. "
+        "В конце отчёта ОБЯЗАТЕЛЬНО выведи секцию с заголовком '## Предлагаемые задачи', "
+        "где каждым пунктом списка дай одно улучшение в формате "
+        "'- **Короткий заголовок** — что и зачем сделать'. От 5 до 15 пунктов, по приоритету."
+    )
+
+
+def _latest_audit_report_text(project: str) -> str | None:
+    """Newest project report that looks like an audit, so the Audit tab can turn
+    it into candidate backlog tasks. Falls back to the newest report of any kind."""
+    files = artifacts.list_markdown_files(REPORTS_DIR / project)
+    audit_files = [f for f in files if any(k in f.name.lower() for k in ("audit", "architecture", "аудит"))]
+    chosen = audit_files or files
+    if not chosen:
+        return None
+    latest = max(chosen, key=lambda path: path.stat().st_mtime)
+    return read_text(latest)
+
+
 if page_key == "dashboard":
     render_home_dashboard(get_execution_center_api(), tasks)
 
@@ -4442,8 +4467,8 @@ elif page_key == "projects":
     selected_project = project_choice
     project_file = project_status_file_path(selected_project)
 
-    tab_status, tab_generated, tab_reports, tab_context, tab_settings, tab_chat = st.tabs(
-        ["Статус", "Задания", "Отчёты", "Контекст", "Настройки", "Чат"]
+    tab_status, tab_generated, tab_reports, tab_context, tab_settings, tab_chat, tab_audit = st.tabs(
+        ["Статус", "Задания", "Отчёты", "Контекст", "Настройки", "Чат", "Аудит"]
     )
 
     with tab_status:
@@ -4659,6 +4684,40 @@ elif page_key == "projects":
 
     with tab_chat:
         render_project_chat(selected_project, tasks, tasks_by_id)
+
+    with tab_audit:
+        st.caption(
+            "Read-only аудит проекта (архитектура, правила, качество, UX). Результат "
+            "превращается в предлагаемые задачи бэклога — примите нужные."
+        )
+        if st.button("Запустить аудит", key=f"proj_audit_run_{selected_project}", type="primary"):
+            audit_task = create_task(
+                selected_project,
+                f"Аудит проекта {selected_project}: архитектура/правила/качество/UX",
+                "architecture_review",
+                "Next",
+                goal="Провести read-only аудит проекта и предложить задачи для бэклога.",
+                prompt=_project_audit_prompt(selected_project),
+            )
+            execution_queue.enqueue_and_persist(ROOT, audit_task, {**tasks_by_id, audit_task["id"]: audit_task})
+            st.success(
+                f"Аудит поставлен в очередь (задача {audit_task['id'][:8]}). Когда read-only "
+                "агент завершит отчёт, его предложения появятся ниже."
+            )
+
+        report_text = _latest_audit_report_text(selected_project)
+        if report_text:
+            st.divider()
+            candidates = backlog_proposals.parse_candidate_tasks(report_text)
+            backlog_proposals.render_candidate_tasks(
+                candidates,
+                ROOT,
+                selected_project,
+                key_prefix=f"proj_audit_cand_{selected_project}",
+                heading="Предложения из аудита",
+            )
+        else:
+            st.caption("Отчётов аудита пока нет — запустите аудит выше.")
 
 
 # --------------------------------------------------------------------------
