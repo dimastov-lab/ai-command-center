@@ -1867,6 +1867,64 @@ def test_exit_zero_with_unchanged_working_tree_is_incomplete_not_completed(
     assert final["failure_reason"] == "incomplete:working_tree_unchanged"
 
 
+def test_exit_zero_unchanged_tree_with_test_pass_evidence_completes(
+    git_repo, configure_project_repo, fake_claude
+):
+    """The recurring false negative: a task whose implementation already landed
+    in an earlier (interrupted) run leaves a clean tree. The agent's own final
+    message carrying explicit test-pass evidence upgrades the would-be
+    INCOMPLETE to COMPLETED so the task stops looping on
+    `incomplete:working_tree_unchanged`."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = ""  # unchanged tree
+    lines = [
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps(
+            {"type": "result", "result": "All 2029 tests pass. The module is already fully implemented per spec."}
+        ),
+    ]
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(lines)
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["exit_code"] == 0
+    assert final["working_tree_changed"] == 0
+    assert final["state"] == "COMPLETED"
+    assert final["failure_reason"] is None
+
+
+def test_exit_zero_unchanged_tree_with_mixed_pass_fail_evidence_is_incomplete(
+    git_repo, configure_project_repo, fake_claude
+):
+    """A mixed 'passed, failed' summary must NOT be upgraded: the failure
+    guard refuses the completion-evidence override even though a pass phrase
+    is present, so the run stays at the safe default INCOMPLETE."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = ""
+    lines = [
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "result", "result": "2029 passed, 3 failed during the run."}),
+    ]
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(lines)
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="do a thing",
+        confirmed=True,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["exit_code"] == 0
+    assert final["working_tree_changed"] == 0
+    assert final["state"] == "FAILED"
+    assert final["failure_reason"] == "incomplete:working_tree_unchanged"
+
+
 def test_exit_zero_read_only_task_type_completes_even_without_working_tree_change(
     git_repo, configure_project_repo, fake_claude
 ):

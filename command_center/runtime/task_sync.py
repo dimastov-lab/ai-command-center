@@ -160,6 +160,24 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task["current_run_id"] = run["id"]
         mutated = True
 
+    # Advance progress for in-progress runs. While a run is RUNNING, the only
+    # observable milestone is `first_output_at` — the agent has started
+    # producing output. Move the task from the pre-launch "Workspace Verified"
+    # (5%) to "Implementation" (40%) so the board reflects live activity instead
+    # of staying frozen at 5% for the entire execution window. This is a
+    # one-way forward advance: `set_current_stage` respects `progress_mode`
+    # (manual overrides are preserved) and stages only move forward in the
+    # STAGE_PROGRESS table.
+    if (
+        status == session_view.STATUS_RUNNING
+        and run.get("first_output_at")
+        and not already_finalized_for_this_run
+    ):
+        current_stage = task.get("current_stage")
+        if current_stage in (None, "Created", "Workspace Verified"):
+            models.set_current_stage(task, "Implementation")
+            mutated = True
+
     if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
         # Must run *before* `target_launch_status` is resolved below: a
         # `Completed` run's launch status depends on `task["progress"]`

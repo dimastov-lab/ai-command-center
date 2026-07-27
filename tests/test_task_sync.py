@@ -291,6 +291,74 @@ def test_sync_task_from_run_is_idempotent_for_the_same_terminal_run(tmp_path, mo
     assert [event["type"] for event in task["timeline"]] == ["tests_passed", "completed"]
 
 
+def test_sync_task_from_run_running_with_output_advances_to_implementation(tmp_path):
+    """A RUNNING run that has produced output (first_output_at set) should
+    advance the task stage from "Workspace Verified" to "Implementation" so
+    the board shows live progress instead of staying frozen at 5%."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="RUNNING")
+    db.update_run_fields(db_path, run["id"], expected_version=run["version"], fields={"first_output_at": "2026-01-01T00:00:01"})
+    run = db.get_run(db_path, run["id"])
+    task = _make_task(current_stage="Workspace Verified", progress=5)
+
+    mutated = task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert mutated is True
+    assert task["launch_status"] == "Running"
+    assert task["current_stage"] == "Implementation"
+    assert task["progress"] == 40
+
+
+def test_sync_task_from_run_running_with_output_does_not_regress_advanced_stage(tmp_path):
+    """If the task is already past 'Implementation' (e.g. manual override),
+    a RUNNING sync must not regress it."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="RUNNING")
+    db.update_run_fields(db_path, run["id"], expected_version=run["version"], fields={"first_output_at": "2026-01-01T00:00:01"})
+    run = db.get_run(db_path, run["id"])
+    task = _make_task(current_stage="Validation", progress=75)
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    # Only the launch_status changes; stage/progress stay.
+    assert task["current_stage"] == "Validation"
+    assert task["progress"] == 75
+
+
+def test_sync_task_from_run_running_without_output_stays_at_workspace_verified(tmp_path):
+    """A RUNNING run that has NOT yet produced output (no first_output_at)
+    should NOT advance progress — it's still in the 'Starting' phase."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="RUNNING")
+    task = _make_task(current_stage="Workspace Verified", progress=5)
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Running"
+    assert task["current_stage"] == "Workspace Verified"
+    assert task["progress"] == 5
+
+
+def test_sync_task_from_run_running_with_output_respects_manual_progress_mode(tmp_path):
+    """A manual progress override must not be clobbered by the RUNNING
+    advancement."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="RUNNING")
+    db.update_run_fields(db_path, run["id"], expected_version=run["version"], fields={"first_output_at": "2026-01-01T00:00:01"})
+    run = db.get_run(db_path, run["id"])
+    task = _make_task(current_stage="Workspace Verified", progress=5, progress_mode="manual")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["progress_mode"] == "manual"
+    assert task["current_stage"] == "Workspace Verified"
+    assert task["progress"] == 5
+
+
 def test_sync_task_from_run_running_updates_are_cheap_and_repeatable(tmp_path):
     """Recomputing `derive_status` every refresh tick for a still-Running
     run is expected and cheap — only the one-time terminal work is guarded."""

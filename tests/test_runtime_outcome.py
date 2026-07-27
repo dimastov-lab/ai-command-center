@@ -102,6 +102,68 @@ def test_classify_incomplete_when_requires_changes_and_working_tree_unchanged():
     assert (classification, reason) == (outcome.INCOMPLETE, "working_tree_unchanged")
 
 
+def test_detect_completion_evidence_matches_explicit_test_pass():
+    assert outcome.detect_completion_evidence("All 2029 tests pass. Dashboard already done.") is not None
+    assert outcome.detect_completion_evidence("19 tests passed; no regressions.") is not None
+    assert outcome.detect_completion_evidence("===== 2029 passed in 12.3s =====") is not None
+
+
+def test_detect_completion_evidence_none_for_bare_done_verdict():
+    """A bare 'done'/'approved' verdict carries no proof the work was
+    verified — it must NOT upgrade an unchanged-tree run to OK."""
+    assert outcome.detect_completion_evidence("Verdict: APPROVED_FOR_COMMIT") is None
+    assert outcome.detect_completion_evidence("done") is None
+    assert outcome.detect_completion_evidence(None) is None
+
+
+def test_detect_completion_evidence_none_when_failure_evidence_present():
+    """A mixed 'passed, failed' summary is a failing run — the failure guard
+    refuses the upgrade even though a pass phrase is present."""
+    assert outcome.detect_completion_evidence("2029 passed, 3 failed") is None
+    assert outcome.detect_completion_evidence("19 tests passed, but 2 failing tests remain") is None
+    assert outcome.detect_completion_evidence("5 errors during collection") is None
+
+
+def test_classify_ok_when_unchanged_tree_but_agent_reports_passing_tests():
+    """The recurring false negative: a task whose implementation already
+    landed in an earlier run leaves a clean tree; the agent's final message
+    carrying explicit test-pass evidence upgrades the would-be INCOMPLETE to
+    OK so the task stops looping on `incomplete:working_tree_unchanged`."""
+    classification, reason = outcome.classify_process_result(
+        task_type="implementation",
+        result_text="All 2029 tests pass. Module is already fully implemented per spec.",
+        permission_denials=[],
+        working_tree_changed=False,
+        provider_completion_valid=True,
+    )
+    assert (classification, reason) == (outcome.OK, None)
+
+
+def test_classify_incomplete_when_provider_says_not_complete_even_with_test_evidence():
+    """A provider that explicitly reports `provider_completion_valid=False`
+    (it did not produce a final message) cannot be upgraded by text alone."""
+    classification, reason = outcome.classify_process_result(
+        task_type="implementation",
+        result_text="All 19 tests pass.",
+        permission_denials=[],
+        working_tree_changed=False,
+        provider_completion_valid=False,
+    )
+    assert (classification, reason) == (outcome.INCOMPLETE, "working_tree_unchanged")
+
+
+def test_classify_blocked_takes_priority_over_completion_evidence():
+    classification, reason = outcome.classify_process_result(
+        task_type="implementation",
+        result_text="All 2029 tests pass but I cannot continue without Bash.",
+        permission_denials=[],
+        working_tree_changed=False,
+        provider_completion_valid=True,
+    )
+    assert classification == outcome.BLOCKED
+    assert reason is not None and reason.startswith("final_response:")
+
+
 def test_classify_ok_for_read_only_task_type_even_when_working_tree_unchanged():
     """A `review`/read-only task type is never expected to change the
     working tree, so an unchanged tree is not evidence of incompleteness for

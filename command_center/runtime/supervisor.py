@@ -1792,6 +1792,7 @@ class Supervisor:
                         result_text=(result_payload or {}).get("result"),
                         permission_denials=(result_payload or {}).get("permission_denials"),
                         working_tree_changed=working_tree_changed,
+                        provider_completion_valid=(result_payload or {}).get("provider_completion_valid"),
                     )
                     if classification == outcome.OK:
                         new_state = "COMPLETED"
