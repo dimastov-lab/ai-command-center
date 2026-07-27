@@ -3706,6 +3706,30 @@ def _latest_audit_report_text(project: str) -> str | None:
     return read_text(latest)
 
 
+def _roadmap_reformat_prompt(project: str, wishes: str) -> str:
+    """Brief for a roadmap rebuild. Ends with the same machine-parsable section
+    the audit uses, so its output flows through the same candidate pipeline."""
+    wishes_clean = (wishes or "").strip() or "(без дополнительных пожеланий — опирайся на текущее состояние проекта)"
+    return (
+        f"Пересобери roadmap проекта {project} с учётом пожеланий пользователя:\n{wishes_clean}\n\n"
+        "Проанализируй текущее состояние (задачи, вехи, волны) и предложи обновлённый план. "
+        "НЕ предлагай работу, которая уже сделана или уже есть в задачах. "
+        "В конце ОБЯЗАТЕЛЬНО выведи секцию с заголовком '## Предлагаемые задачи', где каждым "
+        "пунктом дай одну задачу в формате '- **Короткий заголовок** — что и зачем сделать', "
+        "в порядке приоритета."
+    )
+
+
+def _latest_roadmap_report_text(project: str) -> str | None:
+    """Newest project report that looks like a roadmap rebuild."""
+    files = artifacts.list_markdown_files(REPORTS_DIR / project)
+    roadmap_files = [f for f in files if any(k in f.name.lower() for k in ("roadmap", "переформат", "план"))]
+    if not roadmap_files:
+        return None
+    latest = max(roadmap_files, key=lambda path: path.stat().st_mtime)
+    return read_text(latest)
+
+
 if page_key == "dashboard":
     render_home_dashboard(get_execution_center_api(), tasks)
 
@@ -4467,8 +4491,8 @@ elif page_key == "projects":
     selected_project = project_choice
     project_file = project_status_file_path(selected_project)
 
-    tab_status, tab_generated, tab_reports, tab_context, tab_settings, tab_chat, tab_audit = st.tabs(
-        ["Статус", "Задания", "Отчёты", "Контекст", "Настройки", "Чат", "Аудит"]
+    tab_status, tab_generated, tab_reports, tab_context, tab_settings, tab_chat, tab_audit, tab_roadmap = st.tabs(
+        ["Статус", "Задания", "Отчёты", "Контекст", "Настройки", "Чат", "Аудит", "Roadmap"]
     )
 
     with tab_status:
@@ -4718,6 +4742,50 @@ elif page_key == "projects":
             )
         else:
             st.caption("Отчётов аудита пока нет — запустите аудит выше.")
+
+    with tab_roadmap:
+        st.caption(
+            "Переформатировать Roadmap проекта по новым пожеланиям: агент пересоберёт "
+            "задачи/вехи/волны, покажет предпросмотр. Дубли уже сделанного отфильтровываются."
+        )
+        roadmap_wishes = st.text_area(
+            "Пожелания к Roadmap",
+            key=f"proj_roadmap_wishes_{selected_project}",
+            placeholder="Например: сфокусироваться на надёжности пайплайна и качестве UX",
+        )
+        if st.button("Переформатировать Roadmap", key=f"proj_roadmap_run_{selected_project}", type="primary"):
+            roadmap_task = create_task(
+                selected_project,
+                f"Переформатировать Roadmap: {selected_project}",
+                "architecture_review",
+                "Next",
+                goal="Пересобрать roadmap/задачи/вехи проекта по новым пожеланиям.",
+                prompt=_roadmap_reformat_prompt(selected_project, roadmap_wishes),
+            )
+            execution_queue.enqueue_and_persist(
+                ROOT, roadmap_task, {**tasks_by_id, roadmap_task["id"]: roadmap_task}
+            )
+            st.success(
+                f"Переформатирование поставлено в очередь (задача {roadmap_task['id'][:8]}). "
+                "Когда агент завершит, новые задачи появятся ниже как предложения."
+            )
+
+        roadmap_report = _latest_roadmap_report_text(selected_project)
+        if roadmap_report:
+            st.divider()
+            proposed = backlog_proposals.parse_candidate_tasks(roadmap_report)
+            fresh = backlog_proposals.filter_new_candidates(proposed, tasks)
+            if len(fresh) < len(proposed):
+                st.caption(f"Отфильтровано дублей уже существующих задач: {len(proposed) - len(fresh)}.")
+            backlog_proposals.render_candidate_tasks(
+                fresh,
+                ROOT,
+                selected_project,
+                key_prefix=f"proj_roadmap_cand_{selected_project}",
+                heading="Новые задачи из обновлённого roadmap",
+            )
+        else:
+            st.caption("Отчётов переформатирования пока нет — запустите выше.")
 
 
 # --------------------------------------------------------------------------
