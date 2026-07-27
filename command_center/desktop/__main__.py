@@ -1,4 +1,4 @@
-"""Desktop entry point: ``python -m command_center.desktop`` (`ARCHITECTURE.md` §16)."""
+"""Desktop entry point: ``python -m command_center.desktop`` (`docs/desktop/ARCHITECTURE.md` §16)."""
 
 from __future__ import annotations
 

@@ -585,6 +585,16 @@ class CompletionOrchestrator:
         repo = Path(row["repository_path"])
         remote = row.get("remote") or DEFAULT_REMOTE
         merge_commit = row.get("merge_commit")
+        # A squash merge whose commit oid GitHub had not populated at merge time
+        # persists merge_commit=None. HEAD is not an ancestor of the squashed
+        # base, so verification then depends entirely on that oid — without it a
+        # genuinely-merged PR strands at REQUIRES_ATTENTION forever. Re-discover
+        # the PR once here to recover the oid before relying on it.
+        if not merge_commit and row.get("pull_request_number") and row.get("branch"):
+            refreshed = self._discover_pr(repo, branch=row["branch"], base=row.get("base_branch"))
+            if refreshed is not None and refreshed.merge_commit:
+                merge_commit = refreshed.merge_commit
+                row = {**row, "merge_commit": merge_commit}
         # Fetch so remote-tracking refs reflect the real merge, then check
         # reachability of head OR the merge commit (supports squash merges).
         repo_state.fetch(repo, remote)
@@ -794,6 +804,9 @@ class CompletionOrchestrator:
             reason_code=ReasonCode.TARGET_VERIFIED,
             recommended="Task completed and merged into the target branch.",
             now=now,
+            # Persist a merge commit recovered late in _step_verify; _transition
+            # ignores it when None, so the other call sites are unaffected.
+            merge_commit=row.get("merge_commit"),
             progressed=False,
         )
         return runtime_db.get_completion(self.db_path, row["run_id"]), False

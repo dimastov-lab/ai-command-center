@@ -1,9 +1,10 @@
 # AI Command Center — Desktop Information Architecture
 
-Status: **D0 — target navigation, with Desktop Increment 1's actual scope called out
-explicitly.** This document defines the eventual navigation structure and the subset of it
-Desktop Increment 1 activates. See `DESKTOP_INCREMENT_1.md` for the binding scope of what D1
-actually builds.
+Status: **Target navigation; the D1 subset is shipped.** This document defines the eventual
+navigation structure and the subset of it Desktop Increment 1 activates. The D1 shell now
+implements that subset in `command_center.desktop` (active sections plus the disabled
+placeholders); the fuller structure remains ahead. See `DESKTOP_INCREMENT_1.md` for the binding
+scope of what D1 actually builds.
 
 ## 1. Eventual navigation (target, all increments)
 

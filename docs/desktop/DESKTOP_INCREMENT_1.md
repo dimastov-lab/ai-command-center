@@ -1,8 +1,8 @@
 # AI Command Center — Desktop Increment 1 (Frozen Scope)
 
-Status: **D0 — frozen scope for D1 through D4.** This document is the binding definition of what
-"Desktop Increment 1" means for this product: four stages (D1–D4), each independently gated. No
-stage here begins implementation as part of this D0 documentation increment — see
+Status: **Frozen scope for D1 through D4; D1 implemented.** This document is the binding definition
+of what "Desktop Increment 1" means for this product: four stages (D1–D4), each independently
+gated. D1 (Native Shell Prototype, §2) has shipped; D2–D4 are not yet implemented — see
 `IMPLEMENTATION_ROADMAP.md` for the smaller, commit-sized steps within each stage.
 
 ## 0. Desktop Increment 1 read/write boundary (binding decision 11)
