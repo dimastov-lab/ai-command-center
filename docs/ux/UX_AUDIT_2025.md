@@ -326,8 +326,8 @@ Each increment is scoped to not break the `AppTest` suite or change data/runtime
 
 | Increment | Scope | Key files | Acceptance |
 |---|---|---|---|
-| **UX-2a** Fragment polling | Wrap live board + add Execution Strip as `@st.fragment(run_every=...)`; eliminate full-page flash | `app.py` (board region), new `ui/execution_strip.py` | Page does not blank on poll; strip updates live from any page |
-| **UX-2b** Interactive dashboard | Clickable KPIs/counts/queue rows via `pending_*`; real 24h deltas; real AI-Supervisor state; empty states; next-action hero | `ui/home_dashboard.py`, `app.py:3798` | Every dashboard tile deep-links; no hardcoded "Active" |
+| **UX-2a** Fragment polling ✅ PR #57 (`f16d30d`) | Wrap live board + add Execution Strip as `@st.fragment(run_every=...)`; eliminate full-page flash | `app.py` (board region), new `ui/execution_strip.py` | Page does not blank on poll; strip updates live from any page |
+| **UX-2b** Interactive dashboard ✅ PR #58 (`8075556`) | Clickable KPIs/counts/queue rows via `pending_*`; real 24h deltas; real AI-Supervisor state; empty states; next-action hero | `ui/home_dashboard.py`, `app.py:render_home_dashboard` | Every dashboard tile deep-links; no hardcoded "Active"; windowed 7-day health; real activity-log events; `AICC_OPERATOR` env greeting |
 | **UX-2c** Command bar + Inspector | Top bar: search, project scope, status glyph; inspector wired to selected task/run | `ui/top_bar.py`, `ui/inspector.py`, `app.py` (card click handlers) | Inspector shows real detail; bar shows live glyph |
 | **UX-2d** Visual unification | Retire `.hx-*`; rebuild dashboard on tokens/`st.container`; one card grammar; hover transitions + skeleton CSS in `theme.py` | `ui/home_dashboard.py`, `ui/theme.py`, `ui/tokens.py`, new `ui/charts.py` | Light+dark consistent across all pages; one card style |
 | **UX-2e** IA consolidation | Merge executive + workspace_home into dashboard tabs; merge timeline into runs; merge portfolio pair; demote merged pages from sidebar (keep URL-reachable) | `app.py` (dispatch), `ui/sidebar.py` | 10 sidebar entries; no content lost; deep links still resolve |
