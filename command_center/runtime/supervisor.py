@@ -1589,7 +1589,7 @@ class Supervisor:
                 self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("handshake_received", at=now)["payload"]
             )
         except Exception:
-            pass
+            logger.debug("handshake event persist failed for run %s", run_id, exc_info=True)
         try:
             run = db.get_run(self.db_path, run_id)
             if run is None or run.get("first_output_at"):
@@ -1602,7 +1602,7 @@ class Supervisor:
             # first), KeyError (run gone), or any other db hiccup — the
             # milestone is best-effort; the append-only event above already
             # captured the timing for the audit log.
-            pass
+            logger.debug("first_output_at milestone failed for run %s", run_id, exc_info=True)
 
     def _drain_stdout(self, run_id: str, active: _ActiveRun) -> None:
         process = active.process
@@ -1616,7 +1616,7 @@ class Supervisor:
             try:
                 process.stdout.close()
             except Exception:
-                pass
+                logger.debug("stdout close failed for run %s", run_id, exc_info=True)
 
     def _persist_stdout_event(self, run_id: str, active: _ActiveRun, line: str) -> None:
         event = active.provider_runtime.parse_stdout_line(line)
@@ -1642,7 +1642,7 @@ class Supervisor:
             try:
                 process.stderr.close()
             except Exception:
-                pass
+                logger.debug("stderr close failed for run %s", run_id, exc_info=True)
 
     def _persist_stderr_event(self, run_id: str, active: _ActiveRun, line: str) -> None:
         if active.provider_runtime.stderr_line_is_readiness(line):
@@ -1792,6 +1792,7 @@ class Supervisor:
                         result_text=(result_payload or {}).get("result"),
                         permission_denials=(result_payload or {}).get("permission_denials"),
                         working_tree_changed=working_tree_changed,
+                        provider_completion_valid=(result_payload or {}).get("provider_completion_valid"),
                     )
                     if classification == outcome.OK:
                         new_state = "COMPLETED"

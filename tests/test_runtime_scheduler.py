@@ -41,19 +41,29 @@ def _item(task_id: str, workspace: str, **kw) -> scheduler.WorkItem:
 
 
 def test_default_registry_only_registers_available_executors():
-    """The invariant is the *filter*, not a fixed roster.
+    """The invariant is membership-by-existence, not membership-by-availability.
 
-    Availability is now a live capability probe (`executors.Executor.available`
-    -> `providers`), so which executors qualify depends on what is installed on
-    the host: Codex and Ollama register here when their CLI is present. Asserting
-    a hard-coded list would make this test pass or fail on the developer's
-    machine setup rather than on the behaviour it exists to protect."""
+    `default_registry` registers every executor that has a *provider* behind it
+    (`availability_check is not None`), carrying the live availability probe on
+    the `AgentSpec.available` flag rather than letting it decide membership.
+    That is the whole point: `executor.available` shells out to the provider CLI
+    and can report False for transient reasons (a slow probe, a restarting
+    daemon), so omitting such an executor would turn a self-healing
+    `agent_unavailable` into a structural `no_capable_agent`. An executor with no
+    provider at all is a genuine structural absence and stays omitted."""
     reg = _registry()
     registered = {a.agent_id for a in reg.all()}
+    # Membership == "has a provider (availability_check is not None)", independent
+    # of whether the CLI happens to be installed on this host.
+    with_provider = {
+        eid for eid, exe in executors.EXECUTORS.items() if exe.availability_check is not None
+    }
+    assert registered == with_provider
+    # Live availability is a subset of membership, never the other way around.
     available = {e.id for e in executors.EXECUTORS.values() if e.available}
-    assert registered == available
+    assert available <= registered
     # Claude is always installed in this suite, and a permanently-unavailable
-    # executor must never be registered.
+    # executor (no provider) must never be registered.
     assert reg.get("claude_code") is not None
     assert reg.get("chatgpt") is None
 

@@ -54,13 +54,13 @@ or:
 scripts/start-ui.sh
 ```
 
-`scripts/start-ui.sh` activates `.venv` when present and forwards additional Streamlit arguments.
-It does not install dependencies. Streamlit is an HTTP/WebSocket server and this repository does
-not configure `server.address`; explicitly bind it to localhost when the UI must not be reachable
-from the local network:
+`scripts/start-ui.sh` activates `.venv` when present, forwards additional Streamlit arguments,
+and binds the server to localhost by default (the application has no authentication, so it must
+not be reachable from the local network unless you explicitly opt in). It does not install
+dependencies. To override the bind address, pass an explicit `--server.address`:
 
 ```bash
-scripts/start-ui.sh --server.address localhost
+scripts/start-ui.sh --server.address 0.0.0.0   # explicitly expose (not recommended)
 ```
 
 There is no application authentication layer.
@@ -95,7 +95,7 @@ AI Command Center deliberately has more than one persistence authority:
 | Store | Role |
 |---|---|
 | `data/tasks.json` | Planning and Kanban task store |
-| `data/runtime.db` | Authoritative SQLite schema 7 state for runtime tasks, sessions, runs, run events, reports, completion, and autonomy proposals/evidence/events |
+| `data/runtime.db` | Authoritative SQLite schema 10 state for runtime tasks, sessions, runs, run events, reports, completion, and autonomy proposals/evidence/events |
 | `data/execution_queue.json`, `data/execution_queue.lock` | Separate persisted planning/execution queue plus its same-host cooperative OS advisory lock |
 | `data/runs.jsonl` | Legacy append-only synchronous run journal |
 | `data/chats.json`, `data/activity.jsonl` | Currently used project-chat and activity stores, separate from SQLite |
@@ -106,7 +106,7 @@ AI Command Center deliberately has more than one persistence authority:
 | `generated/<PROJECT>/` | Generated legacy task artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative
-for execution, completion, and the autonomy-proposal lifecycle. Schema 7 contains the application
+for execution, completion, and the autonomy-proposal lifecycle. Schema 10 contains the application
 tables `task`, `session`, `run`, `run_event`, and `report`; the three completion tables; and
 `proposal`, `proposal_evidence`, and `proposal_event`; `schema_version` tracks migrations. It does
 not contain the execution queue or scheduler claims. The legacy `runs.jsonl` journal and the
@@ -116,10 +116,23 @@ persisted boundaries. Reconciliation is therefore required: Execution Center ref
 SQLite run/completion state back to Kanban tasks, and queue readiness is recomputed from the
 planning store. These are projections, not a single transactional database.
 
-Most local artifacts are excluded by the checked-in [`.gitignore`](.gitignore). `runtime.db` is
-local state and must remain untracked; the current checkout excludes it through repository-local
-Git metadata rather than a checked-in ignore rule. A fresh clone should verify that exclusion
-before running the application. Tests redirect data through `AICC_DATA_DIR`.
+Most local artifacts are excluded by the checked-in [`.gitignore`](.gitignore), which
+also covers `data/runtime.db` and its WAL/SHM sidecars. Tests redirect data through
+`AICC_DATA_DIR`.
+
+### Runtime history retention
+
+`data/runtime.db` grows with every run event. Retention is **off by default** and
+opt-in via environment variables, so existing installs and the test suite are
+unaffected:
+
+- `AICC_RUNTIME_RETENTION_DAYS=<N>` — on startup (after schema migration), delete
+  `run_event` rows for runs that have been terminal for longer than `N` days. The
+  terminal run row itself is kept (it remains visible in the Execution Center and
+  to reconciliation); only the bulky per-output event history is pruned.
+- `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` after pruning to reclaim disk.
+  VACUUM rewrites the database under an exclusive lock, so enable it only on a
+  single-host install that can briefly pause other writers.
 
 ## Execution lifecycle
 
@@ -232,7 +245,10 @@ components do have write capabilities:
 - The GitHub adapter may discover, create, and—only when completion policy permits—merge pull
   requests through fixed `gh` argument lists.
 - Validation commands are parsed with `shell=False`, bounded by timeouts, and restricted to an
-  executable allowlist.
+  executable allowlist. The allowlist scopes the *entry binary* (it blocks direct `sh`/`rm`/`curl`
+  invocation); interpreter-class entries such as `python3`, `node`, `npx`, and `make` will run
+  whatever code the operator-supplied arguments specify, so `validation_commands` is trusted
+  operator configuration and must be reviewed like any other privileged setting.
 
 Launches and warnings require explicit UI confirmation. Normal completion defaults preserve
 manual merge. Commit, push, pull-request, and merge authority remains a privileged operational
@@ -269,9 +285,12 @@ repository settings must separately require the check if merges are to be blocke
 - Legacy synchronous/JSONL and current asynchronous/SQLite execution paths coexist.
 - Supervisor ownership is process-local; a server restart loses pipes and live `Popen` handles.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
-- There is no configured static type checker.
+- A static type checker is now configured (permissive, non-strict) via `pyproject.toml` and
+  surfaced as a non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
 - The checked-in CI workflow is automatic but does not itself enforce branch protection; the
   repository's current plan/settings must be checked before treating it as a required merge gate.
+  Enable "Require status checks to pass before merging" on `main` with the `Quality gates` check
+  to make the workflow a real gate.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
   it, and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
@@ -283,8 +302,9 @@ repository settings must separately require the check if merges are to be blocke
   perform it.
 - Fail-closed workspace verification is scoped to normal task-v2 paths that supply a
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
-- Streamlit may be reachable beyond localhost unless explicitly bound; the application has no
-  authentication.
+- Streamlit is bound to localhost by default by `scripts/start-ui.sh`; passing an explicit
+  `--server.address` overrides that. The application has no authentication, so do not bind it
+  to a reachable interface.
 - The system does not provide distributed execution, remote-worker durability, or seamless
   process resumption.
 - Native desktop packaging is not implemented.

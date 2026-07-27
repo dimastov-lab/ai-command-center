@@ -14,6 +14,16 @@ data/execution_queue.lock
 data/pipeline_settings.lock
 data/task_pipeline.lock
 
+# SQLite runtime database and its WAL/SHM sidecars. Local execution state —
+# must never be committed. (Previously excluded only via .git/info/exclude,
+# which does not survive a fresh clone; this checked-in rule closes that gap.)
+data/runtime.db
+data/runtime.db-wal
+data/runtime.db-shm
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
 # Transient AI task artifacts and agent reports generated at runtime
 # (scripts/start-task.sh and the v1.2 Claude Code runner)
 generated/

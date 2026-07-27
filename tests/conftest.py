@@ -316,7 +316,15 @@ def git_repo(tmp_path):
     """A real, throwaway git repository — never one of the user's real projects."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    # Pin the initial branch to ``main`` explicitly: the launch path's
+    # workspace gate (workspace_provisioning.verify_workspace, step
+    # ``base_branch_exists``) checks ``base_branch`` (defaults to ``main`` when
+    # the project config omits it) resolves to a commit. On runners whose git
+    # has no global ``init.defaultBranch=main`` (e.g. ubuntu-latest), a bare
+    # ``git init`` creates ``master`` and that gate fails — diverging from local
+    # runs where git defaults to ``main``. ``-b`` needs git >= 2.28, which every
+    # supported runner ships.
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
     (repo / "f.txt").write_text("hello\n")
@@ -404,6 +412,23 @@ def fake_codex(monkeypatch, tmp_path):
     monkeypatch.setenv("AICC_TEST_FAKE_CODEX_BINARY", str(executable))
     monkeypatch.setenv("FAKE_CODEX_TOUCH_FILE", "fake_codex_default_touch.txt")
     project_config.save_allowed_agents("AIOS", ["claude_code", "codex"])
+    return executable
+
+
+FAKE_COPILOT_SCRIPT = Path(__file__).parent / "fixtures" / "fake_copilot.py"
+
+
+@pytest.fixture
+def fake_copilot(monkeypatch, tmp_path):
+    """Install an isolated executable Copilot CLI double and route every probe/run to it."""
+    from command_center import project_config
+
+    executable = tmp_path / "copilot"
+    shutil.copyfile(FAKE_COPILOT_SCRIPT, executable)
+    executable.chmod(0o700)
+    monkeypatch.setenv("AICC_COPILOT_BINARY", str(executable))
+    monkeypatch.setenv("FAKE_COPILOT_TOUCH_FILE", "fake_copilot_default_touch.txt")
+    project_config.save_allowed_agents("AIOS", ["claude_code", "copilot_cli"])
     return executable
 
 

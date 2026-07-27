@@ -29,10 +29,12 @@ event write before it goes back to reading the next line of subprocess output.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TypeVar
 
@@ -826,6 +828,79 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
+    # Optional, operator-opted-in retention: run after the migration connection
+    # above has closed so VACUUM (if enabled) does not contend with it. See
+    # `apply_runtime_retention`.
+    maybe_apply_runtime_retention(db_path)
+
+
+def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
+    """Delete `run_event` rows (and orphaned `report` rows) for runs that have
+    been terminal for longer than `retention_days`, returning the number of
+    `run_event` rows removed.
+
+    Bounded and conservative:
+      * only *terminal* runs are eligible (their events are historical audit
+        trail, not live state);
+      * the cutoff is computed in Python with the same naive-local ISO
+        convention every other timestamp in this app uses (`models.iso_now`),
+        so it never disagrees with `completed_at` by a UTC offset;
+      * the run row itself is kept (its `state`/`completed_at` remain visible
+        in the Execution Center and to reconciliation); only the bulky
+        per-output-event history is pruned;
+      * runs with a NULL `completed_at` are left untouched.
+
+    Does not VACUUM here — reclaiming disk is a separate, heavier, lock-holding
+    operation the operator should run deliberately (see `maybe_apply_runtime_retention`).
+    """
+    if retention_days <= 0:
+        return 0
+    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in TERMINAL_STATES)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            cur = conn.execute(
+                f"""
+                DELETE FROM run_event
+                 WHERE run_id IN (
+                    SELECT id FROM run
+                     WHERE state IN ({placeholders})
+                       AND completed_at IS NOT NULL
+                       AND completed_at < ?
+                 )
+                """,
+                (*TERMINAL_STATES, cutoff),
+            )
+            removed = cur.rowcount
+        # `report` rows cascade-delete with `run` via FK, but a terminal run's
+        # report file on disk is also historical; leave the DB row (the path is
+        # small) — only events are bulky.
+    return removed
+
+
+def maybe_apply_runtime_retention(db_path: Path) -> None:
+    """Apply retention iff the operator set `AICC_RUNTIME_RETENTION_DAYS` to a
+    positive integer. Default (unset / <= 0) is a no-op, so this never changes
+    behavior for existing installs or the test suite.
+
+    A companion `AICC_RUNTIME_VACUUM_ON_START=1` runs `VACUUM` after pruning to
+    reclaim disk. VACUUM rewrites the whole database under an exclusive lock, so
+    it is opt-in and should only be enabled on a single-host install that can
+    pause other writers briefly.
+    """
+    raw = os.environ.get("AICC_RUNTIME_RETENTION_DAYS")
+    if not raw:
+        return
+    try:
+        retention_days = int(raw)
+    except ValueError:
+        return
+    if retention_days <= 0:
+        return
+    apply_runtime_retention(db_path, retention_days=retention_days)
+    if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
+        with connect(db_path) as conn:
+            conn.execute("VACUUM")
 
 
 def current_schema_version(db_path: Path) -> int:

@@ -33,9 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import shutil
-import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -106,17 +104,11 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
 
 
 def save_tasks(root: Path, tasks: list[dict]) -> None:
-    data_dir = storage.resolve_data_dir(root)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    tasks_file = tasks_file_path(root)
-    fd, tmp_name = tempfile.mkstemp(dir=data_dir, prefix=".tasks_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(tasks, handle, ensure_ascii=False, indent=2)
-        os.replace(tmp_name, tasks_file)
-    except Exception:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+    # Delegate to the shared, fsync-ing `storage.atomic_write_json` primitive
+    # rather than duplicating its temp-file + `os.replace` pattern without the
+    # `fsync` (audit MINOR-10): every other JSON store in the project already
+    # goes through it, so `tasks.json` gets the same on-disk durability.
+    storage.atomic_write_json(tasks_file_path(root), tasks)
 
 
 @contextlib.contextmanager

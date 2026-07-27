@@ -137,6 +137,27 @@ def test_parse_card_handles_colon_inside_quoted_value(tmp_path):
     assert task.title == "Fix: the thing, properly"
 
 
+def test_parse_card_rejects_inline_comment_in_unquoted_scalar(tmp_path):
+    # An unquoted trailing `# note` must not silently become part of the value;
+    # the parser fails closed instead of producing `status: "ready # note"`
+    # (Founder Functional Audit MINOR-3).
+    text = VALID_CARD.replace('status: "ready"', "status: ready # not a status")
+    path = _write_card(tmp_path, "ready", "AICC", "comment.md", text)
+    try:
+        parse_card(path, lane="ready")
+        assert False, "expected PortfolioCardError for inline comment"
+    except PortfolioCardError:
+        pass
+
+
+def test_parse_card_preserves_hash_inside_quoted_value(tmp_path):
+    # A `#` inside a quoted value is literal text, not a comment.
+    text = VALID_CARD.replace('title: "Do the thing"', 'title: "see #42"')
+    path = _write_card(tmp_path, "ready", "AICC", "quotedhash.md", text)
+    task = parse_card(path, lane="ready")
+    assert task.title == "see #42"
+
+
 # --------------------------------------------------------------------------
 # Fail-closed validation — nested mappings, block lists, block scalars,
 # unterminated values, and duplicate keys must all be rejected explicitly

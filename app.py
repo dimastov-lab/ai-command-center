@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import subprocess
 import time
@@ -1493,6 +1494,9 @@ def _build_execution_center_sessions(
     this is just the join. Also performs the read-only heartbeat probe for
     every currently-Running run as a side effect."""
     tasks_by_id = {t["id"]: t for t in tasks if t.get("id")}
+    # Clear per-render git-status cache so stale results from the previous
+    # page load are discarded (many runs share the same workspace path).
+    session_view.clear_git_status_cache()
     runs = api.list_runs(limit=200)
     # Batch the three per-run reads into one query each (audit H5 N+1). This loop
     # used to open ~3 fresh sqlite connections per run — up to ~600 per render —
@@ -2259,13 +2263,18 @@ def _fix_attention_sessions(
     """Relaunch each selected attention item as a new, operator-confirmed
     attempt carrying the shared fix instruction.
 
-    Deliberately goes through `api.start_run(confirmed=True)` rather than the
-    autopilot's queue path: this is a human explicitly saying "run it anyway",
-    so it is not subject to the planner's conservative gates (a `terminal_failure`
-    verdict, a dirty-tree warning) that exist precisely because *no* human was in
-    the loop. The one gate it never bypasses is the fail-closed workspace
-    isolation in `Supervisor.start_raw` — that is a safety boundary, not a
-    convenience refusal, and `start_run` reaches it unchanged.
+    Goes through ``launch_service.execute_agent_launch_v2`` — the same path
+    the Kanban launcher uses — so it inherits executor fallback (tries the
+    next available agent when the configured one is in
+    ``failed_executors``), workspace provisioning + verification (the
+    worktree path passes the fail-closed gate via
+    ``repository_already_validated``), and the per-task timeout. The
+    ``confirmed=True`` flag bypasses the planner's conservative gates
+    (a ``terminal_failure`` verdict, a dirty-tree warning) that exist
+    precisely because *no* human was in the loop. The one gate it never
+    bypasses is the fail-closed workspace isolation in
+    ``Supervisor.start_raw`` — that is a safety boundary, not a
+    convenience refusal.
 
     Returns (task_title, ok, detail) per item, in order."""
     results: list[tuple[str, bool, str]] = []
@@ -2284,23 +2293,72 @@ def _fix_attention_sessions(
         if not workspace:
             results.append((title, False, "Не настроен workspace задачи."))
             continue
+
+        # --- Executor fallback (AICC-DESKTOP-017) ------------------------
+        # The configured executor is retried as-is unless it already failed to
+        # *start* (``failed_executors`` — a recorded startup failure with no
+        # output, e.g. an expired OAuth token), in which case we fall through to
+        # the next available agent in the project's ``allowed_agents`` chain.
+        # We deliberately do NOT gate the configured executor on the live
+        # ``provider.availability()`` probe here: that probe shells out to the
+        # provider CLI and can report ``False`` for transient reasons (a
+        # daemon restarting, a probe timeout under load) that are not evidence
+        # the agent cannot run this task, and in test/CI the real binary is
+        # absent even though the run is faked — gating on it would block the
+        # retry the operator explicitly asked for. ``select_available_executor``
+        # (which does probe) is only consulted once the configured executor is
+        # known to have failed to start.
+        configured_executor = task.get("executor") or "claude_code"
+        failed = set(task.get("failed_executors") or [])
+        if configured_executor not in failed:
+            selected_executor = configured_executor
+        else:
+            selected_executor = execution_queue.select_available_executor(task, cfg)
+            if selected_executor is None:
+                results.append(
+                    (title, False, "ни один из разрешённых исполнителей не доступен — проверьте установку/авторизацию агентов")
+                )
+                continue
+            original = configured_executor
+            task["executor"] = selected_executor
+            task.setdefault("timeline", []).append(
+                {
+                    "ts": models.iso_now(),
+                    "type": "executor_fallback",
+                    "from": original,
+                    "to": selected_executor,
+                    "reason": "configured executor failed to start (attention triage fix)",
+                }
+            )
+
+        source_repository_path = cfg.get("repository_path")
+        expected_branch = task.get("branch")
+        base_branch = cfg.get("base_branch") or "main"
+
         try:
-            run = api.start_run(
+            run = launch_service.execute_agent_launch_v2(
                 project=project_id,
-                repository_path=workspace,
                 task_type=task.get("task_type") or "implementation",
-                instruction=_build_fix_instruction(task, session),
+                prompt=_build_fix_instruction(task, session),
+                timeout_seconds=agent_runner.timeout_for_task(task),
+                repository_path=Path(workspace),
+                execution_center_api=api,
                 confirmed=True,
-                task_id=task.get("id"),
-                executor_id=task.get("executor") or "claude_code",
-                expected_branch=task.get("branch"),
-                launch_source="attention_triage",
+                task=task,
+                executor_id=selected_executor,
+                expected_branch=expected_branch,
+                base_branch=base_branch,
+                source_repository_path=source_repository_path,
+                max_global_concurrency=cfg.get("max_global_concurrency"),
             )
         except (
+            launch_service.DuplicateActiveLaunchError,
             runtime_context_service.ConfirmationRequiredError,
             agent_runner.RunnerError,
             project_config.ProviderAuthorizationError,
             runtime_supervisor.SupervisorError,
+            workspace_provisioning.WorkspaceVerificationError,
+            runtime_supervisor.WorkspaceVerificationFailed,
         ) as exc:
             results.append((title, False, str(exc)))
             continue
@@ -2684,8 +2742,8 @@ def _render_dependency_tree(task: dict, tasks_by_id: dict[str, dict]) -> None:
         mark = "✅" if node.done else "⏳"
         st.markdown(
             f"<div style='font-size:0.82rem;opacity:0.85'>{indent}"
-            f"{live_board.relation_mark(node.relation)} {mark} {node.title[:64]} "
-            f"<code>{node.status}</code></div>",
+            f"{live_board.relation_mark(node.relation)} {mark} {html.escape(node.title[:64])} "
+            f"<code>{html.escape(node.status)}</code></div>",
             unsafe_allow_html=True,
         )
 

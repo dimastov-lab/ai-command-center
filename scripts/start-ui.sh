@@ -16,4 +16,11 @@ if ! command -v streamlit >/dev/null 2>&1; then
   exit 1
 fi
 
+# Bind to localhost by default: the application has no authentication layer,
+# so it must not be reachable from the local network unless the operator
+# explicitly opts in. Pass an explicit --server.address to override.
+if [[ $# -eq 0 ]] || ! grep -q -- "--server.address" <<<"$*"; then
+  set -- --server.address localhost "$@"
+fi
+
 exec streamlit run "$ROOT_DIR/app.py" "$@"

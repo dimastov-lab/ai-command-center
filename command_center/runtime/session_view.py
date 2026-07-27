@@ -201,17 +201,35 @@ def median_completed_run_seconds(runs: list[dict], *, task_type: str | None = No
     return (durations[mid - 1] + durations[mid]) / 2
 
 
+# Per-render cache: many runs share the same workspace, so `get_status` only
+# needs to run once per unique path per page load. Cleared by
+# `clear_git_status_cache()` at the start of each render cycle.
+_git_status_cache: dict[str, dict[str, Any] | None] = {}
+
+
+def clear_git_status_cache() -> None:
+    """Clear the per-render git-status cache. Call once at the start of each
+    dashboard render so stale results from the previous render are discarded."""
+    _git_status_cache.clear()
+
+
 def live_git_status(workspace_path: str | None) -> dict[str, Any] | None:
     """Read-only, best-effort: never switches branches, never mutates the
     workspace. Returns `None` if the path is missing, not a directory, or not
-    a git repo — callers render "—" rather than crashing."""
+    a git repo — callers render "—" rather than crashing. Results are cached
+    per `workspace_path` within a single render cycle for deduplication."""
     if not workspace_path:
         return None
+    if workspace_path in _git_status_cache:
+        return _git_status_cache[workspace_path]
     path = Path(workspace_path).expanduser()
     if not path.is_dir():
+        _git_status_cache[workspace_path] = None
         return None
     status = git_info.get_status(path)
-    return status if status.get("is_repo") else None
+    result = status if status.get("is_repo") else None
+    _git_status_cache[workspace_path] = result
+    return result
 
 
 def _summarize_event(event: dict | None) -> dict | None:
@@ -368,15 +386,25 @@ def derive_live_progress(
     task_type: str | None = None,
     elapsed_seconds: float | None = None,
     timeout_seconds: float | None = None,
+    stage_progress: int | None = None,
+    stage_label: str | None = None,
 ) -> tuple[int | None, str | None]:
     """A truthful (percent, stage) for the progress bar, from what is actually
     observed about the run — its process phase, then its completion state.
 
-    Returns `(None, None)` for a status that has no meaningful progress bar
-    (a plain terminal `Failed`/`Cancelled`/`Requires Attention` with no
+    Returns ``(None, None)`` for a status that has no meaningful progress bar
+    (a plain terminal ``Failed``/``Cancelled``/``Requires Attention`` with no
     completion row): the card shows the reason, not a bar. A completion row,
     when present, always wins over the process phase — it is the later, more
     specific fact.
+
+    ``stage_progress``/``stage_label`` carry the Kanban task's milestone-based
+    progress (``STAGE_PROGRESS`` for ``current_stage``). For a RUNNING run the
+    time-based fraction is a *lower bound*: the bar shows ``max(time_frac,
+    stage_progress)`` so it never drops below a milestone the task already
+    reached (e.g. once the agent started producing output and the task moved
+    to "Implementation" at 40 %, the bar never reads 9 % — it stays at least
+    40 % and climbs with time from there).
     """
     # A read-only task that has exited cleanly is *done* — 100 %. This wins over
     # any completion row: the auto-merge pipeline can spuriously seed a
@@ -400,8 +428,17 @@ def derive_live_progress(
         frac = 0.0
         if elapsed_seconds and timeout_seconds and timeout_seconds > 0:
             frac = min(1.0, max(0.0, elapsed_seconds / timeout_seconds))
-        percent = min(_RUN_WORKING_CEILING, max(_RUN_WORKING_FLOOR, round(frac * 100)))
-        return percent, "Выполняется"
+        time_percent = min(_RUN_WORKING_CEILING, max(_RUN_WORKING_FLOOR, round(frac * 100)))
+        # The task's milestone-based progress is a floor: once the agent has
+        # produced output and the task advanced to "Implementation" (40 %),
+        # the bar must not drop below it. Use whichever is higher — the
+        # time-based fraction or the milestone — and prefer the milestone
+        # label when the milestone wins, so the bar says "Implementation"
+        # rather than the generic "Выполняется".
+        milestone = int(stage_progress) if stage_progress is not None else 0
+        if milestone > time_percent:
+            return min(_RUN_WORKING_CEILING, milestone), stage_label or "Выполняется"
+        return time_percent, "Выполняется"
 
     phase = _RUN_PHASE_PROGRESS.get(display_status)
     if phase:
@@ -450,7 +487,19 @@ def build_session_view(
     started_at = run.get("started_at")
     finished_at = run.get("completed_at")
     workspace_path = run.get("repository_path")
-    git_status = live_git_status(workspace_path)
+    # Only probe the filesystem for live runs — the branch/status of a
+    # terminal run was captured at completion time and never changes. This
+    # avoids one ``git status`` subprocess (3 git calls) per terminal run,
+    # which dominated refresh time at scale (107 runs × ~10 ms = ~1 s).
+    run_state = run.get("state") or ""
+    if run_state in ("PREPARED", "QUEUED", "RUNNING"):
+        git_status = live_git_status(workspace_path)
+        actual_branch = (git_status or {}).get("branch")
+    else:
+        # Terminal runs: branch was captured at completion. Fall back to the
+        # expected branch so the UI still shows it without a git subprocess.
+        git_status = None
+        actual_branch = run.get("expected_branch")
 
     task_title = (kanban_task or {}).get("title") or (run.get("prompt") or "")[:80] or (run.get("id") or "")[:8]
     executor = run.get("provider_id") or (kanban_task or {}).get("executor") or "claude_code"
@@ -475,7 +524,7 @@ def build_session_view(
         "workspace_path": workspace_path,
         "repository_path": (project_cfg or {}).get("repository_path") or workspace_path,
         "expected_branch": run.get("expected_branch"),
-        "actual_branch": (git_status or {}).get("branch"),
+        "actual_branch": actual_branch,
         "git_status": git_status,
         "launch_source": run.get("launch_source") or "execution_center_adhoc",
         "process_id": run.get("pid"),
@@ -520,6 +569,11 @@ def build_session_view(
                     # Prefer the realistic expected duration (estimate/history);
                     # fall back to the timeout only when neither exists.
                     timeout_seconds=reference_seconds if reference_seconds else run.get("timeout_seconds"),
+                    # The task's milestone-based progress (STAGE_PROGRESS for
+                    # current_stage) acts as a floor for the time-based bar so
+                    # it never drops below a milestone the task already reached.
+                    stage_progress=(kanban_task or {}).get("progress"),
+                    stage_label=(kanban_task or {}).get("current_stage"),
                 ),
             )
         ),

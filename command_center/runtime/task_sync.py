@@ -160,6 +160,24 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task["current_run_id"] = run["id"]
         mutated = True
 
+    # Advance progress for in-progress runs. While a run is RUNNING, the only
+    # observable milestone is `first_output_at` — the agent has started
+    # producing output. Move the task from the pre-launch "Workspace Verified"
+    # (5%) to "Implementation" (40%) so the board reflects live activity instead
+    # of staying frozen at 5% for the entire execution window. This is a
+    # one-way forward advance: `set_current_stage` respects `progress_mode`
+    # (manual overrides are preserved) and stages only move forward in the
+    # STAGE_PROGRESS table.
+    if (
+        status == session_view.STATUS_RUNNING
+        and run.get("first_output_at")
+        and not already_finalized_for_this_run
+    ):
+        current_stage = task.get("current_stage")
+        if current_stage in (None, "Created", "Workspace Verified"):
+            models.set_current_stage(task, "Implementation")
+            mutated = True
+
     if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
         # Must run *before* `target_launch_status` is resolved below: a
         # `Completed` run's launch status depends on `task["progress"]`
@@ -168,6 +186,47 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         mutated = True
 
     target_launch_status = _resolve_target_launch_status(status, task)
+
+    # --- Executor fallback auto-retry (AICC-DESKTOP-017) -----------------
+    # A run that died on startup (INTERRUPTED, never produced output) is a
+    # strong signal the executor itself is broken — e.g. an expired OAuth
+    # token that `provider.availability()` (which only probes `--version`)
+    # cannot detect. Instead of stranding the task as "Requires Attention",
+    # record the failed executor and flip the task back to "Ready" so the
+    # next launch automatically tries the next available agent in the chain
+    # (see `execution_queue.select_available_executor`). The task only
+    # reaches "Requires Attention" when *every* allowed executor has failed.
+    if (
+        run.get("state") == "INTERRUPTED"
+        and not run.get("first_output_at")
+        and not already_finalized_for_this_run
+    ):
+        failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
+        failed_list = list(task.get("failed_executors") or [])
+        if failed_executor not in failed_list:
+            failed_list.append(failed_executor)
+            task["failed_executors"] = failed_list
+            mutated = True
+        # Keep the task re-launchable so the next `launch_ready` picks up the
+        # next executor in the chain. Only strand it as "Requires Attention"
+        # when there are no more agents to try.
+        if target_launch_status == "Requires Attention":
+            target_launch_status = "Ready"
+            models.append_timeline_event(
+                task,
+                "executor_failed",
+                f"Исполнитель «{failed_executor}» не запустился (нет вывода). "
+                "Задача возвращена в очередь для повтора другим агентом.",
+            )
+            mutated = True
+
+    # On a clean completion, clear any accumulated executor failures — the
+    # chain is healthy again and a future re-launch should try the configured
+    # executor from scratch.
+    if status == session_view.STATUS_COMPLETED and task.get("failed_executors"):
+        task.pop("failed_executors", None)
+        mutated = True
+
     if task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
         mutated = True
