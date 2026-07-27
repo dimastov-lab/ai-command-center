@@ -43,6 +43,7 @@ from command_center.ui import (
     backlog_proposals,
     backlog_reconcile_panel,
     board_style,
+    execution_strip,
     home_dashboard,
     live_board,
     waves_panel,
@@ -3388,6 +3389,13 @@ def _command_palette_dialog() -> None:
 
 if st.session_state.show_command_palette:
     _command_palette_dialog()
+
+
+# Execution Strip (UX-2a): cross-page live status bar. A polling fragment, so
+# it updates every 5 s on its own without blanking the page behind it. Rendered
+# before the page dispatch so it is visible on every page (pages that call
+# `st.stop()` have already mounted it by then).
+execution_strip.render_execution_strip(get_execution_center_api())
 
 
 # --------------------------------------------------------------------------
