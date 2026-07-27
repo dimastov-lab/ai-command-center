@@ -1,0 +1,39 @@
+# Project tooling configuration. This file does not change runtime behavior;
+# it configures the linter (ruff), the optional static type checker (mypy),
+# and coverage collection so they behave consistently when invoked locally and
+# in CI. The application itself has no build/packaging metadata here.
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+# No explicit rule selection: `ruff check .` keeps using its built-in default
+# selection (the same one CI already enforces), so adding this file cannot
+# introduce new failures.
+
+[tool.mypy]
+# Permissive, opt-in configuration. The codebase predates type hints in several
+# modules, so this is intentionally non-strict: it lets `mypy command_center/`
+# report real inconsistencies without flooding a first run with hundreds of
+# "missing import" / "no stub" errors. Tighten progressively per module.
+python_version = "3.14"
+ignore_missing_imports = true
+check_untyped_defs = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+exclude = "(^build/|^\\.venv/|^__pycache__/|/tests/fixtures/)"
+
+[tool.coverage.run]
+branch = false
+source = ["command_center"]
+omit = ["*/__pycache__/*", "*/tests/*", "*/.venv/*"]
+
+[tool.coverage.report]
+# Show what is uncovered without ever failing the build — coverage is
+# informational here, not a gate (see the non-blocking CI step).
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

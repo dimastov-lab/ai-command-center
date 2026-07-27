@@ -426,7 +426,7 @@ class CompletionOrchestrator:
                     Path(repo),
                     message=f"{(task or {}).get('title') or 'task'} (agent run {row['run_id'][:8]})",
                 )
-            except git_ops.GitOpsError as exc:
+            except git_ops.GitOpsError:
                 self._apply_assessment(row, pre, now=now)
                 return runtime_db.get_completion(self.db_path, row["run_id"]), False
             # Re-inspect after committing; fall through with the clean state.

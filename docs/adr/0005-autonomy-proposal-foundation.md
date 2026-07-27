@@ -1,6 +1,10 @@
 # ADR 0005 — Autonomy Proposal Foundation (AICC-AUTONOMY-002)
 
-Status: **Accepted, implemented.**
+Status: **Accepted, implemented. Experimental foundation** — persisted, evidence-backed
+proposal lifecycle only. There is no Streamlit UI, automated evidence collector,
+project policy resolver, background driver, or executor: `dispatch` records the
+boundary crossing and returns a dry-run plan the caller must run explicitly. Do not
+extend this layer without first deciding whether to complete it or retire it.
 
 ## Context
 

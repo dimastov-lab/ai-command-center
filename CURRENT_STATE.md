@@ -1,6 +1,6 @@
 # AI Command Center — Current State
 
-Updated: 2026-07-23
+Updated: 2026-07-27
 
 ## 0. AI Command Center platform
 
@@ -9,8 +9,9 @@ Status: Active, local Streamlit implementation
 Current position:
 - `app.py` hosts the implemented 19-destination Streamlit control application.
 - `data/tasks.json` remains the planning and Kanban store.
-- `data/runtime.db` schema 7 is authoritative for asynchronous execution, completion and the
-  persisted autonomy-proposal lifecycle.
+- `data/runtime.db` schema 10 is authoritative for asynchronous execution, completion, the
+  persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
+  verdict, and the `queue_entry` mirror (ADR 0007 dual-write).
 - Execution Center provides process supervision, streaming events, cancellation, timeouts and
   restart reconciliation; live process handles remain owned by the hosting Python process.
   Process-group supervision is fail-closed to POSIX `waitid(WNOWAIT)`, keeps the launch-time PGID
@@ -32,7 +33,11 @@ Current position:
   completion autopilot and automatic merge policies are opt-in and disabled by conservative
   defaults.
 - Checked-in CI validates committed-diff whitespace, Ruff, byte compilation and pytest on Python
-  3.14.
+  3.14. Informational, non-blocking `mypy` and coverage steps run alongside the deterministic
+  quartet but do not gate the merge.
+- Runtime history retention is **off by default**: `AICC_RUNTIME_RETENTION_DAYS=<N>` prunes
+  `run_event` rows for terminal runs older than `N` days on startup, and
+  `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
 

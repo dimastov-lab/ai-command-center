@@ -8,9 +8,6 @@ deleting a duplicate — so the Kanban page reflects the change on the next reru
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 from streamlit.testing.v1 import AppTest
 
 from command_center import tasks_repository
@@ -31,7 +28,8 @@ def _task(task_id, title, *, status="Backlog", goal=None, launch_status=None, cr
 def _panel_script() -> None:
     # Re-exec'd as a standalone script by AppTest, so it must be self-contained:
     # the data dir comes from AICC_DATA_DIR (the isolated_data_dir fixture), never
-    # a captured closure variable.
+    # a captured closure variable. These imports live inside the function on
+    # purpose — the re-exec'd script does not see this module's top-level imports.
     import os
     from pathlib import Path
 

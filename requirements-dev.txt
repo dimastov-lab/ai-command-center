@@ -6,3 +6,9 @@ pytest>=9.0,<10.0
 # Linter enforced by CI (`ruff check .`). 0.x minor releases can change the rule
 # set, so the band is held to the validated 0.15 line for deterministic gates.
 ruff>=0.15,<0.16
+# Coverage collection for the non-blocking CI coverage step. Not required to
+# run the core gate (`pytest -q`); only the `pytest --cov` invocation needs it.
+pytest-cov>=5.0,<7.0
+# Static type checker. Configured (non-strict) via pyproject.toml; run locally
+# or via the non-blocking CI step. Not a merge gate.
+mypy>=1.13,<2.0
