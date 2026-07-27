@@ -76,8 +76,6 @@ def test_normalize_v1_adds_source_and_state():
 def test_list_unified_runs_merges_and_dedups(tmp_path, monkeypatch):
     # Build a tiny v2 db with one run, and a v1.2 journal with two runs (one
     # sharing the v2 id -> must be deduped, one unique -> kept).
-    from command_center.runtime import db
-
     db_path = tmp_path / "runtime.db"
     # Minimal schema: only what list_unified_runs touches (run + report tables).
     conn = __import__("sqlite3").connect(db_path)
