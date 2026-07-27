@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import subprocess
 import time
@@ -2684,8 +2685,8 @@ def _render_dependency_tree(task: dict, tasks_by_id: dict[str, dict]) -> None:
         mark = "✅" if node.done else "⏳"
         st.markdown(
             f"<div style='font-size:0.82rem;opacity:0.85'>{indent}"
-            f"{live_board.relation_mark(node.relation)} {mark} {node.title[:64]} "
-            f"<code>{node.status}</code></div>",
+            f"{live_board.relation_mark(node.relation)} {mark} {html.escape(node.title[:64])} "
+            f"<code>{html.escape(node.status)}</code></div>",
             unsafe_allow_html=True,
         )
 
