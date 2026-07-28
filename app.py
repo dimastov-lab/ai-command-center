@@ -5590,7 +5590,8 @@ elif page_key == "git_center":
     # (plus the app itself) so an operator can inspect any of them from one
     # place instead of only ever seeing AICC here.
     repos: list[tuple[str, Path]] = []
-    if (ROOT / ".git").is_dir():
+    # A linked worktree stores ``.git`` as a file, not a directory.
+    if git_info.get_status(ROOT).get("is_repo"):
         repos.append(("AICC (app)", ROOT))
     for pid in models.PROJECT_IDS:
         cfg = project_configs.get(pid, {})
@@ -5640,6 +5641,36 @@ elif page_key == "git_center":
 
             st.caption(f"Корень репозитория: `{repo_status['root']}`")
             st.caption(f"Последний коммит: `{repo_status['last_commit_hash']}` — {repo_status['last_commit_subject']}")
+
+            refresh_key = f"git_center_remote_refreshed::{repo_path.resolve()}"
+            if st.button(
+                "Обновить",
+                key=f"git_center_refresh_{repo_label}",
+                icon=":material/refresh:",
+                help="Выполнить git fetch и обновить сравнение с tracking-веткой.",
+            ):
+                with st.spinner("Обновляем данные remote…"):
+                    fetch_ok, fetch_error = git_info.fetch_remotes(repo_path)
+                if fetch_ok:
+                    st.session_state[refresh_key] = time.time()
+                    st.success("Данные remote обновлены.")
+                else:
+                    st.error(f"Не удалось обновить remote: {fetch_error}")
+
+            refreshed_at = st.session_state.get(refresh_key)
+            if isinstance(refreshed_at, (int, float)):
+                age_minutes = max(0, int((time.time() - refreshed_at) // 60))
+                st.caption(f"Данные remote: обновлено {age_minutes} мин. назад")
+                divergence = git_info.get_ahead_behind(repo_path)
+                if divergence.get("available"):
+                    with st.container(horizontal=True):
+                        st.metric("Ahead", divergence["ahead"], border=True)
+                        st.metric("Behind", divergence["behind"], border=True)
+                    st.caption(f"Сравнение: `{repo_status['branch']}` ↔ `{divergence['upstream']}`")
+                else:
+                    st.warning(str(divergence.get("error") or "Расхождение с remote недоступно."))
+            else:
+                st.caption("Данные remote ещё не обновлялись. Нажмите «Обновить», чтобы выполнить git fetch.")
 
             tab_files, tab_log, tab_diff, tab_branches, tab_remotes = st.tabs(
                 ["Изменённые файлы", "История коммитов", "Diff", "Ветки", "Remotes"]

@@ -77,6 +77,72 @@ def test_get_remotes_with_origin(git_repo, tmp_path):
     assert ("origin", str(other)) in remotes
 
 
+def test_fetch_and_ahead_behind_use_explicit_refresh(git_repo, tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=git_repo, check=True)
+    subprocess.run(["git", "push", "-q", "-u", "origin", "main"], cwd=git_repo, check=True)
+
+    # A local commit is ahead; a commit pushed from a second clone is behind.
+    (git_repo / "local.txt").write_text("local\n")
+    subprocess.run(["git", "add", "local.txt"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "local"], cwd=git_repo, check=True)
+
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(remote), str(other)], check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=other, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=other, check=True)
+    (other / "remote.txt").write_text("remote\n")
+    subprocess.run(["git", "add", "remote.txt"], cwd=other, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "remote"], cwd=other, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=other, check=True)
+
+    # No implicit fetch: origin/main is still the locally cached ref.
+    assert git_info.get_ahead_behind(git_repo) == {
+        "available": True,
+        "upstream": "origin/main",
+        "ahead": 1,
+        "behind": 0,
+        "error": "",
+    }
+
+    assert git_info.fetch_remotes(git_repo) == (True, "")
+    assert git_info.get_ahead_behind(git_repo) == {
+        "available": True,
+        "upstream": "origin/main",
+        "ahead": 1,
+        "behind": 1,
+        "error": "",
+    }
+
+
+def test_ahead_behind_reports_missing_upstream_without_fetch(git_repo, monkeypatch):
+    calls = []
+    real_run = git_info.run_git_command
+
+    def record(cwd, args, timeout=5):
+        calls.append(args)
+        return real_run(cwd, args, timeout)
+
+    monkeypatch.setattr(git_info, "run_git_command", record)
+    result = git_info.get_ahead_behind(git_repo)
+
+    assert result["available"] is False
+    assert "tracking" in str(result["error"])
+    assert not any(args and args[0] == "fetch" for args in calls)
+
+
+def test_fetch_remotes_surfaces_failure(git_repo):
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(git_repo / "missing-remote.git")],
+        cwd=git_repo,
+        check=True,
+    )
+    ok, error = git_info.fetch_remotes(git_repo)
+    assert ok is False
+    assert error
+
+
 def test_get_worktrees_single(git_repo):
     worktrees = git_info.get_worktrees(git_repo)
     assert len(worktrees) == 1
