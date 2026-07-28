@@ -243,6 +243,15 @@ REMEDIATION_BY_REASON: dict[str, str] = {
     "daemon_unreachable": "Локальный сервер Ollama недоступен — запустите `ollama serve`.",
     "model_missing": "Модель не скачана — выполните `ollama pull <модель>`.",
     "insufficient_memory": "Недостаточно памяти для модели — выберите модель меньше.",
+    completion_domain.ReasonCode.VALIDATION_FAILED: (
+        "Локальная проверка не прошла — автодоработка исправит ошибку и повторит проверки."
+    ),
+    completion_domain.ReasonCode.CHECKS_FAILING: (
+        "CI не прошёл — автодоработка разберёт упавшие проверки и отправит исправление."
+    ),
+    completion_domain.ReasonCode.REVIEW_REJECTED: (
+        "Независимое ревью отклонило изменение — автодоработка исправит замечания."
+    ),
 }
 
 
@@ -575,23 +584,36 @@ def _skip(entry: dict, task: dict | None, reason_code: str, explanation: str) ->
 
 
 
-def _preferred_agent(task: dict, project_id: str | None) -> str | None:
-    """The execution provider this task should be planned onto, or `None` to
-    let capability matching decide.
+def _agent_constraints(
+    task: dict, project_id: str | None
+) -> tuple[frozenset[str], str | None]:
+    """Return ``(allowed_agents, hard_pin)`` for one schedulable task.
 
-    Precedence: the task's own `executor` when the project authorizes it, else
-    the project's first authorized provider. A task naming a provider its
-    project forbids is *not* silently redirected — it keeps its choice so the
-    launcher's authorization gate refuses it visibly, rather than the work
-    quietly running somewhere the operator did not intend."""
+    Project ``allowed_agents`` is the authorization boundary. The task's
+    ordinary ``executor`` is only its default/preference: it must not pin all
+    work to Claude Code while Codex is idle. A task may opt into a true hard
+    pin with ``executor_pinned=True``; a task naming a provider forbidden by
+    project policy also remains pinned to that forbidden id so the scheduler
+    reports a visible ``no_capable_agent`` refusal instead of silently
+    redirecting it.
+
+    Providers that already failed to start for this task are removed from the
+    eligible set. This makes failover and normal load distribution use the same
+    planner rather than two conflicting selection rules."""
     try:
-        allowed = project_config.allowed_execution_providers(project_id)
+        allowed = tuple(project_config.allowed_execution_providers(project_id))
     except Exception:  # noqa: BLE001 — malformed policy is reported by the launcher
-        return task.get("executor") or None
+        requested = task.get("executor")
+        return frozenset(), requested or None
+
     requested = task.get("executor")
-    if requested:
-        return requested
-    return allowed[0] if allowed else None
+    if requested and requested not in allowed:
+        return frozenset(allowed), requested
+
+    failed = frozenset(task.get("failed_executors") or ())
+    eligible = frozenset(agent for agent in allowed if agent not in failed)
+    hard_pin = requested if requested and task.get("executor_pinned") else None
+    return eligible, hard_pin
 
 
 def adapt_ready_entries(
@@ -683,6 +705,7 @@ def adapt_ready_entries(
         # exclusivity compares the same spelling the DB workspace lock does.
         workspace = prep.resolved_workspace or launch_service.resolved_workspace_path(prep.selection.path)
         attempts_made, last_state, last_failure_reason, last_completed_at = _run_history(db_path, task_id)
+        allowed_agents, preferred_agent = _agent_constraints(task, canonical)
         adapted.append(
             scheduler.WorkItem(
                 task_id=task_id,
@@ -691,16 +714,11 @@ def adapt_ready_entries(
                     task.get("task_type") or "implementation"
                 ),
                 priority=task.get("priority") or "Medium",
-                # Pinned to a provider the project actually authorizes. This
-                # was deliberately left unpinned while `start_raw` always
-                # spawned the Claude CLI regardless of `executor`; once the
-                # provider abstraction landed that stopped being true, and an
-                # unpinned planner started assigning whichever available agent
-                # had the most spare capacity — including one the project
-                # forbids, producing an ASSIGN that `require_execution_provider_
-                # allowed` then refused at launch. The planner must not propose
-                # work the launcher is required to reject.
-                preferred_agent=_preferred_agent(task, canonical),
+                # Authorization is a set, not a pin. The scheduler can spread
+                # work across every permitted compatible provider while a
+                # forbidden provider can never be proposed.
+                allowed_agents=allowed_agents,
+                preferred_agent=preferred_agent,
                 # A READY entry is by definition dependency-satisfied, but the
                 # queue file is persisted state that could be stale relative to
                 # `tasks.json`. Recomputing from the live graph is pure and
@@ -904,10 +922,8 @@ REWORK_REQUEUED = "requeued"
 REWORK_BUDGET_EXHAUSTED = "rework_budget_exhausted"
 REWORK_DISABLED = "auto_rework_disabled"
 
-# Completion states that mean "the work is not acceptable and a *new attempt by
-# the agent* is the remedy". `VALIDATION_FAILED` is the whole set today; it is
-# expressed as a set so the independent-review verdict can join it without
-# touching the loop.
+# Completion states that unconditionally mean "the work is not acceptable and
+# a new agent attempt is the remedy".
 REWORK_TRIGGER_STATES: frozenset[str] = frozenset(
     {
         completion_domain.CompletionState.VALIDATION_FAILED,
@@ -918,6 +934,18 @@ REWORK_TRIGGER_STATES: frozenset[str] = frozenset(
         completion_domain.CompletionState.REVIEW_REJECTED,
     }
 )
+
+
+def _is_rework_trigger(row: dict) -> bool:
+    state = row.get("completion_state")
+    if state in REWORK_TRIGGER_STATES:
+        return True
+    # A red remote CI run is discovered after the PR exists, so it rests in
+    # MERGE_BLOCKED rather than the terminal local VALIDATION_FAILED state.
+    return (
+        state == completion_domain.CompletionState.MERGE_BLOCKED
+        and row.get("last_reason_code") == completion_domain.ReasonCode.CHECKS_FAILING
+    )
 
 
 def _rework_prompt(task: dict, row: dict) -> str:
@@ -982,7 +1010,7 @@ def plan_rework(
         if task.get("status") == "Done":
             continue
         row = runtime_db.get_completion_by_task(db_path, task_id)
-        if row is None or row.get("completion_state") not in REWORK_TRIGGER_STATES:
+        if row is None or not _is_rework_trigger(row):
             continue
         if task.get(REWORK_LAST_RUN_FIELD) == row.get("run_id"):
             continue  # already reworked this exact failure
@@ -1747,6 +1775,11 @@ def _dispatch(
             project_configs,
             api,
             entry_ids=[d.entry_id for d in assigned],
+            executor_by_entry={
+                d.entry_id: d.executor_id
+                for d in assigned
+                if d.entry_id and d.executor_id
+            },
             timeout_seconds=settings.run_timeout_seconds,
         )
     except Exception as exc:  # noqa: BLE001 — a failed batch must not abort the tick

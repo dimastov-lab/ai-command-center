@@ -277,6 +277,45 @@ def test_workload_distribution_prefers_agent_with_most_spare_capacity():
     assert result.assignments()[0].agent_id == "idle"
 
 
+def test_workload_distribution_respects_authorized_agent_set():
+    reg = scheduler.AgentRegistry(
+        [
+            scheduler.AgentSpec("claude_code", "claude_code", frozenset({scheduler.CAP_ANY}), 2),
+            scheduler.AgentSpec("codex", "codex", frozenset({scheduler.CAP_ANY}), 2),
+        ]
+    )
+    load = scheduler.LoadSnapshot(running_by_agent={"claude_code": 1}, global_running=1)
+    result = scheduler.plan(
+        [
+            _item(
+                "t1",
+                "/repo/a",
+                allowed_agents=frozenset({"claude_code", "codex"}),
+            )
+        ],
+        registry=reg,
+        config=scheduler.SchedulerConfig(max_global_concurrency=10),
+        load=load,
+        now=NOW,
+    )
+    assert result.assignments()[0].agent_id == "codex"
+
+
+def test_workload_distribution_never_escapes_authorized_agent_set():
+    reg = scheduler.AgentRegistry(
+        [
+            scheduler.AgentSpec("claude_code", "claude_code", frozenset({scheduler.CAP_ANY}), 2),
+            scheduler.AgentSpec("codex", "codex", frozenset({scheduler.CAP_ANY}), 2),
+        ]
+    )
+    result = scheduler.plan(
+        [_item("t1", "/repo/a", allowed_agents=frozenset({"claude_code"}))],
+        registry=reg,
+        now=NOW,
+    )
+    assert result.assignments()[0].agent_id == "claude_code"
+
+
 def test_equal_capacity_and_weight_choose_lexicographically_first_agent():
     reg = scheduler.AgentRegistry(
         [
@@ -567,12 +606,12 @@ def test_plan_is_deterministic_for_identical_inputs():
 # --------------------------------------------------------------------------
 
 
-def _make_running_row(db_path, *, repository_path):
+def _make_running_row(db_path, *, repository_path, provider_id="claude_code"):
     task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation")
     session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path=repository_path)
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
-        repository_path=repository_path, prompt="p", is_resume=False,
+        repository_path=repository_path, prompt="p", is_resume=False, provider_id=provider_id,
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(
@@ -592,6 +631,17 @@ def test_build_load_snapshot_reflects_active_runs(tmp_path):
     assert snap.busy_workspaces == frozenset({"/repo/a", "/repo/b"})
     assert len(snap.active_task_ids) == 2
     assert snap.running_by_agent == {"claude_code": 2}
+
+
+def test_build_load_snapshot_attributes_each_run_to_its_provider(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    _make_running_row(db_path, repository_path="/repo/a", provider_id="claude_code")
+    _make_running_row(db_path, repository_path="/repo/b", provider_id="codex")
+
+    snap = scheduler.build_load_snapshot(db_path)
+
+    assert snap.running_by_agent == {"claude_code": 1, "codex": 1}
 
 
 def test_active_task_cannot_be_assigned_again_in_a_different_workspace(tmp_path):

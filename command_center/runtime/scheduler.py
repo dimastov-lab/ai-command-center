@@ -337,6 +337,12 @@ class WorkItem:
     workspace: str
     required_capabilities: frozenset[str] = frozenset()
     priority: str = "Medium"
+    # Project/task authorization boundary. ``None`` means the caller supplied
+    # no allow-list; an explicit set restricts scheduling to exactly those
+    # agents. This is deliberately separate from ``preferred_agent``: an
+    # allow-list can contain Claude Code and Codex so the scheduler may choose
+    # the less-loaded compatible provider without ever escaping project policy.
+    allowed_agents: frozenset[str] | None = None
     preferred_agent: str | None = None
     dependencies_met: bool = True
     attempts_made: int = 0
@@ -762,7 +768,14 @@ def plan(
         # 4) Capability match — structural. No capable agent is BLOCKED.
         if item.preferred_agent is not None:
             preferred = registry.get(item.preferred_agent)
-            if preferred is None or not preferred.can_run(item.required_capabilities):
+            if (
+                preferred is None
+                or (
+                    item.allowed_agents is not None
+                    and preferred.agent_id not in item.allowed_agents
+                )
+                or not preferred.can_run(item.required_capabilities)
+            ):
                 decisions.append(
                     SchedulingDecision(
                         action=ACTION_BLOCKED,
@@ -778,6 +791,8 @@ def plan(
             capable = [preferred]
         else:
             capable = registry.capable_agents(item.required_capabilities)
+            if item.allowed_agents is not None:
+                capable = [a for a in capable if a.agent_id in item.allowed_agents]
         if not capable:
             decisions.append(
                 SchedulingDecision(
@@ -890,13 +905,11 @@ def build_load_snapshot(db_path, *, agent_of_run=None) -> LoadSnapshot:
     `RUNNING`), so the workspace exclusivity the planner enforces exactly
     matches the DB workspace lock's own active-state set.
 
-    Run rows do not record which *agent* executed them (the v1 schema predates
-    this layer and is intentionally left frozen), so per-agent running counts
-    are attributed via `agent_of_run(run) -> agent_id`, defaulting every
-    active run to the `claude_code` agent — the only one that runs anything
-    today."""
+    Current run rows persist ``provider_id`` at launch, so the default
+    attribution uses that authoritative value. ``agent_of_run`` remains an
+    override for callers with a custom agent registry."""
     if agent_of_run is None:
-        agent_of_run = lambda run: "claude_code"  # noqa: E731 — trivial default resolver
+        agent_of_run = lambda run: run.get("provider_id") or "claude_code"  # noqa: E731
     rows = db.list_runs(db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
     running_by_agent: dict[str, int] = {}
     busy: set[str] = set()
