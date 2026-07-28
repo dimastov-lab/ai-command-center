@@ -2345,7 +2345,11 @@ def _fix_attention_sessions(
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=project_id,
-                task_type=task.get("task_type") or "implementation",
+                # "Исправить" must always launch a write-capable remediation
+                # attempt. Reusing the failed run's task type could relaunch a
+                # read-only review/final-gate agent, which can diagnose the
+                # defect but is intentionally unable to change any files.
+                task_type="remediation",
                 prompt=_build_fix_instruction(task, session),
                 timeout_seconds=agent_runner.timeout_for_task(task),
                 repository_path=Path(workspace),
