@@ -41,8 +41,11 @@ def render_execution_queue_panel(
     *,
     project: str | None = None,
     key_prefix: str = "queue",
+    entries: list[dict] | None = None,
+    show_heading: bool = True,
 ) -> None:
-    entries = execution_queue.reevaluate_and_persist(root, tasks_by_id)
+    if entries is None:
+        entries = execution_queue.reevaluate_and_persist(root, tasks_by_id)
     if project:
         # A queue entry copies its task's raw `project` (which may be a display
         # name), while `project` here is the canonical id emitted by the Kanban
@@ -53,7 +56,8 @@ def render_execution_queue_panel(
     waiting = execution_queue.waiting_entries(entries)
     ready = execution_queue.ready_entries(entries)
 
-    st.markdown("#### Очередь запуска")
+    if show_heading:
+        st.markdown("#### Очередь запуска")
 
     # `launch_ready` runs synchronously right before the `st.rerun()` below,
     # in the *same* script pass as the button click — so a plain `st.success`/

@@ -1,11 +1,10 @@
 """Sidebar navigation (UX-1 AppShell).
 
-Nineteen sections in one flat radio list is a directory listing, not
-navigation: everything is equally prominent, so nothing is, and finding a
-screen means reading every label. Sections are grouped here by *what the
-operator is doing* — planning work, watching it execute, managing projects,
-everything consulted occasionally — with the two daily-use groups open by
-default and the rest collapsed.
+Twenty-one page handlers in one flat list is a directory listing, not
+navigation: everything is equally prominent, so nothing is. Ten daily
+destinations remain visible here; related and specialist handlers are
+consolidated into those destinations while their old deep links keep working.
+The visible destinations are grouped by *what the operator is doing*.
 
 Grouping is presentation only. `nav_page` keeps its exact session-state key and
 its values, because tests drive navigation by setting it directly and the URL
@@ -22,27 +21,41 @@ import streamlit as st
 # flat entries far past the 7±2 scanning limit, with three overview pages, two
 # run monitors and several duplicate library pages competing for attention.
 #
-# Until the full page consolidation lands (design: 17 → 6 destinations), this
-# regroups the same pages so the SIX core destinations sit in one open
-# "Основное" group an operator can scan at a glance, and everything else —
-# secondary planning surfaces, analytics, portfolio, and the pages the redesign
-# folds away — collapses out of the daily path. No page is removed (the command
-# palette and every deep link still reach all of them); they are just no longer
-# all shouting at once.
+# The five core destinations sit in one open "Основное" group an operator can
+# scan at a glance. Planning and analytics remain collapsed until needed.
+# Hidden handlers preserve old bookmarked links but are not duplicated in the
+# sidebar or command palette.
 NAV_GROUPS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
     # The core destinations the redesign keeps: overview, planning, execution,
     # projects, git. Chat/reports/generated/context are no longer their own
     # sidebar entries — they live inside the project view (task 02661825).
     ("Основное", ("dashboard", "kanban", "execution_center", "projects", "git_center"), True),
     ("Планирование", ("waves", "create"), False),
-    ("Аналитика", ("executive", "runs", "timeline", "agents"), False),
-    ("Портфель и режимы", ("portfolio", "portfolio_overview", "workspace_home", "workspace", "focus"), False),
+    ("Аналитика", ("runs", "agents", "portfolio"), False),
 )
 
 # Pages whose handler is kept (for delegation / an existing deep link) but which
 # are no longer their own sidebar entry — everything about a project now opens
 # inside the project view as a tab: chat, generated tasks, reports, context.
-HIDDEN_FROM_SIDEBAR: frozenset[str] = frozenset({"chat", "generated", "reports", "context"})
+HIDDEN_FROM_SIDEBAR: frozenset[str] = frozenset(
+    {
+        "chat",
+        "generated",
+        "reports",
+        "context",
+        # Consolidated into the main dashboard.
+        "executive",
+        "workspace_home",
+        # Consolidated into Runs / Portfolio.
+        "timeline",
+        "portfolio_overview",
+        # Specialist/deep-link surfaces; their useful actions are reachable
+        # from Projects, Execution Center or the command flow.
+        "daily_audit",
+        "workspace",
+        "focus",
+    }
+)
 
 
 def _grouped(nav: dict[str, tuple[str, str]]) -> list[tuple[str, list[str], bool]]:
@@ -69,6 +82,7 @@ def _grouped(nav: dict[str, tuple[str, str]]) -> list[tuple[str, list[str], bool
 
 def _select_page(key: str) -> None:
     st.session_state["nav_page"] = key
+    st.session_state["show_command_palette"] = False
     st.query_params["page"] = key
 
 

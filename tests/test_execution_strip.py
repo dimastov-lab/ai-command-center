@@ -10,7 +10,8 @@ waiting-not-always-zero regression.
 
 from __future__ import annotations
 
-from command_center.ui.execution_strip import strip_counts
+from command_center import execution_queue
+from command_center.ui.execution_strip import current_counts, strip_counts
 
 
 def _run(state: str) -> dict:
@@ -84,3 +85,40 @@ def test_adhoc_runs_never_superseded():
     ]
     from command_center.ui.execution_strip import _nonsuperseded_runs
     assert strip_counts(_nonsuperseded_runs(runs)) == (0, 0, 2)
+
+
+def test_headline_waiting_count_includes_durable_execution_queue():
+    entries = [
+        {"id": "q1", "task_id": "t1", "state": execution_queue.STATE_READY},
+        {"id": "q2", "task_id": "t2", "state": execution_queue.STATE_WAITING},
+    ]
+    counts = current_counts([], [], entries)
+    assert counts.waiting == 2
+
+
+def test_headline_and_board_rules_drop_superseded_and_done_attention():
+    tasks = [
+        {"id": "t1", "status": "Backlog", "progress": 40, "task_type": "implementation"},
+        {"id": "t2", "status": "Done", "progress": 100, "task_type": "implementation"},
+    ]
+    runs = [
+        _trun("old", "t1", "FAILED", "2025-01-01T10:00:00"),
+        _trun("new", "t1", "RUNNING", "2025-01-01T11:00:00"),
+        _trun("done-failure", "t2", "FAILED", "2025-01-01T12:00:00"),
+    ]
+    counts = current_counts(runs, tasks, [])
+    assert counts.live == 1
+    assert counts.attention == 0
+
+
+def test_completed_write_task_not_merged_counts_as_attention():
+    tasks = [
+        {"id": "t1", "status": "In Progress", "progress": 55, "task_type": "implementation"}
+    ]
+    counts = current_counts(
+        [_trun("r1", "t1", "COMPLETED", "2025-01-01T10:00:00")],
+        tasks,
+        [],
+    )
+    assert counts.attention == 1
+    assert counts.done == 0

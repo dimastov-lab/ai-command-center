@@ -138,6 +138,23 @@ def derive_status(run: dict, *, awaiting_handshake: bool = False, heartbeat_stal
     return STATUS_REQUIRES_ATTENTION
 
 
+def operator_display_status(
+    status: str, *, progress: int | float | None, task_type: str | None
+) -> str:
+    """Apply the final operator-facing completion guard to a derived status.
+
+    A write-capable run that exited cleanly is not delivered until its task
+    reaches 100 percent (verified merge); read-only reviews/audits genuinely
+    finish at process completion. Keeping this pure rule here lets every
+    counter and every card use the same definition instead of duplicating it
+    in individual Streamlit renderers.
+    """
+    if status == STATUS_COMPLETED and progress is not None and progress < 100:
+        if not is_read_only_task_type(task_type):
+            return STATUS_REQUIRES_ATTENTION
+    return status
+
+
 def format_elapsed(seconds: float | None) -> str:
     """`HH:MM:SS`, or `"—"` for `None`/negative (never happens in practice,
     guarded defensively since `now` can theoretically race a just-recorded
@@ -308,7 +325,22 @@ def completion_view(completion: dict | None) -> dict | None:
         "last_checked_at": completion.get("last_checked_at"),
         "next_retry_at": completion.get("next_retry_at"),
         "retry_count": completion.get("retry_count"),
+        "merge_mode": completion.get("merge_mode"),
+        "manual_merge_available": manual_merge_available(completion),
     }
+
+
+def manual_merge_available(completion: dict | None) -> bool:
+    """Button visibility only; live gates are re-checked on click."""
+    if not completion:
+        return False
+    return (
+        completion.get("merge_mode") == "manual"
+        and completion.get("completion_state") == "AWAITING_MERGE"
+        and completion.get("last_reason_code") == "AWAITING_MANUAL_MERGE"
+        and bool(completion.get("pull_request_number"))
+        and completion.get("pull_request_state") == "OPEN"
+    )
 
 
 # --------------------------------------------------------------------------

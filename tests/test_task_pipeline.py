@@ -245,6 +245,28 @@ def test_second_entry_for_the_same_task_is_skipped_as_duplicate(tmp_path, git_re
     assert wave.skipped[0].reason_code == task_pipeline.REASON_DUPLICATE_QUEUE_ENTRY
 
 
+def test_ready_entry_is_skipped_while_completion_awaits_merge(tmp_path, git_repo, api):
+    task = _task(id="a", workspace_path=str(git_repo))
+    _seed_completion(
+        api,
+        git_repo,
+        task_id="a",
+        completion_state=completion_domain.CompletionState.AWAITING_MERGE,
+    )
+
+    wave = task_pipeline.adapt_ready_entries(
+        [_entry("q1", "a")],
+        {"a": task},
+        {"AIOS": {"repository_path": str(git_repo)}},
+        db_path=api.db_path,
+    )
+
+    assert wave.work_items == ()
+    assert wave.skipped[0].reason_code == task_pipeline.REASON_COMPLETION_IN_PROGRESS
+    assert "AWAITING_MERGE" in wave.skipped[0].explanation
+    assert "merge" in wave.skipped[0].remediation
+
+
 def test_adaptation_order_is_stable_under_input_reversal(tmp_path, git_repo, api):
     repo_b = git_repo.parent / "repo-b"
     repo_b.mkdir()
@@ -425,7 +447,14 @@ def test_every_reason_code_in_the_vocabulary_has_operator_remediation():
 # --------------------------------------------------------------------------
 
 
-def _seed_completion(api, git_repo, *, task_id="a", merge_mode=completion_domain.MERGE_MANUAL):
+def _seed_completion(
+    api,
+    git_repo,
+    *,
+    task_id="a",
+    merge_mode=completion_domain.MERGE_MANUAL,
+    completion_state=completion_domain.CompletionState.EXECUTION_FINISHED,
+):
     # A task may legitimately have several runs (that is what a rework is), so
     # the runtime task row is created once and reused.
     if runtime_db.get_task(api.db_path, task_id) is None:
@@ -452,7 +481,7 @@ def _seed_completion(api, git_repo, *, task_id="a", merge_mode=completion_domain
         task_id=task_id,
         project="AIOS",
         repository_path=str(git_repo),
-        completion_state=completion_domain.CompletionState.EXECUTION_FINISHED,
+        completion_state=completion_state,
         merge_mode=merge_mode,
         policy_json=policy.to_json(),
         last_reason_code="execution_ok",
@@ -611,6 +640,41 @@ def test_failed_validation_is_requeued_as_a_new_attempt(tmp_path, git_repo, api)
     assert "pytest: 1 failed" in persisted["prompt"]
     assert "Сделай штуку" in persisted["prompt"]
     # And it is back in the queue, ready to be planned into the next wave.
+    assert [e["task_id"] for e in execution_queue.load_queue(tmp_path)] == ["a"]
+
+
+def test_failed_remote_ci_is_requeued_as_a_new_attempt(tmp_path, git_repo, api):
+    row = _seed_completion(api, git_repo, task_id="a")
+    for state in (
+        completion_domain.CompletionState.RESULT_VALID,
+        completion_domain.CompletionState.PULL_REQUEST_OPEN,
+        completion_domain.CompletionState.MERGE_BLOCKED,
+    ):
+        row = runtime_db.update_completion(
+            api.db_path,
+            row["run_id"],
+            expected_version=row["version"],
+            fields={"completion_state": state},
+        )
+    runtime_db.update_completion(
+        api.db_path,
+        row["run_id"],
+        expected_version=row["version"],
+        fields={
+            "last_reason_code": completion_domain.ReasonCode.CHECKS_FAILING,
+            "recommended_action": "Required CI checks are failing.",
+        },
+    )
+    task = _task(id="a", workspace_path=str(git_repo), goal="Исправь функцию")
+    tasks_repository.save_tasks(tmp_path, [task])
+
+    records = task_pipeline.plan_rework(
+        tmp_path, {"a": task}, db_path=api.db_path, settings=_rework_settings()
+    )
+
+    assert [r["outcome"] for r in records] == [task_pipeline.REWORK_REQUEUED]
+    persisted = tasks_repository.load_tasks(tmp_path)[0]
+    assert "Required CI checks are failing" in persisted["prompt"]
     assert [e["task_id"] for e in execution_queue.load_queue(tmp_path)] == ["a"]
 
 
@@ -996,10 +1060,9 @@ def test_a_workspace_pointing_somewhere_unrelated_is_not_guessed_at(tmp_path, gi
 # --------------------------------------------------------------------------
 
 
-def test_planner_pins_a_provider_the_project_authorizes(tmp_path, git_repo, api, monkeypatch):
-    """Once providers became real, an unpinned planner assigned whichever agent
-    had the most spare capacity — including one the project forbids, producing
-    an ASSIGN that the launch authorization gate then refused."""
+def test_planner_limits_candidates_to_providers_the_project_authorizes(
+    tmp_path, git_repo, api, monkeypatch
+):
     from command_center import project_config
 
     monkeypatch.setattr(
@@ -1010,7 +1073,32 @@ def test_planner_pins_a_provider_the_project_authorizes(tmp_path, git_repo, api,
         [_entry("q1", "a")], {"a": task}, {"AIOS": {"repository_path": str(git_repo)}},
         db_path=api.db_path,
     )
-    assert wave.work_items[0].preferred_agent == "claude_code"
+    assert wave.work_items[0].allowed_agents == frozenset({"claude_code"})
+    assert wave.work_items[0].preferred_agent is None
+
+
+def test_planner_keeps_multiple_authorized_providers_available_for_load_balancing(
+    tmp_path, git_repo, api, monkeypatch
+):
+    from command_center import project_config
+
+    monkeypatch.setattr(
+        project_config,
+        "allowed_execution_providers",
+        lambda pid: ("claude_code", "codex"),
+    )
+    task = _task(id="a", workspace_path=str(git_repo), executor="claude_code")
+    wave = task_pipeline.adapt_ready_entries(
+        [_entry("q1", "a")],
+        {"a": task},
+        {"AIOS": {"repository_path": str(git_repo)}},
+        db_path=api.db_path,
+    )
+
+    assert wave.work_items[0].allowed_agents == frozenset(
+        {"claude_code", "codex"}
+    )
+    assert wave.work_items[0].preferred_agent is None
 
 
 def test_a_task_naming_a_forbidden_provider_is_not_silently_redirected(
