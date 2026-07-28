@@ -148,8 +148,11 @@ Blocking validation errors and dirty-tree/branch-mismatch warnings are
 enforced in two layers, not one: the launch button's `disabled=` attribute
 (the primary, user-visible gate) *and* an explicit server-side re-check in
 `app.py` immediately after the click (`if not validation.can_launch: ...
-return` / `if validation.warnings and not warnings_ack: ... return`) before
-any call into `launch_service`. The second layer exists because a UI
+return` / `if unacknowledged: ... return`) before any call into
+`launch_service`. Each warning carries its own acknowledgement checkbox,
+keyed by its stable issue code — the single shared "launch anyway" checkbox
+this increment originally shipped let a dirty tree and a branch mismatch be
+dismissed together in one click. The second layer exists because a UI
 `disabled` attribute alone is a widget-level convention, not a guarantee —
 defense in depth for a launch action was judged worth the four extra lines.
 

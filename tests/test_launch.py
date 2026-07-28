@@ -66,6 +66,55 @@ def test_validate_launch_clean_repo_no_warnings(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Per-warning acknowledgement (Founder audit MAJOR-4): a dirty tree and a
+# branch mismatch are tracked as separate, separately-confirmable conditions.
+# --------------------------------------------------------------------------
+
+
+def test_dirty_tree_and_branch_mismatch_are_separately_acknowledgeable(tmp_path):
+    _init_repo(tmp_path)
+    (tmp_path / "untracked.txt").write_text("x")
+    result = launch.validate_launch(workspace_path=str(tmp_path), expected_branch="some-other-branch")
+
+    assert result.warning_codes == [launch.ISSUE_DIRTY_TREE, launch.ISSUE_BRANCH_MISMATCH]
+    # Acknowledging one says nothing about the other, in either direction.
+    assert result.unacknowledged_warning_codes({launch.ISSUE_DIRTY_TREE}) == [
+        launch.ISSUE_BRANCH_MISMATCH
+    ]
+    assert result.unacknowledged_warning_codes({launch.ISSUE_BRANCH_MISMATCH}) == [
+        launch.ISSUE_DIRTY_TREE
+    ]
+    assert not result.warnings_acknowledged(None)
+    assert not result.warnings_acknowledged({launch.ISSUE_DIRTY_TREE})
+    assert result.warnings_acknowledged({launch.ISSUE_DIRTY_TREE, launch.ISSUE_BRANCH_MISMATCH})
+
+
+def test_no_warnings_needs_no_acknowledgement(tmp_path):
+    _init_repo(tmp_path)
+    result = launch.validate_launch(workspace_path=str(tmp_path))
+    assert result.warning_issues == []
+    assert result.warnings_acknowledged(None)
+
+
+def test_every_warning_code_has_its_own_distinct_ack_label():
+    """The prompts must name the specific hazard being accepted — two
+    conditions sharing one wording would reintroduce the single collective
+    checkbox in spirit."""
+    labels = [
+        launch.WARNING_ACK_LABELS[code]
+        for code in (launch.ISSUE_DIRTY_TREE, launch.ISSUE_BRANCH_MISMATCH, launch.ISSUE_DETACHED_HEAD)
+    ]
+    assert len(set(labels)) == len(labels)
+    assert launch.warning_ack_label(
+        launch.LaunchIssue(code=launch.ISSUE_DIRTY_TREE, message="...", severity=launch.SEVERITY_WARNING)
+    ) == launch.WARNING_ACK_LABELS[launch.ISSUE_DIRTY_TREE]
+    # An unknown (future) warning code still gets its own prompt rather than
+    # silently sharing another condition's.
+    unknown = launch.LaunchIssue(code="some_future_code", message="что-то не так", severity=launch.SEVERITY_WARNING)
+    assert "что-то не так" in launch.warning_ack_label(unknown)
+
+
+# --------------------------------------------------------------------------
 # resolve_workspace_path — task.workspace_path / project.default_workspace_path
 # / project.repository_path precedence
 # --------------------------------------------------------------------------
