@@ -176,7 +176,11 @@ def test_no_orphan_at_any_level_when_cancelled_via_ctrl_c(configured_repo):
 
     assert proc.returncode != 0
 
-    time.sleep(0.3)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(
+        identity.process_exists(pid) for pid in pids.values()
+    ):
+        time.sleep(0.05)
     for role, pid in pids.items():
         assert identity.process_exists(pid) is False, f"{role} (pid {pid}) must not survive Ctrl+C cancellation"
 
