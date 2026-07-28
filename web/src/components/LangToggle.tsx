@@ -1,0 +1,25 @@
+import { useTranslation } from 'react-i18next'
+import { toggleLang } from '../lib/i18n'
+
+export default function LangToggle() {
+  const { i18n } = useTranslation()
+  return (
+    <button
+      type="button"
+      onClick={toggleLang}
+      className="glass"
+      style={{
+        padding: '0.35rem 0.75rem',
+        color: 'var(--tx)',
+        fontSize: '0.72rem',
+        fontWeight: 600,
+        letterSpacing: '0.04em',
+        cursor: 'pointer',
+        background: 'rgba(255,255,255,0.02)',
+      }}
+      aria-label="Toggle language"
+    >
+      {i18n.language === 'ru' ? 'RU' : 'EN'}
+    </button>
+  )
+}

@@ -3,5 +3,7 @@
 body {
   margin: 0;
   font-family: var(--font-sans);
-  background: #0b0e1a;
+  background: var(--bg, #0b0e1a);
+  transition: background 0.4s ease;
+  min-height: 100vh;
 }
