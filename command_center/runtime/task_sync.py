@@ -327,9 +327,13 @@ _LAUNCH_STATUS_BY_COMPLETION_STATE: dict[str, str] = {
 def sync_task_from_completion(task: dict, completion: dict) -> bool:
     """Project a completion row onto its task. Once seeded, the completion
     pipeline is the authority for `launch_status`; on terminal success it also
-    advances the task to stage "Merged"/progress 100 and sets
-    `pull_request_status="merged"` (the field `recommend.py` reads for
-    dependency gating). Returns whether the task was mutated."""
+    advances the task to progress 100 and, **only when the completion carries
+    real merge evidence** (a `merge_commit` or `pull_request_url`), sets
+    `pull_request_status="merged"` (the field `recommend.py` reads). A local-only
+    completion (`allow_local_only`: COMPLETED with no PR and no merge commit)
+    never merged anything, so it neither claims "merged" nor records a
+    "Merged into target branch" event (audit D4). Returns whether the task was
+    mutated."""
     state = completion["completion_state"]
     mutated = False
 
@@ -339,11 +343,22 @@ def sync_task_from_completion(task: dict, completion: dict) -> bool:
         mutated = True
 
     if state == completion_states.CompletionState.COMPLETED:
+        # "merged" is a factual claim read by recommendation scoring and shown in
+        # the UI; assert it only when a merge actually happened. The verified-
+        # merge path records a `merge_commit`/`pull_request_url`; the opt-in
+        # local-only path (allow_local_only) records neither.
+        has_merge_evidence = bool(completion.get("merge_commit") or pr_url)
         if (task.get("progress") or 0) < 100:
             models.set_current_stage(task, "Merged")
-            models.append_timeline_event(task, "completed", "Merged into target branch (completion pipeline).")
+            models.append_timeline_event(
+                task,
+                "completed",
+                "Merged into target branch (completion pipeline)."
+                if has_merge_evidence
+                else "Завершено локально — merge не выполнялся (allow_local_only).",
+            )
             mutated = True
-        if task.get("pull_request_status") != "merged":
+        if has_merge_evidence and task.get("pull_request_status") != "merged":
             task["pull_request_status"] = "merged"
             mutated = True
 

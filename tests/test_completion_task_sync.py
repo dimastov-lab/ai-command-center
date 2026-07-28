@@ -162,3 +162,38 @@ def test_regressed_done_task_recovers_when_completion_returns_to_completed():
     assert mutated is True
     assert task["launch_status"] == "Completed"
     assert task.get("regressed_after_done") in (False, None)
+
+
+# --- P0 remediation: "merged" without merge evidence (audit D4) --------------
+# `pull_request_status="merged"` and a "Merged into target branch" timeline entry
+# are factual claims (recommendation scoring reads the field; the UI shows the
+# badge). A local-only completion (COMPLETED with allow_local_only, so no PR and
+# no merge commit) never merged anything and must assert neither.
+
+
+def test_completed_without_merge_evidence_is_not_labelled_merged():
+    task = _task(progress=95)
+    completion = {"completion_state": "COMPLETED", "pull_request_url": None, "merge_commit": None}
+    task_sync.sync_task_from_completion(task, completion)
+    assert task.get("pull_request_status") != "merged"
+
+
+def test_local_only_completion_timeline_does_not_claim_merge():
+    task = _task(progress=95)
+    completion = {"completion_state": "COMPLETED", "pull_request_url": None, "merge_commit": None}
+    task_sync.sync_task_from_completion(task, completion)
+    assert "Merged into target branch" not in str(task.get("timeline", []))
+
+
+def test_completed_with_merge_commit_is_labelled_merged():
+    task = _task(progress=95)
+    completion = {"completion_state": "COMPLETED", "pull_request_url": None, "merge_commit": "abc1234"}
+    assert task_sync.sync_task_from_completion(task, completion) is True
+    assert task["pull_request_status"] == "merged"
+
+
+def test_completed_with_pull_request_url_is_labelled_merged():
+    task = _task(progress=95)
+    completion = {"completion_state": "COMPLETED", "pull_request_url": "https://github.com/x/y/pull/7"}
+    task_sync.sync_task_from_completion(task, completion)
+    assert task["pull_request_status"] == "merged"

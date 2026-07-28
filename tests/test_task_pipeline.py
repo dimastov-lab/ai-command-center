@@ -599,7 +599,14 @@ def test_verified_completion_repairs_stale_execution_fields_on_done_task(
         api.db_path,
         row["run_id"],
         expected_version=row["version"],
-        fields={"completion_state": completion_domain.CompletionState.COMPLETED},
+        fields={
+            "completion_state": completion_domain.CompletionState.COMPLETED,
+            # A genuinely *verified* completion reaches COMPLETED only after its
+            # merge is confirmed in the target branch, so it always carries the
+            # merged-PR evidence. Without it this would be an `allow_local_only`
+            # completion, which must NOT be labelled "merged" (audit D4).
+            "pull_request_url": "https://github.com/x/y/pull/1",
+        },
     )
     task = _task(
         id="a",
