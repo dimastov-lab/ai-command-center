@@ -107,6 +107,12 @@ SOURCE_GENERATED_DEFAULT = "generated_default"
 WORKTREE_MODE_EXISTING = "existing"
 WORKTREE_MODE_NEW = "new"
 
+# Main-line branches must never be used as the task branch of a Portfolio
+# launch. Portfolio launches are isolated implementation/audit runs: allowing
+# one to resolve to a repository's primary branch would make safety depend on
+# `git worktree add` noticing that the branch is already checked out elsewhere.
+PROTECTED_BRANCH_NAMES = frozenset({"main", "master"})
+
 # `build_launch_plan`'s blocker text for "this task_id is already in the
 # registry" — a named constant (rather than a string literal repeated at the
 # append site and every reader) so `build_card_presentation` can reliably
@@ -189,8 +195,15 @@ def worktree_path_for(task_id: str) -> Path:
 
 def _validate_branch_name(name: str) -> str | None:
     """Returns an error message if `name` is not a safe git branch name,
-    else `None`. Delegates to `git check-ref-format --branch`, which needs no
-    repository context and does not touch the filesystem."""
+    else `None`. Rejects protected main-line branches explicitly, then
+    delegates syntax validation to `git check-ref-format --branch`, which
+    needs no repository context and does not touch the filesystem."""
+    if name in PROTECTED_BRANCH_NAMES:
+        protected = ", ".join(sorted(PROTECTED_BRANCH_NAMES))
+        return (
+            f"защищённую ветку «{name}» нельзя использовать для Portfolio-задачи "
+            f"(защищённые ветки: {protected}); укажите отдельную рабочую ветку"
+        )
     try:
         result = subprocess.run(
             ["git", "check-ref-format", "--branch", name],
