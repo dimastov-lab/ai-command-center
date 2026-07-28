@@ -63,8 +63,8 @@ def test_sync_task_from_run_running_sets_launch_status_running(tmp_path):
 
 def test_sync_task_from_run_completed_advances_progress_and_extracts_fields(tmp_path):
     """A `Completed` run's terminal sync now advances `current_stage`/
-    `progress` (mirroring v1's `launch_service._apply_run_outcome_to_task`)
-    instead of leaving it frozen at whatever `launch.begin_launch` set it to
+    `progress` (mirroring the retired v1 synchronous launch flow) instead of
+    leaving it frozen at whatever `launch.begin_launch` set it to
     at launch time. A PR-ready result reaches "PR Ready" (progress 95) — not
     100 ("Merged", which no agent run here is ever permitted to reach on its
     own, since none of them call `git commit`/`push`/`merge`) — so per the

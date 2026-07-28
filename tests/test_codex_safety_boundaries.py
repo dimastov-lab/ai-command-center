@@ -196,55 +196,6 @@ def test_codex_prompt_never_enters_task_prompt_history(fake_codex):
     assert calls == [], "Codex prompt must never be pushed into prompt history"
 
 
-def test_legacy_synchronous_launch_fails_closed_on_authorization(fake_codex, git_repo):
-    """The legacy synchronous `execute_agent_launch` path must enforce the same
-    provider allow-list as every other entry point, before any persistence."""
-    from command_center import launch_service
-
-    # A project that does not authorize Codex must be refused up front.
-    with pytest.raises(project_config.ProviderAuthorizationError):
-        launch_service.execute_agent_launch(
-            project="AICC",  # not authorized for Codex
-            task_type="review",
-            prompt="secret prompt",
-            timeout_seconds=1,
-            repository_path=git_repo,
-            executor_id="codex",
-        )
-
-
-def test_legacy_synchronous_launch_never_persists_codex_prompt(fake_codex, git_repo):
-    """Even where Codex is authorized, the legacy path refuses it before task
-    mutation or v1 run persistence."""
-    from command_center import agent_runner, launch_service, models
-
-    secret = "LEGACY-ONLY-secret-4471-zeta"
-    task = {"id": "legacy-1"}
-    models.normalize_task_execution(task)
-    original_task = dict(task)
-    pushed: list = []
-    original = models.push_prompt_history
-    try:
-        models.push_prompt_history = lambda t, p: pushed.append((t, p))
-        with pytest.raises(RuntimeError, match="Execution Center launcher only"):
-            launch_service.execute_agent_launch(
-                project="AIOS",  # authorized for Codex via fake_codex fixture
-                task_type="review",
-                prompt=f"deploy {secret}",
-                timeout_seconds=1,
-                repository_path=git_repo,
-                task=task,
-                executor_id="codex",
-            )
-    finally:
-        models.push_prompt_history = original
-    assert pushed == [], "legacy path must not push a Codex prompt into history"
-    assert task == original_task
-    serialized = json.dumps(agent_runner.load_runs(), ensure_ascii=False, default=str)
-    assert secret not in serialized
-    assert agent_runner.load_runs() == []
-
-
 # ---------------------------------------------------------------------------
 # MAJOR 3 — exit code 0 is not trusted as success
 # ---------------------------------------------------------------------------
