@@ -3671,7 +3671,6 @@ def render_home_dashboard(
         for t in tasks
         if t.get("project")
     }
-    attention = board[live_board.BUCKET_ATTENTION]
 
     greeting = f"{_home_greeting()} {owner}" if owner else _home_greeting()
     st.markdown(f"### {greeting}")
@@ -3904,12 +3903,20 @@ def render_home_dashboard(
         # The gauge shows the same windowed health as the project-health card; the
         # status pill and caption describe what the supervisor is actually doing.
         window_success = _window_success_rate(runs)
-        if attention:
+        # audit D5: count runs needing attention the same way the Execution Strip
+        # banner does — the non-superseded latest attempt of each task only — so
+        # this caption and the strip never show two different "attention" numbers
+        # on the same screen. `running` (the board live bucket above) stays as-is
+        # for the "Активные агенты" list; only the headline counts are
+        # canonicalised here.
+        _superseded_ids = live_board.superseded_run_ids(sessions)
+        run_counts = read_model.run_snapshot([r for r in runs if r.get("id") not in _superseded_ids])
+        if run_counts.attention:
             sup_status, sup_accent = "Требует внимания", "amber"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(attention)} прогонов требуют внимания"
-        elif running:
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.attention} прогонов требуют внимания"
+        elif run_counts.running:
             sup_status, sup_accent = "В работе", "green"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(running)} прогонов выполняется"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.running} прогонов выполняется"
         else:
             sup_status, sup_accent = "Ожидает", "slate"
             sup_label = "Автопилот включён — ожидает задач" if settings.enabled else "Автопилот выключен"

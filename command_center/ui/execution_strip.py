@@ -22,6 +22,7 @@ import streamlit as st
 
 from command_center import execution_queue, tasks_repository
 from command_center.runtime.api import ExecutionCenterAPI
+from command_center import read_model
 from command_center.runtime.db import RUN_STATES
 from command_center.ui import execution_metrics, tokens
 
@@ -42,9 +43,12 @@ from command_center.ui import execution_metrics, tokens
 #   FAILED            → Failed/Blocked    → board "Требуют внимания" (attention)
 #   INTERRUPTED, UNKNOWN → Requires Attention                          (attention)
 #   COMPLETED, CANCELLED → done / operator-stopped — not surfaced in the strip.
-_LIVE_STATES = frozenset({"RUNNING"})
-_WAITING_STATES = frozenset({"PREPARED", "QUEUED"})
-_ATTENTION_STATES = frozenset({"FAILED", "INTERRUPTED", "UNKNOWN"})
+# Single source of truth for the run buckets: shared with the AI-Supervisor
+# caption and the top-bar glyph via `read_model` (audit D5) so the three surfaces
+# can never again show three different "attention" numbers on one screen.
+_LIVE_STATES = read_model.RUN_LIVE_STATES
+_WAITING_STATES = read_model.RUN_WAITING_STATES
+_ATTENTION_STATES = read_model.RUN_ATTENTION_STATES
 
 
 def strip_counts(runs: list[dict]) -> tuple[int, int, int]:

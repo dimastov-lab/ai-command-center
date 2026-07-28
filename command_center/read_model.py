@@ -75,3 +75,41 @@ def task_snapshot(tasks: list[dict]) -> TaskSnapshot:
         active=sum(by_lane[lane] for lane in ACTIVE_LANES),
         attention=attention,
     )
+
+
+# --- Canonical RUN-level snapshot (audit D5) ---------------------------------
+# The persisted `run.state` vocabulary (runtime/db.RUN_STATES), bucketed exactly
+# as the Execution Strip established. Kept here so the strip banner, the AI-
+# Supervisor caption and the top-bar glyph share ONE definition instead of each
+# counting "runs needing attention" over a different set (24 / 141 / 109 under
+# the same word "внимания"). Callers pass the *non-superseded* runs (a task's
+# latest attempt only) so `attention` means "needs attention now", not a
+# cumulative historical tally. COMPLETED/CANCELLED are terminal and surface in
+# no bucket — the run snapshot is a "what is happening now" view.
+RUN_LIVE_STATES: frozenset[str] = frozenset({"RUNNING"})
+RUN_WAITING_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED"})
+RUN_ATTENTION_STATES: frozenset[str] = frozenset({"FAILED", "INTERRUPTED", "UNKNOWN"})
+
+
+@dataclass(frozen=True)
+class RunSnapshot:
+    """One reconciled view of the run list: how many are live, waiting, or need
+    attention *right now*."""
+
+    total: int
+    running: int
+    queued: int
+    attention: int
+
+
+def run_snapshot(runs: list[dict]) -> RunSnapshot:
+    """Bucket raw run rows by their persisted `state`. Pass the non-superseded
+    runs (see `ui.execution_strip`/`live_board.superseded_run_ids`) so a task
+    that failed once and was retried is not double-counted as still needing
+    attention."""
+    return RunSnapshot(
+        total=len(runs),
+        running=sum(1 for r in runs if r.get("state") in RUN_LIVE_STATES),
+        queued=sum(1 for r in runs if r.get("state") in RUN_WAITING_STATES),
+        attention=sum(1 for r in runs if r.get("state") in RUN_ATTENTION_STATES),
+    )
