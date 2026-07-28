@@ -447,6 +447,44 @@ def test_focus_mode_does_not_crash_on_a_non_canonical_task_status():
     assert not at.exception
     rendered = "\n".join(n.value for n in at.markdown)
     assert "BlockedFocusTask" in rendered
+    persisted = storage.read_json(
+        Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", []
+    )
+    assert persisted[0]["status"] == "Blocked"
+
+
+def test_kanban_renders_blocked_and_unknown_statuses_without_rewriting_them():
+    _seed_tasks(
+        [
+            {
+                "id": "blocked",
+                "project": "AICC",
+                "title": "VisibleBlockedTask",
+                "status": "Blocked",
+            },
+            {
+                "id": "custom",
+                "project": "AICC",
+                "title": "VisibleCustomTask",
+                "status": "Custom State",
+            },
+        ]
+    )
+    at = _at_on_page("kanban", kanban_project_selector_pills="AICC")
+    assert not at.exception
+    rendered = "\n".join(node.value for node in at.markdown)
+    assert "VisibleBlockedTask" in rendered
+    assert "VisibleCustomTask" in rendered
+    assert "**Blocked**" in rendered
+    assert "**Другие статусы**" in rendered
+
+    persisted = storage.read_json(
+        Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", []
+    )
+    assert {task["id"]: task["status"] for task in persisted} == {
+        "blocked": "Blocked",
+        "custom": "Custom State",
+    }
 
 
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
