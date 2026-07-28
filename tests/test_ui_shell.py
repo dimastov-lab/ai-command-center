@@ -1,5 +1,5 @@
 """UX-1: AppShell composition (design tokens, theme engine, Sidebar,
-TopCommandBar, Content Area, Inspector placeholder).
+TopCommandBar and Content Area).
 
 These tests guard the "do not redesign functionality" constraint the UX-1
 increment was scoped under: navigation must still work exactly as before
@@ -37,7 +37,8 @@ def test_shell_renders_title_and_sidebar_navigation():
     # — sections are reachable — rather than the widget implementing it.
     keys = {b.key for b in at.sidebar.button}
     assert "nav_btn_dashboard" in keys
-    assert "nav_btn_focus" in keys
+    assert "nav_btn_runs" in keys
+    assert "nav_btn_focus" not in keys
 
 
 def test_sidebar_still_has_command_palette_trigger():
@@ -52,16 +53,18 @@ def test_navigating_via_nav_page_still_switches_page_content():
     assert any(s.value == "Kanban" for s in at.subheader)
 
 
-def test_inspector_renders_empty_state_without_selection():
+def test_top_bar_search_and_inspector_are_wired():
     """UX-2c: the Inspector pane is now real (search + selected detail). With
     nothing selected it shows a guiding empty state — not the old inert
     placeholder. The popover content runs regardless of its visual state, so
     the empty-state `st.info` is present in `at.info`."""
     at = _at_on_page("dashboard")
     assert not at.exception
+    assert not any("следующей фазе UX" in info.value for info in at.info)
     assert any(
         "Инспектор" in info.value or "Выберите задачу" in info.value for info in at.info
     ), "Inspector empty-state message not found"
+    assert any(button.key == "top_open_palette_btn" for button in at.button)
 
 
 def test_priority_and_launch_status_color_tokens_are_unchanged():

@@ -1,9 +1,11 @@
 # AI Command Center — Desktop Platform Behavior
 
-Status: **D0 — target platform contract.** `command_center.platform` (referenced throughout) is
-target D3 structure (`DESKTOP_INCREMENT_1.md`) — it does not exist in the repository yet. This
-document defines macOS and Windows 11 behavior and the abstraction contract every other package
-must go through to reach it (binding decisions 6, 8).
+Status: **Target platform contract (D3); not yet built.** `command_center.platform` (referenced
+throughout) is target D3 structure (`DESKTOP_INCREMENT_1.md`) — it does not exist in the repository
+yet, so the shipped D1 shell persists its window geometry and preferences through a minimal
+`QSettings`-based store (`command_center/desktop/settings.py`) instead. This document defines macOS
+and Windows 11 behavior and the abstraction contract every other package must go through to reach
+it (binding decisions 6, 8).
 
 ## 1. macOS (Apple Silicon)
 

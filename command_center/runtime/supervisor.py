@@ -157,6 +157,23 @@ class WorkspaceLockedError(SupervisorError):
         )
 
 
+class TaskAlreadyActiveError(SupervisorError):
+    """Raised by `start_raw` when the launched task already has an active run
+    (`db.EXECUTION_CENTER_ACTIVE_STATES`), possibly in a different workspace —
+    wraps `db.TaskAlreadyActiveError` (the atomic, race-free per-task check
+    inside `db.create_run`'s transaction). A `SupervisorError` subclass so the
+    existing launch handlers that catch `SupervisorError` need no new except
+    clause; a caller that wants the conflicting run can read `.conflicting_run`."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Task {conflicting_run['task_id']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r}). Wait for it to "
+            "finish or cancel it before launching the same task again."
+        )
+
+
 class ProviderUnavailableError(SupervisorError):
     """The selected provider cannot be used safely on this machine."""
 
@@ -673,6 +690,8 @@ class Supervisor:
                 self._launching.add(run["id"])
         except db.WorkspaceLockedError as exc:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
+        except db.TaskAlreadyActiveError as exc:
+            raise TaskAlreadyActiveError(exc.conflicting_run) from exc
 
         try:
             if verification_evidence is not None:
@@ -778,7 +797,10 @@ class Supervisor:
                 stdin=subprocess.PIPE if spec.stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=spec.environment,
+                # Strip Git/GitHub push/merge credentials from the agent's
+                # environment (H1): the pipeline, never the launched agent, owns
+                # remote writes. See agent_runner.scrub_vcs_credentials.
+                env=agent_runner.scrub_vcs_credentials(spec.environment),
                 text=True,
                 bufsize=1,
                 shell=False,

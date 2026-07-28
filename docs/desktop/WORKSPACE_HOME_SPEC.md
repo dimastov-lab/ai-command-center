@@ -1,6 +1,8 @@
 # AI Command Center — Desktop Workspace Home Spec
 
-Status: **D0 — target spec for the native Home page, built entirely on existing read models.**
+Status: **Target spec for the native Home page (D2), built entirely on existing read models.**
+The shipped D1 shell renders only a placeholder Home page; the data wiring this spec describes
+lands in D2, once the `command_center.application` adapter exists.
 The native Home page is a `command_center.desktop` renderer over
 `command_center.workspace_home.build_workspace_home_snapshot`, called through a
 `command_center.application` adapter (`ARCHITECTURE.md` §5) — the same snapshot function the

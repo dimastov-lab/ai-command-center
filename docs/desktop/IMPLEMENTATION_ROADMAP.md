@@ -1,10 +1,10 @@
 # AI Command Center — Desktop Implementation Roadmap
 
-Status: **D0 — roadmap only. No increment below has started.** This document sequences
+Status: **D1 complete; D2–D4 remain roadmap.** This document sequences
 `DESKTOP_INCREMENT_1.md`'s four stages (D1–D4) into small, independently reviewable,
-commit-sized steps. Nothing in this document is implemented as part of the D0 documentation
-increment — see `DESKTOP_INCREMENT_1.md` for the frozen per-stage scope this roadmap sequences,
-and see this document's own status line: **next implementation stage is D1A.**
+commit-sized steps. D1 (the native shell) has shipped; the D2–D4 steps below are not yet
+implemented — see `DESKTOP_INCREMENT_1.md` for the frozen per-stage scope this roadmap sequences.
+**Next implementation stage is D2 (Native Workspace Home).**
 
 Every increment below follows the same shape: scope, dependencies, files expected, acceptance
 criteria, test requirements, forbidden scope. An increment is sized to be reviewable as one pull

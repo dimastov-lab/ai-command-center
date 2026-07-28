@@ -12,6 +12,15 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+
+# The desktop suite needs PySide6 (an optional dependency declared in
+# requirements-desktop.txt, not in the base install). Skip the whole suite
+# gracefully when it is absent so `pytest -q` from the repo root still collects
+# and runs the rest of the suite — the documented local quality gate — without
+# the optional Qt stack. CI installs requirements-dev.txt (which pulls in
+# PySide6) and therefore still runs these tests.
+pytest.importorskip("PySide6")
+
 from PySide6.QtCore import QSettings
 
 from command_center.desktop.app import build_shell

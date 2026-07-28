@@ -433,6 +433,22 @@ def test_superseded_run_ids_marks_older_attempts_of_a_task():
     assert live_board.superseded_run_ids(sessions) == frozenset({"old"})
 
 
+def test_completed_task_run_ids_removes_resolved_failures_from_attention():
+    sessions = [
+        {"run_id": "failed-done", "task_id": "done-task"},
+        {"run_id": "failed-open", "task_id": "open-task"},
+        {"run_id": "ad-hoc", "task_id": None},
+    ]
+    tasks_by_id = {
+        "done-task": {"id": "done-task", "status": "Done"},
+        "open-task": {"id": "open-task", "status": "Backlog"},
+    }
+
+    assert live_board.completed_task_run_ids(sessions, tasks_by_id) == frozenset(
+        {"failed-done"}
+    )
+
+
 def test_superseded_leaves_a_single_run_alone():
     sessions = [{"run_id": "only", "task_id": "T", "started_at": "2026-01-01T00:00:00"}]
     assert live_board.superseded_run_ids(sessions) == frozenset()

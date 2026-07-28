@@ -78,6 +78,22 @@ def _run_parent(pidfile_base: str) -> None:
     sys.stdout.flush()
 
     if os.environ.get("FAKE_CLAUDE_TREE_PARENT_EXIT_AFTER_START") == "1":
+        # Do not exit until the child has recorded the grandchild pid. This
+        # parent is the process-group leader, so the instant it exits the
+        # Supervisor may observe the leader exit and drain the whole group
+        # (residual SIGTERM -> SIGKILL) before the child has finished spawning
+        # the grandchild and writing `<base>.grandchild`. On a loaded runner
+        # that teardown wins the race, the grandchild pidfile never appears,
+        # and the test's pidfile poll times out. Gating the exit on the tree
+        # being fully materialised makes "whole tree up" happen-before "leader
+        # exits" happen-before "group drain" — deterministic on any load.
+        grandchild_pidfile = f"{pidfile_base}.grandchild"
+        # 10s deliberately mirrors the test helper `_wait_for_tree_pids`'s own
+        # poll deadline; keep them equal so this gate never gives up before the
+        # poll does.
+        deadline = time.monotonic() + 10.0
+        while not os.path.exists(grandchild_pidfile) and time.monotonic() < deadline:
+            time.sleep(0.01)
         return
 
     time.sleep(60)

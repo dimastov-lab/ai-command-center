@@ -169,6 +169,27 @@ class WorkspaceLockedError(Exception):
         )
 
 
+class TaskAlreadyActiveError(Exception):
+    """Raised by `create_run(..., enforce_workspace_lock=True)` when the same
+    `task_id` already has an active run (`EXECUTION_CENTER_ACTIVE_STATES`),
+    possibly in a *different* workspace than this launch resolved to.
+
+    The workspace lock alone (`WorkspaceLockedError`) only catches a second
+    launch that resolves to the SAME `repository_path`; if a task's configured
+    workspace/branch changes between two in-flight launches they can resolve to
+    different paths and both slip past it. This check runs inside the same
+    `BEGIN IMMEDIATE` transaction as the `INSERT`, so it is a true atomic
+    per-task invariant rather than a raceable pre-flight. Carries the
+    conflicting run for reporting."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Task {conflicting_run['task_id']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r})."
+        )
+
+
 class GlobalConcurrencyLimitError(Exception):
     """Raised by `create_run(..., max_global_concurrency=N)` when N runs are
     already active (`EXECUTION_CENTER_ACTIVE_STATES`) across *all* workspaces.
@@ -1095,6 +1116,22 @@ def create_run(
                 if conflict is not None:
                     raise WorkspaceLockedError(_row_to_dict(conflict))
 
+                # Task-id exclusivity (audit M1): the workspace lock above only
+                # catches a double-launch that resolves to the SAME workspace. If
+                # a task's configured workspace/branch changes between two
+                # in-flight launches they can resolve to *different* paths and
+                # slip past it — two agents running for one task. Checked in the
+                # same BEGIN IMMEDIATE transaction as the INSERT, so it cannot
+                # lose the race a separate pre-flight query can. Ordered after the
+                # workspace check so a same-workspace conflict still surfaces as
+                # WorkspaceLockedError (unchanged behaviour).
+                task_conflict = conn.execute(
+                    f"SELECT * FROM run WHERE task_id = ? AND state IN ({placeholders})",
+                    (task_id, *EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()
+                if task_conflict is not None:
+                    raise TaskAlreadyActiveError(_row_to_dict(task_conflict))
+
             if max_global_concurrency is not None:
                 # Global cap as an atomic invariant, in the SAME transaction as
                 # the INSERT (like the workspace lock above): count every run
@@ -1169,6 +1206,25 @@ def create_run(
 def get_run(db_path: Path, run_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+        return _row_to_dict(row)
+
+
+def get_latest_run_for_task(db_path: Path, task_id: str) -> dict | None:
+    """Newest run row for `task_id`, or None if the task has no runs.
+
+    Distinct from `list_runs(task_id=..., limit=1)`: that path orders only by
+    `created_at DESC`, and `created_at` is second-granularity (`iso_now()`),
+    so two runs created in the same second tie and SQLite returns them in
+    unspecified rowid order. We add `rowid DESC` as a stable tiebreak — rowid
+    is insertion order, so the higher rowid is the newer row — guaranteeing
+    the actually-newest run is returned. Used by `task_sync.sync_tasks` to
+    self-heal tasks whose `current_run_id` was orphaned by a lost update.
+    """
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM run WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
         return _row_to_dict(row)
 
 

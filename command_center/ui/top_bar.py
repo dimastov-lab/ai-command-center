@@ -1,10 +1,11 @@
 """Top command bar component (UX-1 AppShell, extended UX-2c).
 
-Hosts the page-level title/caption, a live execution status glyph, and the
-Inspector pane as a popover (`command_center/ui/inspector.py`). A popover
-(rather than a persistent column split) means mounting the Inspector adds no
-layout change to any existing page's content — it only ever appears on
-demand, anchored from the top bar itself.
+Hosts the page-level title/caption, command-palette trigger, live execution
+status glyph, and Inspector pane as a popover
+(`command_center/ui/inspector.py`). A popover (rather than a persistent column
+split) means mounting the Inspector adds no layout change to any existing
+page's content — it only ever appears on demand, anchored from the top bar
+itself.
 """
 
 from __future__ import annotations
@@ -34,8 +35,18 @@ def _live_status_glyph(api) -> str:
     return " · ".join(parts)
 
 
-def render_top_bar(title: str, caption: str, *, tasks_by_id: dict[str, dict] | None = None, api=None) -> None:
-    header_col, status_col, inspector_col = st.columns([6, 2, 1], vertical_alignment="bottom")
+def render_top_bar(
+    title: str,
+    caption: str,
+    *,
+    on_open_palette,
+    tasks_by_id: dict[str, dict] | None = None,
+    api=None,
+) -> None:
+    header_col, status_col, search_col, inspector_col = st.columns(
+        [5, 2, 1, 1],
+        vertical_alignment="bottom",
+    )
     with header_col:
         st.title(title)
         st.caption(caption)
@@ -43,6 +54,15 @@ def render_top_bar(title: str, caption: str, *, tasks_by_id: dict[str, dict] | N
         glyph = _live_status_glyph(api)
         if glyph:
             st.markdown(f"###### {glyph}")
+    with search_col:
+        st.button(
+            "Поиск",
+            icon=":material/search:",
+            shortcut="Mod+K",
+            on_click=on_open_palette,
+            width="stretch",
+            key="top_open_palette_btn",
+        )
     with inspector_col:
         label = inspector.current_label(tasks_by_id or {})
         with st.popover(label, icon=":material/right_panel_open:", width="stretch"):

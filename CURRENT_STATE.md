@@ -7,9 +7,10 @@ Updated: 2026-07-27
 Status: Active, local Streamlit implementation
 
 Current position:
-- `app.py` hosts the implemented 19-destination Streamlit control application.
+- `app.py` hosts the implemented Streamlit control application: 20 page handlers, 16 shown in the
+  sidebar (chat, generated files, reports, and context open inside the project view).
 - `data/tasks.json` remains the planning and Kanban store.
-- `data/runtime.db` schema 10 is authoritative for asynchronous execution, completion, the
+- `data/runtime.db` schema 11 is authoritative for asynchronous execution, completion, the
   persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
   verdict, and the `queue_entry` mirror (ADR 0007 dual-write).
 - Execution Center provides process supervision, streaming events, cancellation, timeouts and

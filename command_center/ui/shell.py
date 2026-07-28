@@ -41,6 +41,12 @@ def render_shell(
     # every run so it survives reruns (see theme.inject_global_css docstring).
     theme.inject_global_css()
 
-    top_bar.render_top_bar(title, caption, tasks_by_id=tasks_by_id, api=api)
+    top_bar.render_top_bar(
+        title,
+        caption,
+        on_open_palette=on_open_palette,
+        tasks_by_id=tasks_by_id,
+        api=api,
+    )
 
     return sidebar.render_sidebar(nav, project_count=project_count, on_open_palette=on_open_palette)
