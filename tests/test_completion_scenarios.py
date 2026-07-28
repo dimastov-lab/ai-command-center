@@ -488,3 +488,35 @@ def test_begin_completion_skips_non_completed_run(env):
     orch = CompletionOrchestrator(db_path, github=FakeGitHubClient())
     assert orch.begin_completion(run, project_cfg=_auto_cfg()) is None
     assert runtime_db.get_completion(db_path, run["id"]) is None
+
+
+def test_step_verify_recovers_late_merge_commit_oid(env):
+    # M2: a squash merge whose commit oid GitHub has not populated at merge time
+    # persists merge_commit=None. HEAD is not an ancestor of the squashed base,
+    # so without the oid a genuinely-merged task strands at REQUIRES_ATTENTION.
+    # _step_verify must re-discover the PR, recover the oid, verify the real
+    # merge, and persist the recovered oid.
+    import dataclasses
+
+    db_path, remote, work, tmp = env
+    branch = "task/aicc-late-oid"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    class LateOidGitHub(FakeGitHubClient):
+        """merge() reports success but with no merge-commit oid; the stored PR
+        keeps the real oid, so a later discover() reveals it."""
+
+        def merge_pull_request(self, repo, *, number, method="squash"):
+            pr = super().merge_pull_request(repo, number=number, method=method)
+            return dataclasses.replace(pr, merge_commit=None)
+
+    gh = LateOidGitHub(on_merge=lambda pr: merge_into_main(remote, tmp, pr.head_ref, squash=True))
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg=_auto_cfg())
+    orch.advance(run["id"], now=NOW)
+
+    row = runtime_db.get_completion(db_path, run["id"])
+    assert row["completion_state"] == CompletionState.COMPLETED
+    # the oid recovered by the re-discovery was persisted, not left null
+    assert row["merge_commit"]

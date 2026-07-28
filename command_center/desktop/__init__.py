@@ -3,7 +3,7 @@
 This is the presentation layer described by ``docs/desktop/ARCHITECTURE.md``. It
 depends only on ``PySide6`` and the Python standard library; it imports nothing
 from ``app.py``/Streamlit and starts no HTTP listener or browser
-(`ARCHITECTURE.md` §8.1). The data-adapter layer that bridges to the existing
+(`docs/desktop/ARCHITECTURE.md` §8.1). The data-adapter layer that bridges to the existing
 ``command_center`` core (``command_center.application``) lands in a later
 increment; this package is a pure shell.
 
