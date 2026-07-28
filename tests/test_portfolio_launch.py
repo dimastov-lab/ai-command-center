@@ -922,6 +922,39 @@ def test_malformed_branch_override_is_blocked(git_repo, tmp_path, portfolio_work
     assert any("недопустим" in b for b in plan.blockers)
 
 
+@pytest.mark.parametrize("protected_branch", sorted(portfolio_launch.PROTECTED_BRANCH_NAMES))
+def test_launch_rejects_protected_branch_before_worktree_add(
+    git_repo, tmp_path, portfolio_worktrees_root, monkeypatch, protected_branch
+):
+    task = _write_card(
+        tmp_path,
+        base_branch=_current_branch(git_repo),
+        repository=str(git_repo),
+        branch=protected_branch,
+    )
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+
+    def unexpected_create_worktree(*args, **kwargs):
+        pytest.fail("create_worktree must not be called for a protected branch")
+
+    monkeypatch.setattr(portfolio_launch, "create_worktree", unexpected_create_worktree)
+
+    result = portfolio_launch.launch_portfolio_task(
+        tmp_path,
+        task,
+        tasks_by_id={},
+        repository_paths={"AICC": str(git_repo)},
+        execution_center_api=api,
+        confirmed=True,
+    )
+
+    assert result.launched is False
+    assert not result.plan.launchable
+    assert "защищённую ветку" in result.message
+    assert f"«{protected_branch}»" in result.message
+    assert not Path(result.plan.worktree).exists()
+
+
 def test_relative_worktree_override_is_blocked_as_ambiguous(git_repo, tmp_path, portfolio_worktrees_root):
     base_branch = _current_branch(git_repo)
     task = _write_card(tmp_path, base_branch=base_branch, repository=str(git_repo), worktree="relative/path")
