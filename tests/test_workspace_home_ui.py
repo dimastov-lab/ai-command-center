@@ -68,6 +68,22 @@ def test_workspace_home_empty_state_all_six_unconfigured():
     assert any("Активности пока нет" in text for text in infos)
 
 
+def test_workspace_home_shows_shared_health_metrics_and_recommendations():
+    at = _at_on_workspace_home()
+    assert not at.exception
+
+    metric_labels = {metric.label for metric in at.metric}
+    assert {
+        "Здоровье",
+        "Прогресс спринта",
+        "Roadmap",
+        "Осталось",
+        "Заблокировано",
+        "Завершено",
+    } <= metric_labels
+    assert any("Рекомендованные задачи" in markdown.value for markdown in at.markdown)
+
+
 # --------------------------------------------------------------------------
 # Quick Actions (§11/§17 step 9) — every action lands on the correct existing
 # page/form, pre-filled where specified, with zero auto-submitted mutation.

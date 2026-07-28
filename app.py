@@ -3310,8 +3310,65 @@ def _quick_action_view_run(source: str, run_id: str) -> None:
         st.session_state.pending_nav = "runs"
 
 
-def render_workspace_home_page(api: runtime_api.ExecutionCenterAPI) -> None:
+def render_project_planning_intelligence(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    *,
+    selector_key: str,
+    recommendation_key_prefix: str,
+    include_backlog_reconcile: bool = False,
+) -> str | None:
+    """Render the shared founder health/recommendation surface.
+
+    Workspace Home and Kanban deliberately delegate to the same component
+    functions here so their metrics, scoring, queue state, and launch behavior
+    cannot drift into separate implementations.
+    """
+    project_filter = project_selector.render_project_selector(tasks, key=selector_key)
+    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
+
+    project_configs = project_config.load_project_configs()
+    with st.expander(
+        "Планирование и рекомендации",
+        icon=":material/auto_awesome:",
+        expanded=False,
+    ):
+        recommendations_panel.render_recommendations_panel(
+            tasks,
+            tasks_by_id,
+            ROOT,
+            api,
+            project_configs,
+            upsert_tasks,
+            project=project_filter,
+            key_prefix=recommendation_key_prefix,
+        )
+        if include_backlog_reconcile:
+            backlog_reconcile_panel.render_backlog_reconcile_panel(
+                tasks,
+                ROOT,
+                project=project_filter,
+                key_prefix="kanban_reconcile",
+            )
+    return project_filter
+
+
+def render_workspace_home_page(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+) -> None:
     snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
+
+    render_project_planning_intelligence(
+        api,
+        tasks,
+        tasks_by_id,
+        selector_key="workspace_home_project_selector",
+        recommendation_key_prefix="workspace_home_reco",
+    )
+    st.divider()
 
     with st.container(horizontal=True):
         st.metric("Проекты", len(snapshot["projects"]), border=True)
@@ -4269,7 +4326,7 @@ if page_key == "dashboard":
     if dashboard_section == "Аналитика":
         render_dashboard_analytics(dashboard_api, tasks, tasks_by_id)
     elif dashboard_section == "Репозитории и артефакты":
-        render_workspace_home_page(dashboard_api)
+        render_workspace_home_page(dashboard_api, tasks, tasks_by_id)
     else:
         render_home_dashboard(dashboard_api, tasks)
 
@@ -4282,9 +4339,9 @@ elif page_key == "workspace_home":
     content_area.page_header(
         "Workspace Home",
         "Кросс-проектная сводка: репозитории, прогоны, артефакты и отчёты — "
-        "в одном месте, только для чтения.",
+        "в одном месте, с health-метриками и рекомендациями следующих действий.",
     )
-    render_workspace_home_page(get_execution_center_api())
+    render_workspace_home_page(get_execution_center_api(), tasks, tasks_by_id)
 
 
 # --------------------------------------------------------------------------
@@ -4712,29 +4769,14 @@ elif page_key == "waves":
 elif page_key == "kanban":
     st.subheader("Kanban", anchor="kanban")
 
-    project_filter = project_selector.render_project_selector(tasks, key="kanban_project_selector")
-    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
-    st.divider()
-
-    project_configs = project_config.load_project_configs()
-    with st.expander(
-        "Планирование и рекомендации",
-        icon=":material/auto_awesome:",
-        expanded=False,
-    ):
-        recommendations_panel.render_recommendations_panel(
-            tasks,
-            tasks_by_id,
-            ROOT,
-            get_execution_center_api(),
-            project_configs,
-            upsert_tasks,
-            project=project_filter,
-            key_prefix="kanban_reco",
-        )
-        backlog_reconcile_panel.render_backlog_reconcile_panel(
-            tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
-        )
+    project_filter = render_project_planning_intelligence(
+        get_execution_center_api(),
+        tasks,
+        tasks_by_id,
+        selector_key="kanban_project_selector",
+        recommendation_key_prefix="kanban_reco",
+        include_backlog_reconcile=True,
+    )
     st.divider()
 
     # Options come from the tasks themselves (canonical priorities + any
