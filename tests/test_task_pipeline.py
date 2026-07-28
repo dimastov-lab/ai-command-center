@@ -245,6 +245,28 @@ def test_second_entry_for_the_same_task_is_skipped_as_duplicate(tmp_path, git_re
     assert wave.skipped[0].reason_code == task_pipeline.REASON_DUPLICATE_QUEUE_ENTRY
 
 
+def test_ready_entry_is_skipped_while_completion_awaits_merge(tmp_path, git_repo, api):
+    task = _task(id="a", workspace_path=str(git_repo))
+    _seed_completion(
+        api,
+        git_repo,
+        task_id="a",
+        completion_state=completion_domain.CompletionState.AWAITING_MERGE,
+    )
+
+    wave = task_pipeline.adapt_ready_entries(
+        [_entry("q1", "a")],
+        {"a": task},
+        {"AIOS": {"repository_path": str(git_repo)}},
+        db_path=api.db_path,
+    )
+
+    assert wave.work_items == ()
+    assert wave.skipped[0].reason_code == task_pipeline.REASON_COMPLETION_IN_PROGRESS
+    assert "AWAITING_MERGE" in wave.skipped[0].explanation
+    assert "merge" in wave.skipped[0].remediation
+
+
 def test_adaptation_order_is_stable_under_input_reversal(tmp_path, git_repo, api):
     repo_b = git_repo.parent / "repo-b"
     repo_b.mkdir()
@@ -425,7 +447,14 @@ def test_every_reason_code_in_the_vocabulary_has_operator_remediation():
 # --------------------------------------------------------------------------
 
 
-def _seed_completion(api, git_repo, *, task_id="a", merge_mode=completion_domain.MERGE_MANUAL):
+def _seed_completion(
+    api,
+    git_repo,
+    *,
+    task_id="a",
+    merge_mode=completion_domain.MERGE_MANUAL,
+    completion_state=completion_domain.CompletionState.EXECUTION_FINISHED,
+):
     # A task may legitimately have several runs (that is what a rework is), so
     # the runtime task row is created once and reused.
     if runtime_db.get_task(api.db_path, task_id) is None:
@@ -452,7 +481,7 @@ def _seed_completion(api, git_repo, *, task_id="a", merge_mode=completion_domain
         task_id=task_id,
         project="AIOS",
         repository_path=str(git_repo),
-        completion_state=completion_domain.CompletionState.EXECUTION_FINISHED,
+        completion_state=completion_state,
         merge_mode=merge_mode,
         policy_json=policy.to_json(),
         last_reason_code="execution_ok",

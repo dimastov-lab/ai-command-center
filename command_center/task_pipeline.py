@@ -136,9 +136,30 @@ REASON_TASK_MISSING = execution_queue.LAUNCH_SKIP_TASK_NOT_FOUND
 REASON_WORKSPACE_UNCONFIGURED = execution_queue.LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED
 REASON_LAUNCH_BLOCKED = execution_queue.LAUNCH_SKIP_BLOCKED
 REASON_NEEDS_CONFIRMATION = execution_queue.LAUNCH_SKIP_NEEDS_CONFIRMATION
-# These two have no launch-time counterpart: they describe the queue itself.
+# These admission-only reasons have no launch-time counterpart.
 REASON_DUPLICATE_QUEUE_ENTRY = "duplicate_queue_entry"
+REASON_COMPLETION_IN_PROGRESS = "completion_in_progress"
 REASON_ADAPTATION_FAILED = "adaptation_failed"
+
+# A READY queue row can outlive execution and overlap the completion pipeline.
+# These states mean the engineering work is already being validated, reviewed,
+# published, merged, or verified, so launching another agent would duplicate
+# work. Failure states are deliberately excluded: the bounded rework loop may
+# legitimately enqueue a new attempt after validation or CI fails.
+_COMPLETION_LAUNCH_BLOCKING_STATES: frozenset[str] = frozenset(
+    {
+        completion_domain.CompletionState.EXECUTION_FINISHED,
+        completion_domain.CompletionState.VALIDATING_RESULT,
+        completion_domain.CompletionState.RESULT_VALID,
+        completion_domain.CompletionState.AWAITING_REVIEW,
+        completion_domain.CompletionState.PREPARING_PULL_REQUEST,
+        completion_domain.CompletionState.PULL_REQUEST_OPEN,
+        completion_domain.CompletionState.AWAITING_MERGE,
+        completion_domain.CompletionState.MERGED,
+        completion_domain.CompletionState.VERIFYING_TARGET_BRANCH,
+        completion_domain.CompletionState.RECOVERY_PENDING,
+    }
+)
 
 # Why a whole tick did not run (or did not launch).
 TICK_DISABLED = "autopilot_disabled"
@@ -198,6 +219,10 @@ REMEDIATION_BY_REASON: dict[str, str] = {
     ),
     scheduler.REASON_RETRY_EXHAUSTED: "Исчерпан бюджет повторов — разберите причину сбоя и перезапустите вручную.",
     REASON_DUPLICATE_QUEUE_ENTRY: "В очереди несколько записей для одной задачи — лишние игнорируются.",
+    REASON_COMPLETION_IN_PROGRESS: (
+        "Задача уже проходит проверку, публикацию PR или merge — дождитесь завершения "
+        "completion pipeline либо выполните доступное ручное действие."
+    ),
     REASON_ADAPTATION_FAILED: "Не удалось подготовить задачу к планированию — см. текст ошибки.",
     execution_queue.LAUNCH_OK: "Запуск начат.",
     execution_queue.LAUNCH_SKIP_TASK_NOT_FOUND: "Задача очереди больше не существует — очистите запись очереди.",
@@ -664,6 +689,23 @@ def adapt_ready_entries(
             continue
 
         try:
+            completion = runtime_db.get_completion_by_task(db_path, task_id)
+            if completion is not None and completion.get(
+                "completion_state"
+            ) in _COMPLETION_LAUNCH_BLOCKING_STATES:
+                skipped.append(
+                    _skip(
+                        entry,
+                        task,
+                        REASON_COMPLETION_IN_PROGRESS,
+                        (
+                            "latest completion "
+                            f"{completion.get('run_id')!r} is "
+                            f"{completion.get('completion_state')!r}"
+                        ),
+                    )
+                )
+                continue
             canonical = project_config.canonical_project_id(task.get("project"))
             cfg = project_configs.get(canonical, {})
             prep = launch_service.prepare_task_launch(task=task, project_config=cfg)
