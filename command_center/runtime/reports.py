@@ -17,6 +17,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from command_center import tasks_repository
 from command_center.models import iso_now
 from command_center.storage import atomic_write_text
 
@@ -174,3 +175,32 @@ def save_report(run: dict, events: list[dict]) -> Path:
     content = render_report_markdown(run, events)
     atomic_write_text(path, content)
     return path
+
+
+def project_terminal_run_to_task(run: dict, *, db_path: Path, root: Path = ROOT) -> bool:
+    """Persist a terminal run's report/Timeline projection without a UI tick.
+
+    The report row must already exist when this is called: ``task_sync`` uses
+    it to populate ``task["report_path"]`` while applying the terminal fields.
+    The mutation goes through the repository lock, so it cannot lose a
+    concurrent Kanban edit. Repeated calls are harmless because
+    ``sync_task_from_run`` recognizes a task already finalized for this run.
+
+    Returns ``True`` only when a matching task existed and changed. Runs
+    started without a task id (the raw Execution Center flow) intentionally
+    have nothing to project.
+    """
+    task_id = run.get("task_id")
+    if not task_id:
+        return False
+
+    # Lazy import avoids the reports -> task_sync -> reports module cycle.
+    from command_center.runtime import task_sync
+
+    def _project(tasks: list[dict]) -> bool:
+        for task in tasks:
+            if task.get("id") == task_id:
+                return task_sync.sync_task_from_run(task, run, db_path=db_path)
+        return False
+
+    return tasks_repository.mutate_tasks(root, _project, persist_if=bool)

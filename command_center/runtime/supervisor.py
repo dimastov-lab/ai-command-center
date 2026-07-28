@@ -1915,6 +1915,20 @@ class Supervisor:
                         run_id,
                         error=str(exc),
                     )
+                else:
+                    try:
+                        # Completion projection is owned by the process-exit
+                        # hook, not by a Streamlit page refresh or the optional
+                        # background-sync daemon. The repository mutation is
+                        # locked and idempotent, so a later sync tick is safe.
+                        reports.project_terminal_run_to_task(run, db_path=self.db_path)
+                    except Exception as exc:
+                        logger.exception("Could not project terminal run %s to its task", run_id)
+                        self._append_lifecycle_event_best_effort(
+                            "task_result_projection_failed",
+                            run_id,
+                            error=str(exc),
+                        )
         except Exception:
             logger.exception("Unexpected supervision failure for run %s", run_id)
             exited = active.process_exited_event.is_set()

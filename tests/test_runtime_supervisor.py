@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from command_center import agent_runner
+from command_center import agent_runner, tasks_repository
 from command_center.runtime import context_service, db, identity, supervisor
 
 
@@ -1331,6 +1331,56 @@ def test_timeout_none_means_no_automatic_timeout(git_repo, configure_project_rep
     assert final["state"] == "COMPLETED", "a run with no timeout must complete normally, never time out"
     events = db.list_run_events(sup.db_path, run["id"])
     assert not any(e["payload"].get("lifecycle") == "timeout_exceeded" for e in events if e["event_type"] == "lifecycle")
+
+
+def test_terminal_run_projects_report_and_timeline_without_ui_page(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """The Supervisor exit hook owns the projection; no Streamlit tick runs."""
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "0.2"
+    # Managed macOS test sandboxes can deny `ps` even for our own child.
+    monkeypatch.setattr(
+        supervisor,
+        "_capture_stable_process_identity",
+        lambda process: identity.ProcessIdentity(process.pid, "test-start", "fake-claude"),
+    )
+    monkeypatch.setattr(
+        supervisor.Supervisor,
+        "_wait_for_process_exit",
+        lambda self, run_id, active, timeout, lifecycle_prefix: active.process.wait(timeout=10),
+    )
+    configure_project_repo("AIOS", git_repo)
+    task = tasks_repository.create_task(
+        git_repo,
+        "AIOS",
+        "Background result collection",
+        "implementation",
+        "In Progress",
+    )
+    sup = supervisor.Supervisor()
+
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="p",
+        confirmed=True,
+        task_id=task["id"],
+        timeout_seconds=None,
+    )
+    final = sup.wait_for_run(run["id"], timeout=10)
+
+    assert final["state"] == "COMPLETED"
+    stored = next(
+        item
+        for item in tasks_repository.load_tasks(git_repo)
+        if item["id"] == task["id"]
+    )
+    report = db.get_report(sup.db_path, run["id"])
+    assert report is not None
+    assert stored["report_path"] == report["path"]
+    assert stored["current_run_id"] == run["id"]
+    assert any(event["type"] == "completed" for event in stored["timeline"])
 
 
 def test_timeout_graceful_process_exits_on_sigterm(git_repo, configure_project_repo, fake_claude):
