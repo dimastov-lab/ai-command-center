@@ -29,13 +29,25 @@ const NAV_KEYS = [
   'settings',
 ] as const
 
-// "all_healthy" is a fixed status phrase, not a "N <label>" pattern — the
-// other three KPIs (agents/tasks/reviews) pair `meta_n` with `meta_key`
-// ("2 running", "5 in progress", "1 pending").
+// Pairs `meta_n` with `meta_key` for the agents/tasks/reviews KPIs
+// ("2 running", "5 in progress", "1 pending"). NOT used for the Projects
+// KPI — see `formatProjectsMeta` below.
 function formatKpiMeta(kpi: Kpi, t: (key: string) => string): string {
-  if (kpi.meta_key === 'all_healthy') return t('all_healthy')
   if (kpi.meta_n !== undefined) return `${kpi.meta_n} ${t(kpi.meta_key)}`
   return t(kpi.meta_key)
+}
+
+// The backend's `kpis.projects.meta_key` is ALWAYS the literal string
+// "all_healthy" (see serializers.py `_kpis`), regardless of whether every
+// project is actually healthy — it's a fixed field name, not a computed
+// verdict. Trusting it directly would let the KPI card claim "All healthy"
+// while some projects are unhealthy. The real rollup lives in
+// `health.{projects_healthy,projects_total}` (the same source
+// `HealthDonut` uses), so we derive the Projects KPI's meta text from that
+// instead of from `meta_key`.
+function formatProjectsMeta(healthy: number, total: number, t: (key: string) => string): string {
+  if (total > 0 && healthy === total) return t('all_healthy')
+  return `${healthy} ${t('healthyCount')}`
 }
 
 function NavDot() {
@@ -138,7 +150,11 @@ export default function Home() {
 
         <main style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', minWidth: 0 }}>
           <div className="kpi-grid">
-            <KpiCard label={t('projects')} value={data.kpis.projects.value} meta={formatKpiMeta(data.kpis.projects, t)} />
+            <KpiCard
+              label={t('projects')}
+              value={data.kpis.projects.value}
+              meta={formatProjectsMeta(data.health.projects_healthy, data.health.projects_total, t)}
+            />
             <KpiCard label={t('agents')} value={data.kpis.agents.value} meta={formatKpiMeta(data.kpis.agents, t)} />
             <KpiCard label={t('tasks')} value={data.kpis.tasks.value} meta={formatKpiMeta(data.kpis.tasks, t)} />
             <KpiCard label={t('reviews')} value={data.kpis.reviews.value} meta={formatKpiMeta(data.kpis.reviews, t)} />

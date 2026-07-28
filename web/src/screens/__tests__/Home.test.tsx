@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import { describe, test, expect, vi, beforeEach } from 'vitest'
 import Home from '../Home'
 import { fetchHome } from '../../lib/api'
@@ -56,6 +56,33 @@ describe('Home', () => {
     // Health donut computed from health.projects_healthy/projects_total
     // (4/5 = 80%) — never the fabricated 94%-style score from the mockup.
     expect(screen.getByText('80%')).toBeInTheDocument()
+    // Regression guard: the backend ALWAYS sends the literal meta_key
+    // "all_healthy" for the Projects KPI (serializers.py `_kpis`), even
+    // when not every project is healthy — baseHome's own fixture is
+    // value:5 / meta_n:4 with health 4/5. The KPI card must derive its
+    // meta text from the real health rollup, not echo the backend's fixed
+    // meta_key, so it must NOT claim "All healthy" here.
+    expect(screen.queryByText('All healthy')).not.toBeInTheDocument()
+    expect(screen.getByText('4 healthy')).toBeInTheDocument()
+  })
+
+  test('redacts sensitive projects: shows "Restricted", no healthy/unhealthy badge or raw metric', async () => {
+    vi.mocked(fetchHome).mockResolvedValue({
+      ...baseHome,
+      projects: [...baseHome.projects, { id: 'BANK', name: 'Bank Strategy', healthy: true, redacted: true }],
+    })
+    render(<Home />)
+
+    await waitFor(() => expect(screen.getByText('Bank Strategy')).toBeInTheDocument())
+    const row = screen.getByText('Bank Strategy').closest('div')
+    expect(row).not.toBeNull()
+    const scoped = within(row as HTMLElement)
+    expect(scoped.getByText('Restricted')).toBeInTheDocument()
+    // Must not leak a healthy/unhealthy verdict (or any raw metric) for a
+    // redacted project, even though `healthy` is technically still present
+    // on the DTO entry.
+    expect(scoped.queryByText('Healthy')).not.toBeInTheDocument()
+    expect(scoped.queryByText('Needs attention')).not.toBeInTheDocument()
   })
 
   test('shows tasteful empty states when queue/activity/projects/status are empty', async () => {
