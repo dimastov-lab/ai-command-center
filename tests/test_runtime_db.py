@@ -760,6 +760,53 @@ def test_create_run_with_workspace_lock_raises_when_another_active_run_holds_wor
     assert [r["id"] for r in runs] == [first["id"]]
 
 
+def test_create_run_task_lock_rejects_second_active_run_same_task_other_workspace(tmp_path):
+    # M1: the workspace lock only catches a double-launch resolving to the SAME
+    # path. When the same task resolves to a DIFFERENT workspace on the second
+    # in-flight launch, the task-id exclusivity check is what stops two agents
+    # running for one task.
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    s1 = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/a")
+    s2 = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/b")
+    first = db.create_run(
+        path, session_id=s1["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/a", prompt="p", is_resume=False, enforce_workspace_lock=True,
+    )
+    assert first["state"] == "PREPARED"
+
+    # Same task, DIFFERENT workspace: passes the workspace lock, hits the task lock.
+    with pytest.raises(db.TaskAlreadyActiveError) as excinfo:
+        db.create_run(
+            path, session_id=s2["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+            repository_path="/tmp/b", prompt="p2", is_resume=False, enforce_workspace_lock=True,
+        )
+    assert excinfo.value.conflicting_run["id"] == first["id"]
+    # The rejected attempt was never inserted.
+    assert [r["id"] for r in db.list_runs(path, session_id=s2["id"])] == []
+
+
+def test_create_run_task_lock_allows_relaunch_after_prior_run_terminal(tmp_path):
+    # A legitimate re-launch after the prior run finished must still succeed.
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    s1 = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/a")
+    s2 = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/b")
+    first = db.create_run(
+        path, session_id=s1["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/a", prompt="p", is_resume=False, enforce_workspace_lock=True,
+    )
+    first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="QUEUED")
+    first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="RUNNING")
+    first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="COMPLETED")
+
+    second = db.create_run(
+        path, session_id=s2["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        repository_path="/tmp/b", prompt="p2", is_resume=False, enforce_workspace_lock=True,
+    )
+    assert second["state"] == "PREPARED"
+
+
 @pytest.mark.parametrize("active_state", sorted(db.EXECUTION_CENTER_ACTIVE_STATES))
 def test_create_run_with_workspace_lock_conflicts_on_every_active_state(tmp_path, active_state):
     path = _fresh_db(tmp_path)
@@ -801,16 +848,21 @@ def test_create_run_with_workspace_lock_allows_when_conflict_is_terminal(tmp_pat
 
 
 def test_create_run_with_workspace_lock_does_not_conflict_across_different_paths(tmp_path):
+    # The workspace lock is scoped to repository_path: two DIFFERENT tasks, each
+    # in its own workspace, launch concurrently without conflict. (The same task
+    # in two workspaces is separately rejected by the task lock — see
+    # test_create_run_task_lock_rejects_second_active_run_same_task_other_workspace.)
     path = _fresh_db(tmp_path)
-    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
-    session_a = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/a")
-    session_b = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/b")
+    task_a = db.create_task(path, project="AIOS", title="a", task_type="implementation")
+    task_b = db.create_task(path, project="AIOS", title="b", task_type="implementation")
+    session_a = db.create_session(path, task_id=task_a["id"], project="AIOS", repository_path="/tmp/a")
+    session_b = db.create_session(path, task_id=task_b["id"], project="AIOS", repository_path="/tmp/b")
     run_a = db.create_run(
-        path, session_id=session_a["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        path, session_id=session_a["id"], task_id=task_a["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/a", prompt="p", is_resume=False, enforce_workspace_lock=True,
     )
     run_b = db.create_run(
-        path, session_id=session_b["id"], task_id=task["id"], project="AIOS", task_type="implementation",
+        path, session_id=session_b["id"], task_id=task_b["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/b", prompt="p", is_resume=False, enforce_workspace_lock=True,
     )
     assert run_a["state"] == "PREPARED"
