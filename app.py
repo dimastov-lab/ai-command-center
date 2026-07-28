@@ -48,6 +48,7 @@ from command_center.ui import (
     live_board,
     waves_panel,
     content_area,
+    daily_audit_panel,
     portfolio_overview_panel,
     portfolio_panel,
     project_intelligence_panel,
@@ -191,6 +192,7 @@ NAV: dict[str, tuple[str, str]] = {
     "waves": ("Волны", ":material/waves:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
     "execution_center": ("Live Execution Center", ":material/bolt:"),
+    "daily_audit": ("Ежедневный аудит", ":material/fact_check:"),
     "runs": ("Журнал запусков", ":material/history:"),
     "timeline": ("Таймлайн", ":material/timeline:"),
     "projects": ("Проекты", ":material/folder_open:"),
@@ -4573,6 +4575,14 @@ elif page_key == "execution_center":
     )
 
     render_live_execution_center(get_execution_center_api(), tasks)
+
+
+# --------------------------------------------------------------------------
+# Persistent daily product/engineering audit
+# --------------------------------------------------------------------------
+
+elif page_key == "daily_audit":
+    daily_audit_panel.render_daily_audit_page(get_execution_center_api().db_path)
 
 
 # --------------------------------------------------------------------------
