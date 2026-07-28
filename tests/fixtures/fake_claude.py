@@ -83,6 +83,21 @@ def main() -> int:
         with open(touch_file, "a") as handle:
             handle.write("modified by fake_claude\n")
 
+    # Simulate an agent that *commits* its work: stage+commit so HEAD advances
+    # while leaving the working tree clean — exactly the real-world case the
+    # supervisor's `head_advanced` detection must catch (see supervisor.py's
+    # working_tree_changed computation). A non-empty commit message is
+    # required; git refuses empty commits without --allow-empty.
+    commit_msg = os.environ.get("FAKE_CLAUDE_COMMIT")
+    if commit_msg:
+        import subprocess
+
+        subprocess.run(["git", "add", "-A"], check=True)
+        # --allow-empty so HEAD advances even when the run made no file changes
+        # (e.g. an agent that amended an earlier interrupted run by committing
+        # staged state, or simply produced an empty commit to record progress).
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", commit_msg], check=True)
+
     hold_file = os.environ.get("FAKE_CLAUDE_HOLD_FILE")
     if hold_file:
         deadline = time.monotonic() + 300

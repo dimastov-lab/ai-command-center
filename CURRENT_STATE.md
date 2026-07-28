@@ -7,9 +7,10 @@ Updated: 2026-07-27
 Status: Active, local Streamlit implementation
 
 Current position:
-- `app.py` hosts the implemented 19-destination Streamlit control application.
+- `app.py` hosts the implemented Streamlit control application: 20 page handlers, 16 shown in the
+  sidebar (chat, generated files, reports, and context open inside the project view).
 - `data/tasks.json` remains the planning and Kanban store.
-- `data/runtime.db` schema 10 is authoritative for asynchronous execution, completion, the
+- `data/runtime.db` schema 11 is authoritative for asynchronous execution, completion, the
   persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
   verdict, and the `queue_entry` mirror (ADR 0007 dual-write).
 - Execution Center provides process supervision, streaming events, cancellation, timeouts and
@@ -24,12 +25,9 @@ Current position:
   the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
 - `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
   decisions. It creates no durable claim, queue entry or run and has no background driver.
-- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state,
-  but has no Streamlit UI, automated evidence collectors, project policy resolver, background
-  driver or executor. **Status: experimental foundation** — `dispatch` returns a dry-run plan the
-  caller must run explicitly via `start_run`; it is not a supported, end-to-end autonomy feature
-  and should not be extended without first deciding whether to complete or retire it (see
-  `docs/adr/0005-autonomy-proposal-foundation.md`).
+- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state.
+  An operator approve/reject inbox (`ui/proposals_panel.py`) surfaces and decides proposals, but
+  there are no automated evidence collectors, project policy resolver, background driver or executor.
 - Portfolio Execution and Portfolio Overview provide guarded worktree launch plus read-only
   dependency, health, capacity and recommendation views.
 - The persisted completion pipeline supports validation, push, pull-request and merge workflows;

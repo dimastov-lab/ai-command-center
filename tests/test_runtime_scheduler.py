@@ -41,21 +41,38 @@ def _item(task_id: str, workspace: str, **kw) -> scheduler.WorkItem:
 
 
 def test_default_registry_only_registers_available_executors():
-    """The invariant is the *filter*, not a fixed roster.
+    """The invariant is membership-by-existence, not membership-by-availability.
 
-    Availability is now a live capability probe (`executors.Executor.available`
-    -> `providers`), so which executors qualify depends on what is installed on
-    the host: Codex and Ollama register here when their CLI is present. Asserting
-    a hard-coded list would make this test pass or fail on the developer's
-    machine setup rather than on the behaviour it exists to protect."""
+    `default_registry` registers every executor that has a *provider* behind it
+    (`availability_check is not None`), carrying the live availability probe on
+    the `AgentSpec.available` flag rather than letting it decide membership.
+    That is the whole point: `executor.available` shells out to the provider CLI
+    and can report False for transient reasons (a slow probe, a restarting
+    daemon), so omitting such an executor would turn a self-healing
+    `agent_unavailable` into a structural `no_capable_agent`. An executor with no
+    provider at all is a genuine structural absence and stays omitted."""
     reg = _registry()
     registered = {a.agent_id for a in reg.all()}
+    # Membership == "has a provider (availability_check is not None)", independent
+    # of whether the CLI happens to be installed on this host.
+    with_provider = {
+        eid for eid, exe in executors.EXECUTORS.items() if exe.availability_check is not None
+    }
+    assert registered == with_provider
+    # Live availability is a subset of membership, never the other way around.
     available = {e.id for e in executors.EXECUTORS.values() if e.available}
-    assert registered == available
+    assert available <= registered
     # Claude is always installed in this suite, and a permanently-unavailable
-    # executor must never be registered.
+    # executor (no provider) must never be registered.
     assert reg.get("claude_code") is not None
     assert reg.get("chatgpt") is None
+
+
+def test_default_registry_does_not_offer_implementation_work_to_ollama():
+    ollama = _registry().get("ollama")
+    assert ollama is not None
+    assert ollama.can_run(scheduler.capabilities_for_task_type("architecture_review"))
+    assert not ollama.can_run(scheduler.capabilities_for_task_type("implementation"))
 
 
 def test_register_rejects_unknown_executor():
@@ -267,6 +284,45 @@ def test_workload_distribution_prefers_agent_with_most_spare_capacity():
     assert result.assignments()[0].agent_id == "idle"
 
 
+def test_workload_distribution_respects_authorized_agent_set():
+    reg = scheduler.AgentRegistry(
+        [
+            scheduler.AgentSpec("claude_code", "claude_code", frozenset({scheduler.CAP_ANY}), 2),
+            scheduler.AgentSpec("codex", "codex", frozenset({scheduler.CAP_ANY}), 2),
+        ]
+    )
+    load = scheduler.LoadSnapshot(running_by_agent={"claude_code": 1}, global_running=1)
+    result = scheduler.plan(
+        [
+            _item(
+                "t1",
+                "/repo/a",
+                allowed_agents=frozenset({"claude_code", "codex"}),
+            )
+        ],
+        registry=reg,
+        config=scheduler.SchedulerConfig(max_global_concurrency=10),
+        load=load,
+        now=NOW,
+    )
+    assert result.assignments()[0].agent_id == "codex"
+
+
+def test_workload_distribution_never_escapes_authorized_agent_set():
+    reg = scheduler.AgentRegistry(
+        [
+            scheduler.AgentSpec("claude_code", "claude_code", frozenset({scheduler.CAP_ANY}), 2),
+            scheduler.AgentSpec("codex", "codex", frozenset({scheduler.CAP_ANY}), 2),
+        ]
+    )
+    result = scheduler.plan(
+        [_item("t1", "/repo/a", allowed_agents=frozenset({"claude_code"}))],
+        registry=reg,
+        now=NOW,
+    )
+    assert result.assignments()[0].agent_id == "claude_code"
+
+
 def test_equal_capacity_and_weight_choose_lexicographically_first_agent():
     reg = scheduler.AgentRegistry(
         [
@@ -422,6 +478,59 @@ def test_retry_budget_exhausted_is_blocked():
     assert result.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED
 
 
+def test_provider_unavailable_failure_skips_retry_budget_and_assigns():
+    """A provider-unavailable failure (expired OAuth, exhausted quota, …) is
+    not a signal about the task — the configured executor cannot run it right
+    now. `task_sync` has already moved that executor to `failed_executors` and
+    the launch layer's `select_available_executor` will pick the next one, so
+    the prior attempt must NOT consume the retry budget: even at
+    attempts_made >= max_attempts the scheduler falls through to assignment
+    instead of blocking with `retry_exhausted`. Otherwise a `max_run_attempts=1`
+    config would strand the task before failover ever happens."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=1)
+    item = _item(
+        "t1", "/repo/a", attempts_made=3, last_state="FAILED",
+        last_failure_reason="session_expired",
+        last_completed_at=_iso(NOW, seconds=-10000),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    d = result.assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+
+
+def test_provider_unavailable_failure_skips_backoff_and_assigns_immediately():
+    """Provider failover also needs no backoff — a *different* executor is
+    tried, not the same one, so the prior failure carries no timing signal
+    about it. The task assigns immediately even within the backoff window."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(base_backoff_seconds=30, multiplier=2)
+    # Completed 1s ago; backoff 30s would normally defer — but a provider
+    # failure bypasses backoff and assigns now.
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED",
+        last_failure_reason="quota_limit", last_completed_at=_iso(NOW, seconds=-1),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    d = result.assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+
+
+def test_non_provider_recoverable_failure_still_respects_budget():
+    """Sanity: a recoverable failure that is NOT provider-unavailable (e.g.
+    `timeout`) must still hit the retry budget and block — the exemption is
+    narrow to provider-unavailability reasons only."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=1)
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED",
+        last_failure_reason="timeout", last_completed_at=_iso(NOW, seconds=-10000),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    assert result.decisions[0].action == scheduler.ACTION_BLOCKED
+    assert result.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED
+
+
 # --------------------------------------------------------------------------
 # Dependencies
 # --------------------------------------------------------------------------
@@ -504,12 +613,12 @@ def test_plan_is_deterministic_for_identical_inputs():
 # --------------------------------------------------------------------------
 
 
-def _make_running_row(db_path, *, repository_path):
+def _make_running_row(db_path, *, repository_path, provider_id="claude_code"):
     task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation")
     session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path=repository_path)
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
-        repository_path=repository_path, prompt="p", is_resume=False,
+        repository_path=repository_path, prompt="p", is_resume=False, provider_id=provider_id,
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(
@@ -529,6 +638,17 @@ def test_build_load_snapshot_reflects_active_runs(tmp_path):
     assert snap.busy_workspaces == frozenset({"/repo/a", "/repo/b"})
     assert len(snap.active_task_ids) == 2
     assert snap.running_by_agent == {"claude_code": 2}
+
+
+def test_build_load_snapshot_attributes_each_run_to_its_provider(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    _make_running_row(db_path, repository_path="/repo/a", provider_id="claude_code")
+    _make_running_row(db_path, repository_path="/repo/b", provider_id="codex")
+
+    snap = scheduler.build_load_snapshot(db_path)
+
+    assert snap.running_by_agent == {"claude_code": 1, "codex": 1}
 
 
 def test_active_task_cannot_be_assigned_again_in_a_different_workspace(tmp_path):

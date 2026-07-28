@@ -130,8 +130,8 @@ def test_new_task_record_applies_given_workspace_branch_executor_prompt():
 
 def test_new_task_record_executor_also_sets_legacy_agent_field():
     """`agent` is the pre-v2 field name for the same concept; keeping both in
-    sync at creation time avoids the same drift `launch_service._apply_run_outcome_to_task`
-    already guards against after a run completes."""
+    sync at creation time avoids the same drift the retired v1 synchronous
+    launch flow guarded against after a run completes."""
     task = tr.new_task_record("AIOS", "T", "implementation", "Backlog", executor="claude_code")
     assert task["agent"] == "claude_code"
     assert task["executor"] == "claude_code"

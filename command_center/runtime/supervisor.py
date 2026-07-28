@@ -157,6 +157,23 @@ class WorkspaceLockedError(SupervisorError):
         )
 
 
+class TaskAlreadyActiveError(SupervisorError):
+    """Raised by `start_raw` when the launched task already has an active run
+    (`db.EXECUTION_CENTER_ACTIVE_STATES`), possibly in a different workspace —
+    wraps `db.TaskAlreadyActiveError` (the atomic, race-free per-task check
+    inside `db.create_run`'s transaction). A `SupervisorError` subclass so the
+    existing launch handlers that catch `SupervisorError` need no new except
+    clause; a caller that wants the conflicting run can read `.conflicting_run`."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Task {conflicting_run['task_id']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r}). Wait for it to "
+            "finish or cancel it before launching the same task again."
+        )
+
+
 class ProviderUnavailableError(SupervisorError):
     """The selected provider cannot be used safely on this machine."""
 
@@ -673,6 +690,8 @@ class Supervisor:
                 self._launching.add(run["id"])
         except db.WorkspaceLockedError as exc:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
+        except db.TaskAlreadyActiveError as exc:
+            raise TaskAlreadyActiveError(exc.conflicting_run) from exc
 
         try:
             if verification_evidence is not None:
@@ -685,12 +704,20 @@ class Supervisor:
                     )["payload"],
                 )
             run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
-            pre_run_status = agent_runner.git_snapshot(repo_path).get("status_summary")
+            pre_run_snapshot = agent_runner.git_snapshot(repo_path)
+            pre_run_status = pre_run_snapshot.get("status_summary")
             run = db.update_run_fields(
                 self.db_path,
                 run["id"],
                 expected_version=run["version"],
-                fields={"pre_run_git_status": pre_run_status},
+                fields={
+                    "pre_run_git_status": pre_run_status,
+                    # Short HEAD at launch. A committed change leaves the working
+                    # tree clean, so the porcelain diff alone cannot tell "agent
+                    # committed" from "agent did nothing"; comparing pre/post HEAD
+                    # can. See `outcome.classify_process_result`.
+                    "pre_run_head": pre_run_snapshot.get("head"),
+                },
             )
         except Exception:
             # `_launch_process` (which owns clearing `self._launching` on
@@ -770,7 +797,10 @@ class Supervisor:
                 stdin=subprocess.PIPE if spec.stdin_text is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=spec.environment,
+                # Strip Git/GitHub push/merge credentials from the agent's
+                # environment (H1): the pipeline, never the launched agent, owns
+                # remote writes. See agent_runner.scrub_vcs_credentials.
+                env=agent_runner.scrub_vcs_credentials(spec.environment),
                 text=True,
                 bufsize=1,
                 shell=False,
@@ -1741,9 +1771,20 @@ class Supervisor:
             if run is None:
                 raise KeyError(f"No such run: {run_id!r}")
 
-            post_status = agent_runner.git_snapshot(repo_path).get("status_summary")
+            post_snapshot = agent_runner.git_snapshot(repo_path)
+            post_status = post_snapshot.get("status_summary")
+            post_head = post_snapshot.get("head")
             pre_status = run.get("pre_run_git_status")
+            pre_head = run.get("pre_run_head")
             working_tree_changed = pre_status is not None and post_status != pre_status
+            # A committed change leaves the working tree clean, so a clean pre/
+            # post diff does NOT mean "nothing happened" — the agent may have
+            # committed. If HEAD advanced during the run, count that as work
+            # produced so the run is not mis-classified
+            # `incomplete:working_tree_unchanged` (AICC-DESKTOP-017: copilot_cli
+            # and claude_code routinely commit their work).
+            if pre_head and post_head and pre_head != post_head:
+                working_tree_changed = True
             result_payload = self._final_result_payload(run_id) if exit_code == 0 else None
 
             for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
@@ -1792,6 +1833,7 @@ class Supervisor:
                         result_text=(result_payload or {}).get("result"),
                         permission_denials=(result_payload or {}).get("permission_denials"),
                         working_tree_changed=working_tree_changed,
+                        provider_completion_valid=(result_payload or {}).get("provider_completion_valid"),
                     )
                     if classification == outcome.OK:
                         new_state = "COMPLETED"

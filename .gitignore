@@ -45,6 +45,15 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Local virtual environments (machine-specific — e.g. the desktop PySide6 venv)
+.venv/
+.venv-*/
+venv/
 # Local backup artifacts
 data/backups/
 roadmap/*.zip
+
+# stray test artifacts at repo root
+runtime.db
+runtime.db-shm
+runtime.db-wal

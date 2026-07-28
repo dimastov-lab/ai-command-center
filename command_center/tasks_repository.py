@@ -33,9 +33,8 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
+import logging
 import shutil
-import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -44,6 +43,25 @@ from typing import TypeVar
 from command_center import models, storage, task_view
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
+
+# Fields a task record cannot be useful without; a record missing any of these
+# is surfaced by `validate_tasks` rather than silently accepted (audit BLOCKER-4).
+REQUIRED_TASK_FIELDS: tuple[str, ...] = ("id", "project", "title", "status")
+
+# `load_tasks` runs on nearly every Streamlit rerun, so an integrity warning
+# there must not flood the log with the same line many times per second. Keyed
+# on a content signature so a newly appearing problem still warns exactly once.
+_warned_signatures: set[str] = set()
+
+
+def _warn_once(signature: str, msg: str, *args: object) -> None:
+    if signature in _warned_signatures:
+        return
+    _warned_signatures.add(signature)
+    logger.warning(msg, *args)
+
 
 TASKS_LOCK_FILE_NAME = "tasks.lock"
 TASKS_LOCK_TIMEOUT_SECONDS = 30.0
@@ -78,6 +96,60 @@ def _decode_tasks(tasks_file: Path) -> list[dict]:
     return [normalize_task(task) for task in data]
 
 
+def validate_tasks(tasks: list[dict]) -> list[str]:
+    """Return a list of human-readable integrity problems in `tasks`, empty
+    when the list is clean. This is surfacing, not mutation — the "warn instead
+    of silently accept" the audit asked for (BLOCKER-4): a record whose
+    `project` is not in `models.PROJECT_IDS` is otherwise silently dropped from
+    every project-scoped view (Project Intelligence, health, filters) with no
+    signal that the task exists at all. Checks each record for missing required
+    fields and an unknown `project` (with a "did you mean …?" hint from
+    `models.PROJECT_ALIASES`), and the list for duplicate ids (BLOCKER-3's
+    precondition)."""
+    issues: list[str] = []
+    seen_ids: dict[str, int] = {}
+    for index, task in enumerate(tasks):
+        label = task.get("id") or task.get("title") or f"#{index}"
+        for field in REQUIRED_TASK_FIELDS:
+            if not task.get(field):
+                issues.append(f"task {label!r}: missing required field {field!r}")
+        project = task.get("project")
+        if project and project not in models.PROJECT_IDS:
+            hint = models.PROJECT_ALIASES.get(project)
+            suffix = f" (did you mean {hint!r}?)" if hint else ""
+            issues.append(f"task {label!r}: unknown project {project!r} not in registry{suffix}")
+        task_id = task.get("id")
+        if task_id:
+            if task_id in seen_ids:
+                issues.append(f"duplicate task id {task_id!r} (indices {seen_ids[task_id]} and {index})")
+            else:
+                seen_ids[task_id] = index
+    return issues
+
+
+def _dedupe_by_id(tasks: list[dict]) -> tuple[list[dict], list[str]]:
+    """Keep the first record for each id and drop later duplicates, returning
+    the deduped list and the ids that were dropped. `delete_task` removes a
+    single record and `create_task` refuses a colliding id, so a duplicate can
+    only originate from a hand-edited or out-of-band file; collapsing it on read
+    (keep-first, deterministic) guarantees a downstream `delete_task` is never
+    handed two records sharing an id — the second, independent guard behind
+    BLOCKER-3. Records with no id are kept as-is (`validate_tasks` flags the
+    missing field)."""
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    dropped: list[str] = []
+    for task in tasks:
+        task_id = task.get("id")
+        if task_id and task_id in seen:
+            dropped.append(task_id)
+            continue
+        if task_id:
+            seen.add(task_id)
+        deduped.append(task)
+    return deduped, dropped
+
+
 def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = False) -> list[dict]:
     """Load the task list. A missing file is created empty (or seeded from
     `example_file`) and read back as `[]` — that is a legitimate fresh store.
@@ -88,7 +160,15 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
     read-modify-write path (`mutate_tasks`) passes `strict=True` so a bad read
     RAISES instead of returning `[]`. Returning `[]` there and then saving would
     persist `[]` over the real list — the "one transient read error wipes
-    tasks.json" data-loss amplification the audit flagged."""
+    tasks.json" data-loss amplification the audit flagged.
+
+    Two integrity guards run on every successful read: duplicate ids are
+    dropped keep-first (`_dedupe_by_id`), so a downstream `delete_task` can
+    never be handed two records sharing an id (audit BLOCKER-3), and any
+    remaining problem (unknown `project`, missing required field) is logged
+    once via `validate_tasks` instead of being silently accepted (audit
+    BLOCKER-4). Neither guard mutates the stored file; they normalise the
+    in-memory view and surface the rest."""
     data_dir = storage.resolve_data_dir(root)
     data_dir.mkdir(parents=True, exist_ok=True)
     tasks_file = tasks_file_path(root)
@@ -98,25 +178,30 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
         else:
             save_tasks(root, [])
     try:
-        return _decode_tasks(tasks_file)
+        tasks = _decode_tasks(tasks_file)
     except (json.JSONDecodeError, OSError, ValueError):
         if strict:
             raise
         return []
+    tasks, dropped = _dedupe_by_id(tasks)
+    if dropped:
+        _warn_once(
+            "dropped-dupes:" + ",".join(sorted(set(dropped))),
+            "tasks.json: dropped %d duplicate task id(s) on load (kept first): %s",
+            len(dropped),
+            sorted(set(dropped)),
+        )
+    for issue in validate_tasks(tasks):
+        _warn_once("integrity:" + issue, "tasks.json integrity: %s", issue)
+    return tasks
 
 
 def save_tasks(root: Path, tasks: list[dict]) -> None:
-    data_dir = storage.resolve_data_dir(root)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    tasks_file = tasks_file_path(root)
-    fd, tmp_name = tempfile.mkstemp(dir=data_dir, prefix=".tasks_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(tasks, handle, ensure_ascii=False, indent=2)
-        os.replace(tmp_name, tasks_file)
-    except Exception:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+    # Delegate to the shared, fsync-ing `storage.atomic_write_json` primitive
+    # rather than duplicating its temp-file + `os.replace` pattern without the
+    # `fsync` (audit MINOR-10): every other JSON store in the project already
+    # goes through it, so `tasks.json` gets the same on-disk durability.
+    storage.atomic_write_json(tasks_file_path(root), tasks)
 
 
 @contextlib.contextmanager
@@ -253,6 +338,12 @@ def create_task(root: Path, project: str, title: str, task_type: str, status: st
 
     def _mutator(tasks: list[dict]) -> dict:
         record = new_task_record(project, title, task_type, status, **kwargs)
+        # A uuid4 collision is astronomically unlikely, but making the "every
+        # task id is unique" invariant explicit and fail-closed here — rather
+        # than appending a second record with a colliding id — is what keeps a
+        # later delete_task/update_task_status unambiguous (audit BLOCKER-3).
+        if any(existing.get("id") == record["id"] for existing in tasks):
+            raise ValueError(f"refusing to create a task with a colliding id: {record['id']!r}")
         tasks.append(record)
         return record
 
@@ -347,11 +438,50 @@ def set_manual_launch_status(root: Path, task_id: str, status: str, note: str) -
     return mutate_tasks(root, _mutator)
 
 
-def delete_task(root: Path, task_id: str) -> None:
-    def _mutator(tasks: list[dict]) -> None:
-        tasks[:] = [task for task in tasks if task.get("id") != task_id]
+def delete_task(root: Path, task_id: str) -> bool:
+    """Remove a *single* task by id, returning whether one was removed.
 
-    mutate_tasks(root, _mutator)
+    Deliberately deletes at most one record — not every record whose id matches
+    (audit BLOCKER-3). The historical `tasks[:] = [t ... if id != task_id]`
+    filter removed *all* matches, so if a duplicate id ever reached the store (a
+    hand-edited file, an out-of-band import) a single "delete this card" click
+    would silently erase several tasks at once. `load_tasks` now also drops
+    duplicate ids on read, so a duplicate should never survive to here; removing
+    only the first match is the second, independent guard."""
+
+    def _mutator(tasks: list[dict]) -> bool:
+        for index, task in enumerate(tasks):
+            if task.get("id") == task_id:
+                del tasks[index]
+                return True
+        return False
+
+    return mutate_tasks(root, _mutator)
+
+
+def reconcile_project_aliases(root: Path) -> dict[str, int]:
+    """One-shot, idempotent data migration for BLOCKER-4: rewrite any task whose
+    `project` is a known non-canonical alias (`models.PROJECT_ALIASES`) to its
+    canonical `models.PROJECT_IDS` id, held under `tasks_lock` so it is safe to
+    run against a live store while the app is in use. Returns a `{alias: count}`
+    summary of what was rewritten (empty on a second run). A record whose
+    `project` is unknown *and* not a listed alias is left untouched and keeps
+    surfacing via `validate_tasks` — guessing a canonical id for an
+    unrecognised label would hide exactly the divergence the audit wants
+    visible."""
+
+    def _mutator(tasks: list[dict]) -> dict[str, int]:
+        changed: dict[str, int] = {}
+        for task in tasks:
+            alias = task.get("project")
+            canonical = models.PROJECT_ALIASES.get(alias)
+            if canonical:
+                changed[alias] = changed.get(alias, 0) + 1
+                task["project"] = canonical
+                task["updated_at"] = models.iso_now()
+        return changed
+
+    return mutate_tasks(root, _mutator)
 
 
 def task_label(task: dict) -> str:

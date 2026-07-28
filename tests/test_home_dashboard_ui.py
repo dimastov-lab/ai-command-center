@@ -192,7 +192,9 @@ def test_dashboard_page_renders_and_nav_entry_exists():
     assert not at.exception
     assert any(b.key == "nav_btn_dashboard" for b in at.sidebar.button)
     body = " ".join(m.value for m in at.markdown)
-    assert "Artyom" in body  # the greeting line
+    assert any(
+        greeting in body for greeting in ("Доброе утро", "Добрый день", "Добрый вечер")
+    )
 
 
 def test_dashboard_empty_state_shows_no_fabricated_activity():

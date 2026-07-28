@@ -26,6 +26,38 @@ from command_center.runtime import stream_parser
 CLAUDE_ID = "claude_code"
 CODEX_ID = "codex"
 OLLAMA_ID = "ollama"
+COPILOT_ID = "copilot_cli"
+
+# Failure reasons that mean the *executor itself* is unavailable — the provider
+# cannot run this task at all right now, as opposed to the task being too hard
+# or the agent refusing for content/policy reasons. When a run ends with one of
+# these, the autopilot records the dead executor in
+# ``task["failed_executors"]`` (task_sync) and lets the scheduler fall through
+# to the next available agent (see ``execution_queue.select_available_executor``)
+# instead of stranding the task or burning the retry budget retrying the same
+# dead provider.
+#
+# Deliberately *excludes*:
+#   ``incomplete:working_tree_unchanged``  — task content, not the provider;
+#   ``blocked:permission_denied:*``        — environment policy, identical on
+#                                            every executor, so switching helps
+#                                            no one;
+#   ``blocked:final_response:*``           — the agent judged the task blocked;
+#   ``timeout`` / "process killed manually" — ambiguous: could be the task,
+#                                            the machine, or the provider, so
+#                                            retry budget (not failover) governs.
+PROVIDER_UNAVAILABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "session_expired",
+        "authentication_failed",
+        "quota_limit",
+        "provider_api_error",
+        "provider_exit_nonzero",
+        "provider_launch_failed",
+        "executable_missing",
+        "network_error",
+    }
+)
 
 MAX_PERSISTED_EVENT_CHARS = 65_536
 MAX_CODEX_PROMPT_CHARS = 100_000
@@ -35,6 +67,7 @@ MAX_CODEX_PROMPT_CHARS = 100_000
 # lower ceiling than Codex's keeps the failure explicit and on our side.
 MAX_OLLAMA_PROMPT_CHARS = 32_000
 DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:7b"
+MAX_COPILOT_PROMPT_CHARS = 100_000
 MAX_REDACTION_SOURCE_CHARS = 16_384
 MAX_PROMPT_PATTERNS = 96
 MAX_CREDENTIAL_CHARS = 512
@@ -1008,10 +1041,259 @@ class OllamaProvider:
         return "provider_exit_nonzero" if exit_code else None
 
 
+class CopilotRuntime:
+    """JSONL event-stream runtime for GitHub Copilot CLI.
+
+    Copilot CLI emits one JSON object per line when ``--output-format json``
+    is used. Key events (the ``type`` field):
+
+    - ``assistant.turn_start`` — readiness: the process is alive and the
+      model turn has started.
+    - ``assistant.message`` — a complete assistant message with
+      ``data.content`` holding the text.
+    - ``tool.execution_start`` / ``tool.execution_complete`` — tool calls
+      (bash, file edits, etc.).
+    - ``assistant.turn_end`` — the model turn finished.
+    - ``result`` — the terminal event with ``exitCode`` and ``usage``.
+
+    ``requires_valid_result = True`` because a non-empty
+    ``assistant.message`` + ``assistant.turn_end`` is the machine-checkable
+    "the turn completed successfully" marker — same contract Codex holds.
+    """
+
+    requires_valid_result = True
+    requires_verified_identity = True
+
+    def __init__(self, prompt: str, sensitive_values: tuple[str, ...] = ()) -> None:
+        self._boundary = SanitizationBoundary(prompt, sensitive_values)
+        self._last_assistant_text = ""
+        self._turn_ended = False
+
+    def feed_stdout(self, chunk: str) -> list[str]:
+        return self._boundary.feed_stdout(chunk)
+
+    def feed_stderr(self, chunk: str) -> list[str]:
+        return self._boundary.feed_stderr(chunk)
+
+    def flush_stdout(self) -> list[str]:
+        return self._boundary.flush_stdout()
+
+    def flush_stderr(self) -> list[str]:
+        return self._boundary.flush_stderr()
+
+    def parse_stdout_line(self, line: str) -> dict | None:
+        if len(line) > MAX_PERSISTED_EVENT_CHARS:
+            return {
+                "event_type": "malformed",
+                "payload": {
+                    "raw": line[:MAX_PERSISTED_EVENT_CHARS],
+                    "error": "provider event exceeded persistence bound",
+                },
+            }
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        msg_type = obj.get("type")
+        data = obj.get("data") or {}
+        if msg_type == "assistant.turn_start":
+            return {"event_type": "lifecycle", "payload": {"provider_event": msg_type}}
+        if msg_type == "assistant.message":
+            content = data.get("content")
+            if isinstance(content, str) and content:
+                self._last_assistant_text = content[:MAX_PERSISTED_EVENT_CHARS]
+                return {
+                    "event_type": "assistant_message",
+                    "payload": {
+                        "provider": COPILOT_ID,
+                        "message": {"content": [{"type": "text", "text": self._last_assistant_text}]},
+                    },
+                }
+            return None
+        if msg_type == "assistant.turn_end":
+            self._turn_ended = True
+            return {
+                "event_type": "result",
+                "payload": {
+                    "provider": COPILOT_ID,
+                    "provider_event": msg_type,
+                    "provider_completion_valid": bool(self._last_assistant_text),
+                    "result": self._last_assistant_text,
+                    "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
+                },
+            }
+        if msg_type == "result":
+            exit_code = obj.get("exitCode")
+            if isinstance(exit_code, int) and exit_code != 0:
+                return {
+                    "event_type": "provider_error",
+                    "payload": {
+                        "provider": COPILOT_ID,
+                        "provider_event": "result",
+                        "code": str(exit_code)[:128],
+                        "message": f"Copilot CLI exited with code {exit_code}",
+                    },
+                }
+            return None
+        if msg_type in {"error", "assistant.error"}:
+            message = data.get("message") or data.get("error") or msg_type
+            return {
+                "event_type": "provider_error",
+                "payload": {
+                    "provider": COPILOT_ID,
+                    "provider_event": msg_type,
+                    "code": str(data.get("code", ""))[:128] if data.get("code") else None,
+                    "message": str(message)[:MAX_PERSISTED_EVENT_CHARS],
+                },
+            }
+        return None
+
+    @staticmethod
+    def stdout_event_is_readiness(line: str, event: dict | None) -> bool:
+        return bool(
+            event
+            and event.get("event_type") == "lifecycle"
+            and (event.get("payload") or {}).get("provider_event") == "assistant.turn_start"
+        )
+
+    @staticmethod
+    def stderr_line_is_readiness(line: str) -> bool:
+        return bool(line.strip())
+
+    @staticmethod
+    def event_is_valid_result(event: dict) -> bool:
+        return bool(
+            event.get("event_type") == "result"
+            and (event.get("payload") or {}).get("provider_completion_valid")
+        )
+
+    @staticmethod
+    def event_is_provider_error(event: dict) -> bool:
+        return event.get("event_type") == "provider_error"
+
+
+class CopilotProvider:
+    """GitHub Copilot CLI as an execution provider.
+
+    Copilot CLI is a non-interactive coding agent that can read, search, edit
+    files and run shell commands. Like Codex, it is launched in a
+    PID-tracked process group via the Execution Center v2 supervisor, reads
+    its prompt from stdin, and emits structured JSONL events on stdout.
+
+    The prompt is passed via stdin (not ``-p``) so it never appears in
+    ``argv`` — the same security property Codex holds.
+    """
+
+    id = COPILOT_ID
+    label = "Copilot CLI"
+    supports_resume = False
+    requires_dedicated_worktree = True
+
+    def _executable(self) -> str | None:
+        configured = os.environ.get("AICC_COPILOT_BINARY")
+        if configured:
+            path = Path(configured).expanduser()
+            return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+        return shutil.which("copilot")
+
+    def availability(self) -> ProviderAvailability:
+        executable = self._executable()
+        if executable is None:
+            return ProviderAvailability(
+                self.id, False, "executable_missing",
+                "Copilot CLI not found; install it or configure AICC_COPILOT_BINARY.",
+            )
+        version_ok, version = _probe(executable, ["--version"], provider_id=self.id)
+        if not version_ok:
+            return ProviderAvailability(self.id, False, "version_probe_failed", version, executable=executable)
+        return ProviderAvailability(self.id, True, "usable", "Copilot CLI is available.", executable, version)
+
+    @staticmethod
+    def validate_prompt(prompt: str) -> None:
+        if len(prompt) > MAX_COPILOT_PROMPT_CHARS:
+            raise ValueError(
+                f"Copilot prompt exceeds the {MAX_COPILOT_PROMPT_CHARS}-character safety limit."
+            )
+        _sensitive_environment_values(dict(os.environ))
+
+    def build_launch(
+        self,
+        *,
+        repository_path: Path,
+        session_id: str,
+        prompt: str,
+        task_type: str,
+        is_resume: bool,
+        model: str | None,
+    ) -> LaunchSpec:
+        if is_resume:
+            raise ValueError("Copilot CLI resume is not supported by this provider increment.")
+        self.validate_prompt(prompt)
+        environment = dict(os.environ)
+        _sensitive_environment_values(environment)
+        availability = self.availability()
+        if not availability.available or not availability.executable:
+            raise RuntimeError(availability.message)
+
+        argv = [
+            availability.executable,
+            "--output-format", "json",
+            "--no-color",
+            "--no-ask-user",
+            "--no-auto-update",
+            "--no-remote",
+            "--no-remote-export",
+            "--no-custom-instructions",
+            "--disable-builtin-mcps",
+            "--allow-all-tools",
+            "-C", str(repository_path),
+        ]
+        if model:
+            argv.extend(["--model", model])
+
+        audit = {
+            "provider_id": self.id,
+            "provider_version": availability.version,
+            "non_interactive": True,
+            "readiness": "assistant_turn_start",
+            "result_evidence": "assistant_message_then_turn_end",
+            "cancellation": "verified_process_group_sigterm_then_sigkill",
+            **_prompt_audit(prompt, "stdin"),
+        }
+        return LaunchSpec(tuple(argv), environment, prompt, audit)
+
+    @staticmethod
+    def create_runtime(*, prompt: str, environment: dict[str, str]) -> ProviderRuntime:
+        return CopilotRuntime(prompt, _sensitive_environment_values(environment))
+
+    def parse_stdout_line(self, line: str) -> dict | None:
+        return CopilotRuntime("").parse_stdout_line(line)
+
+    @staticmethod
+    def sanitize_stderr(line: str) -> str:
+        runtime = CopilotRuntime("")
+        runtime.feed_stderr(line)
+        return "".join(runtime.flush_stderr())
+
+    @staticmethod
+    def classify_failure(*, exit_code: int, diagnostic_lines: list[str]) -> str | None:
+        text = "\n".join(diagnostic_lines).lower()
+        if any(token in text for token in ("quota", "usage limit", "spend limit", "rate limit", "ai credits")):
+            return "quota_limit"
+        if any(token in text for token in ("not logged in", "authentication", "unauthorized", "api key", "login")):
+            return "authentication_failed"
+        if any(token in text for token in ("network", "connection", "timeout", "econnrefused")):
+            return "network_error"
+        return "provider_exit_nonzero" if exit_code else None
+
+
 _PROVIDERS: dict[str, ExecutionProvider] = {
     CLAUDE_ID: ClaudeProvider(),
     CODEX_ID: CodexProvider(),
     OLLAMA_ID: OllamaProvider(),
+    COPILOT_ID: CopilotProvider(),
 }
 
 

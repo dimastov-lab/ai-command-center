@@ -8,8 +8,8 @@ the small set of display/bookkeeping fields (`current_run_id`,
 `latest_verdict`, `pull_request_url`) that already exist on every task
 record — and, as of this remediation, also `current_stage`/`progress` for a
 genuinely `Completed` run's terminal sync (see `_apply_terminal_fields`),
-mirroring the exact `models.set_current_stage` calls the v1 synchronous
-flow (`launch_service._apply_run_outcome_to_task`) already makes. Before
+mirroring the exact `models.set_current_stage` calls the retired v1
+synchronous launch flow made. Before
 this fix, progress/stage were *never* advanced for a v2-launched task: a
 task launched once (which sets stage to "Workspace Verified", progress 5 —
 see `launch.begin_launch`) stayed frozen at 5% forever, even after its run
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from command_center import models, project_config, report_parser
 from command_center.runtime import completion as completion_states
-from command_center.runtime import db, reports, session_view
+from command_center.runtime import db, providers, reports, session_view
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.runtime.completion_service import CompletionOrchestrator
 
@@ -58,6 +58,12 @@ _LAUNCH_STATUS_BY_DISPLAY_STATUS: dict[str, str] = {
 }
 
 _TERMINAL_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review", "Failed", "Blocked", "Incomplete"})
+
+# Launch statuses that mean "this run stranded the task; nothing will auto-
+# advance it." An executor-availability failure (AICC-DESKTOP-017) flips any of
+# these back to "Ready" so the next available agent in the chain is tried,
+# instead of leaving the task parked on a dead provider.
+_STRANDED_LAUNCH_STATUSES = frozenset({"Failed", "Requires Attention", "Blocked", "Incomplete"})
 
 
 def _resolve_target_launch_status(status: str, task: dict) -> str:
@@ -126,8 +132,8 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
             pass  # cosmetic run-row enrichment only; the task fields above are already set
 
     # Advance `current_stage`/`progress` for a genuinely completed run —
-    # same rule v1's `launch_service._apply_run_outcome_to_task` already
-    # uses. Never for `Blocked`/`Incomplete`/`Failed`/`Cancelled`: none of
+    # same rule the retired v1 synchronous launch flow used. Never for
+    # `Blocked`/`Incomplete`/`Failed`/`Cancelled`: none of
     # those represent real forward progress, so `progress` must stay exactly
     # where it was (whatever stage the task was actually verified to reach),
     # not be nudged forward by a run that didn't deliver.
@@ -160,6 +166,24 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task["current_run_id"] = run["id"]
         mutated = True
 
+    # Advance progress for in-progress runs. While a run is RUNNING, the only
+    # observable milestone is `first_output_at` — the agent has started
+    # producing output. Move the task from the pre-launch "Workspace Verified"
+    # (5%) to "Implementation" (40%) so the board reflects live activity instead
+    # of staying frozen at 5% for the entire execution window. This is a
+    # one-way forward advance: `set_current_stage` respects `progress_mode`
+    # (manual overrides are preserved) and stages only move forward in the
+    # STAGE_PROGRESS table.
+    if (
+        status == session_view.STATUS_RUNNING
+        and run.get("first_output_at")
+        and not already_finalized_for_this_run
+    ):
+        current_stage = task.get("current_stage")
+        if current_stage in (None, "Created", "Workspace Verified"):
+            models.set_current_stage(task, "Implementation")
+            mutated = True
+
     if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
         # Must run *before* `target_launch_status` is resolved below: a
         # `Completed` run's launch status depends on `task["progress"]`
@@ -168,6 +192,64 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         mutated = True
 
     target_launch_status = _resolve_target_launch_status(status, task)
+
+    # --- Executor fallback auto-retry (AICC-DESKTOP-017) -----------------
+    # A run that died because the *executor itself* is unavailable is a strong
+    # signal the configured provider cannot run this task right now — e.g. an
+    # expired OAuth token (`session_expired`), an exhausted quota
+    # (`quota_limit`), a 5xx API outage (`provider_api_error`), or a startup
+    # crash with no output (INTERRUPTED). `provider.availability()` only probes
+    # `--version`, so it cannot detect any of these; the only honest signal is
+    # the run's own `failure_reason`. Instead of stranding the task as
+    # "Failed"/"Requires Attention" (or retrying the same dead provider until
+    # the retry budget is gone), record the failed executor and flip the task
+    # back to "Ready" so the next launch automatically tries the next available
+    # agent in the chain (see `execution_queue.select_available_executor`). The
+    # task only stays stranded when *every* allowed executor has failed (the
+    # launch layer then reports `LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`).
+    if not already_finalized_for_this_run:
+        reason = run.get("failure_reason")
+        died_on_startup = (
+            run.get("state") == "INTERRUPTED" and not run.get("first_output_at")
+        )
+        provider_unavailable = reason in providers.PROVIDER_UNAVAILABLE_REASONS
+        if died_on_startup or provider_unavailable:
+            failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
+            failed_list = list(task.get("failed_executors") or [])
+            if failed_executor not in failed_list:
+                failed_list.append(failed_executor)
+                task["failed_executors"] = failed_list
+                mutated = True
+            # Flip any "stranded, won't auto-relaunch" status back to "Ready" so
+            # the next `launch_ready` picks up the next executor in the chain.
+            # `died_on_startup` (INTERRUPTED, no output) resolves to "Requires
+            # Attention"; a classified provider failure (state=FAILED) resolves to
+            # "Failed" — both are stranded statuses, so both are re-queued. A
+            # non-provider failure (`incomplete:working_tree_unchanged`,
+            # `blocked:permission_denied:*`) never reaches here, so its
+            # "Incomplete"/"Blocked" status is preserved.
+            if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                target_launch_status = "Ready"
+                detail = (
+                    f"Исполнитель «{failed_executor}» недоступен ({reason or 'нет вывода'})."
+                    if provider_unavailable
+                    else f"Исполнитель «{failed_executor}» не запустился (нет вывода)."
+                )
+                models.append_timeline_event(
+                    task,
+                    "executor_failed",
+                    detail
+                    + " Задача возвращена в очередь для повтора другим агентом.",
+                )
+                mutated = True
+
+    # On a clean completion, clear any accumulated executor failures — the
+    # chain is healthy again and a future re-launch should try the configured
+    # executor from scratch.
+    if status == session_view.STATUS_COMPLETED and task.get("failed_executors"):
+        task.pop("failed_executors", None)
+        mutated = True
+
     if task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
         mutated = True
@@ -337,10 +419,31 @@ def sync_tasks(
     every existing caller."""
     mutated: list[dict] = []
     for task in tasks:
+        # ``Done`` is the canonical engineering outcome: it is only assigned
+        # after the operator or completion pipeline accepts the delivered
+        # result. Historical run rows remain queryable, but a later refresh
+        # must not project an older failed/review run back onto the resolved
+        # task and turn Completed into Failed/Needs Review again.
+        if task.get("status") == "Done":
+            continue
         run_id = task.get("current_run_id")
         if not run_id:
             continue
         run = api.get_run(run_id)
+        # Self-heal a stale or dangling `current_run_id`. A lost update can
+        # clobber the launch's single-task `upsert_task` with a stale full-list
+        # `save_tasks`, freezing the pointer on an old run while a newer run
+        # exists in the DB (the old run is usually still present, so a plain
+        # `get_run` does NOT return None here). Prefer the actually-newest run
+        # for the task so a fresh FAILED run is still synced (and its executor
+        # failover still fires) instead of stranding the task on the old run's
+        # status forever. When the pointer is current, `latest` equals `run` and
+        # nothing changes; when no runs exist, both stay None and we skip.
+        task_id = task.get("id")
+        if task_id:
+            latest = api.get_latest_run_for_task(task_id)
+            if latest is not None and (run is None or latest["id"] != run_id):
+                run = latest
         if run is None:
             continue
         changed = sync_task_from_run(task, run, db_path=api.db_path)

@@ -169,6 +169,27 @@ class WorkspaceLockedError(Exception):
         )
 
 
+class TaskAlreadyActiveError(Exception):
+    """Raised by `create_run(..., enforce_workspace_lock=True)` when the same
+    `task_id` already has an active run (`EXECUTION_CENTER_ACTIVE_STATES`),
+    possibly in a *different* workspace than this launch resolved to.
+
+    The workspace lock alone (`WorkspaceLockedError`) only catches a second
+    launch that resolves to the SAME `repository_path`; if a task's configured
+    workspace/branch changes between two in-flight launches they can resolve to
+    different paths and both slip past it. This check runs inside the same
+    `BEGIN IMMEDIATE` transaction as the `INSERT`, so it is a true atomic
+    per-task invariant rather than a raceable pre-flight. Carries the
+    conflicting run for reporting."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Task {conflicting_run['task_id']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r})."
+        )
+
+
 class GlobalConcurrencyLimitError(Exception):
     """Raised by `create_run(..., max_global_concurrency=N)` when N runs are
     already active (`EXECUTION_CENTER_ACTIVE_STATES`) across *all* workspaces.
@@ -231,6 +252,12 @@ _UPDATABLE_RUN_FIELDS: frozenset[str] = frozenset(
         # here as a defense-in-depth allowlist entry like every other column.
         "commit_hash",
         "pull_request_url",
+        # Migration 11: short HEAD captured at launch so the post-run classifier
+        # can tell "the agent committed" (HEAD advanced) from "the agent left the
+        # tree clean without doing anything" — a committed change leaves the
+        # working tree clean, so the porcelain-status diff alone under-counts
+        # completed work (see `supervisor._supervise` and `outcome.classify_`).
+        "pre_run_head",
     }
 )
 
@@ -246,7 +273,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -407,6 +434,22 @@ def _migration_9_add_execution_provider_fields(conn: sqlite3.Connection) -> None
             conn.execute("ALTER TABLE run ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'claude_code'")
         if "provider_metadata_json" not in existing:
             conn.execute("ALTER TABLE run ADD COLUMN provider_metadata_json TEXT")
+
+
+def _migration_11_add_pre_run_head(conn: sqlite3.Connection) -> None:
+    """Capture the short HEAD at launch so the post-run outcome classifier can
+    distinguish "agent committed its work" (HEAD advanced, tree clean) from
+    "agent did nothing" (HEAD unchanged, tree clean). Without this, any agent
+    that commits — copilot_cli, claude_code — is mis-classified
+    `incomplete:working_tree_unchanged` and re-run forever (AICC-DESKTOP-017).
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2,
+    3, 4, 9 — safe to re-run and safe under concurrent first-application via
+    the `BEGIN IMMEDIATE` transaction in `migrate()`."""
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "pre_run_head" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN pre_run_head TEXT")
 
 
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
@@ -659,6 +702,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     # finds the columns present.
     (9, _migration_9_add_execution_provider_fields),
     (10, _SCHEMA_V10),
+    (11, _migration_11_add_pre_run_head),
 ]
 
 
@@ -1072,6 +1116,22 @@ def create_run(
                 if conflict is not None:
                     raise WorkspaceLockedError(_row_to_dict(conflict))
 
+                # Task-id exclusivity (audit M1): the workspace lock above only
+                # catches a double-launch that resolves to the SAME workspace. If
+                # a task's configured workspace/branch changes between two
+                # in-flight launches they can resolve to *different* paths and
+                # slip past it — two agents running for one task. Checked in the
+                # same BEGIN IMMEDIATE transaction as the INSERT, so it cannot
+                # lose the race a separate pre-flight query can. Ordered after the
+                # workspace check so a same-workspace conflict still surfaces as
+                # WorkspaceLockedError (unchanged behaviour).
+                task_conflict = conn.execute(
+                    f"SELECT * FROM run WHERE task_id = ? AND state IN ({placeholders})",
+                    (task_id, *EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()
+                if task_conflict is not None:
+                    raise TaskAlreadyActiveError(_row_to_dict(task_conflict))
+
             if max_global_concurrency is not None:
                 # Global cap as an atomic invariant, in the SAME transaction as
                 # the INSERT (like the workspace lock above): count every run
@@ -1149,6 +1209,25 @@ def get_run(db_path: Path, run_id: str) -> dict | None:
         return _row_to_dict(row)
 
 
+def get_latest_run_for_task(db_path: Path, task_id: str) -> dict | None:
+    """Newest run row for `task_id`, or None if the task has no runs.
+
+    Distinct from `list_runs(task_id=..., limit=1)`: that path orders only by
+    `created_at DESC`, and `created_at` is second-granularity (`iso_now()`),
+    so two runs created in the same second tie and SQLite returns them in
+    unspecified rowid order. We add `rowid DESC` as a stable tiebreak — rowid
+    is insertion order, so the higher rowid is the newer row — guaranteeing
+    the actually-newest run is returned. Used by `task_sync.sync_tasks` to
+    self-heal tasks whose `current_run_id` was orphaned by a lost update.
+    """
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM run WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return _row_to_dict(row)
+
+
 def list_runs(
     db_path: Path,
     *,
@@ -1200,6 +1279,34 @@ def list_runs(
             f"SELECT * FROM run {where} ORDER BY created_at DESC{limit_clause}", params
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_runs(
+    db_path: Path,
+    *,
+    states: Iterable[str] | None = None,
+) -> int:
+    """Cheap `COUNT(*)` over `run` — the authoritative total run count without
+    materializing any rows. Used by the dashboard footer/health so "Всего" and
+    success-rate denominators are not silently truncated by the Live Board's
+    `limit=200` window (`list_runs(limit=200)` only ever sees the 200 newest
+    runs, which under-counts on busy installs). Accepts the same `states`
+    filter as `list_runs` for windowed counts (e.g. terminal runs in the last
+    sprint); `None` counts every run regardless of state."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if states is not None:
+        states_list = list(states)
+        if states_list:
+            placeholders = ", ".join("?" for _ in states_list)
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(states_list)
+        else:
+            clauses.append("0")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect(db_path) as conn:
+        (n,) = conn.execute(f"SELECT COUNT(*) FROM run {where}", params).fetchone()
+        return int(n)
 
 
 def update_run_state(

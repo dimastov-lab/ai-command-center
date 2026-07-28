@@ -181,7 +181,45 @@ GIT_WRITE_DISALLOWED_TOOLS: list[str] = [
     "Bash(git clean:*)",
     "Bash(git branch -d:*)",
     "Bash(git branch -D:*)",
+    # `gh` (GitHub CLI): opening and merging pull requests is the completion
+    # pipeline's job, never the agent's, so gh is denied wholesale — this blocks
+    # the `gh pr create`/`gh pr merge`/`gh api` writes an agent could otherwise
+    # run freely (gh was previously unrestricted here). Pattern-based denial,
+    # like the git entries above: it does not stop gh re-invoked through a nested
+    # shell — `scrub_vcs_credentials` is the complementary control that removes
+    # the tokens gh would need to authenticate.
+    "Bash(gh:*)",
 ]
+
+# Environment variables that carry Git/GitHub push/merge credentials, stripped
+# from every spawned agent's environment. An implementation/remediation agent
+# has no task reason to authenticate to a remote; removing these means that even
+# if it reaches `git push`/`gh` through a nested shell (which pattern-based tool
+# denial cannot fully prevent), it holds no env-provided credential to push or
+# merge with. Defence-in-depth, not a sandbox: a credential cached on disk
+# (`gh auth login`, a git credential helper / OS keychain) is outside this
+# process's reach. Deliberately never touches ANTHROPIC_*/CLAUDE_* (the agent's
+# own model auth), PATH, or HOME.
+_VCS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GITHUB_API_TOKEN",
+        "GITHUB_ACCESS_TOKEN",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+    }
+)
+
+
+def scrub_vcs_credentials(environment: dict[str, str]) -> dict[str, str]:
+    """Return a copy of `environment` with Git/GitHub credential variables
+    (`_VCS_CREDENTIAL_ENV_VARS`) removed, so a spawned agent cannot inherit
+    ambient push/merge credentials. Never removes the agent's own model auth."""
+    return {key: value for key, value in environment.items() if key not in _VCS_CREDENTIAL_ENV_VARS}
+
 
 DEFAULT_TIMEOUT_SECONDS = 900
 MIN_TIMEOUT_SECONDS = 30
@@ -352,6 +390,10 @@ def run_claude_code(
             text=True,
             timeout=timeout_seconds,
             check=False,
+            # Strip ambient Git/GitHub credentials: this agent has no reason to
+            # authenticate to a remote, and the completion pipeline (not the
+            # agent) owns push/merge. See scrub_vcs_credentials.
+            env=scrub_vcs_credentials(dict(os.environ)),
         )
         duration = time.monotonic() - started_monotonic
         status = "completed" if completed.returncode == 0 else "failed"
@@ -558,11 +600,8 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 
 def save_report(run: dict, parsed: dict) -> Path:
     path = report_path_for(run)
-    path.parent.mkdir(parents=True, exist_ok=True)
     content = render_report_markdown(run, parsed)
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
+    storage.atomic_write_text(path, content)
     return path
 
 

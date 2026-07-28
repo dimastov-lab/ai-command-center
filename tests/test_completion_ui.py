@@ -52,12 +52,14 @@ def test_finished_process_but_unmerged_not_shown_as_done():
     api = runtime_api.ExecutionCenterAPI()
     run = _completed_run(api.db_path)
     _seed_completion(api.db_path, run, state="AWAITING_MERGE", pull_request_number=7,
-                     pull_request_state="OPEN", recommended_action="Awaiting manual merge.")
+                     pull_request_state="OPEN", last_reason_code="AWAITING_MANUAL_MERGE",
+                     recommended_action="Awaiting manual merge.")
     at = _at_execution_center()
     assert not at.exception
     captions = " ".join(c.value for c in at.caption)
     assert "процесс завершён, но задача ещё не смёржена" in captions
     assert "задача завершена и смёржена" not in captions
+    assert any(button.label == "Сделать мердж" for button in at.button)
 
 
 # 22 -------------------------------------------------------------------------

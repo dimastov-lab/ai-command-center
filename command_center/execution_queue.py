@@ -375,6 +375,67 @@ LAUNCH_SKIP_WORKSPACE_VERIFICATION = "workspace_verification_failed"
 LAUNCH_SKIP_GLOBAL_AT_CAPACITY = "global_at_capacity"
 LAUNCH_SKIP_WORKSPACE_LOCKED = "workspace_locked"
 LAUNCH_SKIP_LAUNCH_ERROR = "launch_error"
+LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR = "no_available_executor"
+
+
+def select_available_executor(
+    task: dict, cfg: dict, *, preferred_executor: str | None = None
+) -> str | None:
+    """Pick the first *available* executor for this task, trying them in
+    preference order and skipping any that already failed to start
+    (``task["failed_executors"]``) or whose binary is unreachable
+    (``provider.availability()``).
+
+    Preference order: the task's own ``executor`` first (the configured
+    choice), then the remaining ``allowed_agents`` from the project config in
+    listed order. A provider whose ``availability()`` probe returns
+    ``available=False`` is skipped — so a machine without ``codex`` or with
+    an uninstalled ``ollama`` is never selected. A provider already in
+    ``task["failed_executors"]`` (set by ``task_sync`` when a run died on
+    startup with no output — e.g. an expired OAuth token that
+    ``availability()`` cannot detect) is also skipped, so the next launch
+    automatically falls through to the next agent in the chain without
+    manual intervention.
+
+    Returns ``None`` when every allowed executor is unavailable or has
+    already failed — the caller skips the launch with
+    ``LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`` so the task stays queued for an
+    operator to fix the agent (re-authenticate, install, …) rather than
+    silently doing nothing.
+    """
+    from command_center.runtime import providers as runtime_providers
+
+    allowed = list(cfg.get("allowed_agents") or [])
+    configured = (
+        preferred_executor
+        or task.get("executor")
+        or (allowed[0] if allowed else "claude_code")
+    )
+
+    # Preference order: configured executor first, then the rest of allowed.
+    tried: set[str] = set()
+    preference: list[str] = []
+    if configured not in tried:
+        preference.append(configured)
+        tried.add(configured)
+    for aid in allowed:
+        if aid not in tried:
+            preference.append(aid)
+            tried.add(aid)
+
+    failed = set(task.get("failed_executors") or [])
+
+    for executor_id in preference:
+        if executor_id in failed:
+            continue
+        provider = runtime_providers.get_provider(executor_id)
+        if provider is None:
+            continue
+        if not provider.availability().available:
+            continue
+        return executor_id
+
+    return None
 
 
 @dataclass
@@ -425,6 +486,7 @@ def launch_ready(
     execution_center_api,
     *,
     entry_ids: list[str] | None = None,
+    executor_by_entry: dict[str, str] | None = None,
     timeout_seconds: int | None = None,
 ) -> tuple[list[dict], list[LaunchAttemptResult]]:
     """Launches every `READY` entry (or, if `entry_ids` is given, just those
@@ -546,6 +608,56 @@ def launch_ready(
 
         # READY or PROVISIONABLE — proceed through the shared launcher.
         resolved_workspace = Path(prep.resolved_workspace)
+
+        # --- Executor fallback (AICC-DESKTOP-017) ---------------------------
+        # The task may name an executor whose binary is unavailable or that
+        # already died on startup (e.g. an expired OAuth token that the
+        # `--version` probe cannot detect). Try the configured executor first,
+        # then the rest of the project's `allowed_agents` in order, skipping
+        # any in `task["failed_executors"]`. When the selected executor
+        # differs from the task's configured one, record the switch so the
+        # board shows which agent actually ran.
+        cfg = project_configs.get(task.get("project")) or {}
+        planned_executor = (executor_by_entry or {}).get(entry.get("id"))
+        selected_executor = select_available_executor(
+            task,
+            cfg,
+            preferred_executor=planned_executor,
+        )
+        if selected_executor is None:
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message=(
+                        "ни один из разрешённых исполнителей не доступен — "
+                        "проверьте установку/авторизацию агентов"
+                    ),
+                    reason_code=LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR,
+                )
+            )
+            continue
+        if selected_executor != (task.get("executor") or "claude_code"):
+            original = task.get("executor") or "claude_code"
+            task.setdefault("timeline", []).append(
+                {
+                    "ts": models.iso_now(),
+                    "type": (
+                        "executor_assignment"
+                        if planned_executor == selected_executor
+                        else "executor_fallback"
+                    ),
+                    "from": original,
+                    "to": selected_executor,
+                    "reason": (
+                        "selected by load-aware scheduler"
+                        if planned_executor == selected_executor
+                        else "configured executor unavailable or failed"
+                    ),
+                }
+            )
+
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=task.get("project"),
@@ -567,7 +679,7 @@ def launch_ready(
                 execution_center_api=execution_center_api,
                 confirmed=True,
                 task=task,
-                executor_id=task.get("executor") or "claude_code",
+                executor_id=selected_executor,
                 validation=validation,
                 expected_branch=expected_branch,
                 base_branch=base_branch,

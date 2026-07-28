@@ -287,6 +287,10 @@ def test_plan_schedule_reads_live_load_and_defers_busy_workspace(git_repo, confi
     and it never launches anything itself."""
     from command_center.runtime import scheduler
 
+    # Keep the fake process alive long enough for `plan_schedule` (which probes
+    # every registered executor's binary) to return while the run is still
+    # RUNNING — without this the ~0.2 s default output window can close first.
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     configure_project_repo("AIOS", git_repo)
     api = ExecutionCenterAPI()
     run = api.start_run(

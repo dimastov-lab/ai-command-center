@@ -1,9 +1,13 @@
 # ADR 0007 — Unify task and execution-queue storage
 
-Status: **Accepted, not implemented.** Nothing in this document is implemented. It exists to be
-agreed before code is written, because the change moves live operator data
-(122 tasks, 24 queue entries at the time of writing) and a half-finished
-attempt would be worse than the problem it fixes.
+Status: **Accepted; step 1 (dual-write) implemented.** The schema-migration and dual-write phase
+is live: `runtime.db` has a `queue_entry` table (added at schema version 10), and `execution_queue`
+mirrors every write into it through `_mirror_to_runtime_db`, with `backfill_mirror` and
+`queue_divergence` providing the step-2 backfill and read-time verification. Reads still come from
+`execution_queue.json`, which remains authoritative; the later phases (flip the read path, then
+stop writing JSON) are not implemented. Because the change moves live operator data (122 tasks,
+24 queue entries at the time of writing), each remaining phase stays independently gated and
+reversible, and a half-finished attempt would be worse than the problem it fixes.
 
 ## Context
 

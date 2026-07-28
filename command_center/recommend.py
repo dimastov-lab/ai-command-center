@@ -28,6 +28,20 @@ class Recommendation:
     reasons: list[str] = field(default_factory=list)
 
 
+def _resolve(path: str | None) -> str | None:
+    """Mirror of ``live_board._resolve`` — normalize a workspace path so the
+    "исполнитель занят" check matches the Launch Gate's workspace-busy rule
+    exactly (a trailing slash or unresolved ``~`` must not let a task slip past
+    a genuinely busy repo). Kept here rather than imported from ``live_board``
+    so this module stays a pure, Streamlit-free read model."""
+    if not path:
+        return None
+    try:
+        return str(Path(path).expanduser().resolve())
+    except OSError:
+        return None
+
+
 def _repo_health(repository_path: str | None) -> tuple[bool, str | None]:
     """Read-only workspace/git health check, reusing `git_info` exactly as
     the Launch System does — no new git wrapping here."""
@@ -46,18 +60,58 @@ def _repo_health(repository_path: str | None) -> tuple[bool, str | None]:
     return True, None
 
 
-def _score_candidates(tasks: list[dict], project: str | None = None) -> list[Recommendation]:
+def _score_candidates(
+    tasks: list[dict],
+    project: str | None = None,
+    *,
+    active_runs: list[dict] | None = None,
+) -> list[Recommendation]:
     """The scoring core shared by `recommend_next_task` (top-1) and
     `list_recommendations` (top-N) — one loop, one set of scoring rules, so
     the two never drift into two different opinions about what to work on
     next. Returns every eligible candidate, sorted best-first; callers slice
-    to however many they need."""
+    to however many they need.
+
+    ``active_runs`` is the authoritative source for "is an executor already
+    busy here" — pass the runtime.db runs filtered to
+    ``EXECUTION_CENTER_ACTIVE_STATES`` (exactly what ``live_board.launch_gate``
+    checks against). When omitted, the function falls back to the Kanban
+    ``launch_status == "Running"`` heuristic so existing callers keep working,
+    but that heuristic can lag reality (a run can be active before the task
+    status flips, or stay "Running" after the run crashed), which is why the
+    runtime.db view is preferred.
+    """
     tasks_by_id = {task["id"]: task for task in tasks if task.get("id")}
-    running_repos = {
-        task.get("repository_path")
-        for task in tasks
-        if task.get("launch_status") == "Running" and task.get("repository_path")
-    }
+
+    if active_runs is not None:
+        # Authoritative: mirror launch_gate's duplicate + workspace-busy rules.
+        active_task_ids = {run.get("task_id") for run in active_runs if run.get("task_id")}
+        busy_workspaces = {
+            _resolve(run.get("repository_path"))
+            for run in active_runs
+            if run.get("repository_path")
+        }
+        busy_workspaces.discard(None)
+
+        def _busy_reason(task: dict) -> tuple[int, str]:
+            if task.get("id") in active_task_ids:
+                return -20, "у задачи уже есть активная попытка"
+            ws = _resolve(task.get("workspace_path") or task.get("repository_path"))
+            if ws and ws in busy_workspaces:
+                return -20, "исполнитель уже занят на этом workspace другим прогоном"
+            return 0, "исполнитель свободен"
+    else:
+        # Legacy fallback: Kanban launch_status, which can lag the run table.
+        running_repos = {
+            task.get("repository_path")
+            for task in tasks
+            if task.get("launch_status") == "Running" and task.get("repository_path")
+        }
+
+        def _busy_reason(task: dict) -> tuple[int, str]:
+            if task.get("repository_path") in running_repos:
+                return -20, "исполнитель уже занят на этом репозитории другой задачей"
+            return 0, "исполнитель свободен"
 
     candidates: list[Recommendation] = []
     for task in tasks:
@@ -87,11 +141,9 @@ def _score_candidates(tasks: list[dict], project: str | None = None) -> list[Rec
             score += 5
             reasons.append("репозиторий чист и готов к работе")
 
-        if task.get("repository_path") in running_repos:
-            score -= 20
-            reasons.append("исполнитель уже занят на этом репозитории другой задачей")
-        else:
-            reasons.append("исполнитель свободен")
+        delta, busy_reason = _busy_reason(task)
+        score += delta
+        reasons.append(busy_reason)
 
         deps = task.get("depends_on") or []
         if deps:
@@ -117,15 +169,26 @@ def _score_candidates(tasks: list[dict], project: str | None = None) -> list[Rec
     return candidates
 
 
-def recommend_next_task(tasks: list[dict], project: str | None = None) -> Recommendation | None:
-    candidates = _score_candidates(tasks, project=project)
+def recommend_next_task(
+    tasks: list[dict],
+    project: str | None = None,
+    *,
+    active_runs: list[dict] | None = None,
+) -> Recommendation | None:
+    candidates = _score_candidates(tasks, project=project, active_runs=active_runs)
     return candidates[0] if candidates else None
 
 
-def list_recommendations(tasks: list[dict], project: str | None = None, limit: int = 3) -> list[Recommendation]:
+def list_recommendations(
+    tasks: list[dict],
+    project: str | None = None,
+    limit: int = 3,
+    *,
+    active_runs: list[dict] | None = None,
+) -> list[Recommendation]:
     """Top-`limit` recommendations, best-first — the same eligibility rules
     and scoring as `recommend_next_task`, just not truncated to one. Exists
     so a richer recommendation surface (dependencies, impact, launch/queue
     actions — see `command_center.recommendation_service`) can show more
     than a single suggestion without re-implementing the scoring loop."""
-    return _score_candidates(tasks, project=project)[:limit]
+    return _score_candidates(tasks, project=project, active_runs=active_runs)[:limit]

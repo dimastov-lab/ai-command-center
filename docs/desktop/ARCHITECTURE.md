@@ -1,11 +1,11 @@
 # AI Command Center — Desktop Architecture
 
-Status: **D0 — target architecture.** Every package named `command_center.desktop`,
-`command_center.application`, and `command_center.platform` below is **target structure for
-Desktop Increment 1 and later** (D1–D3, see `DESKTOP_INCREMENT_1.md`). None of these packages
-exist in the repository as of this document. Where this document says "existing," it refers to
-code already present under `command_center/` and `command_center/runtime/` today, verified by
-reading that code directly, not aspirational.
+Status: **D1 shipped; D2–D3 are target architecture.** `command_center.desktop` exists today as
+the Increment 1 native shell. The `command_center.application` and `command_center.platform`
+packages named below remain **target structure for later increments** (D2–D3, see
+`DESKTOP_INCREMENT_1.md`) and do not exist in the repository yet. Where this document says
+"existing," it refers to code already present under `command_center/` and `command_center/runtime/`
+today, verified by reading that code directly, not aspirational.
 
 This document defines the architecture the desktop application must be built to. It does not
 implement it — see `IMPLEMENTATION_ROADMAP.md` for the increment sequence that will.

@@ -4,6 +4,15 @@
 # menu can switch between them; there is no separate Python "engine" beyond
 # this file plus command_center/ui/theme.py's st.context.theme helper.
 
+[server]
+# The application has NO authentication layer yet performs privileged git/gh and
+# subprocess operations, so the console must never be reachable off-host. Pinning
+# localhost here makes it the default for EVERY launch path — including a bare
+# `streamlit run app.py`, which does not go through scripts/start-ui.sh. An
+# explicit `--server.address` CLI flag still overrides this for an intentional,
+# reviewed exposure (see README "Getting started").
+address = "localhost"
+
 [client]
 # Hide Streamlit's own developer toolbar — "Deploy", "Stop", the hamburger
 # menu and the accessibility affordance it carries. This is a local desktop

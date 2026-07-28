@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -135,9 +136,30 @@ REASON_TASK_MISSING = execution_queue.LAUNCH_SKIP_TASK_NOT_FOUND
 REASON_WORKSPACE_UNCONFIGURED = execution_queue.LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED
 REASON_LAUNCH_BLOCKED = execution_queue.LAUNCH_SKIP_BLOCKED
 REASON_NEEDS_CONFIRMATION = execution_queue.LAUNCH_SKIP_NEEDS_CONFIRMATION
-# These two have no launch-time counterpart: they describe the queue itself.
+# These admission-only reasons have no launch-time counterpart.
 REASON_DUPLICATE_QUEUE_ENTRY = "duplicate_queue_entry"
+REASON_COMPLETION_IN_PROGRESS = "completion_in_progress"
 REASON_ADAPTATION_FAILED = "adaptation_failed"
+
+# A READY queue row can outlive execution and overlap the completion pipeline.
+# These states mean the engineering work is already being validated, reviewed,
+# published, merged, or verified, so launching another agent would duplicate
+# work. Failure states are deliberately excluded: the bounded rework loop may
+# legitimately enqueue a new attempt after validation or CI fails.
+_COMPLETION_LAUNCH_BLOCKING_STATES: frozenset[str] = frozenset(
+    {
+        completion_domain.CompletionState.EXECUTION_FINISHED,
+        completion_domain.CompletionState.VALIDATING_RESULT,
+        completion_domain.CompletionState.RESULT_VALID,
+        completion_domain.CompletionState.AWAITING_REVIEW,
+        completion_domain.CompletionState.PREPARING_PULL_REQUEST,
+        completion_domain.CompletionState.PULL_REQUEST_OPEN,
+        completion_domain.CompletionState.AWAITING_MERGE,
+        completion_domain.CompletionState.MERGED,
+        completion_domain.CompletionState.VERIFYING_TARGET_BRANCH,
+        completion_domain.CompletionState.RECOVERY_PENDING,
+    }
+)
 
 # Why a whole tick did not run (or did not launch).
 TICK_DISABLED = "autopilot_disabled"
@@ -197,6 +219,10 @@ REMEDIATION_BY_REASON: dict[str, str] = {
     ),
     scheduler.REASON_RETRY_EXHAUSTED: "Исчерпан бюджет повторов — разберите причину сбоя и перезапустите вручную.",
     REASON_DUPLICATE_QUEUE_ENTRY: "В очереди несколько записей для одной задачи — лишние игнорируются.",
+    REASON_COMPLETION_IN_PROGRESS: (
+        "Задача уже проходит проверку, публикацию PR или merge — дождитесь завершения "
+        "completion pipeline либо выполните доступное ручное действие."
+    ),
     REASON_ADAPTATION_FAILED: "Не удалось подготовить задачу к планированию — см. текст ошибки.",
     execution_queue.LAUNCH_OK: "Запуск начат.",
     execution_queue.LAUNCH_SKIP_TASK_NOT_FOUND: "Задача очереди больше не существует — очистите запись очереди.",
@@ -227,6 +253,10 @@ REMEDIATION_BY_REASON: dict[str, str] = {
         "дождитесь его завершения и повторите."
     ),
     execution_queue.LAUNCH_SKIP_LAUNCH_ERROR: "Запуск завершился ошибкой — см. сообщение.",
+    execution_queue.LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR: (
+        "Ни один из разрешённых исполнителей не доступен — "
+        "проверьте установку и авторизацию агентов (claude, copilot, ollama)."
+    ),
     # Provider-reported causes (see `providers.*.classify_failure`). These
     # arrive as a run's `failure_reason`, and the wave shows them verbatim, so
     # each needs the one action that actually resolves it.
@@ -238,6 +268,15 @@ REMEDIATION_BY_REASON: dict[str, str] = {
     "daemon_unreachable": "Локальный сервер Ollama недоступен — запустите `ollama serve`.",
     "model_missing": "Модель не скачана — выполните `ollama pull <модель>`.",
     "insufficient_memory": "Недостаточно памяти для модели — выберите модель меньше.",
+    completion_domain.ReasonCode.VALIDATION_FAILED: (
+        "Локальная проверка не прошла — автодоработка исправит ошибку и повторит проверки."
+    ),
+    completion_domain.ReasonCode.CHECKS_FAILING: (
+        "CI не прошёл — автодоработка разберёт упавшие проверки и отправит исправление."
+    ),
+    completion_domain.ReasonCode.REVIEW_REJECTED: (
+        "Независимое ревью отклонило изменение — автодоработка исправит замечания."
+    ),
 }
 
 
@@ -570,23 +609,36 @@ def _skip(entry: dict, task: dict | None, reason_code: str, explanation: str) ->
 
 
 
-def _preferred_agent(task: dict, project_id: str | None) -> str | None:
-    """The execution provider this task should be planned onto, or `None` to
-    let capability matching decide.
+def _agent_constraints(
+    task: dict, project_id: str | None
+) -> tuple[frozenset[str], str | None]:
+    """Return ``(allowed_agents, hard_pin)`` for one schedulable task.
 
-    Precedence: the task's own `executor` when the project authorizes it, else
-    the project's first authorized provider. A task naming a provider its
-    project forbids is *not* silently redirected — it keeps its choice so the
-    launcher's authorization gate refuses it visibly, rather than the work
-    quietly running somewhere the operator did not intend."""
+    Project ``allowed_agents`` is the authorization boundary. The task's
+    ordinary ``executor`` is only its default/preference: it must not pin all
+    work to Claude Code while Codex is idle. A task may opt into a true hard
+    pin with ``executor_pinned=True``; a task naming a provider forbidden by
+    project policy also remains pinned to that forbidden id so the scheduler
+    reports a visible ``no_capable_agent`` refusal instead of silently
+    redirecting it.
+
+    Providers that already failed to start for this task are removed from the
+    eligible set. This makes failover and normal load distribution use the same
+    planner rather than two conflicting selection rules."""
     try:
-        allowed = project_config.allowed_execution_providers(project_id)
+        allowed = tuple(project_config.allowed_execution_providers(project_id))
     except Exception:  # noqa: BLE001 — malformed policy is reported by the launcher
-        return task.get("executor") or None
+        requested = task.get("executor")
+        return frozenset(), requested or None
+
     requested = task.get("executor")
-    if requested:
-        return requested
-    return allowed[0] if allowed else None
+    if requested and requested not in allowed:
+        return frozenset(allowed), requested
+
+    failed = frozenset(task.get("failed_executors") or ())
+    eligible = frozenset(agent for agent in allowed if agent not in failed)
+    hard_pin = requested if requested and task.get("executor_pinned") else None
+    return eligible, hard_pin
 
 
 def adapt_ready_entries(
@@ -637,6 +689,23 @@ def adapt_ready_entries(
             continue
 
         try:
+            completion = runtime_db.get_completion_by_task(db_path, task_id)
+            if completion is not None and completion.get(
+                "completion_state"
+            ) in _COMPLETION_LAUNCH_BLOCKING_STATES:
+                skipped.append(
+                    _skip(
+                        entry,
+                        task,
+                        REASON_COMPLETION_IN_PROGRESS,
+                        (
+                            "latest completion "
+                            f"{completion.get('run_id')!r} is "
+                            f"{completion.get('completion_state')!r}"
+                        ),
+                    )
+                )
+                continue
             canonical = project_config.canonical_project_id(task.get("project"))
             cfg = project_configs.get(canonical, {})
             prep = launch_service.prepare_task_launch(task=task, project_config=cfg)
@@ -678,6 +747,7 @@ def adapt_ready_entries(
         # exclusivity compares the same spelling the DB workspace lock does.
         workspace = prep.resolved_workspace or launch_service.resolved_workspace_path(prep.selection.path)
         attempts_made, last_state, last_failure_reason, last_completed_at = _run_history(db_path, task_id)
+        allowed_agents, preferred_agent = _agent_constraints(task, canonical)
         adapted.append(
             scheduler.WorkItem(
                 task_id=task_id,
@@ -686,16 +756,11 @@ def adapt_ready_entries(
                     task.get("task_type") or "implementation"
                 ),
                 priority=task.get("priority") or "Medium",
-                # Pinned to a provider the project actually authorizes. This
-                # was deliberately left unpinned while `start_raw` always
-                # spawned the Claude CLI regardless of `executor`; once the
-                # provider abstraction landed that stopped being true, and an
-                # unpinned planner started assigning whichever available agent
-                # had the most spare capacity — including one the project
-                # forbids, producing an ASSIGN that `require_execution_provider_
-                # allowed` then refused at launch. The planner must not propose
-                # work the launcher is required to reject.
-                preferred_agent=_preferred_agent(task, canonical),
+                # Authorization is a set, not a pin. The scheduler can spread
+                # work across every permitted compatible provider while a
+                # forbidden provider can never be proposed.
+                allowed_agents=allowed_agents,
+                preferred_agent=preferred_agent,
                 # A READY entry is by definition dependency-satisfied, but the
                 # queue file is persisted state that could be stale relative to
                 # `tasks.json`. Recomputing from the live graph is pure and
@@ -825,13 +890,14 @@ def apply_merge_policy(
     """Reconcile every pre-merge completion row's persisted merge *policy* with
     the current opt-in, and return one audit record per row actually changed.
 
-    This function decides nothing about whether a PR may merge. It writes
-    `merge_mode`/`policy_json` and nothing else; every real gate — checks
-    passing, a required review, mergeability, conflicts, the closed-unmerged
-    recovery rules — stays where it already is, in `CompletionEvaluator`. A row
-    whose policy already matches is left completely untouched (no write, no
-    version bump, no audit event), which is what makes calling this twice per
-    tick free."""
+    This function decides nothing about whether a PR may merge. It writes the
+    policy only, except that a row upgraded from manual to automatic is made
+    immediately due by clearing the manual wait's retry timer and counter.
+    Every real gate — checks passing, a required review, mergeability,
+    conflicts, the closed-unmerged recovery rules — stays where it already is,
+    in `CompletionEvaluator`. A row whose policy already matches is left
+    completely untouched (no write, no version bump, no audit event), which is
+    what makes calling this twice per tick free."""
     updates: list[dict] = []
     rows = runtime_db.list_completions(
         db_path, states=sorted(_REPOLICIABLE_STATES), limit=COMPLETION_SCAN_LIMIT
@@ -842,12 +908,26 @@ def apply_merge_policy(
         if policy.merge_mode == desired and row.get("merge_mode") == desired:
             continue
         updated_policy = CompletionPolicy.from_dict({**policy.to_dict(), "merge_mode": desired})
+        fields: dict[str, object] = {
+            "merge_mode": desired,
+            "policy_json": updated_policy.to_json(),
+        }
+        if (
+            policy.merge_mode == completion_domain.MERGE_MANUAL
+            and desired != completion_domain.MERGE_MANUAL
+        ):
+            # Manual waiting deliberately backs off for an hour. Retaining that
+            # timer after an explicit auto-merge opt-in makes the switch appear
+            # broken and also carries a large manual-poll retry count into the
+            # automatic policy. The next completion advance must evaluate the
+            # PR now, with a fresh retry budget.
+            fields.update({"next_retry_at": None, "retry_count": 0})
         try:
             runtime_db.update_completion(
                 db_path,
                 row["run_id"],
                 expected_version=row["version"],
-                fields={"merge_mode": desired, "policy_json": updated_policy.to_json()},
+                fields=fields,
             )
         except (runtime_db.LostUpdateError, KeyError):
             # A concurrent advancer moved (or removed) the row between the list
@@ -899,10 +979,8 @@ REWORK_REQUEUED = "requeued"
 REWORK_BUDGET_EXHAUSTED = "rework_budget_exhausted"
 REWORK_DISABLED = "auto_rework_disabled"
 
-# Completion states that mean "the work is not acceptable and a *new attempt by
-# the agent* is the remedy". `VALIDATION_FAILED` is the whole set today; it is
-# expressed as a set so the independent-review verdict can join it without
-# touching the loop.
+# Completion states that unconditionally mean "the work is not acceptable and
+# a new agent attempt is the remedy".
 REWORK_TRIGGER_STATES: frozenset[str] = frozenset(
     {
         completion_domain.CompletionState.VALIDATION_FAILED,
@@ -913,6 +991,18 @@ REWORK_TRIGGER_STATES: frozenset[str] = frozenset(
         completion_domain.CompletionState.REVIEW_REJECTED,
     }
 )
+
+
+def _is_rework_trigger(row: dict) -> bool:
+    state = row.get("completion_state")
+    if state in REWORK_TRIGGER_STATES:
+        return True
+    # A red remote CI run is discovered after the PR exists, so it rests in
+    # MERGE_BLOCKED rather than the terminal local VALIDATION_FAILED state.
+    return (
+        state == completion_domain.CompletionState.MERGE_BLOCKED
+        and row.get("last_reason_code") == completion_domain.ReasonCode.CHECKS_FAILING
+    )
 
 
 def _rework_prompt(task: dict, row: dict) -> str:
@@ -977,7 +1067,7 @@ def plan_rework(
         if task.get("status") == "Done":
             continue
         row = runtime_db.get_completion_by_task(db_path, task_id)
-        if row is None or row.get("completion_state") not in REWORK_TRIGGER_STATES:
+        if row is None or not _is_rework_trigger(row):
             continue
         if task.get(REWORK_LAST_RUN_FIELD) == row.get("run_id"):
             continue  # already reworked this exact failure
@@ -1650,20 +1740,33 @@ def project_verified_completions(root: Path, *, db_path: Path) -> list[str]:
     direct JSON replacement. Idempotent: a task already `Done` is skipped, so
     repeated ticks neither rewrite it nor re-emit its timeline event."""
 
-    def _mutator(tasks: list[dict]) -> list[str]:
+    def _mutator(tasks: list[dict]) -> tuple[list[str], bool]:
         moved: list[str] = []
+        changed = False
         for task in tasks:
             task_id = task.get("id")
-            if not task_id or task.get("status") == "Done":
+            if not task_id:
                 continue
             row = runtime_db.get_completion_by_task(db_path, task_id)
             if row is None:
                 continue
-            if task_sync.project_completion_to_kanban(task, row):
+            # The completion row can belong to an earlier successful run while
+            # a later verification/rework attempt is the task's current run.
+            # Project the full completion read-model before the Kanban lane so
+            # `Done` can never coexist with stale "Incomplete", 40%, or
+            # "Implementation" fields in the live UI.
+            execution_projection_changed = task_sync.sync_task_from_completion(task, row)
+            kanban_changed = task_sync.project_completion_to_kanban(task, row)
+            if kanban_changed:
                 moved.append(task_id)
-        return moved
+            if execution_projection_changed or kanban_changed:
+                changed = True
+        return moved, changed
 
-    return mutate_moved(root, _mutator)
+    result = tasks_repository.mutate_tasks(
+        root, _mutator, persist_if=lambda value: value[1]
+    )
+    return result[0]
 
 
 def mutate_moved(root: Path, mutator) -> list[str]:
@@ -1742,6 +1845,11 @@ def _dispatch(
             project_configs,
             api,
             entry_ids=[d.entry_id for d in assigned],
+            executor_by_entry={
+                d.entry_id: d.executor_id
+                for d in assigned
+                if d.entry_id and d.executor_id
+            },
             timeout_seconds=settings.run_timeout_seconds,
         )
     except Exception as exc:  # noqa: BLE001 — a failed batch must not abort the tick
@@ -1965,6 +2073,31 @@ def _locked_tick(
     _advance("advance_post")
     tasks = _sync()
 
+    # 6b. Re-enqueue tasks sent back to "Ready" by the executor-fallback
+    #     auto-retry (AICC-DESKTOP-017). `sync_task_from_run` records the dead
+    #     executor in `failed_executors` and flips `launch_status` to "Ready"
+    #     when a run died on startup (no output, e.g. expired OAuth). The queue
+    #     entry for that run is still `launched`, so without a re-enqueue the
+    #     planner would never see the task again. `enqueue_and_persist` is
+    #     idempotent — it only creates a new entry when no open one exists.
+    reenqueued: list[str] = []
+    try:
+        tasks_by_id_sync = {t["id"]: t for t in tasks if t.get("id")}
+        for task in tasks:
+            if (
+                task.get("failed_executors")
+                and task.get("launch_status") == "Ready"
+                and task.get("status") != "Done"
+            ):
+                execution_queue.enqueue_and_persist(
+                    root, task, tasks_by_id_sync
+                )
+                reenqueued.append(task["id"])
+    except Exception as exc:  # noqa: BLE001
+        _record(exc, "reenqueue_executor_retry")
+    if reenqueued:
+        tasks = tasks_repository.load_tasks(root)
+
     # 7. Verified merge -> Kanban Done -> dependents become eligible.
     completed_task_ids: list[str] = []
     try:
@@ -2069,3 +2202,66 @@ def _locked_tick(
         completed_task_ids=tuple(completed_task_ids),
         errors=tuple(errors),
     )
+
+
+# ---------------------------------------------------------------------------
+# Background sync driver (audit MAJOR-8) — opt-in, off by default.
+#
+# The run->task Kanban projection is normally driven by an open Live Execution
+# Center page's refresh (see `app.py`'s `_maybe_run_autopilot_tick`), so with no
+# page open the projection freezes until someone looks again. That is fine for an
+# interactive operator — the board reconciles the instant it is opened — but
+# leaves a headless / unattended host (the same audience as
+# `AICC_COMPLETION_AUTOPILOT`) with stale task state. This optional daemon runs
+# one `tick` every `interval_seconds` so a backend keeps task state truthful with
+# nobody watching. The interactive app never starts it; a host opts in via
+# `AICC_BACKGROUND_SYNC` (see `app.py`'s `get_execution_center_api`).
+# ---------------------------------------------------------------------------
+
+_BACKGROUND_SYNC_INTERVAL_SECONDS = 15.0
+_background_sync_thread: threading.Thread | None = None
+_background_sync_stop: threading.Event | None = None
+
+
+def start_background_sync(
+    root: Path,
+    api,
+    project_configs_provider: Callable[[], dict[str, dict]],
+    *,
+    interval_seconds: float = _BACKGROUND_SYNC_INTERVAL_SECONDS,
+) -> None:
+    """Start a bounded, daemon background poller that runs one `tick` every
+    `interval_seconds`, keeping the run->task projection current even when no
+    page is open to drive it (audit MAJOR-8).
+
+    Idempotent: a second call while one is already running is a no-op. Reuses
+    `tick`'s host-wide `pipeline_lock`, so this poller and a live page's tick can
+    never interleave — whichever takes the lock does the work, the other returns
+    `TICK_BUSY` and skips. `project_configs_provider` is called fresh on every
+    tick (not captured once), so a project-config edit is picked up without a
+    restart. One bad tick is swallowed so a single fault never kills the poller —
+    the same contract as `Supervisor.start_completion_autopilot`."""
+    global _background_sync_thread, _background_sync_stop
+    if _background_sync_thread is not None and _background_sync_thread.is_alive():
+        return
+    stop = threading.Event()
+    _background_sync_stop = stop
+
+    def _loop() -> None:
+        while not stop.wait(interval_seconds):
+            try:
+                tick(root, api, project_configs_provider())
+            except Exception:  # noqa: BLE001 - one bad tick must never kill the poller
+                continue
+
+    thread = threading.Thread(target=_loop, name="aicc-background-sync", daemon=True)
+    _background_sync_thread = thread
+    thread.start()
+
+
+def stop_background_sync() -> None:
+    """Signal the background sync poller (if running) to stop after its current
+    wait. The thread is `daemon=True` and also dies with the process; this is the
+    graceful path used by tests and an orderly shutdown."""
+    if _background_sync_stop is not None:
+        _background_sync_stop.set()

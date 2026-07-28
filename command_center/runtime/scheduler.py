@@ -66,6 +66,7 @@ from typing import Mapping
 
 from command_center import agent_runner, executors, models
 from command_center.runtime import db
+from command_center.runtime import providers as runtime_providers
 
 # --------------------------------------------------------------------------
 # Actions & reason codes (the vocabulary of an explainable decision)
@@ -190,6 +191,23 @@ def capabilities_for_task_type(task_type: str) -> frozenset[str]:
     return frozenset({f"task_type:{task_type}", f"profile:{profile}"})
 
 
+def capabilities_for_executor(executor_id: str) -> frozenset[str]:
+    """Capabilities the real provider behind an executor can actually honor.
+
+    Most CLI providers can run both read-only and trusted-development profiles.
+    Ollama is intentionally different: its provider has no editor or shell and
+    rejects every task type outside ``READ_ONLY_TASK_TYPES``. Keeping that fact
+    in the scheduler registry prevents a plan that is guaranteed to fail at
+    launch time.
+    """
+    if executor_id == "ollama":
+        return frozenset(
+            {f"profile:{agent_runner.PROFILE_READ_ONLY}"}
+            | {f"task_type:{task_type}" for task_type in agent_runner.READ_ONLY_TASK_TYPES}
+        )
+    return frozenset({CAP_ANY})
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     """One registered execution agent — a capacity- and capability-bearing
@@ -248,8 +266,8 @@ class AgentRegistry:
 
 def default_registry(*, max_concurrency: int = 2) -> AgentRegistry:
     """A registry seeded from `executors.EXECUTORS`: every executor that has a
-    provider behind it becomes a general-purpose (`CAP_ANY`) agent whose id
-    equals its executor id.
+    provider behind it becomes an agent whose id equals its executor id and
+    whose advertised capabilities match the provider's real launch contract.
 
     Availability is carried on the `AgentSpec` rather than deciding membership,
     and that distinction is the whole point. `executor.available` is a *live
@@ -268,7 +286,7 @@ def default_registry(*, max_concurrency: int = 2) -> AgentRegistry:
         AgentSpec(
             agent_id=executor.id,
             executor_id=executor.id,
-            capabilities=frozenset({CAP_ANY}),
+            capabilities=capabilities_for_executor(executor.id),
             max_concurrency=max_concurrency,
             available=executor.available,
         )
@@ -336,6 +354,12 @@ class WorkItem:
     workspace: str
     required_capabilities: frozenset[str] = frozenset()
     priority: str = "Medium"
+    # Project/task authorization boundary. ``None`` means the caller supplied
+    # no allow-list; an explicit set restricts scheduling to exactly those
+    # agents. This is deliberately separate from ``preferred_agent``: an
+    # allow-list can contain Claude Code and Codex so the scheduler may choose
+    # the less-loaded compatible provider without ever escaping project policy.
+    allowed_agents: frozenset[str] | None = None
     preferred_agent: str | None = None
     dependencies_met: bool = True
     attempts_made: int = 0
@@ -687,7 +711,21 @@ def plan(
                 )
                 continue
             # RECOVERABLE from here — budget first, then backoff timing.
-            if item.attempts_made >= policy.max_attempts:
+            #
+            # Provider-unavailable failures (expired OAuth, exhausted quota,
+            # 5xx outage, startup crash, …) are *not* a signal about the task —
+            # they mean this executor cannot run it right now. `task_sync` has
+            # already recorded the dead provider in `failed_executors` and the
+            # next launch's `select_available_executor` will pick a live one, so
+            # the prior attempt carries no information about the next executor.
+            # Such an attempt must NOT consume the retry budget (otherwise a
+            # `max_run_attempts=1` config strands the task before failover can
+            # happen) and needs no backoff (a different agent is tried, not the
+            # same one). Fall through to normal assignment. Bounded by
+            # `failed_executors`: once every allowed executor has failed, the
+            # launch layer strands the task at LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR.
+            provider_unavailable = item.last_failure_reason in runtime_providers.PROVIDER_UNAVAILABLE_REASONS
+            if not provider_unavailable and item.attempts_made >= policy.max_attempts:
                 decisions.append(
                     SchedulingDecision(
                         action=ACTION_BLOCKED,
@@ -701,50 +739,60 @@ def plan(
                     )
                 )
                 continue
-            backoff = policy.backoff_seconds(item.attempts_made)
-            last_epoch = _to_epoch(item.last_completed_at)
-            if last_epoch is None or now_epoch is None:
-                # F4: recoverable, but the backoff deadline cannot be computed
-                # (missing/unparseable last_completed_at, or unparseable now).
-                # Fail safe — DEFER; never assign immediately, never fabricate
-                # a next_eligible_at.
-                decisions.append(
-                    SchedulingDecision(
-                        action=ACTION_DEFER,
-                        reason_code=REASON_RETRY_TIMING_UNKNOWN,
-                        explanation=(
-                            f"recoverable failure after attempt {item.attempts_made}, but the completion "
-                            "time is unknown so the backoff deadline cannot be computed; deferring rather "
-                            "than retrying immediately"
-                        ),
-                        failure_classification=RECOVERABLE,
-                        next_eligible_at=None,
-                        **base,
+            if not provider_unavailable:
+                backoff = policy.backoff_seconds(item.attempts_made)
+                last_epoch = _to_epoch(item.last_completed_at)
+                if last_epoch is None or now_epoch is None:
+                    # F4: recoverable, but the backoff deadline cannot be computed
+                    # (missing/unparseable last_completed_at, or unparseable now).
+                    # Fail safe — DEFER; never assign immediately, never fabricate
+                    # a next_eligible_at.
+                    decisions.append(
+                        SchedulingDecision(
+                            action=ACTION_DEFER,
+                            reason_code=REASON_RETRY_TIMING_UNKNOWN,
+                            explanation=(
+                                f"recoverable failure after attempt {item.attempts_made}, but the completion "
+                                "time is unknown so the backoff deadline cannot be computed; deferring rather "
+                                "than retrying immediately"
+                            ),
+                            failure_classification=RECOVERABLE,
+                            next_eligible_at=None,
+                            **base,
+                        )
                     )
-                )
-                continue
-            if now_epoch < last_epoch + backoff:
-                decisions.append(
-                    SchedulingDecision(
-                        action=ACTION_DEFER,
-                        reason_code=REASON_BACKOFF,
-                        explanation=(
-                            f"recoverable failure; backing off {backoff:.0f}s after attempt "
-                            f"{item.attempts_made} before the next attempt"
-                        ),
-                        failure_classification=RECOVERABLE,
-                        next_eligible_at=_iso_add(item.last_completed_at, backoff),
-                        **base,
+                    continue
+                if now_epoch < last_epoch + backoff:
+                    decisions.append(
+                        SchedulingDecision(
+                            action=ACTION_DEFER,
+                            reason_code=REASON_BACKOFF,
+                            explanation=(
+                                f"recoverable failure; backing off {backoff:.0f}s after attempt "
+                                f"{item.attempts_made} before the next attempt"
+                            ),
+                            failure_classification=RECOVERABLE,
+                            next_eligible_at=_iso_add(item.last_completed_at, backoff),
+                            **base,
+                        )
                     )
-                )
-                continue
+                    continue
             # else: backoff already elapsed — fall through to normal assignment
-            # as a fresh attempt (attempt number attempts_made + 1).
+            # as a fresh attempt (attempt number attempts_made + 1). For a
+            # provider-unavailable failure, fall through immediately (no budget,
+            # no backoff) so the next available executor is tried right away.
 
         # 4) Capability match — structural. No capable agent is BLOCKED.
         if item.preferred_agent is not None:
             preferred = registry.get(item.preferred_agent)
-            if preferred is None or not preferred.can_run(item.required_capabilities):
+            if (
+                preferred is None
+                or (
+                    item.allowed_agents is not None
+                    and preferred.agent_id not in item.allowed_agents
+                )
+                or not preferred.can_run(item.required_capabilities)
+            ):
                 decisions.append(
                     SchedulingDecision(
                         action=ACTION_BLOCKED,
@@ -760,6 +808,8 @@ def plan(
             capable = [preferred]
         else:
             capable = registry.capable_agents(item.required_capabilities)
+            if item.allowed_agents is not None:
+                capable = [a for a in capable if a.agent_id in item.allowed_agents]
         if not capable:
             decisions.append(
                 SchedulingDecision(
@@ -872,13 +922,11 @@ def build_load_snapshot(db_path, *, agent_of_run=None) -> LoadSnapshot:
     `RUNNING`), so the workspace exclusivity the planner enforces exactly
     matches the DB workspace lock's own active-state set.
 
-    Run rows do not record which *agent* executed them (the v1 schema predates
-    this layer and is intentionally left frozen), so per-agent running counts
-    are attributed via `agent_of_run(run) -> agent_id`, defaulting every
-    active run to the `claude_code` agent — the only one that runs anything
-    today."""
+    Current run rows persist ``provider_id`` at launch, so the default
+    attribution uses that authoritative value. ``agent_of_run`` remains an
+    override for callers with a custom agent registry."""
     if agent_of_run is None:
-        agent_of_run = lambda run: "claude_code"  # noqa: E731 — trivial default resolver
+        agent_of_run = lambda run: run.get("provider_id") or "claude_code"  # noqa: E731
     rows = db.list_runs(db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
     running_by_agent: dict[str, int] = {}
     busy: set[str] = set()

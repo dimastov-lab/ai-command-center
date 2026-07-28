@@ -1,0 +1,4 @@
+# Native desktop shell (command_center.desktop) dependencies.
+# Kept separate from requirements.txt, which stays Streamlit-only until a later
+# decision to unify (DESKTOP_INCREMENT_1.md D1 / IMPLEMENTATION_ROADMAP.md D1A).
+PySide6>=6.6,<7.0

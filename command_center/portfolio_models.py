@@ -351,6 +351,17 @@ def _parse_scalar(raw: str, *, field_name: str, source_path: Path) -> Any:
         return int(raw)
     if _FLOAT_RE.match(raw):
         return float(raw)
+    # Fail closed on a YAML-style inline comment (` # ...`) or a value that is
+    # itself only a comment (`# ...`): this flat subset does not strip comments,
+    # so an unquoted trailing `# note` would otherwise silently become part of
+    # the scalar (`status: ready # note` -> "ready # note"), violating the
+    # module's fail-closed principle (Founder Functional Audit MINOR-3). A
+    # `#` inside a quoted string was already returned verbatim above.
+    if raw.startswith("#") or " #" in raw or "\t#" in raw:
+        raise PortfolioCardError(
+            f"{source_path}: field {field_name!r} has an inline `#` comment in {raw!r} — "
+            "comments are not stripped by this flat parser; remove the comment or quote the value"
+        )
     return raw
 
 

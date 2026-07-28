@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Command Center — Kanban Prototype (static, local-only)</title>
+<style>
+/* ==========================================================================
+   Static, local-only visual prototype for docs/ux/KANBAN_REDESIGN.md and
+   docs/ux/DESIGN_SYSTEM.md. No external dependencies (fonts, scripts, CDNs).
+   Not wired into any production code — for founder review only.
+   ========================================================================== */
+
+:root {
+  --space-xs: 4px; --space-sm: 8px; --space-md: 12px; --space-lg: 16px; --space-xl: 24px; --space-xxl: 32px;
+  --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px;
+  --type-page-title: 20px; --type-card-title: 15px; --type-body: 14px; --type-caption: 12px; --type-overline: 11px; --type-mono: 13px;
+
+  --surface-page: #F7F8FA;
+  --surface-sunken: #EEF0F3;
+  --surface-card: #FFFFFF;
+  --surface-card-hover: #FBFBFC;
+  --surface-overlay: #FFFFFF;
+  --surface-selected: #EEF2FF;
+  --border-hairline: #E2E4E9;
+  --text-primary: #14161A;
+  --text-secondary: #5B6270;
+  --text-tertiary: #8A90A0;
+  --color-accent: #4F46E5;
+
+  --status-neutral: #6B7280; --status-neutral-bg: #F1F2F4;
+  --status-info: #2563EB; --status-info-bg: #EAF1FE;
+  --status-active: #2563EB; --status-active-bg: #EAF1FE;
+  --status-warning: #D97706; --status-warning-bg: #FDF3E3;
+  --status-danger: #DC2626; --status-danger-bg: #FCEAEA;
+  --status-success: #16A34A; --status-success-bg: #E9F7EE;
+
+  --shadow-raised: 0 4px 16px rgba(0,0,0,0.08);
+}
+
+:root[data-theme="dark"] {
+  --surface-page: #14161A;
+  --surface-sunken: #0E0F12;
+  --surface-card: #1B1E24;
+  --surface-card-hover: #20232A;
+  --surface-overlay: #22252C;
+  --surface-selected: #1E2340;
+  --border-hairline: #2A2E37;
+  --text-primary: #F1F2F5;
+  --text-secondary: #A6ACB9;
+  --text-tertiary: #767C8A;
+  --color-accent: #818CF8;
+
+  --status-neutral: #9CA3AF; --status-neutral-bg: #23262D;
+  --status-info: #60A5FA; --status-info-bg: #16223A;
+  --status-active: #60A5FA; --status-active-bg: #16223A;
+  --status-warning: #FBBF24; --status-warning-bg: #2E2513;
+  --status-danger: #F87171; --status-danger-bg: #331A1A;
+  --status-success: #4ADE80; --status-success-bg: #12271A;
+
+  --shadow-raised: 0 4px 16px rgba(0,0,0,0.4);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --surface-page: #14161A; --surface-sunken: #0E0F12; --surface-card: #1B1E24;
+    --surface-card-hover: #20232A; --surface-overlay: #22252C; --surface-selected: #1E2340;
+    --border-hairline: #2A2E37; --text-primary: #F1F2F5; --text-secondary: #A6ACB9;
+    --text-tertiary: #767C8A; --color-accent: #818CF8;
+    --status-neutral: #9CA3AF; --status-neutral-bg: #23262D;
+    --status-info: #60A5FA; --status-info-bg: #16223A;
+    --status-active: #60A5FA; --status-active-bg: #16223A;
+    --status-warning: #FBBF24; --status-warning-bg: #2E2513;
+    --status-danger: #F87171; --status-danger-bg: #331A1A;
+    --status-success: #4ADE80; --status-success-bg: #12271A;
+    --shadow-raised: 0 4px 16px rgba(0,0,0,0.4);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-family: -apple-system, "Segoe UI", "Source Sans Pro", Helvetica, Arial, sans-serif;
+  font-size: var(--type-body);
+  overflow-x: hidden;
+}
+
+.shell { display: flex; flex-direction: column; height: 100vh; }
+
+/* ---------- Command Bar ---------- */
+.command-bar {
+  height: 48px; flex: 0 0 48px;
+  display: flex; align-items: center; gap: var(--space-lg);
+  padding: 0 var(--space-lg);
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--surface-card);
+}
+.command-bar .wordmark { font-weight: 700; font-size: 15px; display:flex; align-items:center; gap:6px; color: var(--text-primary); }
+.command-bar .wordmark .dot { width:8px; height:8px; border-radius:50%; background: var(--color-accent); }
+.command-bar .page-title { font-size: var(--type-page-title); font-weight: 600; }
+.command-bar .search {
+  margin-left: auto; display: flex; align-items: center; gap: var(--space-sm);
+  background: var(--surface-sunken); border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg); padding: 6px 12px; color: var(--text-tertiary);
+  font-size: var(--type-caption); min-width: 260px;
+}
+.command-bar .search kbd {
+  margin-left: auto; font-family: inherit; font-size: 10px; background: var(--surface-card);
+  border: 1px solid var(--border-hairline); border-radius: 4px; padding: 1px 5px; color: var(--text-tertiary);
+}
+.command-bar .status-glyph {
+  display: flex; align-items: center; gap: 6px; font-size: var(--type-caption); color: var(--text-secondary);
+  padding: 4px 10px; border-radius: var(--radius-sm); border: 1px solid var(--border-hairline);
+}
+.command-bar .status-glyph .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--status-active); animation: pulse 1.6s infinite; }
+.theme-toggle {
+  border: 1px solid var(--border-hairline); background: var(--surface-sunken); color: var(--text-secondary);
+  border-radius: var(--radius-sm); padding: 5px 10px; font-size: var(--type-caption); cursor: pointer;
+}
+
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* ---------- Body layout ---------- */
+.body-row { display: flex; flex: 1 1 auto; min-height: 0; }
+
+/* ---------- Sidebar ---------- */
+.sidebar {
+  width: 232px; flex: 0 0 232px;
+  background: var(--surface-sunken);
+  border-right: 1px solid var(--border-hairline);
+  padding: var(--space-lg) var(--space-md);
+  overflow-y: auto;
+}
+.nav-group { margin-bottom: var(--space-lg); }
+.nav-group .label {
+  font-size: var(--type-overline); text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-tertiary); font-weight: 600; padding: 0 var(--space-sm); margin-bottom: 6px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: var(--space-sm);
+  padding: 7px var(--space-sm); border-radius: var(--radius-sm);
+  color: var(--text-secondary); font-size: var(--type-body); cursor: pointer;
+}
+.nav-item:hover { background: var(--surface-card-hover); }
+.nav-item.active { background: var(--surface-selected); color: var(--color-accent); font-weight: 600; border: 1px solid var(--color-accent); }
+.nav-item .glyph { width: 16px; text-align: center; opacity: 0.8; }
+
+/* ---------- Central workspace ---------- */
+.workspace { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.workspace-scroll { flex: 1 1 auto; overflow-y: auto; padding: var(--space-xl); }
+
+.project-pills { display: flex; gap: var(--space-sm); margin-bottom: var(--space-lg); flex-wrap: wrap; }
+.pill {
+  padding: 6px 14px; border-radius: 999px; border: 1px solid var(--border-hairline);
+  font-size: var(--type-caption); color: var(--text-secondary); background: var(--surface-card);
+}
+.pill.active { background: var(--color-accent); color: white; border-color: var(--color-accent); font-weight: 600; }
+
+/* ---------- KPI strip ---------- */
+.kpi-strip { display: grid; grid-template-columns: repeat(6, 1fr); gap: var(--space-md); margin-bottom: var(--space-xl); }
+.kpi-card {
+  background: var(--surface-card); border: 1px solid var(--border-hairline); border-radius: var(--radius-md);
+  padding: var(--space-md) var(--space-lg);
+}
+.kpi-card .label { font-size: var(--type-overline); text-transform: uppercase; color: var(--text-tertiary); letter-spacing: 0.03em; }
+.kpi-card .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+.kpi-card .value.good { color: var(--status-success); }
+.kpi-card .value.risk { color: var(--status-danger); }
+
+/* ---------- Section headers ---------- */
+.section-header { display: flex; align-items: baseline; gap: var(--space-sm); margin-bottom: var(--space-md); }
+.section-header h2 { font-size: 16px; margin: 0; font-weight: 600; }
+.section-header .count { font-size: var(--type-caption); color: var(--text-tertiary); }
+
+/* ---------- Recommendations rail ---------- */
+.reco-rail { display: flex; gap: var(--space-lg); overflow-x: auto; padding-bottom: var(--space-sm); margin-bottom: var(--space-xl); }
+.reco-card {
+  flex: 0 0 320px; background: var(--surface-card); border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md); padding: var(--space-lg);
+}
+.reco-card .title { font-size: var(--type-card-title); font-weight: 600; margin-bottom: 2px; }
+.reco-card .meta { font-size: var(--type-caption); color: var(--text-secondary); margin-bottom: var(--space-sm); }
+.reco-card .reason { font-size: var(--type-caption); color: var(--text-tertiary); margin-bottom: 4px; }
+.reco-actions { display: flex; gap: var(--space-sm); margin-top: var(--space-md); }
+.btn {
+  border-radius: var(--radius-sm); border: 1px solid var(--border-hairline); background: var(--surface-card);
+  color: var(--text-primary); font-size: var(--type-caption); padding: 7px 12px; cursor: pointer; flex: 1;
+  text-align: center; font-weight: 500;
+}
+.btn.primary { background: var(--color-accent); border-color: var(--color-accent); color: white; }
+.btn.danger { background: var(--status-danger); border-color: var(--status-danger); color: white; }
+
+/* ---------- Kanban board ---------- */
+.board-scroll { overflow-x: auto; padding-bottom: var(--space-md); }
+.board { display: flex; gap: var(--space-xl); min-width: max-content; align-items: flex-start; }
+.column { width: 320px; flex: 0 0 320px; }
+.column-header { display: flex; align-items: center; gap: var(--space-sm); padding: 0 4px var(--space-md); }
+.column-header .name { font-size: var(--type-card-title); font-weight: 600; }
+.column-header .count-badge {
+  background: var(--status-neutral-bg); color: var(--status-neutral); font-size: 11px; font-weight: 600;
+  border-radius: 999px; padding: 1px 8px;
+}
+.card-stack { display: flex; flex-direction: column; gap: var(--space-md); }
+
+.task-card {
+  background: var(--surface-card); border: 1px solid var(--border-hairline); border-radius: var(--radius-md);
+  padding: var(--space-md); cursor: pointer; transition: background 0.1s ease;
+}
+.task-card:hover { background: var(--surface-card-hover); }
+.task-card.selected { border-color: var(--color-accent); background: var(--surface-selected); }
+.task-card .title { font-size: var(--type-card-title); font-weight: 600; line-height: 1.3; margin-bottom: 4px; }
+.task-card .meta { font-size: var(--type-caption); color: var(--text-tertiary); margin-bottom: var(--space-sm); }
+
+.progress-wrap { margin-bottom: var(--space-sm); }
+.progress-track { height: 5px; background: var(--surface-sunken); border-radius: 999px; overflow: hidden; margin-bottom: 3px; }
+.progress-fill { height: 100%; background: var(--status-active); border-radius: 999px; }
+.progress-label { font-size: 11px; color: var(--text-tertiary); }
+
+.badge-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.badge-row:last-child { margin-bottom: 0; }
+.badge {
+  display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 500;
+  padding: 3px 8px; border-radius: var(--radius-sm); white-space: nowrap;
+}
+.badge.b-neutral { background: var(--status-neutral-bg); color: var(--status-neutral); }
+.badge.b-info    { background: var(--status-info-bg); color: var(--status-info); }
+.badge.b-warning { background: var(--status-warning-bg); color: var(--status-warning); }
+.badge.b-danger  { background: var(--status-danger-bg); color: var(--status-danger); }
+.badge.b-success { background: var(--status-success-bg); color: var(--status-success); }
+.badge .live-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse 1.6s infinite; }
+
+.readiness-note { font-size: 11px; color: var(--status-danger); margin-top: 2px; }
+.empty-column { border: 1px dashed var(--border-hairline); border-radius: var(--radius-md); padding: var(--space-lg); text-align: center; color: var(--text-tertiary); font-size: var(--type-caption); }
+
+/* ---------- Execution strip ---------- */
+.execution-strip {
+  flex: 0 0 auto; border-top: 1px solid var(--border-hairline); background: var(--surface-sunken);
+}
+.strip-summary {
+  display: flex; align-items: center; gap: var(--space-lg); padding: var(--space-sm) var(--space-xl);
+  font-size: var(--type-caption); color: var(--text-secondary); cursor: pointer;
+}
+.strip-summary strong { color: var(--text-primary); }
+.strip-summary .chip { display:flex; align-items:center; gap:6px; }
+.strip-summary .chip .dot { width:6px; height:6px; border-radius:50%; }
+.strip-summary .expand-hint { margin-left: auto; color: var(--text-tertiary); }
+.strip-body { display: none; padding: 0 var(--space-xl) var(--space-lg); gap: var(--space-md); }
+.strip-body.open { display: flex; }
+.strip-item {
+  flex: 0 0 260px; background: var(--surface-card); border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md); padding: var(--space-md); font-size: var(--type-caption);
+}
+.strip-item .t { font-weight: 600; font-size: var(--type-body); margin-bottom: 4px; }
+
+/* ---------- Inspector (right panel) ---------- */
+.inspector {
+  width: 0; flex: 0 0 0; overflow: hidden; border-left: 1px solid var(--border-hairline);
+  background: var(--surface-card); transition: width 0.15s ease, flex-basis 0.15s ease;
+}
+.inspector.open { width: 360px; flex: 0 0 360px; overflow-y: auto; }
+.inspector-header { display: flex; align-items: center; justify-content: space-between; padding: var(--space-lg); border-bottom: 1px solid var(--border-hairline); }
+.inspector-header .t { font-size: var(--type-card-title); font-weight: 700; padding-right: var(--space-md); }
+.inspector-header .close { cursor: pointer; color: var(--text-tertiary); font-size: 18px; line-height:1; background:none; border:none; }
+.inspector-section { padding: var(--space-lg); border-bottom: 1px solid var(--border-hairline); }
+.inspector-section h4 { margin: 0 0 var(--space-sm); font-size: var(--type-overline); text-transform: uppercase; color: var(--text-tertiary); letter-spacing: 0.03em; }
+.inspector-section .row { display: flex; justify-content: space-between; font-size: var(--type-caption); padding: 3px 0; color: var(--text-secondary); }
+.inspector-section .row .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--text-primary); }
+.inspector-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: var(--space-lg); }
+.inspector-footer { display: flex; gap: var(--space-sm); padding: var(--space-lg); }
+.select-fake { flex: 1; border: 1px solid var(--border-hairline); border-radius: var(--radius-sm); padding: 7px 10px; font-size: var(--type-caption); background: var(--surface-sunken); }
+
+footer.note {
+  padding: var(--space-sm) var(--space-xl); font-size: 11px; color: var(--text-tertiary);
+  border-top: 1px solid var(--border-hairline); background: var(--surface-card);
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <div class="command-bar">
+    <div class="wordmark"><span class="dot"></span> AI Command Center</div>
+    <div class="page-title">Kanban</div>
+    <div class="search">🔎 Найти команду или страницу… <kbd>⌘K</kbd></div>
+    <div class="status-glyph"><span class="pulse"></span> 2 запущено · 3 в очереди</div>
+    <button class="theme-toggle" onclick="toggleTheme()">☾ / ☀</button>
+  </div>
+
+  <div class="body-row">
+
+    <div class="sidebar">
+      <div class="nav-group">
+        <div class="label">Overview</div>
+        <div class="nav-item"><span class="glyph">◧</span> Обзор</div>
+        <div class="nav-item"><span class="glyph">⌂</span> Workspace Home</div>
+        <div class="nav-item"><span class="glyph">✺</span> Исполнительная панель</div>
+      </div>
+      <div class="nav-group">
+        <div class="label">Plan</div>
+        <div class="nav-item active"><span class="glyph">▤</span> Kanban</div>
+        <div class="nav-item"><span class="glyph">✎</span> Создать задачу</div>
+      </div>
+      <div class="nav-group">
+        <div class="label">Execute</div>
+        <div class="nav-item"><span class="glyph">⚡</span> Live Execution Center</div>
+        <div class="nav-item"><span class="glyph">≡</span> Журнал запусков</div>
+        <div class="nav-item"><span class="glyph">◎</span> Focus Mode</div>
+        <div class="nav-item"><span class="glyph">🤖</span> AI-агенты</div>
+      </div>
+      <div class="nav-group">
+        <div class="label">Git &amp; Context</div>
+        <div class="nav-item"><span class="glyph">⎇</span> Git Center</div>
+        <div class="nav-item"><span class="glyph">🚀</span> Workspace Launcher</div>
+        <div class="nav-item"><span class="glyph">📁</span> Проекты</div>
+        <div class="nav-item"><span class="glyph">📄</span> Сгенерированные задачи</div>
+        <div class="nav-item"><span class="glyph">🗒</span> Отчёты</div>
+        <div class="nav-item"><span class="glyph">📚</span> Глобальный контекст</div>
+      </div>
+      <div class="nav-group">
+        <div class="label">Chat</div>
+        <div class="nav-item"><span class="glyph">💬</span> Чат по проекту</div>
+      </div>
+    </div>
+
+    <div class="workspace">
+      <div class="workspace-scroll">
+
+        <div class="project-pills">
+          <div class="pill active">Все проекты · 24</div>
+          <div class="pill">AICOS · 9</div>
+          <div class="pill">AIOS · 6</div>
+          <div class="pill">BANK · 4</div>
+          <div class="pill">LEGAL · 2</div>
+          <div class="pill">BUSINESS · 2</div>
+          <div class="pill">PERSONAL · 1</div>
+        </div>
+
+        <div class="kpi-strip">
+          <div class="kpi-card"><div class="label">Здоровье</div><div class="value good">🟢 Good</div></div>
+          <div class="kpi-card"><div class="label">Прогресс спринта</div><div class="value">62%</div></div>
+          <div class="kpi-card"><div class="label">Roadmap</div><div class="value">41%</div></div>
+          <div class="kpi-card"><div class="label">Осталось</div><div class="value">14</div></div>
+          <div class="kpi-card"><div class="label">Заблокировано</div><div class="value risk">2</div></div>
+          <div class="kpi-card"><div class="label">Завершено</div><div class="value">37%</div></div>
+        </div>
+
+        <div class="section-header"><h2>Рекомендованные задачи</h2></div>
+        <div class="reco-rail">
+          <div class="reco-card">
+            <div class="title">Fix sort order regression in Kanban</div>
+            <div class="meta">AICOS · приоритет High</div>
+            <div class="reason">Почему: разблокирует 2 задачи; высокий приоритет</div>
+            <div class="reco-actions">
+              <div class="btn">В очередь</div>
+              <div class="btn primary">Запустить</div>
+            </div>
+          </div>
+          <div class="reco-card">
+            <div class="title">Add dependency graph to Inspector</div>
+            <div class="meta">AICOS · приоритет Medium</div>
+            <div class="reason">Почему: без блокирующих зависимостей</div>
+            <div class="reco-actions">
+              <div class="btn">В очередь</div>
+              <div class="btn primary">Запустить</div>
+            </div>
+          </div>
+          <div class="reco-card">
+            <div class="title">Draft LEGAL onboarding checklist</div>
+            <div class="meta">LEGAL · приоритет Low</div>
+            <div class="reason">Почему: давно в Backlog</div>
+            <div class="reco-actions">
+              <div class="btn">В очередь</div>
+              <div class="btn primary">Запустить</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-header"><h2>Kanban</h2></div>
+        <div class="board-scroll">
+          <div class="board">
+
+            <div class="column">
+              <div class="column-header"><span class="name">Backlog</span><span class="count-badge">4</span></div>
+              <div class="card-stack">
+                <div class="task-card">
+                  <div class="title">Draft LEGAL onboarding checklist</div>
+                  <div class="meta">LEGAL · implementation</div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">Low</span>
+                    <span class="badge b-neutral">dc</span>
+                    <span class="badge b-neutral">2h</span>
+                  </div>
+                </div>
+                <div class="task-card">
+                  <div class="title">Investigate flaky git-status cache in Focus Mode under concurrent tab refresh</div>
+                  <div class="meta">AIOS · bugfix</div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">Medium</span>
+                    <span class="badge b-neutral">5h</span>
+                  </div>
+                </div>
+                <div class="empty-column" style="padding:8px; font-size:11px;">+ 2 ещё</div>
+              </div>
+            </div>
+
+            <div class="column">
+              <div class="column-header"><span class="name">Next</span><span class="count-badge">3</span></div>
+              <div class="card-stack">
+                <div class="task-card">
+                  <div class="title">Add dependency graph to Inspector</div>
+                  <div class="meta">AICOS · implementation</div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">Medium</span>
+                    <span class="badge b-neutral">dc</span>
+                    <span class="badge b-neutral">4h</span>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-success">Зависимости выполнены</span>
+                  </div>
+                </div>
+                <div class="task-card">
+                  <div class="title">Wire queue-state dot on compact task card</div>
+                  <div class="meta">AICOS · implementation</div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">High</span>
+                    <span class="badge b-neutral">3h</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="column">
+              <div class="column-header"><span class="name">In Progress</span><span class="count-badge">2</span></div>
+              <div class="card-stack">
+                <div class="task-card selected">
+                  <div class="title">Fix sort order regression in Kanban</div>
+                  <div class="meta">AICOS · bugfix</div>
+                  <div class="progress-wrap">
+                    <div class="progress-track"><div class="progress-fill" style="width:45%"></div></div>
+                    <div class="progress-label">Implementation — 45%</div>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">High</span>
+                    <span class="badge b-neutral">dc</span>
+                    <span class="badge b-neutral">3h</span>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-info"><span class="live-dot"></span> Running</span>
+                    <span class="badge b-neutral">claude-code</span>
+                    <span class="badge b-neutral">fix/kanban-sort</span>
+                  </div>
+                </div>
+                <div class="task-card">
+                  <div class="title">Rebuild recommendation ranking against stale queue state</div>
+                  <div class="meta">BANK · implementation</div>
+                  <div class="progress-wrap">
+                    <div class="progress-track"><div class="progress-fill" style="width:15%; background: var(--status-warning)"></div></div>
+                    <div class="progress-label">Workspace Verified — 15%</div>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">Critical</span>
+                    <span class="badge b-neutral">2h</span>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-warning">Requires Attention</span>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-danger">⛔ Заблокировано</span>
+                  </div>
+                  <div class="readiness-note">Ожидает: Add dependency graph to Inspector</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="column">
+              <div class="column-header"><span class="name">Review</span><span class="count-badge">1</span></div>
+              <div class="card-stack">
+                <div class="task-card">
+                  <div class="title">Migrate Actions expander content into Inspector</div>
+                  <div class="meta">AICOS · implementation</div>
+                  <div class="progress-wrap">
+                    <div class="progress-track"><div class="progress-fill" style="width:90%; background: var(--status-success)"></div></div>
+                    <div class="progress-label">Tests Passed — 90%</div>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">High</span>
+                    <span class="badge b-neutral">6h</span>
+                  </div>
+                  <div class="badge-row">
+                    <span class="badge b-success">Одобрено для commit</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="column">
+              <div class="column-header"><span class="name">Done</span><span class="count-badge">14</span></div>
+              <div class="card-stack">
+                <div class="task-card">
+                  <div class="title">Bridge Kanban Launch onto v2 Session Supervisor</div>
+                  <div class="meta">AICOS · implementation</div>
+                  <div class="badge-row">
+                    <span class="badge b-neutral">High</span>
+                    <span class="badge b-neutral">8h</span>
+                  </div>
+                </div>
+                <div class="empty-column" style="padding:8px; font-size:11px;">+ 13 ещё</div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </div>
+
+      <div class="execution-strip">
+        <div class="strip-summary" onclick="toggleStrip()">
+          <span class="chip"><span class="dot" style="background: var(--status-active)"></span> 2 запущено</span>
+          <span class="chip"><span class="dot" style="background: var(--status-neutral)"></span> 3 в очереди</span>
+          <span class="chip"><span class="dot" style="background: var(--status-warning)"></span> 1 требует внимания</span>
+          <span class="expand-hint" id="strip-hint">развернуть ▾</span>
+        </div>
+        <div class="strip-body" id="strip-body">
+          <div class="strip-item">
+            <div class="t">Fix sort order regression in Kanban</div>
+            run <span style="font-family:monospace">a1b2c3d4</span> · claude-code · 45%
+          </div>
+          <div class="strip-item">
+            <div class="t">Rebuild recommendation ranking</div>
+            run <span style="font-family:monospace">f9e8d7c6</span> · требует внимания
+          </div>
+          <div class="strip-item">
+            <div class="t">Очередь · готово к запуску</div>
+            2 задачи · <span style="color:var(--color-accent); font-weight:600;">Запустить готовые</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="inspector open" id="inspector">
+      <div class="inspector-header">
+        <div class="t">Fix sort order regression in Kanban</div>
+        <button class="close" onclick="document.getElementById('inspector').classList.toggle('open')">×</button>
+      </div>
+      <div class="inspector-section">
+        <div class="badge-row">
+          <span class="badge b-neutral">High</span>
+          <span class="badge b-neutral">dc</span>
+          <span class="badge b-neutral">3h</span>
+        </div>
+        <div class="badge-row">
+          <span class="badge b-info"><span class="live-dot"></span> Running</span>
+          <span class="badge b-neutral">claude-code</span>
+          <span class="badge b-neutral">fix/kanban-sort</span>
+        </div>
+      </div>
+      <div class="inspector-section">
+        <h4>Overview</h4>
+        <div class="row"><span>ID</span><span class="mono">a1b2c3d4</span></div>
+        <div class="row"><span>Стадия workflow</span><span>Финальная проверка</span></div>
+        <div class="row"><span>Репозиторий</span><span class="mono">~/aicc</span></div>
+        <div class="row"><span>Workspace</span><span class="mono">~/aicc/.worktrees/fix-sort</span></div>
+        <div class="row"><span>Git</span><span class="mono">чисто</span></div>
+      </div>
+      <div class="inspector-actions">
+        <div class="btn">Workspace</div>
+        <div class="btn">Git</div>
+        <div class="btn">Промпт</div>
+        <div class="btn">Отчёт</div>
+        <div class="btn">В очередь</div>
+        <div class="btn danger">Cancel</div>
+      </div>
+      <div class="inspector-footer">
+        <div class="select-fake">Статус: In Progress ▾</div>
+        <div class="btn danger" style="flex: 0 0 auto; padding: 7px 16px;">Удалить</div>
+      </div>
+    </div>
+
+  </div>
+
+  <footer class="note">
+    Статический прототип, только для локального просмотра · docs/ux/prototype/index.html · нет внешних зависимостей · не подключён к продакшн-коду
+  </footer>
+</div>
+
+<script>
+function toggleTheme() {
+  const root = document.documentElement;
+  const current = root.getAttribute('data-theme');
+  if (current === 'dark') { root.setAttribute('data-theme', 'light'); }
+  else if (current === 'light') { root.setAttribute('data-theme', 'dark'); }
+  else {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    root.setAttribute('data-theme', prefersDark ? 'light' : 'dark');
+  }
+}
+function toggleStrip() {
+  const body = document.getElementById('strip-body');
+  const hint = document.getElementById('strip-hint');
+  const open = body.classList.toggle('open');
+  hint.textContent = open ? 'свернуть ▴' : 'развернуть ▾';
+}
+</script>
+</body>
+</html>
