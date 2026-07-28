@@ -65,6 +65,8 @@ class ExecutionCenterAPI:
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
         executor_id: str = "claude_code",
         max_global_concurrency: int | None = None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -109,6 +111,8 @@ class ExecutionCenterAPI:
             executor_id=executor_id,
             canonical_repository_path=project_config.get_project_config(project).get("repository_path"),
             max_global_concurrency=max_global_concurrency,
+            untrusted=untrusted,
+            operator_elevated=operator_elevated,
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)

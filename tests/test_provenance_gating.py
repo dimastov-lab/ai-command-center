@@ -87,6 +87,29 @@ def test_build_command_untrusted_but_operator_elevated_keeps_full_development():
     assert "bypassPermissions" in cmd
 
 
+def test_claude_provider_build_launch_untrusted_drops_bypass_and_bash(tmp_path):
+    from command_center.runtime import providers
+
+    spec = providers.ClaudeProvider().build_launch(
+        repository_path=tmp_path, session_id="s", prompt="p",
+        task_type="implementation", is_resume=False, model=None, untrusted=True,
+    )
+    argv = list(spec.argv)
+    assert "bypassPermissions" not in argv
+    assert "--tools" in argv
+    assert "--disallowedTools" not in argv
+
+
+def test_claude_provider_build_launch_trusted_keeps_full_development(tmp_path):
+    from command_center.runtime import providers
+
+    spec = providers.ClaudeProvider().build_launch(
+        repository_path=tmp_path, session_id="s", prompt="p",
+        task_type="implementation", is_resume=False, model=None,
+    )
+    assert "bypassPermissions" in list(spec.argv)
+
+
 def test_is_untrusted_source():
     # An imported task carries its package's provenance label; an in-app task
     # has no source.

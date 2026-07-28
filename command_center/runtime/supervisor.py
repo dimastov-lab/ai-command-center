@@ -477,6 +477,8 @@ class Supervisor:
         executor_id: str = providers.CLAUDE_ID,
         canonical_repository_path: str | None = None,
         max_global_concurrency: int | None = None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> dict:
         """Prepare and launch a run from an already-final `prompt` string.
 
@@ -656,6 +658,8 @@ class Supervisor:
                 task_type=task_type,
                 is_resume=is_resume,
                 model=model,
+                untrusted=untrusted,
+                operator_elevated=operator_elevated,
             )
         except (RuntimeError, ValueError) as exc:
             raise ProviderUnavailableError(str(exc)) from exc
