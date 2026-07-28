@@ -571,7 +571,9 @@ def test_terminal_completion_rows_are_never_repolicied(tmp_path, git_repo, api):
 # --------------------------------------------------------------------------
 
 
-def test_verified_completion_moves_the_task_to_done(tmp_path, git_repo, api):
+def test_local_only_completion_moves_the_task_to_done_without_claiming_merge(
+    tmp_path, git_repo, api
+):
     row = _seed_completion(api, git_repo)
     runtime_db.update_completion(
         api.db_path,
@@ -587,8 +589,9 @@ def test_verified_completion_moves_the_task_to_done(tmp_path, git_repo, api):
     persisted = {t["id"]: t for t in tasks_repository.load_tasks(tmp_path)}
     assert persisted["a"]["status"] == "Done"
     assert persisted["a"]["launch_status"] == "Completed"
-    assert persisted["a"]["current_stage"] == "Merged"
+    assert persisted["a"]["current_stage"] == "Completed Locally"
     assert persisted["a"]["progress"] == 100
+    assert persisted["a"].get("pull_request_status") != "merged"
 
 
 def test_verified_completion_repairs_stale_execution_fields_on_done_task(

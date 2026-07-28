@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from command_center import models
+from command_center.runtime import api as runtime_api
+from command_center.runtime import db as runtime_db
 from command_center.runtime import task_sync
 
 
@@ -176,6 +178,8 @@ def test_completed_without_merge_evidence_is_not_labelled_merged():
     completion = {"completion_state": "COMPLETED", "pull_request_url": None, "merge_commit": None}
     task_sync.sync_task_from_completion(task, completion)
     assert task.get("pull_request_status") != "merged"
+    assert task["current_stage"] == "Completed Locally"
+    assert task["progress"] == 100
 
 
 def test_local_only_completion_timeline_does_not_claim_merge():
@@ -190,6 +194,7 @@ def test_completed_with_merge_commit_is_labelled_merged():
     completion = {"completion_state": "COMPLETED", "pull_request_url": None, "merge_commit": "abc1234"}
     assert task_sync.sync_task_from_completion(task, completion) is True
     assert task["pull_request_status"] == "merged"
+    assert task["current_stage"] == "Merged"
 
 
 def test_completed_with_pull_request_url_is_labelled_merged():
@@ -197,3 +202,82 @@ def test_completed_with_pull_request_url_is_labelled_merged():
     completion = {"completion_state": "COMPLETED", "pull_request_url": "https://github.com/x/y/pull/7"}
     task_sync.sync_task_from_completion(task, completion)
     assert task["pull_request_status"] == "merged"
+    assert task["current_stage"] == "Merged"
+
+
+def test_local_only_completion_repairs_legacy_false_merged_stage():
+    task = _task(
+        progress=100,
+        current_stage="Merged",
+        progress_mode="manual",
+        launch_status="Completed",
+    )
+    completion = {"completion_state": "COMPLETED", "pull_request_url": None, "merge_commit": None}
+    assert task_sync.sync_task_from_completion(task, completion) is True
+    assert task["current_stage"] == "Completed Locally"
+    assert task["progress"] == 100
+    assert task["progress_mode"] == "manual"
+    assert task_sync.sync_task_from_completion(task, completion) is False
+
+
+def test_done_task_uses_latest_completion_even_when_newer_run_has_none(tmp_path):
+    """A later benign run must not hide an older completion rejection."""
+    db_path = tmp_path / "runtime.db"
+    runtime_db.migrate(db_path)
+    api = runtime_api.ExecutionCenterAPI(db_path=db_path)
+    task_id = "done-with-rejected-completion"
+    runtime_db.create_task(
+        db_path,
+        project="AICC",
+        title="Done task",
+        task_type="implementation",
+        task_id=task_id,
+    )
+    session = runtime_db.create_session(
+        db_path,
+        task_id=task_id,
+        project="AICC",
+        repository_path=str(tmp_path),
+    )
+    rejected_run = runtime_db.create_run(
+        db_path,
+        session_id=session["id"],
+        task_id=task_id,
+        project="AICC",
+        task_type="implementation",
+        repository_path=str(tmp_path),
+        prompt="first",
+        is_resume=False,
+    )
+    runtime_db.create_completion(
+        db_path,
+        run_id=rejected_run["id"],
+        task_id=task_id,
+        project="AICC",
+        repository_path=str(tmp_path),
+        completion_state="REVIEW_REJECTED",
+    )
+    newer_run = runtime_db.create_run(
+        db_path,
+        session_id=session["id"],
+        task_id=task_id,
+        project="AICC",
+        task_type="implementation",
+        repository_path=str(tmp_path),
+        prompt="second",
+        is_resume=True,
+    )
+    assert api.get_latest_run_for_task(task_id)["id"] == newer_run["id"]
+    assert api.get_completion(newer_run["id"]) is None
+
+    task = _task(
+        id=task_id,
+        status="Done",
+        launch_status="Completed",
+        progress=100,
+        current_run_id=newer_run["id"],
+    )
+    assert task_sync.sync_tasks(api, [task]) == [task]
+    assert task["status"] == "Done"
+    assert task["launch_status"] == "Requires Attention"
+    assert task["regressed_after_done"] is True

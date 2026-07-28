@@ -94,15 +94,13 @@ def _resolve_target_launch_status(status: str, task: dict) -> str:
     STATUS`. `Completed` is resolved dynamically against the task's *current*
     `progress` (already advanced by `_apply_terminal_fields`, which always
     runs — for a terminal, not-yet-finalized run — before this is called):
-    `progress == 100` is "Merged" (see `models.STAGE_PROGRESS`), the only
-    stage this codebase's agent-safety model ever lets an *agent* run reach
-    on its own is "PR Ready" (95) — reaching "Merged" requires a human/
-    process action this project's agents are never permitted to take (no
-    run here ever calls `git commit`/`push`/`merge`). So a successful run
-    is "Needs Review" (PR ready, awaiting human review/merge) rather than
-    "Completed" until that happens — this is what makes "Completed implies
-    progress == 100" a real, permanently-held invariant instead of a
-    tautology that's vacuously true because nothing ever reaches it."""
+    Progress 100 has two truthful terminal stages: "Merged" when merge
+    evidence exists, and "Completed Locally" for the explicit local-only
+    completion policy. A normal agent run can reach only "PR Ready" (95);
+    the completion pipeline owns both terminal stages. Therefore an ordinary
+    successful run remains "Needs Review" until that pipeline resolves it —
+    this keeps "Completed implies progress == 100" a real invariant without
+    making a false merge claim."""
     if status != session_view.STATUS_COMPLETED:
         return _LAUNCH_STATUS_BY_DISPLAY_STATUS[status]
     # A read-only task (review/audit/gate) has no merge/review lifecycle: its
@@ -348,8 +346,16 @@ def sync_task_from_completion(task: dict, completion: dict) -> bool:
         # merge path records a `merge_commit`/`pull_request_url`; the opt-in
         # local-only path (allow_local_only) records neither.
         has_merge_evidence = bool(completion.get("merge_commit") or pr_url)
-        if (task.get("progress") or 0) < 100:
-            models.set_current_stage(task, "Merged")
+        desired_stage = "Merged" if has_merge_evidence else "Completed Locally"
+        was_below_terminal_progress = (task.get("progress") or 0) < 100
+        if task.get("current_stage") != desired_stage or was_below_terminal_progress:
+            # A completion verdict is the terminal lifecycle fact. Preserve the
+            # user's progress mode, but correct legacy rows that the old D4 code
+            # already stamped as "Merged" without evidence.
+            stage_mode = "manual" if task.get("progress_mode") == "manual" else "auto"
+            models.set_current_stage(task, desired_stage, mode=stage_mode)
+            mutated = True
+        if was_below_terminal_progress:
             models.append_timeline_event(
                 task,
                 "completed",
@@ -518,8 +524,11 @@ def sync_tasks(
         # surfaces that on the display `launch_status` only, never `status`.
         if task.get("status") == "Done":
             task_id = task.get("id")
-            latest = api.get_latest_run_for_task(task_id) if task_id else None
-            completion = db.get_completion(api.db_path, latest["id"]) if latest else None
+            # Completion verdicts and raw runs are separate histories. A newer
+            # benign run may legitimately have no completion row; looking only
+            # at that run would then hide the task's latest explicit rejection.
+            # Read the latest completion for the task itself instead.
+            completion = api.get_completion_by_task(task_id) if task_id else None
             if flag_done_regression(task, completion):
                 mutated.append(task)
             continue
