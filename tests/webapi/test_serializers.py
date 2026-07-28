@@ -132,6 +132,10 @@ def test_serialize_home_shapes_kpis_and_redacts_sensitive():
 
     assert out["queue"][0]["state"] == "RUNNING"
 
+    # STRICT redaction: the sensitive project (BANK) is absent from status[]
+    # entirely — only the non-sensitive AICC row remains.
+    assert [s["project"] for s in out["status"]] == ["AICC"]
+
 
 def test_serialize_home_kpi_aggregates_exclude_sensitive_projects_raw_metrics():
     """Fix round 1 (code review finding): `kpis.agents.value`/`kpis.tasks.value`
@@ -188,6 +192,10 @@ def test_serialize_home_kpi_aggregates_exclude_sensitive_projects_raw_metrics():
     assert "task_count" not in legal
     assert "active_run_count" not in legal
 
+    # STRICT redaction (mixed run set): LEGAL's two runs (l1/l2) are dropped
+    # from queue[] entirely; only AICC's non-sensitive run survives.
+    assert [q["project"] for q in out["queue"]] == ["AICC"]
+
 
 def test_serialize_home_reviews_kpi_counts_non_passing_verdicts_as_pending():
     snap = _snapshot()
@@ -210,21 +218,16 @@ def test_serialize_home_handles_empty_snapshot():
     assert out["status"] == []
 
 
-def test_serialize_home_sensitive_run_queue_and_activity_expose_only_allowlisted_fields():
-    """Pins the redaction intent documented in `serializers.py`: `queue`/`activity`
-    carry no per-serializer filtering of their own for run/activity entries — they
-    rely entirely on `workspace_home.sanitize_workspace_project_entry` having already
-    reduced any *sensitive* project's run/activity dicts down to
-    `_RUN_ALLOWED_FIELDS`/`_ACTIVITY_ALLOWED_FIELDS` before they ever reach the
-    snapshot's `active_runs`/`recent_activity`. This fixture mirrors that real,
-    already-sanitized shape (built from the actual allowlists, not guessed) — no
-    `title`, no `message`, no prompt/report body — the way a genuine BANK/LEGAL run
-    would look by the time it reaches this module.
+def test_serialize_home_excludes_sensitive_run_from_queue_status_and_activity():
+    """STRICT REDACTION: a sensitive (BANK/LEGAL) project's run/activity/status
+    rows are dropped from `queue`, `status` and `activity` entirely — not
+    merely reduced to their upstream-allowlisted fields — and
+    `overview.recent_activity_count` follows the filtered feed.
 
-    This test passes today; it exists to catch a regression where `queue`/`activity`
-    start deriving fields from something other than the fixed, safe field set below
-    (e.g. a future `r.get("message")`/`r.get("prompt")` fallback added to
-    `_serialize_queue`), which would defeat the upstream allowlist for this surface.
+    The fixture still mirrors the real, already-sanitized shape a genuine
+    BANK/LEGAL run/activity would have by the time it reaches this module
+    (built from the actual allowlists, not guessed) to prove that even an
+    already-allowlisted sensitive row is dropped whole here.
     """
     sensitive_run = {
         "run_id": "bank-r9",
@@ -275,29 +278,37 @@ def test_serialize_home_sensitive_run_queue_and_activity_expose_only_allowlisted
 
     out = serialize_home(snap)
 
-    # queue[] entry: only the fixed, safe DTO fields — the fallback chain
-    # (task_type, since no "title" key exists) resolves to a category label,
-    # never anything resembling raw prompt/report content.
-    assert len(out["queue"]) == 1
-    queue_entry = out["queue"][0]
-    assert set(queue_entry.keys()) == {"title", "project", "progress", "state"}
-    assert queue_entry["title"] == "implementation"
-    assert queue_entry["project"] == "BANK"
-    assert queue_entry["state"] == "RUNNING"
-    for forbidden in ("message", "prompt", "report", "body", "text", "summary"):
-        assert forbidden not in queue_entry
+    # STRICT: the sole active run belongs to a sensitive project, so `queue`
+    # is empty — the BANK run is dropped whole, not field-allowlisted.
+    assert out["queue"] == []
 
-    # activity[] is a direct passthrough of `recent_activity` in this module
-    # (see serializers.py's `_overview`/`serialize_home` docs) — so it must
-    # carry only what the upstream allowlist already produced.
-    assert len(out["activity"]) == 1
-    activity_entry = out["activity"][0]
-    assert set(activity_entry.keys()) <= _ACTIVITY_ALLOWED_FIELDS
-    for forbidden in ("message", "prompt", "report", "body", "text", "title"):
-        assert forbidden not in activity_entry
+    # STRICT: the sensitive project is omitted from `status` too, so its
+    # `repository_state` ("ok" here) is never disclosed.
+    assert out["status"] == []
+
+    # STRICT: the BANK activity row is dropped whole (even though it is already
+    # allowlisted, per the assertion above), and the count follows the feed.
+    assert out["activity"] == []
+    assert out["overview"]["recent_activity_count"] == 0
 
     # The project's own rollup entry stays fully redacted, as covered by the
     # existing tests above — asserted here too since this fixture is BANK-only.
     bank = next(p for p in out["projects"] if p["id"] == "BANK")
     assert bank["redacted"] is True
     assert "health" not in bank
+
+
+def test_serialize_home_activity_feed_excludes_sensitive_project_rows():
+    """STRICT REDACTION (mixed feed): activity rows for a sensitive project are
+    dropped from `activity`, and `overview.recent_activity_count` counts only
+    the surviving non-sensitive rows."""
+    snap = _snapshot(
+        recent_activity=[
+            {"project": "AICC", "event_type": "run_completed", "ts": "t2", "run_id": "r0", "task_id": "t0"},
+            {"project": "BANK", "event_type": "run_completed", "ts": "t1", "run_id": "b0", "task_id": "bt0"},
+        ]
+    )
+    out = serialize_home(snap)
+
+    assert [a["project"] for a in out["activity"]] == ["AICC"]
+    assert out["overview"]["recent_activity_count"] == 1

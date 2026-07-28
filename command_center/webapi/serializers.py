@@ -15,7 +15,15 @@ unfiltered (see `workspace_home.py` around `build_workspace_home_snapshot`'s
 `projects_out.append(...)`). This module is the one place that gap is closed
 for the web surface: any project flagged `sensitive` (or, defensively,
 `redacted`) never gets a `health` block or raw counts in the serialized
-output — only `id`/`name`/`healthy`/`redacted`. A pure function, no I/O, no
+output — only `id`/`name`/`healthy`/`redacted`. On top of that, this module
+applies a STRICT row-exclusion for the `queue`, `status` and `activity`
+lists: runs, repository-state rows and activity entries belonging to a
+sensitive project are dropped entirely (not just field-allowlisted), so
+BANK/LEGAL never surface as a queue entry, a status row or an activity item
+on this public web surface. `overview.recent_activity_count` counts the
+already-filtered activity feed. The only sensitive-inclusive figures left are
+bare aggregate counts with no per-row field to strip: `reviews` and
+`overview.reports_count`/`artifacts_count`. A pure function, no I/O, no
 mutation, safe to unit test without a database.
 """
 
@@ -82,35 +90,29 @@ def _active_runs(snap: dict[str, Any]) -> list[dict[str, Any]]:
     return snap.get("runs") or []
 
 
-def _serialize_queue(active_runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # INTENTIONAL POLICY: `queue` (like `activity`/`status`/`overview.recent_
-    # activity_count`/`reviews` below) does no per-serializer field filtering
-    # of its own for a sensitive project's run. It inherits the upstream
-    # field-allowlist in `command_center/workspace_home.py`
-    # (`_RUN_ALLOWED_FIELDS`/`_ACTIVITY_ALLOWED_FIELDS`, applied by
-    # `sanitize_workspace_project_entry`) as the *authoritative* redaction
-    # boundary — that allowlist already permits project/task_type/state/
-    # run_id/timestamps to reach here for BANK/LEGAL runs, matching what the
-    # existing Streamlit Workspace Home page shows today. See
-    # `tests/webapi/test_serializers.py::
-    # test_serialize_home_sensitive_run_queue_and_activity_expose_only_allowlisted_fields`
-    # for the regression test pinning this.
+def _serialize_queue(
+    active_runs: list[dict[str, Any]], sensitive_ids: set[Any]
+) -> list[dict[str, Any]]:
+    # STRICT REDACTION POLICY: a run belonging to a sensitive (BANK/LEGAL)
+    # project is dropped from `queue` entirely — not merely reduced to its
+    # upstream-allowlisted fields. This is stricter than the internal Streamlit
+    # Workspace Home page (which lists every project's runs) and stricter than
+    # the field-allowlist that `command_center/workspace_home.py`
+    # (`sanitize_workspace_project_entry`, `_RUN_ALLOWED_FIELDS`) already
+    # applies: on this public web surface a sensitive project's runs never
+    # appear at all, so not even an allowlisted run_id/task_type/timestamp for
+    # BANK/LEGAL is exposed. `status` (below) is row-excluded the same way.
     #
-    # This is DELIBERATELY asymmetric with `kpis.agents`/`kpis.tasks` and the
-    # per-project raw counts in `_serialize_projects`/`_kpis` below, which
-    # ADDITIONALLY exclude sensitive projects entirely (not merely allowlist
-    # their fields) — because those are aggregates where a sensitive project's
-    # raw number could otherwise be recovered by subtraction (see `_kpis`).
-    # No such subtraction risk exists for `queue`/`activity`/`status`/
-    # `reviews`, since they only ever carry already-allowlisted per-entry
-    # fields, never a raw count to subtract from.
-    #
-    # Fully excluding sensitive-project rows from `queue`/`activity` (rather
-    # than allowlisting their fields) would be a *stricter* policy than what
-    # workspace_home.py's own Streamlit page does — that's a future policy
-    # decision, not something this module changes unilaterally.
+    # `kpis.agents`/`kpis.tasks` remain aggregate-only and already exclude
+    # sensitive projects (see `_kpis`), so nothing dropped here is recoverable
+    # by subtraction. `activity` is row-excluded the same way (see `_activity`),
+    # and `overview.recent_activity_count` counts that filtered feed. `reviews`
+    # and `overview.reports_count` stay bare counts — no per-row field to
+    # disclose.
     queue = []
     for r in active_runs:
+        if r.get("project") in sensitive_ids:
+            continue
         queue.append(
             {
                 # Real run entries carry no display title; `task_type` is the
@@ -197,12 +199,16 @@ def _kpis(snap: dict[str, Any], raw_projects: list[dict[str, Any]], active_runs:
 
 
 def _status(raw_projects: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # `repository_state` (ok/unconfigured/invalid_path/not_git_repo) is not a
-    # raw metric, so it's safe to surface for every project, sensitive or not.
+    # STRICT REDACTION POLICY: sensitive (BANK/LEGAL) projects are omitted from
+    # `status` entirely. `repository_state`
+    # (ok/unconfigured/invalid_path/not_git_repo) is not a raw metric, but it
+    # still discloses that a sensitive project exists and how its repo is
+    # configured — on this public surface we reveal neither. Mirrors the
+    # row-exclusion applied to `queue` above.
     return [
         {"project": p.get("id", ""), "repository_state": p.get("repository_state")}
         for p in raw_projects
-        if "repository_state" in p
+        if "repository_state" in p and not _is_sensitive(p)
     ]
 
 
@@ -212,29 +218,39 @@ def _health(raw_projects: list[dict[str, Any]]) -> dict[str, Any]:
     return {"projects_healthy": healthy, "projects_total": total}
 
 
-def _overview(snap: dict[str, Any]) -> dict[str, Any]:
-    # `recent_activity_count` is a `len()` over the same upstream-allowlisted
-    # `recent_activity` list used for `activity` below — see the policy
-    # comment above `_serialize_queue`. Same reasoning: a bare count, so
-    # nothing sensitive is added or excluded here beyond what the allowlist
-    # already did.
+def _activity(snap: dict[str, Any], sensitive_ids: set[Any]) -> list[dict[str, Any]]:
+    # STRICT REDACTION POLICY: activity rows belonging to a sensitive
+    # (BANK/LEGAL) project are dropped entirely — the same row-exclusion
+    # applied to `queue`/`status`. Prefer the real snapshot key, falling back
+    # to a legacy "activity" key so a simpler fixture still works.
+    entries = snap.get("recent_activity") or snap.get("activity") or []
+    return [e for e in entries if e.get("project") not in sensitive_ids]
+
+
+def _overview(snap: dict[str, Any], activity: list[dict[str, Any]]) -> dict[str, Any]:
+    # `recent_activity_count` counts the already-filtered `activity` list, so
+    # it can never disagree with the feed or re-leak a sensitive row that the
+    # feed dropped. `reports_count`/`artifacts_count` are bare aggregate counts
+    # over lists this module does not row-exclude (no per-row field to strip).
     return {
         "reports_count": len(snap.get("reports") or []),
         "artifacts_count": len(snap.get("artifacts") or []),
-        "recent_activity_count": len(snap.get("recent_activity") or []),
+        "recent_activity_count": len(activity),
     }
 
 
 def serialize_home(snap: dict[str, Any]) -> dict[str, Any]:
     raw_projects = snap.get("projects") or []
     active_runs = _active_runs(snap)
+    sensitive_ids = {p.get("id") for p in raw_projects if _is_sensitive(p)}
+    activity = _activity(snap, sensitive_ids)
 
     return {
         "projects": _serialize_projects(raw_projects),
         "kpis": _kpis(snap, raw_projects, active_runs),
-        "queue": _serialize_queue(active_runs),
+        "queue": _serialize_queue(active_runs, sensitive_ids),
         "health": _health(raw_projects),
-        "activity": snap.get("recent_activity") or snap.get("activity") or [],
-        "overview": _overview(snap),
+        "activity": activity,
+        "overview": _overview(snap, activity),
         "status": _status(raw_projects),
     }
