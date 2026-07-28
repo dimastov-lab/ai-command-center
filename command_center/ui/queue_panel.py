@@ -1,9 +1,8 @@
-"""Renders the Execution Queue: Waiting / Ready lists, a prominent "Launch
-Ready" control, and an optional "launch next ready task" action — the only
-two places in the app that ever call `execution_queue.launch_ready`. Nothing
-in this module (or the `execution_queue` service it calls) launches anything
-on a plain rerun; every launch here is the direct result of a button click
-in this render, this run.
+"""Renders the Execution Queue and the founder approval surface.
+
+Nothing in this module launches anything on a plain rerun. Manual queue actions
+and orchestrator packages both reach ``execution_queue.launch_ready`` only as
+the direct result of their own button click in this render, this run.
 """
 
 from __future__ import annotations
@@ -13,8 +12,12 @@ from pathlib import Path
 
 import streamlit as st
 
-from command_center import execution_queue, project_config, recommend
+from command_center import execution_queue, project_config, recommend, task_pipeline
+from command_center.runtime import scheduler
 from command_center.ui.launch_feedback import render_skipped_launch
+
+
+ORCHESTRATOR_APPROVAL_FLASH_KEY = "orchestrator_approval_flash"
 
 
 def _pick_next(ready_entries: list[dict], tasks_by_id: dict[str, dict]) -> dict | None:
@@ -29,6 +32,97 @@ def _pick_next(ready_entries: list[dict], tasks_by_id: dict[str, dict]) -> dict 
         return (-recommend.PRIORITY_WEIGHT.get(priority, 1), entry.get("added_at") or "")
 
     return sorted(ready_entries, key=sort_key)[0]
+
+
+def render_orchestrator_approval(
+    decisions: list[task_pipeline.EntryDecision],
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    root: Path,
+    execution_center_api,
+    project_configs: dict[str, dict],
+    save_tasks_fn: Callable[[list[dict]], None],
+    *,
+    key_prefix: str = "orchestrator_approval",
+) -> None:
+    """Show and, only on a founder click, dispatch one proposed launch package.
+
+    The proposal is immutable for this render: the exact entry ids, executors,
+    branches and worktrees shown here are the exact subset handed to
+    ``launch_ready``. That service rechecks queue readiness, capacity, workspace
+    ownership and launch safety under its normal lock, so approval cannot turn
+    a stale proposal into an unsafe launch.
+    """
+    assignments = [
+        decision
+        for decision in decisions
+        if decision.action == scheduler.ACTION_ASSIGN
+        and decision.entry_id
+        and decision.task_id
+        and not decision.launched
+    ]
+    if not assignments:
+        return
+
+    st.warning(
+        "Требуется решение founder: AI Orchestrator подготовил пакет, "
+        "но ни одна задача ещё не запущена."
+    )
+    st.markdown("#### Подтверждение пакета запусков")
+    st.caption(
+        f"В пакете {len(assignments)} задач. Проверьте полный список задач, "
+        "веток и worktree перед подтверждением."
+    )
+
+    for index, decision in enumerate(assignments, start=1):
+        task = tasks_by_id.get(decision.task_id, {})
+        branch = task.get("branch") or "—"
+        workspace = decision.workspace or task.get("workspace_path") or "—"
+        st.markdown(f"**{index}. {decision.title or task.get('title') or decision.task_id}**")
+        st.caption(
+            f"Task: {decision.task_id} · Project: {decision.project or task.get('project') or '—'} "
+            f"· Branch: {branch} · Worktree: {workspace} "
+            f"· Executor: {decision.executor_id or decision.agent_id or '—'}"
+        )
+
+    st.error(
+        "Запуск произойдёт только после нажатия founder-кнопки ниже. "
+        "Подтверждение относится ко всему показанному пакету."
+    )
+    approved = st.button(
+        f"Founder: подтвердить и запустить пакет ({len(assignments)})",
+        key=f"{key_prefix}_confirm",
+        type="primary",
+        width="stretch",
+    )
+    if not approved:
+        return
+
+    entries = execution_queue.load_queue(root)
+    entry_ids = [decision.entry_id for decision in assignments if decision.entry_id]
+    executor_by_entry = {
+        decision.entry_id: decision.executor_id
+        for decision in assignments
+        if decision.entry_id and decision.executor_id
+    }
+    _, results = execution_queue.launch_ready(
+        root,
+        entries,
+        tasks,
+        tasks_by_id,
+        project_configs,
+        execution_center_api,
+        entry_ids=entry_ids,
+        executor_by_entry=executor_by_entry,
+    )
+    save_tasks_fn(tasks)
+    launched = [result for result in results if result.launched]
+    skipped = [result for result in results if not result.launched]
+    st.session_state[ORCHESTRATOR_APPROVAL_FLASH_KEY] = {
+        "launched_count": len(launched),
+        "skipped_count": len(skipped),
+    }
+    st.rerun()
 
 
 def render_execution_queue_panel(

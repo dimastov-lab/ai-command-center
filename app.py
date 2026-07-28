@@ -4,6 +4,7 @@ import html
 import os
 import subprocess
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -2993,7 +2994,24 @@ def _run_autopilot_tick(api: runtime_api.ExecutionCenterAPI):
     real running processes. The failure is surfaced in the panel, not
     swallowed silently."""
     try:
-        return task_pipeline.tick(ROOT, api, project_config.load_project_configs())
+        settings = task_pipeline.pipeline_settings.load_settings(ROOT)
+        # Founder safety gate: the refresh may plan a complete orchestrator wave
+        # but may never dispatch it. The exact proposed entry ids are shown and
+        # launched only by queue_panel.render_orchestrator_approval after the
+        # founder's explicit click.
+        planning_settings = replace(
+            settings,
+            auto_launch=False,
+            auto_rework=False,
+            auto_remediate_workspace=False,
+        )
+        result = task_pipeline.tick(
+            ROOT,
+            api,
+            project_config.load_project_configs(),
+            settings=planning_settings,
+        )
+        return replace(result, settings=settings)
     except Exception as exc:  # noqa: BLE001 — never let autopilot break the dashboard
         st.session_state[autopilot_panel.TICK_ERROR_KEY] = str(exc)
         return None
@@ -3149,6 +3167,29 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
 
     main, side = st.columns([3, 1], gap="medium")
     with main:
+        approval_result = st.session_state.get(autopilot_panel.TICK_RESULT_KEY)
+        approval_flash = st.session_state.pop(
+            queue_panel.ORCHESTRATOR_APPROVAL_FLASH_KEY, None
+        )
+        if approval_flash:
+            st.success(
+                f"Founder подтвердил пакет. Запущено: {approval_flash['launched_count']}; "
+                f"не прошло повторную проверку: {approval_flash['skipped_count']}."
+            )
+        if (
+            approval_result is not None
+            and approval_result.ran
+            and approval_result.settings.auto_launch_active
+        ):
+            queue_panel.render_orchestrator_approval(
+                approval_result.assignments(),
+                tasks,
+                tasks_by_id,
+                ROOT,
+                api,
+                project_config.load_project_configs(),
+                upsert_tasks,
+            )
         _render_board_sections(
             api,
             board,
