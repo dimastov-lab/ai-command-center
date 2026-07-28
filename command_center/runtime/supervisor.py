@@ -185,6 +185,8 @@ def build_claude_command(
     task_type: str,
     is_resume: bool,
     model: str | None = None,
+    untrusted: bool = False,
+    operator_elevated: bool = False,
 ) -> list[str]:
     """Construct the exact `claude` argv for one run.
 
@@ -205,7 +207,9 @@ def build_claude_command(
     against exactly this). `agent_runner.build_command` (the v1 synchronous
     executor) already set this; this was the divergence between the two.
     """
-    profile = agent_runner.profile_for_task_type(task_type)
+    profile = agent_runner.profile_for_task(
+        task_type, untrusted=untrusted, operator_elevated=operator_elevated
+    )
     command = [CLAUDE_BINARY]
     if is_resume:
         command += ["--resume", session_id]
@@ -223,7 +227,11 @@ def build_claude_command(
         "--permission-mode",
         agent_runner.PERMISSION_MODE_BY_PROFILE[profile],
     ]
-    if task_type in agent_runner.READ_ONLY_TASK_TYPES:
+    # Key the tool set on the *resolved* profile, not the task type alone: an
+    # untrusted task downgraded to read-only (audit D7) must get `--tools` (which
+    # replaces the built-in set, so Bash does not exist for the run), never the
+    # `--disallowedTools` pattern layer that still leaves Bash present.
+    if profile == agent_runner.PROFILE_READ_ONLY:
         command += ["--tools", ",".join(agent_runner.READ_ONLY_ALLOWED_TOOLS)]
     else:
         command += ["--disallowedTools", ",".join(agent_runner.GIT_WRITE_DISALLOWED_TOOLS)]
