@@ -108,10 +108,13 @@ def test_serialize_home_shapes_kpis_and_redacts_sensitive():
     assert set(out.keys()) == {"projects", "kpis", "queue", "health", "activity", "overview", "status"}
 
     assert out["kpis"]["projects"]["value"] == 2
-    # agents KPI aggregates each project's own (unfiltered upstream)
-    # active_run_count: 4 (AICC) + 3 (BANK) = 7; "running" sub-count only
-    # counts runs actually in RUNNING state (1 of the 2 active_runs fixture rows).
-    assert out["kpis"]["agents"] == {"value": 7, "meta_key": "running", "meta_n": 1}
+    # agents KPI aggregates each NON-sensitive project's own active_run_count
+    # only: AICC's 4, excluding BANK's 3 (BANK is sensitive) — see
+    # test_serialize_home_kpi_aggregates_exclude_sensitive_projects_raw_metrics
+    # for the dedicated regression covering this. "running" sub-count only
+    # counts non-sensitive runs actually in RUNNING state (1 of the 2
+    # active_runs fixture rows, both of which happen to belong to AICC here).
+    assert out["kpis"]["agents"] == {"value": 4, "meta_key": "running", "meta_n": 1}
 
     # sensitive project is present but must carry no raw metrics.
     bank = next(p for p in out["projects"] if p["id"] == "BANK")
@@ -127,6 +130,62 @@ def test_serialize_home_shapes_kpis_and_redacts_sensitive():
     assert aicc["health"]["task_count"] == 12
 
     assert out["queue"][0]["state"] == "RUNNING"
+
+
+def test_serialize_home_kpi_aggregates_exclude_sensitive_projects_raw_metrics():
+    """Fix round 1 (code review finding): `kpis.agents.value`/`kpis.tasks.value`
+    must not include a sensitive project's `active_run_count`/`task_count`,
+    even indirectly via a workspace-wide sum. Every non-sensitive project's
+    own `health` block is fully exposed in `projects[]`, so if the aggregate
+    included LEGAL's contribution a client could recover LEGAL's raw totals
+    by subtracting the (visible) non-sensitive project's values from the
+    workspace-wide sum — a sensitive-derived raw metric reaching the API.
+    """
+    snap = {
+        "projects": [
+            {
+                "id": "AICC",
+                "display_name": "AI Command Center",
+                "sensitive": False,
+                "repository_state": "ok",
+                "task_count": 5,
+                "active_run_count": 2,
+            },
+            {
+                "id": "LEGAL",
+                "display_name": "Legal",
+                "sensitive": True,
+                "repository_state": "ok",
+                "task_count": 100,
+                "active_run_count": 50,
+            },
+        ],
+        "active_runs": [
+            {"run_id": "a1", "project": "AICC", "task_type": "implementation", "state": "RUNNING"},
+            {"run_id": "l1", "project": "LEGAL", "task_type": "implementation", "state": "RUNNING"},
+            {"run_id": "l2", "project": "LEGAL", "task_type": "review", "state": "QUEUED"},
+        ],
+        "recent_runs": [],
+        "recent_activity": [],
+        "artifacts": [],
+        "reports": [],
+    }
+
+    out = serialize_home(snap)
+
+    # Totals equal only AICC's (non-sensitive) values — LEGAL's 50/100
+    # contribute nothing, despite being non-zero and despite LEGAL having
+    # its own RUNNING run in `active_runs`.
+    assert out["kpis"]["agents"]["value"] == 2
+    assert out["kpis"]["agents"]["meta_n"] == 1  # only AICC's RUNNING run counted, not LEGAL's l1
+    assert out["kpis"]["tasks"]["value"] == 5
+
+    # LEGAL's own project entry is still fully redacted, as before this fix.
+    legal = next(p for p in out["projects"] if p["id"] == "LEGAL")
+    assert legal["redacted"] is True
+    assert "health" not in legal
+    assert "task_count" not in legal
+    assert "active_run_count" not in legal
 
 
 def test_serialize_home_reviews_kpi_counts_non_passing_verdicts_as_pending():

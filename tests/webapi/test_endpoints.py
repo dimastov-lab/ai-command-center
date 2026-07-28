@@ -74,7 +74,9 @@ def test_home_endpoint_returns_serialized(monkeypatch):
 
     assert r.status_code == 200
     body = r.json()
-    assert body["kpis"]["agents"]["value"] == 7
+    # AICC's active_run_count (4) only — BANK's 3 is excluded from the
+    # workspace-wide aggregate because BANK is sensitive (fix round 1).
+    assert body["kpis"]["agents"]["value"] == 4
     assert set(body.keys()) == {"projects", "kpis", "queue", "health", "activity", "overview", "status"}
 
 

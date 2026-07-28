@@ -104,16 +104,32 @@ def _serialize_queue(active_runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _kpis(snap: dict[str, Any], raw_projects: list[dict[str, Any]], active_runs: list[dict[str, Any]]) -> dict[str, Any]:
     healthy_count = sum(1 for p in raw_projects if _project_healthy(p))
 
-    # `active_run_count` is attached to every project (sensitive or not,
-    # see module docstring) unfiltered by workspace_home's allowlist, so
-    # summing it — a workspace-wide total, not a per-project breakdown — is
-    # consistent with the existing internal Streamlit Workspace Home page
-    # (`app.py`'s `render_workspace_home_page`), which sums the very same
-    # field across all projects, sensitive included, for its top metric row.
-    total_active = sum(p.get("active_run_count", 0) for p in raw_projects)
-    running_count = sum(1 for r in active_runs if (r.get("state") or r.get("status")) == _RUNNING_STATE)
+    # `active_run_count`/`task_count` are attached to every project (sensitive
+    # or not, see module docstring) unfiltered by workspace_home's allowlist.
+    # Fix round 1 (code review finding): summing them across ALL projects —
+    # even though no single field ever says "BANK: N" — still leaks a
+    # sensitive-derived raw number, because every *non*-sensitive project's
+    # own `health` block is fully exposed in `projects[]`; a client can
+    # recover the combined BANK+LEGAL raw total by subtracting the visible
+    # non-sensitive projects' values from the workspace-wide sum. These KPI
+    # aggregates are therefore computed over non-sensitive projects only —
+    # unlike the existing internal Streamlit Workspace Home page (`app.py`'s
+    # `render_workspace_home_page`), which sums the same fields including
+    # sensitive projects for its top metric row; that precedent doesn't hold
+    # here because this API additionally exposes each non-sensitive project's
+    # value individually, which the Streamlit page's aggregate-only metric
+    # does not, making the subtraction attack possible only on this surface.
+    non_sensitive_projects = [p for p in raw_projects if not _is_sensitive(p)]
+    non_sensitive_ids = {p.get("id") for p in non_sensitive_projects}
 
-    total_tasks = sum(p.get("task_count", 0) for p in raw_projects)
+    total_active = sum(p.get("active_run_count", 0) for p in non_sensitive_projects)
+    running_count = sum(
+        1
+        for r in active_runs
+        if r.get("project") in non_sensitive_ids and (r.get("state") or r.get("status")) == _RUNNING_STATE
+    )
+
+    total_tasks = sum(p.get("task_count", 0) for p in non_sensitive_projects)
 
     reports = snap.get("reports") or []
     total_reviews = len(reports)
