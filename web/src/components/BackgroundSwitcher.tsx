@@ -1,39 +1,18 @@
 import { useState } from 'react'
-
-type Preset = { id: string; label: string; value: string }
-
-// Gradient presets built from the same design tokens used everywhere else
-// (--accent-1/--accent-2/--teal/--warn), applied by setting the `--bg`
-// custom property that theme/tokens.css'/index.css's `body` background
-// reads from.
-const PRESETS: Preset[] = [
-  { id: 'midnight', label: 'Midnight', value: '#0b0e1a' },
-  {
-    id: 'nebula',
-    label: 'Nebula',
-    value:
-      'radial-gradient(circle at 20% 20%, rgba(124,92,255,0.35), transparent 55%), radial-gradient(circle at 80% 0%, rgba(77,159,255,0.3), transparent 50%), #0b0e1a',
-  },
-  {
-    id: 'aurora',
-    label: 'Aurora',
-    value:
-      'radial-gradient(circle at 15% 85%, rgba(51,224,192,0.28), transparent 55%), radial-gradient(circle at 85% 15%, rgba(124,92,255,0.3), transparent 50%), #0b0e1a',
-  },
-  {
-    id: 'dusk',
-    label: 'Dusk',
-    value:
-      'radial-gradient(circle at 75% 75%, rgba(245,178,58,0.18), transparent 55%), radial-gradient(circle at 20% 20%, rgba(77,159,255,0.28), transparent 55%), #0b0e1a',
-  },
-]
+import { useTranslation } from 'react-i18next'
+import { BACKGROUND_PRESETS } from '../lib/backgroundPresets'
+import type { BackgroundPreset } from '../lib/backgroundPresets'
 
 type BackgroundSwitcherProps = { label: string }
 
+// Swaps BackgroundLayer's fixed gradient by writing the `--bg` custom
+// property on <html> — BackgroundLayer (rendered once at the app root)
+// reads it via `background: var(--bg, …)`.
 export default function BackgroundSwitcher({ label }: BackgroundSwitcherProps) {
-  const [active, setActive] = useState(PRESETS[0].id)
+  const { t } = useTranslation()
+  const [active, setActive] = useState(BACKGROUND_PRESETS[0].id)
 
-  function apply(preset: Preset) {
+  function apply(preset: BackgroundPreset) {
     document.documentElement.style.setProperty('--bg', preset.value)
     setActive(preset.id)
   }
@@ -42,12 +21,12 @@ export default function BackgroundSwitcher({ label }: BackgroundSwitcherProps) {
     <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
       <span style={{ fontSize: '0.7rem', color: 'var(--tx3)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</span>
       <div style={{ display: 'flex', gap: '0.4rem' }}>
-        {PRESETS.map((p) => (
+        {BACKGROUND_PRESETS.map((p) => (
           <button
             key={p.id}
             type="button"
-            title={p.label}
-            aria-label={p.label}
+            title={t(p.labelKey)}
+            aria-label={t(p.labelKey)}
             aria-pressed={active === p.id}
             onClick={() => apply(p)}
             className={`bg-swatch${active === p.id ? ' active' : ''}`}
@@ -58,8 +37,7 @@ export default function BackgroundSwitcher({ label }: BackgroundSwitcherProps) {
               border: '1px solid var(--gline)',
               padding: 0,
               cursor: 'pointer',
-              backgroundImage: p.value.includes('gradient') ? p.value : undefined,
-              backgroundColor: p.value.includes('gradient') ? undefined : p.value,
+              backgroundImage: p.value,
             }}
           />
         ))}

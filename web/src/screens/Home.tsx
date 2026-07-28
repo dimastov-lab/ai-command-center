@@ -15,6 +15,18 @@ import StatusRow from '../components/StatusRow'
 import NavItem from '../components/NavItem'
 import BackgroundSwitcher from '../components/BackgroundSwitcher'
 import LangToggle from '../components/LangToggle'
+import {
+  HomeIcon,
+  WorkspaceIcon,
+  AgentsIcon,
+  ExecutionIcon,
+  GitIcon,
+  TasksIcon,
+  ReportsIcon,
+  ArtifactsIcon,
+  ReviewCenterIcon,
+  SettingsIcon,
+} from '../components/NavIcons'
 
 const NAV_KEYS = [
   'home',
@@ -27,6 +39,20 @@ const NAV_KEYS = [
   'artifacts',
   'reviewCenter',
   'settings',
+] as const
+
+// Parallel to NAV_KEYS — one icon component per nav item, in the same order.
+const NAV_ICONS = [
+  HomeIcon,
+  WorkspaceIcon,
+  AgentsIcon,
+  ExecutionIcon,
+  GitIcon,
+  TasksIcon,
+  ReportsIcon,
+  ArtifactsIcon,
+  ReviewCenterIcon,
+  SettingsIcon,
 ] as const
 
 // Pairs `meta_n` with `meta_key` for the agents/tasks/reviews KPIs
@@ -48,10 +74,6 @@ function formatKpiMeta(kpi: Kpi, t: (key: string) => string): string {
 function formatProjectsMeta(healthy: number, total: number, t: (key: string) => string): string {
   if (total > 0 && healthy === total) return t('all_healthy')
   return `${healthy} ${t('healthyCount')}`
-}
-
-function NavDot() {
-  return <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'currentColor', display: 'inline-block' }} />
 }
 
 function EmptyState({ label }: { label: string }) {
@@ -113,10 +135,13 @@ export default function Home() {
   return (
     <div style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
       <header className="glass" style={{ padding: '1rem 1.5rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
-        <div>
-          <div style={{ color: 'var(--tx)', fontWeight: 700, fontSize: '1rem' }}>AI Command Center</div>
-          <div style={{ color: 'var(--tx2)', fontSize: '0.8rem', marginTop: '0.15rem' }}>{t('greeting')}</div>
-          <div style={{ color: 'var(--tx3)', fontSize: '0.72rem' }}>{t('greetingSub')}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem' }}>
+          <div className="mark" aria-hidden="true" />
+          <div>
+            <div style={{ color: 'var(--tx)', fontWeight: 700, fontSize: '1rem' }}>AI Command Center</div>
+            <div style={{ color: 'var(--tx2)', fontSize: '0.8rem', marginTop: '0.15rem' }}>{t('greeting')}</div>
+            <div style={{ color: 'var(--tx3)', fontSize: '0.72rem' }}>{t('greetingSub')}</div>
+          </div>
         </div>
         <button
           type="button"
@@ -143,9 +168,10 @@ export default function Home() {
           className="glass"
           style={{ padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.25rem', position: 'sticky', top: '1.5rem' }}
         >
-          {NAV_KEYS.map((key, i) => (
-            <NavItem key={key} label={t(key)} icon={<NavDot />} active={i === 0} />
-          ))}
+          {NAV_KEYS.map((key, i) => {
+            const Icon = NAV_ICONS[i]
+            return <NavItem key={key} label={t(key)} icon={<Icon />} active={i === 0} />
+          })}
         </aside>
 
         <main style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', minWidth: 0 }}>

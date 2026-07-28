@@ -2,7 +2,7 @@ import { useTranslation } from 'react-i18next'
 import { toggleLang } from '../lib/i18n'
 
 export default function LangToggle() {
-  const { i18n } = useTranslation()
+  const { t, i18n } = useTranslation()
   return (
     <button
       type="button"
@@ -17,7 +17,7 @@ export default function LangToggle() {
         cursor: 'pointer',
         background: 'rgba(255,255,255,0.02)',
       }}
-      aria-label="Toggle language"
+      aria-label={t('toggleLanguage')}
     >
       {i18n.language === 'ru' ? 'RU' : 'EN'}
     </button>

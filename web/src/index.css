@@ -3,7 +3,9 @@
 body {
   margin: 0;
   font-family: var(--font-sans);
-  background: var(--bg, #0b0e1a);
-  transition: background 0.4s ease;
+  /* Visible background now comes from BackgroundLayer, a fixed
+     full-viewport element (z-index: -1) rendered once at the app root —
+     see components/BackgroundLayer.tsx. Keep body transparent so it shows
+     through undistorted. */
   min-height: 100vh;
 }

@@ -53,6 +53,14 @@ export const en = {
   toolTaskTriage: 'Task triage',
   toolGitOps: 'Git operations',
   comingSoon: 'Coming soon',
+  toggleLanguage: 'Toggle language',
+  bgAuto: 'Auto',
+  bgDay: 'Day',
+  bgSunset: 'Sunset',
+  bgNight: 'Night',
+  bgRain: 'Rain',
+  bgSnow: 'Snow',
+  bgCustom: 'Custom',
 }
 
 export const ru = {
@@ -107,6 +115,14 @@ export const ru = {
   toolTaskTriage: 'Сортировка задач',
   toolGitOps: 'Git-операции',
   comingSoon: 'Скоро',
+  toggleLanguage: 'Переключить язык',
+  bgAuto: 'Авто',
+  bgDay: 'День',
+  bgSunset: 'Закат',
+  bgNight: 'Ночь',
+  bgRain: 'Дождь',
+  bgSnow: 'Снег',
+  bgCustom: 'Свой',
 }
 
 i18n
