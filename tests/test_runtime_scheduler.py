@@ -68,6 +68,13 @@ def test_default_registry_only_registers_available_executors():
     assert reg.get("chatgpt") is None
 
 
+def test_default_registry_does_not_offer_implementation_work_to_ollama():
+    ollama = _registry().get("ollama")
+    assert ollama is not None
+    assert ollama.can_run(scheduler.capabilities_for_task_type("architecture_review"))
+    assert not ollama.can_run(scheduler.capabilities_for_task_type("implementation"))
+
+
 def test_register_rejects_unknown_executor():
     reg = scheduler.AgentRegistry()
     try:

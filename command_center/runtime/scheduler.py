@@ -191,6 +191,23 @@ def capabilities_for_task_type(task_type: str) -> frozenset[str]:
     return frozenset({f"task_type:{task_type}", f"profile:{profile}"})
 
 
+def capabilities_for_executor(executor_id: str) -> frozenset[str]:
+    """Capabilities the real provider behind an executor can actually honor.
+
+    Most CLI providers can run both read-only and trusted-development profiles.
+    Ollama is intentionally different: its provider has no editor or shell and
+    rejects every task type outside ``READ_ONLY_TASK_TYPES``. Keeping that fact
+    in the scheduler registry prevents a plan that is guaranteed to fail at
+    launch time.
+    """
+    if executor_id == "ollama":
+        return frozenset(
+            {f"profile:{agent_runner.PROFILE_READ_ONLY}"}
+            | {f"task_type:{task_type}" for task_type in agent_runner.READ_ONLY_TASK_TYPES}
+        )
+    return frozenset({CAP_ANY})
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     """One registered execution agent — a capacity- and capability-bearing
@@ -249,8 +266,8 @@ class AgentRegistry:
 
 def default_registry(*, max_concurrency: int = 2) -> AgentRegistry:
     """A registry seeded from `executors.EXECUTORS`: every executor that has a
-    provider behind it becomes a general-purpose (`CAP_ANY`) agent whose id
-    equals its executor id.
+    provider behind it becomes an agent whose id equals its executor id and
+    whose advertised capabilities match the provider's real launch contract.
 
     Availability is carried on the `AgentSpec` rather than deciding membership,
     and that distinction is the whole point. `executor.available` is a *live
@@ -269,7 +286,7 @@ def default_registry(*, max_concurrency: int = 2) -> AgentRegistry:
         AgentSpec(
             agent_id=executor.id,
             executor_id=executor.id,
-            capabilities=frozenset({CAP_ANY}),
+            capabilities=capabilities_for_executor(executor.id),
             max_concurrency=max_concurrency,
             available=executor.available,
         )
