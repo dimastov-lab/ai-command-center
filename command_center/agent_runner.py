@@ -230,8 +230,34 @@ class RunnerError(Exception):
     """Raised when a run cannot even be attempted (validation failure)."""
 
 
-def claude_cli_available() -> bool:
-    return shutil.which(CLAUDE_BINARY) is not None
+def claude_cli_available(binary: str | None = None) -> bool:
+    """Is the Claude Code CLI resolvable on PATH?
+
+    `binary` lets a caller probe the executable *its own* launch path will
+    exec rather than this module's `CLAUDE_BINARY`: the v2 Session Supervisor
+    resolves its own (`runtime.supervisor.CLAUDE_BINARY`, honouring
+    `AICC_CLAUDE_BINARY`), so a preflight for a v2 launch must ask about that
+    one — otherwise it reports on a binary nobody is going to run."""
+    return shutil.which(binary or CLAUDE_BINARY) is not None
+
+
+def claude_cli_preflight(binary: str | None = None) -> tuple[bool, str]:
+    """`(available, message)` for the Claude Code CLI — the same probe as
+    `claude_cli_available`, plus the operator-facing explanation to render
+    when it fails.
+
+    Exists so a launch entry point can state the reason *before* the operator
+    walks a confirmation flow, instead of surfacing a bare `FileNotFoundError`
+    at exec time (audit MINOR-2). Project Chat keeps its own, mode-specific
+    wording for the same probe (`chat_service.ClaudeCodeChatProvider`)."""
+    resolved = binary or CLAUDE_BINARY
+    if claude_cli_available(resolved):
+        return True, ""
+    return False, (
+        f"CLI `{resolved}` не найден в PATH — запуск Claude Code завершится ошибкой ещё до "
+        "старта агента. Установите Claude Code (`npm install -g @anthropic-ai/claude-code`) "
+        "и убедитесь, что бинарник доступен в PATH, либо выберите другой execution provider."
+    )
 
 
 def validate_repository(project_id: str, repository_path: str) -> Path:

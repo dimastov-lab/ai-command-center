@@ -630,6 +630,31 @@ def _save_message_as_report(conversation: dict, message: dict) -> Path:
     return path
 
 
+def _preselected_executor_id(*, cfg: dict, task: dict | None, options: list[str] | None = None) -> str:
+    """Which executor the launcher will preselect: the task's own, else the
+    project default, else `claude_code` — clamped to `options` (the project's
+    authorized providers) exactly as the confirmation dialog's selectbox
+    clamps it, so the pre-dialog preflight below can never warn about a
+    provider the dialog is not going to offer."""
+    configured = (task or {}).get("executor") or cfg.get("default_executor") or "claude_code"
+    if options and configured not in options:
+        return options[0]
+    return configured
+
+
+def _claude_cli_preflight(executor_id: str) -> str | None:
+    """The message to show when `executor_id` is Claude Code but its CLI is
+    not on PATH; `None` when nothing is wrong (or another provider is
+    selected — each provider carries its own availability probe).
+
+    Probes `runtime_supervisor.CLAUDE_BINARY`, the executable the v2 Session
+    Supervisor will actually exec, not a separately-guessed name."""
+    if executor_id != "claude_code":
+        return None
+    available, message = agent_runner.claude_cli_preflight(runtime_supervisor.CLAUDE_BINARY)
+    return None if available else message
+
+
 def render_agent_launcher(
     *,
     key_prefix: str,
@@ -652,6 +677,25 @@ def render_agent_launcher(
     repo_path = cfg.get("repository_path")
     confirm_key = f"{key_prefix}_confirm_open"
     st.session_state.setdefault(confirm_key, False)
+    task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
+
+    # Preflight (audit MINOR-2): a missing `claude` binary makes the run fail
+    # at exec time, which used to be discovered only *after* the operator had
+    # walked the entire confirmation flow. Say it here, next to the button
+    # that opens that flow. The dialog re-checks the *selected* provider
+    # below — this one reports on the provider it will preselect.
+    try:
+        preselectable_executors = list(project_config.allowed_execution_providers(project))
+    except project_config.ProviderAuthorizationError:
+        # A broken authorization policy blocks the launch outright and the
+        # dialog reports it in full; a CLI warning on top would only be noise.
+        preselectable_executors = []
+    if preselectable_executors:
+        cli_preflight_message = _claude_cli_preflight(
+            _preselected_executor_id(cfg=cfg, task=task_for_launch, options=preselectable_executors)
+        )
+        if cli_preflight_message:
+            st.warning(cli_preflight_message)
 
     if st.button("Запустить агента", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
         st.session_state[confirm_key] = True
@@ -666,7 +710,6 @@ def render_agent_launcher(
     # this entire form into a sliver a few hundred pixels wide.
     @st.dialog("Подтверждение запуска агента", width="large")
     def _render_launch_confirmation() -> None:
-        task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
         selection = launch.resolve_workspace_path(task=task_for_launch, project_config=cfg)
 
         if not selection.path:
@@ -700,11 +743,9 @@ def render_agent_launcher(
         except project_config.ProviderAuthorizationError as exc:
             st.error(str(exc))
             return
-        configured_executor = (
-            (task_for_launch or {}).get("executor") or cfg.get("default_executor") or "claude_code"
+        configured_executor = _preselected_executor_id(
+            cfg=cfg, task=task_for_launch, options=executor_options
         )
-        if configured_executor not in executor_options:
-            configured_executor = executor_options[0]
         executor_id = st.selectbox(
             "Execution provider",
             executor_options,
@@ -721,6 +762,13 @@ def render_agent_launcher(
                 else f"Недоступен ({provider_availability.code}): {provider_availability.message}"
             )
             (st.caption if provider_availability.available else st.error)(availability_text)
+        # `ClaudeProvider.availability()` reports "configured", not "installed"
+        # (it never probes PATH), so the missing-binary case is caught here —
+        # still above the prompt, the confirmation checkbox and the launch
+        # button, never after them.
+        selected_cli_preflight_message = _claude_cli_preflight(executor_id)
+        if selected_cli_preflight_message:
+            st.error(selected_cli_preflight_message)
         prompt = st.text_area(
             "Промпт для агента", value=default_prompt, height=220, key=f"{key_prefix}_prompt"
         )
@@ -813,6 +861,7 @@ def render_agent_launcher(
                     or not prep.launchable
                     or not warnings_ack
                     or not bool(provider_availability and provider_availability.available)
+                    or bool(selected_cli_preflight_message)
                 ),
                 icon=":material/play_arrow:",
             )
@@ -836,6 +885,13 @@ def render_agent_launcher(
             return
         if validation.warnings and not warnings_ack:
             st.error("Подтвердите предупреждения выше перед запуском.")
+            return
+        # Same defense in depth for the CLI preflight, and re-probed at click
+        # time: the operator may have installed the binary while this dialog
+        # was open, so this is a fresh check, not the render-time verdict.
+        click_time_preflight_message = _claude_cli_preflight(executor_id)
+        if click_time_preflight_message:
+            st.error(click_time_preflight_message)
             return
 
         # `selection.path` was already validated above (existence, is_dir,

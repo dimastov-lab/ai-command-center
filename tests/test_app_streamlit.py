@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -22,6 +23,7 @@ from streamlit.testing.v1 import AppTest
 from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage, task_view, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
+from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import project_selector
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -233,6 +235,106 @@ def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
 
     errors = [e.value for e in at.error]
     assert any("не настроен" in message for message in errors)
+
+
+# --------------------------------------------------------------------------
+# Missing `claude` binary is surfaced *before* the confirmation flow (audit
+# MINOR-2): `claude_cli_available()` existed but was wired only into Project
+# Chat, so the main task launcher discovered a missing CLI at exec time —
+# after the operator had already picked a provider, written a prompt and
+# confirmed the launch.
+# --------------------------------------------------------------------------
+
+
+def _seed_launchable_aios_task(tmp_path) -> Path:
+    repo = tmp_path / "aios-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task()
+    return repo
+
+
+def test_kanban_launcher_warns_about_missing_claude_binary_before_confirmation(monkeypatch, tmp_path):
+    """The DoD case: with no `claude` resolvable on PATH the warning must be
+    on the card itself, next to the button that opens the confirmation
+    dialog — visible while nothing has been confirmed and the dialog has not
+    even been opened."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", "claude-not-installed-for-test")
+    _seed_launchable_aios_task(tmp_path)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    warnings = [w.value for w in at.warning]
+    assert any(
+        "claude-not-installed-for-test" in message and "не найден" in message for message in warnings
+    ), f"launcher did not warn about the missing claude binary before confirmation: {warnings}"
+    # "before, not after": the confirmation dialog is still closed.
+    assert not any(c.key == "kanban_seeded-task-1_launch_confirmed" for c in at.checkbox)
+
+
+def test_kanban_launcher_shows_no_cli_warning_when_the_binary_resolves(monkeypatch, tmp_path):
+    """Control for the test above — the preflight must not nag on every card
+    of a correctly installed setup. `sys.executable` stands in for a `claude`
+    that is genuinely resolvable (nothing is launched here)."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", sys.executable)
+    _seed_launchable_aios_task(tmp_path)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    assert not any("не найден" in w.value and "PATH" in w.value for w in at.warning)
+
+
+def test_kanban_launcher_cli_warning_follows_the_preselected_provider(monkeypatch, tmp_path, fake_codex):
+    """The preflight is about the provider this launcher will actually
+    preselect: a project running on Codex must not be warned about a Claude
+    binary it never execs."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", "claude-not-installed-for-test")
+    _seed_launchable_aios_task(tmp_path)  # fake_codex authorizes claude_code + codex for AIOS
+    project_config.save_project_settings("AIOS", default_executor="codex")
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_open_btn")  # the card really did render
+    assert not any("claude-not-installed-for-test" in w.value for w in at.warning)
+
+
+def test_kanban_launcher_missing_claude_binary_blocks_the_launch_itself(monkeypatch, tmp_path):
+    """The warning is not merely cosmetic: inside the dialog the same
+    preflight renders above the confirmation checkbox, disables the launch
+    button, and — since `AppTest.click()` ignores `disabled` — is re-checked
+    server-side so a forced click cannot start an agent that could only fail
+    at exec time."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", "claude-not-installed-for-test")
+
+    real_popen = subprocess.Popen
+
+    def fail_if_claude_launched(command, *args, **kwargs):
+        argv = list(command) if isinstance(command, (list, tuple)) else [command]
+        if argv and str(argv[0]) == "claude-not-installed-for-test":
+            raise AssertionError("no agent may be launched while the claude binary is missing")
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fail_if_claude_launched)
+    _seed_launchable_aios_task(tmp_path)
+
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    # Rendered inside the dialog, above the confirmation checkbox.
+    assert any("claude-not-installed-for-test" in e.value for e in at.error)
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert not at.exception
+    launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
+    assert launch_button.disabled is True
+
+    at = launch_button.click().run()
+    assert not at.exception
+    assert any("claude-not-installed-for-test" in e.value for e in at.error)
+    assert agent_runner.load_runs() == []
 
 
 # --------------------------------------------------------------------------

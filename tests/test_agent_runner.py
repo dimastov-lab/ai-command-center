@@ -1,4 +1,5 @@
 import subprocess
+import sys
 
 import pytest
 
@@ -293,6 +294,42 @@ def test_run_claude_code_handles_missing_binary(monkeypatch, tmp_path):
     )
     assert result.status == "failed"
     assert result.exit_code is None
+
+
+# --------------------------------------------------------------------------
+# CLI preflight — the "is `claude` even installed?" probe every launch entry
+# point asks *before* it lets an operator confirm a launch (audit MINOR-2)
+# --------------------------------------------------------------------------
+
+
+def test_claude_cli_preflight_reports_available_for_an_existing_binary():
+    # `sys.executable` is guaranteed to exist and be executable; the probe is
+    # about resolvability on PATH, not about the binary being Claude Code.
+    available, message = agent_runner.claude_cli_preflight(sys.executable)
+    assert available is True
+    assert message == ""
+
+
+def test_claude_cli_preflight_names_the_missing_binary_and_how_to_fix_it():
+    available, message = agent_runner.claude_cli_preflight("claude-not-installed-for-test")
+    assert available is False
+    assert "claude-not-installed-for-test" in message
+    assert "PATH" in message
+
+
+def test_claude_cli_probe_follows_path_and_defaults_to_the_module_binary(monkeypatch, tmp_path):
+    """With nothing on PATH the default probe must fail, and it must succeed
+    again once `CLAUDE_BINARY` is resolvable there — i.e. the check really is
+    a PATH lookup of the executable the runner would exec, not a constant."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert agent_runner.claude_cli_available() is False
+    assert agent_runner.claude_cli_preflight()[0] is False
+
+    stand_in = tmp_path / agent_runner.CLAUDE_BINARY
+    stand_in.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stand_in.chmod(0o700)
+    assert agent_runner.claude_cli_available() is True
+    assert agent_runner.claude_cli_preflight() == (True, "")
 
 
 # --------------------------------------------------------------------------
