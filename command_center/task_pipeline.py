@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -2098,3 +2099,66 @@ def _locked_tick(
         completed_task_ids=tuple(completed_task_ids),
         errors=tuple(errors),
     )
+
+
+# ---------------------------------------------------------------------------
+# Background sync driver (audit MAJOR-8) — opt-in, off by default.
+#
+# The run->task Kanban projection is normally driven by an open Live Execution
+# Center page's refresh (see `app.py`'s `_maybe_run_autopilot_tick`), so with no
+# page open the projection freezes until someone looks again. That is fine for an
+# interactive operator — the board reconciles the instant it is opened — but
+# leaves a headless / unattended host (the same audience as
+# `AICC_COMPLETION_AUTOPILOT`) with stale task state. This optional daemon runs
+# one `tick` every `interval_seconds` so a backend keeps task state truthful with
+# nobody watching. The interactive app never starts it; a host opts in via
+# `AICC_BACKGROUND_SYNC` (see `app.py`'s `get_execution_center_api`).
+# ---------------------------------------------------------------------------
+
+_BACKGROUND_SYNC_INTERVAL_SECONDS = 15.0
+_background_sync_thread: threading.Thread | None = None
+_background_sync_stop: threading.Event | None = None
+
+
+def start_background_sync(
+    root: Path,
+    api,
+    project_configs_provider: Callable[[], dict[str, dict]],
+    *,
+    interval_seconds: float = _BACKGROUND_SYNC_INTERVAL_SECONDS,
+) -> None:
+    """Start a bounded, daemon background poller that runs one `tick` every
+    `interval_seconds`, keeping the run->task projection current even when no
+    page is open to drive it (audit MAJOR-8).
+
+    Idempotent: a second call while one is already running is a no-op. Reuses
+    `tick`'s host-wide `pipeline_lock`, so this poller and a live page's tick can
+    never interleave — whichever takes the lock does the work, the other returns
+    `TICK_BUSY` and skips. `project_configs_provider` is called fresh on every
+    tick (not captured once), so a project-config edit is picked up without a
+    restart. One bad tick is swallowed so a single fault never kills the poller —
+    the same contract as `Supervisor.start_completion_autopilot`."""
+    global _background_sync_thread, _background_sync_stop
+    if _background_sync_thread is not None and _background_sync_thread.is_alive():
+        return
+    stop = threading.Event()
+    _background_sync_stop = stop
+
+    def _loop() -> None:
+        while not stop.wait(interval_seconds):
+            try:
+                tick(root, api, project_configs_provider())
+            except Exception:  # noqa: BLE001 - one bad tick must never kill the poller
+                continue
+
+    thread = threading.Thread(target=_loop, name="aicc-background-sync", daemon=True)
+    _background_sync_thread = thread
+    thread.start()
+
+
+def stop_background_sync() -> None:
+    """Signal the background sync poller (if running) to stop after its current
+    wait. The thread is `daemon=True` and also dies with the process; this is the
+    graceful path used by tests and an orderly shutdown."""
+    if _background_sync_stop is not None:
+        _background_sync_stop.set()
