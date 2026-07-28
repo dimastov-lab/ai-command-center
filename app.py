@@ -4578,19 +4578,50 @@ elif page_key == "create":
     st.divider()
     st.markdown("#### Импорт пакета задач")
     st.caption(
-        "Загрузите JSON-файл со списком задач (например, пакет от Founder-аудита) — "
-        "поддерживаются как «конверт» `{schema_version, package_id, tasks}`, так и "
-        "простой список задач. Ничего не записывается в `data/tasks.json` до нажатия "
-        "«Импортировать задачи»."
+        "Загрузите файл или вставьте пакет задач (например, пакет от Founder-аудита). "
+        "Поддерживаются JSON, YAML, Markdown и простой текст, в двух формах: «конверт» "
+        "`{schema_version, package_id, tasks}` или простой список задач. Ничего не "
+        "записывается в `data/tasks.json` до нажатия «Импортировать задачи»."
     )
     uploaded_package = st.file_uploader(
-        "JSON-пакет задач", type=["json"], key="import_task_package_uploader"
+        "Файл пакета задач (JSON / YAML / Markdown / текст)",
+        type=list(task_import.SUPPORTED_IMPORT_SUFFIXES),
+        key="import_task_package_uploader",
     )
+    pasted_package = st.text_area(
+        "…или вставьте пакет сюда",
+        key="import_task_package_paste",
+        height=120,
+        placeholder='{"tasks": [ … ]}   ·   YAML   ·   Markdown c ```json / ```yaml-блоком',
+    )
+    paste_format = st.selectbox(
+        "Формат вставленного текста",
+        ("авто", "json", "yaml", "markdown"),
+        key="import_task_package_paste_format",
+        help="«авто» распознаёт JSON или YAML. Для вставленного Markdown выберите его явно.",
+    )
+
+    parsed_package = None
+    import_parse_error: task_import.TaskImportError | None = None
     if uploaded_package is not None:
+        # Pass the real filename so the parser can pick YAML/Markdown by
+        # extension, not just sniff JSON/YAML out of the raw bytes.
         try:
-            parsed_package = task_import.parse_task_package(uploaded_package.getvalue())
+            parsed_package = task_import.parse_task_package(
+                uploaded_package.getvalue(), filename=uploaded_package.name
+            )
         except task_import.TaskImportError as exc:
-            st.error(f"Ошибка разбора пакета: {exc}")
+            import_parse_error = exc
+    elif pasted_package.strip():
+        fmt = None if paste_format == "авто" else paste_format
+        try:
+            parsed_package = task_import.parse_task_package(pasted_package, fmt=fmt)
+        except task_import.TaskImportError as exc:
+            import_parse_error = exc
+
+    if import_parse_error is not None or parsed_package is not None:
+        if import_parse_error is not None:
+            st.error(f"Ошибка разбора пакета: {import_parse_error}")
         else:
             import_validation = task_import.validate_task_package(parsed_package)
             import_preview = task_import.build_import_preview(ROOT, parsed_package, import_validation)
