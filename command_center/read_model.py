@@ -17,15 +17,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# The canonical Kanban lanes, in board order, plus `Blocked` as a first-class
-# lane. `models.KANBAN_STATUSES` omits `Blocked`, which is exactly why 86 blocked
-# tasks (49% of the backlog) rendered in no column at all (audit D2). Any status
-# outside this set is counted in `other` rather than dropped.
+# The canonical *read-side* lanes, in board order, plus `Blocked` as a
+# first-class compatibility lens. The stored planning vocabulary deliberately
+# remains the five `models.KANBAN_STATUSES`; `Blocked` is included here because
+# legacy/live data already contains it and those tasks must be visible rather
+# than silently dropped (audit D2). Any status outside this set is counted in
+# `other`.
 CANONICAL_LANES: tuple[str, ...] = ("Backlog", "Next", "In Progress", "Review", "Blocked", "Done")
 
 # Lanes that represent in-flight or ready-to-start work — neither resolved
 # (`Done`) nor stuck (`Blocked`).
-_ACTIVE_LANES: tuple[str, ...] = ("Backlog", "Next", "In Progress", "Review")
+ACTIVE_LANES: tuple[str, ...] = ("Backlog", "Next", "In Progress", "Review")
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,6 @@ def task_snapshot(tasks: list[dict]) -> TaskSnapshot:
         other=other,
         done=by_lane["Done"],
         blocked=by_lane["Blocked"],
-        active=sum(by_lane[lane] for lane in _ACTIVE_LANES),
+        active=sum(by_lane[lane] for lane in ACTIVE_LANES),
         attention=attention,
     )
