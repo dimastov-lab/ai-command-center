@@ -1293,6 +1293,14 @@ def get_execution_center_api() -> runtime_api.ExecutionCenterAPI:
     """
     api = runtime_api.ExecutionCenterAPI()
     api.reconcile()
+    # Opt-in background sync (audit MAJOR-8): keep the run->task projection
+    # current on a host that runs unattended (no Live Execution Center tab open
+    # to drive the tick). Off by default — the interactive app relies on a tab's
+    # refresh. Started once per server process (this function is
+    # `@st.cache_resource`) and shares `tick`'s host-wide `pipeline_lock`, so it
+    # never races the page tick.
+    if os.environ.get("AICC_BACKGROUND_SYNC"):
+        task_pipeline.start_background_sync(ROOT, api, project_config.load_project_configs)
     return api
 
 
