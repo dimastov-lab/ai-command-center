@@ -502,6 +502,20 @@ REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REP
 
 
 def report_path_for(run: dict) -> Path:
+    """The report file for `run`, always inside `REPORTS_ROOT`.
+
+    `run["project"]` is a path component here, and it is not always a value
+    this app authored: a Portfolio card's `project` frontmatter field is
+    externally-authored text that flows card -> `portfolio_launch.
+    _synthetic_task` -> `execution_queue.launch_ready` -> `db.create_run
+    (project=...)` -> this run record, and neither `portfolio_models.
+    parse_card` nor `db.create_run` constrains it the way `validate_task_id`
+    constrains `task_id`. `storage.assert_within_root` is therefore the gate
+    on the *write* side, mirroring `resolve_report_path` on the read side
+    (audit MAJOR-9): a `project` of `../../etc` — or one whose
+    `reports/<project>/` directory is a symlink out of the tree — raises
+    `storage.PathContainmentError` instead of writing outside `reports/`.
+    """
     project = run.get("project") or "UNKNOWN"
     started = run.get("started_at") or run.get("created_at") or models.iso_now()
     try:
@@ -512,7 +526,9 @@ def report_path_for(run: dict) -> Path:
     task_part = (run.get("task_id") or "adhoc")[:12]
     agent = run.get("agent") or "agent"
     filename = f"{timestamp}_{task_part}_{agent}.md"
-    return REPORTS_ROOT / project / filename
+    candidate = REPORTS_ROOT / project / filename
+    storage.assert_within_root(candidate, REPORTS_ROOT, what="report")
+    return candidate
 
 
 def _format_findings_markdown(parsed: dict) -> str:

@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from command_center.models import iso_now
-from command_center.storage import atomic_write_text
+from command_center.storage import assert_within_root, atomic_write_text
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 # `AICC_REPORTS_ROOT` mirrors `storage.resolve_data_dir`'s `AICC_DATA_DIR` override,
@@ -38,6 +38,23 @@ REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REP
 
 
 def report_path_for(run: dict) -> Path:
+    """The report file for `run`, always inside `REPORTS_ROOT`.
+
+    `run["project"]` is a path component here, and it is not always a value
+    this app authored: a Portfolio card's `project` frontmatter field is
+    externally-authored text that flows card -> `portfolio_launch.
+    _synthetic_task` -> `execution_queue.launch_ready` -> `db.create_run
+    (project=...)` -> this run row, and neither `portfolio_models.parse_card`
+    nor `db.create_run` constrains it the way `validate_task_id` constrains
+    `task_id`. `storage.assert_within_root` is therefore the gate on the
+    *write* side, mirroring `agent_runner.resolve_report_path` on the read
+    side (audit MAJOR-9): a `project` of `../../etc` — or one whose
+    `reports/<project>/` directory is a symlink out of the tree — raises
+    `storage.PathContainmentError` instead of writing outside `reports/`.
+    `Supervisor._supervise` already treats any exception from `save_report`
+    as a `report_persistence_failed` lifecycle event, so the run's own
+    terminal state still persists.
+    """
     project = run.get("project") or "UNKNOWN"
     started = run.get("started_at") or run.get("created_at") or iso_now()
     try:
@@ -46,7 +63,9 @@ def report_path_for(run: dict) -> Path:
         started_dt = datetime.now()
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
     run_part = (run.get("id") or "unknown")[:12]
-    return REPORTS_ROOT / project / f"{timestamp}_{run_part}.md"
+    candidate = REPORTS_ROOT / project / f"{timestamp}_{run_part}.md"
+    assert_within_root(candidate, REPORTS_ROOT, what="report")
+    return candidate
 
 
 def _assistant_text_blocks(events: list[dict]) -> list[str]:

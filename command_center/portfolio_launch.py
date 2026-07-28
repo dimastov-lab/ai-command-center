@@ -157,16 +157,16 @@ def _assert_within_root(candidate: Path, root: Path, *, what: str) -> None:
     """Raises `PortfolioLaunchError` if `candidate` does not resolve to a
     location inside `root` — the last-line defense against a symlinked
     ancestor directory redirecting a syntactically-safe `task_id`-derived
-    path outside its intended sandbox. Resolves both sides (symlinks
-    included) before comparing; does not require either path to exist yet."""
-    resolved_root = root.resolve()
-    resolved_candidate = candidate.resolve(strict=False)
+    path outside its intended sandbox.
+
+    The containment rule itself lives in `storage.assert_within_root` (one
+    implementation, also used by both report-writing paths); this wrapper only
+    re-raises it as this module's own exception, since every caller here is on
+    the mutation/launch path and already handles `PortfolioLaunchError`."""
     try:
-        resolved_candidate.relative_to(resolved_root)
-    except ValueError as exc:
-        raise PortfolioLaunchError(
-            f"resolved {what} path escapes the configured sandbox root ({resolved_root}): {resolved_candidate}"
-        ) from exc
+        storage.assert_within_root(candidate, root, what=what)
+    except storage.PathContainmentError as exc:
+        raise PortfolioLaunchError(str(exc)) from exc
 
 
 def branch_name_for(task_id: str) -> str:

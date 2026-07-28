@@ -56,6 +56,41 @@ def resolve_data_dir(root: Path) -> Path:
     return Path(override) if override else root / "data"
 
 
+class PathContainmentError(ValueError):
+    """A path built from caller-supplied input resolves outside the root it was
+    required to stay inside. Raised by `assert_within_root`."""
+
+
+def assert_within_root(candidate: Path, root: Path, *, what: str) -> None:
+    """Raises `PathContainmentError` if `candidate` does not resolve to a
+    location inside `root`.
+
+    The single implementation of this project's path-containment rule, shared
+    by every place that joins an externally-authored string (a Portfolio card's
+    `task_id` or `project`, a run record's `project`) onto a sandbox root:
+    `command_center.portfolio_launch` (worktree/lock paths, which wrap the
+    `PathContainmentError` into their own `PortfolioLaunchError`) and both
+    report-writing paths (`agent_runner.report_path_for`,
+    `runtime.reports.report_path_for`). Resolves both sides — symlinks and
+    `..` segments included — before comparing, so neither a traversal segment,
+    an absolute value, nor a symlinked ancestor directory can redirect a
+    syntactically-innocent candidate outside its intended root. Neither path
+    has to exist yet.
+
+    An invalid value is always rejected outright, never silently normalized
+    into something safe-looking (same discipline as
+    `portfolio_models.validate_task_id`).
+    """
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve(strict=False)
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise PathContainmentError(
+            f"resolved {what} path escapes the configured sandbox root ({resolved_root}): {resolved_candidate}"
+        ) from exc
+
+
 def atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}_", suffix=".tmp")
