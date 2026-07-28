@@ -419,6 +419,13 @@ def sync_tasks(
     every existing caller."""
     mutated: list[dict] = []
     for task in tasks:
+        # ``Done`` is the canonical engineering outcome: it is only assigned
+        # after the operator or completion pipeline accepts the delivered
+        # result. Historical run rows remain queryable, but a later refresh
+        # must not project an older failed/review run back onto the resolved
+        # task and turn Completed into Failed/Needs Review again.
+        if task.get("status") == "Done":
+            continue
         run_id = task.get("current_run_id")
         if not run_id:
             continue

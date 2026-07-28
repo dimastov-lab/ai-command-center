@@ -100,6 +100,24 @@ def superseded_run_ids(sessions: list[dict]) -> frozenset[str]:
     )
 
 
+def completed_task_run_ids(
+    sessions: list[dict], tasks_by_id: dict[str, dict]
+) -> frozenset[str]:
+    """Run ids whose linked task is already resolved as ``Done``.
+
+    A failed historical attempt remains valuable in the run journal, but it is
+    no longer actionable work once the canonical task record is ``Done``.
+    Keeping such a run in the attention bucket invites an operator to launch a
+    needless remediation against already-delivered code.
+    """
+    return frozenset(
+        session["run_id"]
+        for session in sessions
+        if session.get("task_id")
+        and tasks_by_id.get(session["task_id"], {}).get("status") == "Done"
+    )
+
+
 def split_board(sessions: list[dict], *, display_status: str = "status") -> dict[str, list[dict]]:
     """Bucket `sessions` for the board, newest-started first inside each
     bucket. Every bucket key in `BUCKET_ORDER` is always present, so a caller

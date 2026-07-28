@@ -531,6 +531,30 @@ def test_reconcile_and_sync_skips_tasks_without_current_run_id(tmp_path):
     assert tasks[0]["launch_status"] == "Ready"
 
 
+def test_reconcile_and_sync_does_not_reopen_done_task_from_failed_run(tmp_path):
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    run = _make_run(
+        api.db_path,
+        state="FAILED",
+        failure_reason="incomplete:working_tree_unchanged",
+        completed_at="2026-01-01T00:01:00",
+    )
+    task = _make_task(
+        status="Done",
+        current_run_id=run["id"],
+        launch_status="Completed",
+        current_stage="Merged",
+        progress=100,
+    )
+
+    mutated = task_sync.reconcile_and_sync(api, [task])
+
+    assert mutated == []
+    assert task["launch_status"] == "Completed"
+    assert task["current_stage"] == "Merged"
+    assert task["progress"] == 100
+
+
 def test_reconcile_and_sync_reconciles_dead_process_and_marks_task_ready_for_retry(tmp_path):
     """A dead process that never produced output is a startup failure (e.g.
     expired OAuth). The executor is recorded in `failed_executors` and the task

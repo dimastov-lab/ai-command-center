@@ -3022,9 +3022,13 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # it finished"). Only the attention bucket is filtered; the superseded run
     # still exists in the run journal and its own terminal bucket.
     superseded = live_board.superseded_run_ids(sessions)
-    if superseded:
+    resolved = live_board.completed_task_run_ids(sessions, tasks_by_id)
+    hidden_attention_run_ids = superseded | resolved
+    if hidden_attention_run_ids:
         board[live_board.BUCKET_ATTENTION] = [
-            s for s in board[live_board.BUCKET_ATTENTION] if s["run_id"] not in superseded
+            s
+            for s in board[live_board.BUCKET_ATTENTION]
+            if s["run_id"] not in hidden_attention_run_ids
         ]
 
     board_style.begin()
