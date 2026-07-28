@@ -3033,7 +3033,8 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # still exists in the run journal and its own terminal bucket.
     superseded = live_board.superseded_run_ids(sessions)
     resolved = live_board.completed_task_run_ids(sessions, tasks_by_id)
-    hidden_attention_run_ids = superseded | resolved
+    removed = live_board.removed_task_run_ids(sessions, tasks_by_id)
+    hidden_attention_run_ids = superseded | resolved | removed
     if hidden_attention_run_ids:
         board[live_board.BUCKET_ATTENTION] = [
             s

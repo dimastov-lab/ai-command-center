@@ -449,6 +449,19 @@ def test_completed_task_run_ids_removes_resolved_failures_from_attention():
     )
 
 
+def test_removed_task_run_ids_hides_deleted_task_but_not_ad_hoc_run():
+    sessions = [
+        {"run_id": "deleted-task-run", "task_id": "TASK-DELETED"},
+        {"run_id": "known-task-run", "task_id": "TASK-KNOWN"},
+        {"run_id": "genuine-ad-hoc-run", "task_id": None},
+    ]
+    tasks_by_id = {"TASK-KNOWN": {"id": "TASK-KNOWN", "status": "Backlog"}}
+
+    assert live_board.removed_task_run_ids(sessions, tasks_by_id) == frozenset(
+        {"deleted-task-run"}
+    )
+
+
 def test_superseded_leaves_a_single_run_alone():
     sessions = [{"run_id": "only", "task_id": "T", "started_at": "2026-01-01T00:00:00"}]
     assert live_board.superseded_run_ids(sessions) == frozenset()

@@ -118,6 +118,23 @@ def completed_task_run_ids(
     )
 
 
+def removed_task_run_ids(
+    sessions: list[dict], tasks_by_id: dict[str, dict]
+) -> frozenset[str]:
+    """Run ids linked to a task that is no longer in the canonical backlog.
+
+    The run remains available in the journal, but a deleted or consolidated
+    task leaves nothing actionable for the attention workflow to repair.
+    Genuine ad-hoc runs have no ``task_id`` and deliberately remain visible.
+    """
+    return frozenset(
+        session["run_id"]
+        for session in sessions
+        if session.get("task_id")
+        and session["task_id"] not in tasks_by_id
+    )
+
+
 def split_board(sessions: list[dict], *, display_status: str = "status") -> dict[str, list[dict]]:
     """Bucket `sessions` for the board, newest-started first inside each
     bucket. Every bucket key in `BUCKET_ORDER` is always present, so a caller
