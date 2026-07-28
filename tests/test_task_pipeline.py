@@ -586,6 +586,40 @@ def test_verified_completion_moves_the_task_to_done(tmp_path, git_repo, api):
     assert moved == ["a"]
     persisted = {t["id"]: t for t in tasks_repository.load_tasks(tmp_path)}
     assert persisted["a"]["status"] == "Done"
+    assert persisted["a"]["launch_status"] == "Completed"
+    assert persisted["a"]["current_stage"] == "Merged"
+    assert persisted["a"]["progress"] == 100
+
+
+def test_verified_completion_repairs_stale_execution_fields_on_done_task(
+    tmp_path, git_repo, api
+):
+    row = _seed_completion(api, git_repo)
+    runtime_db.update_completion(
+        api.db_path,
+        row["run_id"],
+        expected_version=row["version"],
+        fields={"completion_state": completion_domain.CompletionState.COMPLETED},
+    )
+    task = _task(
+        id="a",
+        workspace_path=str(git_repo),
+        status="Done",
+        launch_status="Incomplete",
+        current_stage="Implementation",
+        progress=40,
+    )
+    tasks_repository.save_tasks(tmp_path, [task])
+
+    moved = task_pipeline.project_verified_completions(tmp_path, db_path=api.db_path)
+
+    assert moved == []
+    persisted = tasks_repository.load_tasks(tmp_path)[0]
+    assert persisted["status"] == "Done"
+    assert persisted["launch_status"] == "Completed"
+    assert persisted["current_stage"] == "Merged"
+    assert persisted["progress"] == 100
+    assert persisted["pull_request_status"] == "merged"
 
 
 def test_unverified_completion_never_moves_the_task_to_done(tmp_path, git_repo, api):

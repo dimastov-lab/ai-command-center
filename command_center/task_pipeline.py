@@ -1740,20 +1740,33 @@ def project_verified_completions(root: Path, *, db_path: Path) -> list[str]:
     direct JSON replacement. Idempotent: a task already `Done` is skipped, so
     repeated ticks neither rewrite it nor re-emit its timeline event."""
 
-    def _mutator(tasks: list[dict]) -> list[str]:
+    def _mutator(tasks: list[dict]) -> tuple[list[str], bool]:
         moved: list[str] = []
+        changed = False
         for task in tasks:
             task_id = task.get("id")
-            if not task_id or task.get("status") == "Done":
+            if not task_id:
                 continue
             row = runtime_db.get_completion_by_task(db_path, task_id)
             if row is None:
                 continue
-            if task_sync.project_completion_to_kanban(task, row):
+            # The completion row can belong to an earlier successful run while
+            # a later verification/rework attempt is the task's current run.
+            # Project the full completion read-model before the Kanban lane so
+            # `Done` can never coexist with stale "Incomplete", 40%, or
+            # "Implementation" fields in the live UI.
+            execution_projection_changed = task_sync.sync_task_from_completion(task, row)
+            kanban_changed = task_sync.project_completion_to_kanban(task, row)
+            if kanban_changed:
                 moved.append(task_id)
-        return moved
+            if execution_projection_changed or kanban_changed:
+                changed = True
+        return moved, changed
 
-    return mutate_moved(root, _mutator)
+    result = tasks_repository.mutate_tasks(
+        root, _mutator, persist_if=lambda value: value[1]
+    )
+    return result[0]
 
 
 def mutate_moved(root: Path, mutator) -> list[str]:
