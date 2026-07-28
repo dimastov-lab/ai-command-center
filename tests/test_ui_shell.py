@@ -53,10 +53,17 @@ def test_navigating_via_nav_page_still_switches_page_content():
     assert any(s.value == "Kanban" for s in at.subheader)
 
 
-def test_dead_inspector_placeholder_is_replaced_by_working_search():
+def test_top_bar_search_and_inspector_are_wired():
+    """UX-2c: the Inspector pane is now real (search + selected detail). With
+    nothing selected it shows a guiding empty state — not the old inert
+    placeholder. The popover content runs regardless of its visual state, so
+    the empty-state `st.info` is present in `at.info`."""
     at = _at_on_page("dashboard")
     assert not at.exception
     assert not any("следующей фазе UX" in info.value for info in at.info)
+    assert any(
+        "Инспектор" in info.value or "Выберите задачу" in info.value for info in at.info
+    ), "Inspector empty-state message not found"
     assert any(button.key == "top_open_palette_btn" for button in at.button)
 
 
