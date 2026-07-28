@@ -378,7 +378,9 @@ LAUNCH_SKIP_LAUNCH_ERROR = "launch_error"
 LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR = "no_available_executor"
 
 
-def select_available_executor(task: dict, cfg: dict) -> str | None:
+def select_available_executor(
+    task: dict, cfg: dict, *, preferred_executor: str | None = None
+) -> str | None:
     """Pick the first *available* executor for this task, trying them in
     preference order and skipping any that already failed to start
     (``task["failed_executors"]``) or whose binary is unreachable
@@ -404,7 +406,11 @@ def select_available_executor(task: dict, cfg: dict) -> str | None:
     from command_center.runtime import providers as runtime_providers
 
     allowed = list(cfg.get("allowed_agents") or [])
-    configured = task.get("executor") or (allowed[0] if allowed else "claude_code")
+    configured = (
+        preferred_executor
+        or task.get("executor")
+        or (allowed[0] if allowed else "claude_code")
+    )
 
     # Preference order: configured executor first, then the rest of allowed.
     tried: set[str] = set()
@@ -480,6 +486,7 @@ def launch_ready(
     execution_center_api,
     *,
     entry_ids: list[str] | None = None,
+    executor_by_entry: dict[str, str] | None = None,
     timeout_seconds: int | None = None,
 ) -> tuple[list[dict], list[LaunchAttemptResult]]:
     """Launches every `READY` entry (or, if `entry_ids` is given, just those
@@ -611,7 +618,12 @@ def launch_ready(
         # differs from the task's configured one, record the switch so the
         # board shows which agent actually ran.
         cfg = project_configs.get(task.get("project")) or {}
-        selected_executor = select_available_executor(task, cfg)
+        planned_executor = (executor_by_entry or {}).get(entry.get("id"))
+        selected_executor = select_available_executor(
+            task,
+            cfg,
+            preferred_executor=planned_executor,
+        )
         if selected_executor is None:
             results.append(
                 LaunchAttemptResult(
@@ -628,14 +640,21 @@ def launch_ready(
             continue
         if selected_executor != (task.get("executor") or "claude_code"):
             original = task.get("executor") or "claude_code"
-            task["executor"] = selected_executor
             task.setdefault("timeline", []).append(
                 {
                     "ts": models.iso_now(),
-                    "type": "executor_fallback",
+                    "type": (
+                        "executor_assignment"
+                        if planned_executor == selected_executor
+                        else "executor_fallback"
+                    ),
                     "from": original,
                     "to": selected_executor,
-                    "reason": "configured executor unavailable or failed",
+                    "reason": (
+                        "selected by load-aware scheduler"
+                        if planned_executor == selected_executor
+                        else "configured executor unavailable or failed"
+                    ),
                 }
             )
 

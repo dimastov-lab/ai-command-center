@@ -142,7 +142,9 @@ def render_portfolio_overview_panel(*, root: Path) -> None:
     st.markdown("#### Portfolio Overview")
     st.caption(
         "Детерминированный, доказуемый обзор портфеля: здоровье, зависимости, волны, "
-        "критический путь, спрос на ресурсы и рекомендации. Только чтение — запуск в Portfolio Execution."
+        "критический путь, спрос на ресурсы и рекомендации. Источник — файловые "
+        "roadmap-карточки Portfolio, а не оперативный Kanban; поэтому эти числа "
+        "не смешиваются со счётчиками задач Live Center. Только чтение."
     )
 
     p_root = portfolio_root()
@@ -165,10 +167,10 @@ def render_portfolio_overview_panel(*, root: Path) -> None:
                 st.warning(f"`{issue.source_path}`: {issue.message}")
 
     top = st.columns(4)
-    top[0].metric("Всего задач", overview.total_tasks)
-    top[1].metric("Готовы сейчас", len(overview.ready_now))
-    top[2].metric("Заблокированы", len(overview.blocked))
-    top[3].metric("Проекты в риске", len(overview.at_risk_projects))
+    top[0].metric("Roadmap-карточек", overview.total_tasks)
+    top[1].metric("Готовы по roadmap", len(overview.ready_now))
+    top[2].metric("Заблокированы в roadmap", len(overview.blocked))
+    top[3].metric("Roadmap-проекты в риске", len(overview.at_risk_projects))
 
     if overview.total_tasks == 0:
         st.info("В загруженных дорожках нет задач.")

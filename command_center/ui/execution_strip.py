@@ -1,7 +1,7 @@
 """Execution Strip (UX-2a): a slim, always-visible status bar that surfaces
 what is running right now regardless of which page is open.
 
-It is a `@st.fragment(run_every=5s)`, so it polls the runtime database on its
+It is a small, isolated polling fragment, so it polls the runtime database on its
 own cadence and repaints *only itself* — the page behind it never blanks just
 because the strip ticked. This is the direct answer to the operator's reported
 "every few seconds the whole page visibly refreshes" pain: execution state
@@ -16,11 +16,14 @@ does not build the full session views the Execution Center page does.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import streamlit as st
 
+from command_center import execution_queue, tasks_repository
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.runtime.db import RUN_STATES
-from command_center.ui import tokens
+from command_center.ui import execution_metrics, tokens
 
 # The strip mirrors the Live Execution Center's three buckets (live / waiting /
 # attention) but counts them from the **persisted** `run.state` vocabulary
@@ -106,17 +109,47 @@ assert _unbucketed <= {"COMPLETED", "CANCELLED"}, (
 )
 
 
-@st.fragment(run_every=5.0)
-def render_execution_strip(api: ExecutionCenterAPI) -> None:
+def current_counts(
+    runs: list[dict],
+    tasks: list[dict],
+    queue_entries: list[dict],
+    *,
+    dismissed_attention_run_ids: set[str] | frozenset[str] = frozenset(),
+) -> execution_metrics.ExecutionCounts:
+    """Build the same four counts the Live Center headline uses."""
+    tasks_by_id = {task["id"]: task for task in tasks if task.get("id")}
+    sessions = execution_metrics.lightweight_sessions_from_runs(runs, tasks_by_id)
+    board = execution_metrics.actionable_board(
+        sessions,
+        tasks_by_id,
+        dismissed_attention_run_ids=dismissed_attention_run_ids,
+    )
+    return execution_metrics.counts_for_snapshot(board, queue_entries)
+
+
+@st.fragment(run_every=15.0)
+def render_execution_strip(api: ExecutionCenterAPI, root: Path) -> None:
     """Render the cross-page execution status strip.
 
-    Polls ``api.list_runs`` every 5 s and shows live / waiting / attention
+    Polls a lightweight snapshot every 15 s and shows the exact same live /
+    waiting / attention totals as the Live Center headline. The slower cadence
+    keeps the status current without repainting the page every five seconds.
     counts with a single button to jump to the Live Execution Center. When
     nothing is running and nothing needs attention the strip renders a quiet
     idle line so the bar never looks broken-empty.
     """
-    runs = api.list_runs(limit=100)
-    live, waiting, attention = strip_counts(_nonsuperseded_runs(runs))
+    runs = api.list_runs(limit=200)
+    tasks = tasks_repository.load_tasks(root)
+    queue_entries = execution_queue.load_queue(root)
+    counts = current_counts(
+        runs,
+        tasks,
+        queue_entries,
+        dismissed_attention_run_ids=st.session_state.get(
+            "exec_attention_dismissed", set()
+        ),
+    )
+    live, waiting, attention = counts.live, counts.waiting, counts.attention
 
     with st.container(border=True, key="exec_strip"):
         left, right = st.columns([5, 2], vertical_alignment="center")
@@ -131,7 +164,7 @@ def render_execution_strip(api: ExecutionCenterAPI) -> None:
             label = "  ·  ".join(parts) if parts else "Система простаивает — активных прогонов нет"
             tone = tokens.TONE_DANGER if attention else tokens.TONE_ACTIVE if live else tokens.TONE_NEUTRAL
             st.markdown(f"**{label}**")
-            st.caption("Live Execution Center · автообновление каждые 5 с", )
+            st.caption("Live Execution Center · актуальный снимок каждые 15 с")
             # The tone is exposed as a colored badge so a glance catches the
             # worst state (attention) without reading the label.
             st.badge(

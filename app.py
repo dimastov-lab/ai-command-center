@@ -43,6 +43,7 @@ from command_center.ui import (
     backlog_proposals,
     backlog_reconcile_panel,
     board_style,
+    execution_metrics,
     execution_strip,
     home_dashboard,
     live_board,
@@ -57,6 +58,7 @@ from command_center.ui import (
     queue_panel,
     recommendations_panel,
     shell,
+    sidebar,
     tokens,
 )
 
@@ -202,7 +204,7 @@ NAV: dict[str, tuple[str, str]] = {
     "git_center": ("Git Center", ":material/commit:"),
     "workspace": ("Workspace Launcher", ":material/rocket_launch:"),
     "focus": ("Focus Mode", ":material/center_focus_strong:"),
-    "portfolio": ("Portfolio Execution", ":material/inventory_2:"),
+    "portfolio": ("Портфель", ":material/inventory_2:"),
     "portfolio_overview": ("Portfolio Overview", ":material/hub:"),
 }
 
@@ -1008,6 +1010,35 @@ def _set_launch_status(task_id: str, status: str, note: str) -> None:
     tasks_repository.set_manual_launch_status(ROOT, task_id, status, note)
 
 
+def _render_manual_merge_button(
+    api: runtime_api.ExecutionCenterAPI,
+    completion: dict | None,
+    *,
+    key: str,
+) -> None:
+    if not session_view.manual_merge_available(completion):
+        return
+    if st.button(
+        "Сделать мердж",
+        key=key,
+        type="primary",
+        icon=":material/merge:",
+        help="Слияния выполняются строго последовательно; CI, ревью и конфликты проверяются повторно.",
+    ):
+        try:
+            updated = api.request_manual_merge(
+                completion["run_id"], confirmed=True
+            )
+        except Exception as exc:  # noqa: BLE001 - gate refusal belongs in the UI
+            st.error(f"Мердж не выполнен: {exc}")
+        else:
+            if updated and updated.get("completion_state") == "COMPLETED":
+                st.success("PR смёржен и подтверждён в целевой ветке.")
+            else:
+                st.success("PR смёржен; проверяется целевая ветка.")
+            st.rerun()
+
+
 def render_task_timeline(task: dict) -> None:
     events = task_view.sorted_timeline(task)
     if not events:
@@ -1032,6 +1063,8 @@ def render_task_card(
     tasks_by_id: dict[str, dict],
     key_prefix: str,
     git_status_cache: dict[str, dict],
+    completion: dict | None = None,
+    live_progress: tuple[int | None, str | None] | None = None,
     show_kanban_controls: bool = False,
 ) -> None:
     task_id = task.get("id")
@@ -1042,8 +1075,17 @@ def render_task_card(
         st.markdown(f"### {title}")
         st.caption(f"{task.get('project')} · {TASK_TYPE_LABELS.get(task.get('task_type'), task.get('task_type'))}")
 
-        progress = int(task.get("progress") or 0)
-        stage = task.get("current_stage") or models.EXECUTION_STAGES[0]
+        live_percent, live_stage = live_progress or (None, None)
+        progress = (
+            int(live_percent)
+            if live_percent is not None
+            else int(task.get("progress") or 0)
+        )
+        stage = (
+            live_stage
+            or task.get("current_stage")
+            or models.EXECUTION_STAGES[0]
+        )
         st.progress(progress / 100, text=f"{stage} — {progress}%")
 
         # Three distinct, visually separated clusters — planning state
@@ -1102,6 +1144,12 @@ def render_task_card(
                     models.VERDICT_LABELS.get(task["latest_verdict"], task["latest_verdict"]),
                     color="green" if passing else "red",
                 )
+
+        _render_manual_merge_button(
+            get_execution_center_api(),
+            completion,
+            key=f"{key_prefix}_manual_merge",
+        )
 
         with st.expander("Действия", icon=":material/tune:"):
             st.caption(f"ID: `{task_id}` · Создано: {task.get('created_at', '—')} · Обновлено: {task.get('updated_at', '—')}")
@@ -1473,13 +1521,11 @@ def _execution_center_display_status(session: dict) -> str:
     `progress` legitimately never reaches 100. Downgrading it to Requires
     Attention was the bug behind "a successful analysis shows as needing
     attention" — read-only completed runs stay `Completed`."""
-    status = session["status"]
-    progress = session.get("progress")
-    if status == session_view.STATUS_COMPLETED and progress is not None and progress < 100:
-        if session_view.is_read_only_task_type(session.get("task_type")):
-            return status
-        return session_view.STATUS_REQUIRES_ATTENTION
-    return status
+    return session_view.operator_display_status(
+        session["status"],
+        progress=session.get("progress"),
+        task_type=session.get("task_type"),
+    )
 
 
 def _execution_center_record_heartbeat(run_id: str, pid: int | None, now: datetime) -> None:
@@ -1575,7 +1621,9 @@ def _build_execution_center_sessions(
     return sessions, tasks_by_id
 
 
-def _render_execution_center_completion(session: dict) -> None:
+def _render_execution_center_completion(
+    api: runtime_api.ExecutionCenterAPI, session: dict
+) -> None:
     """Compact "autonomous completion" panel for a session card. Reads only
     `session["completion"]` (a pure projection built in `session_view`) — no
     orchestration happens here. Clearly separates "process finished" from "task
@@ -1626,6 +1674,12 @@ def _render_execution_center_completion(session: dict) -> None:
         if completion["recommended_action"]:
             note = st.warning if (completion["requires_human"] or completion["display"] == "Requires Attention") else st.info
             note(f"Рекомендуемое действие: {completion['recommended_action']}")
+        if completion.get("manual_merge_available"):
+            _render_manual_merge_button(
+                api,
+                api.get_completion(session["run_id"]),
+                key=f"exec_manual_merge_{session['run_id']}",
+            )
 
 
 _PROMPT_PREVIEW_CHARS = 700
@@ -1674,6 +1728,12 @@ def _task_detail_dialog(task: dict, tasks_by_id: dict[str, dict]) -> None:
         st.markdown(f"🎯 **Цель.** {task['goal']}")
     if task.get("pull_request_url"):
         st.link_button("Pull Request", task["pull_request_url"], icon=":material/merge:")
+    completion = get_execution_center_api().get_completion_by_task(task.get("id"))
+    _render_manual_merge_button(
+        get_execution_center_api(),
+        completion,
+        key=f"task_detail_manual_merge_{task.get('id')}",
+    )
 
     st.markdown("**Зависимости**")
     _render_dependency_tree(task, tasks_by_id)
@@ -1882,7 +1942,7 @@ def _render_execution_center_card(
         elif session["last_error"]:
             st.error(f"Последняя ошибка: {session['last_error']}")
 
-        _render_execution_center_completion(session)
+        _render_execution_center_completion(api, session)
 
         # Localized labels (Russian) throughout — the console UI is otherwise
         # Russian, and an English row of controls in the middle of it was one of
@@ -2203,7 +2263,9 @@ def _render_inline_reports() -> None:
             st.markdown(read_text(chosen))
 
 
-def _render_board_summary(board: dict[str, list[dict]]) -> None:
+def _render_board_summary(
+    board: dict[str, list[dict]], counts: execution_metrics.ExecutionCounts
+) -> None:
     """One line that answers "what is the state of the machine" before any
     scrolling. Deliberately the first thing rendered — the previous layout led
     with the planner's wave, so this answer was several screens down.
@@ -2211,7 +2273,13 @@ def _render_board_summary(board: dict[str, list[dict]]) -> None:
     Rendered as `board_style`'s tinted, accented tiles rather than flat
     `st.metric` boxes: a running count and a failure count must not look
     identical, which four grey boxes made them."""
-    board_style.stat_tiles(board)
+    board_style.stat_tiles(
+        board,
+        counts={
+            bucket: counts.for_bucket(bucket)
+            for bucket in live_board.BUCKET_ORDER
+        },
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2556,7 +2624,9 @@ def _render_attention_triage_row(
 def _render_board_sections(
     api: runtime_api.ExecutionCenterAPI,
     board: dict[str, list[dict]],
+    tasks: list[dict],
     tasks_by_id: dict[str, dict],
+    queue_entries: list[dict],
     *,
     now: datetime,
 ) -> None:
@@ -2579,7 +2649,14 @@ def _render_board_sections(
 
     _render_attention_triage(api, board[live_board.BUCKET_ATTENTION], tasks_by_id, now=now)
 
-    _render_waiting_section(api, board[live_board.BUCKET_WAITING], tasks_by_id, now=now)
+    _render_waiting_section(
+        api,
+        board[live_board.BUCKET_WAITING],
+        tasks,
+        tasks_by_id,
+        queue_entries,
+        now=now,
+    )
 
     done = board[live_board.BUCKET_DONE]
     if done:
@@ -2591,7 +2668,9 @@ def _render_board_sections(
 def _render_waiting_section(
     api: runtime_api.ExecutionCenterAPI,
     waiting_sessions: list[dict],
+    tasks: list[dict],
     tasks_by_id: dict[str, dict],
+    queue_entries: list[dict],
     *,
     now: datetime,
 ) -> None:
@@ -2611,8 +2690,9 @@ def _render_waiting_section(
        is nearly always empty — which is exactly why the old section looked
        broken.
     """
-    entries = execution_queue.load_queue(ROOT)
-    open_entries = [e for e in entries if e.get("state") in execution_queue.OPEN_STATES]
+    open_entries = [
+        e for e in queue_entries if e.get("state") in execution_queue.OPEN_STATES
+    ]
     open_entries.sort(key=lambda e: (e.get("state") != execution_queue.STATE_READY, e.get("added_at") or ""))
 
     total = len(open_entries) + len(waiting_sessions)
@@ -2626,30 +2706,17 @@ def _render_waiting_section(
         )
         return
 
-    st.caption(
-        "Задачи в очереди запуска: «готова» стартует, как только освободится слот; "
-        "«ждёт» — держится причиной (обычно незавершённые зависимости)."
+    queue_panel.render_execution_queue_panel(
+        tasks,
+        tasks_by_id,
+        ROOT,
+        api,
+        project_config.load_project_configs(),
+        upsert_tasks,
+        key_prefix="exec_queue",
+        entries=open_entries,
+        show_heading=False,
     )
-    for entry in open_entries[:_BOARD_HISTORY_LIMIT]:
-        task = tasks_by_id.get(entry.get("task_id")) or {}
-        title = task.get("title") or entry.get("task_id") or "—"
-        is_ready = entry.get("state") == execution_queue.STATE_READY
-        with st.container(border=True):
-            row = st.columns([6, 2, 2], vertical_alignment="center")
-            row[0].markdown(f"**{title}**")
-            with row[1]:
-                st.badge("готова" if is_ready else "ждёт", color="green" if is_ready else "orange")
-            with row[2]:
-                if st.button(
-                    "Детали", key=f"exec_wait_detail_{entry.get('id')}", icon=":material/task_alt:",
-                    disabled=entry.get("task_id") not in tasks_by_id, width="stretch",
-                ):
-                    _open_task_detail(entry["task_id"])
-                    st.rerun()
-            st.caption(
-                f"Проект **{entry.get('project') or '—'}** · "
-                + (entry.get("reason") or ("готова к запуску — ждёт свободного слота" if is_ready else "ожидает"))
-            )
 
     if waiting_sessions:
         st.caption("Прогоны, готовящиеся к старту (обычно исчезают за секунды):")
@@ -3041,8 +3108,22 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
             if s["run_id"] not in hidden_attention_run_ids
         ]
 
+    queue_entries = execution_queue.load_queue(ROOT)
+    dismissed_attention = st.session_state.get(_ATTENTION_DISMISSED_KEY, set())
+    visible_board = {
+        bucket: list(rows)
+        for bucket, rows in board.items()
+    }
+    if dismissed_attention:
+        visible_board[live_board.BUCKET_ATTENTION] = [
+            row
+            for row in visible_board[live_board.BUCKET_ATTENTION]
+            if row.get("run_id") not in dismissed_attention
+        ]
+    counts = execution_metrics.counts_for_snapshot(visible_board, queue_entries)
+
     board_style.begin()
-    _render_board_summary(board)
+    _render_board_summary(board, counts)
     _render_console_actions(tasks, tasks_by_id)
 
     # Wide main column for what the operator acts on; narrow side column for
@@ -3056,7 +3137,14 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
 
     main, side = st.columns([3, 1], gap="medium")
     with main:
-        _render_board_sections(api, board, tasks_by_id, now=now)
+        _render_board_sections(
+            api,
+            board,
+            tasks,
+            tasks_by_id,
+            queue_entries,
+            now=now,
+        )
         selected_project = st.session_state.get(_PROJECT_TREE_KEY)
         if selected_project:
             _render_project_tree_section(api, selected_project, tasks, tasks_by_id, running_task_ids)
@@ -3075,36 +3163,31 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     st.session_state["exec_center_last_refreshed_at"] = now.strftime("%H:%M:%S")
 
 
-# Four fixed-interval pollers (2/3/4/5s) — `st.fragment(run_every=...)`
+# Three fixed-interval monitoring pollers (15/30/60s) —
+# `st.fragment(run_every=...)`
 # requires a static interval per decorated function, so a user-configurable
 # interval is implemented as a small fixed set of pollers, dispatched to by
 # `render_live_execution_center` below, rather than any unmanaged background
 # thread or a dynamically-parameterized refresh mechanism.
-@st.fragment(run_every=2.0)
-def _render_live_execution_center_poll_2s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+@st.fragment(run_every=15.0)
+def _render_live_execution_center_poll_15s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     _render_live_execution_center_body(api, tasks)
 
 
-@st.fragment(run_every=3.0)
-def _render_live_execution_center_poll_3s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+@st.fragment(run_every=30.0)
+def _render_live_execution_center_poll_30s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     _render_live_execution_center_body(api, tasks)
 
 
-@st.fragment(run_every=4.0)
-def _render_live_execution_center_poll_4s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
-    _render_live_execution_center_body(api, tasks)
-
-
-@st.fragment(run_every=5.0)
-def _render_live_execution_center_poll_5s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+@st.fragment(run_every=60.0)
+def _render_live_execution_center_poll_60s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     _render_live_execution_center_body(api, tasks)
 
 
 _EXECUTION_CENTER_POLLERS = {
-    2: _render_live_execution_center_poll_2s,
-    3: _render_live_execution_center_poll_3s,
-    4: _render_live_execution_center_poll_4s,
-    5: _render_live_execution_center_poll_5s,
+    15: _render_live_execution_center_poll_15s,
+    30: _render_live_execution_center_poll_30s,
+    60: _render_live_execution_center_poll_60s,
 }
 
 
@@ -3115,27 +3198,42 @@ def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: lis
     linked Kanban task's `launch_status` on every render — see
     `task_sync.reconcile_and_sync` (always the existing `Supervisor`, never
     a second execution engine)."""
-    header_cols = st.columns([1, 1, 1, 2])
+    # One-time migration from the old always-on 2-5 second poller. That mode
+    # rebuilt the entire interactive board while the operator was clicking or
+    # typing. The default is now stable/manual; monitoring remains an explicit
+    # opt-in at a humane cadence.
+    if not st.session_state.get("exec_center_refresh_v2_migrated"):
+        st.session_state["exec_center_auto_refresh"] = False
+        st.session_state["exec_center_refresh_interval"] = 30
+        st.session_state["exec_center_refresh_v2_migrated"] = True
+
+    header_cols = st.columns([1.4, 1, 1, 2])
     with header_cols[0]:
         auto_refresh = st.toggle(
-            "Автообновление", value=st.session_state.get("exec_center_auto_refresh", True), key="exec_center_auto_refresh"
+            "Режим мониторинга",
+            value=st.session_state.get("exec_center_auto_refresh", False),
+            key="exec_center_auto_refresh",
+            help="Периодически обновляет всю доску. Выключите во время работы с карточками.",
         )
     with header_cols[1]:
+        current_interval = st.session_state.get("exec_center_refresh_interval", 30)
+        if current_interval not in _EXECUTION_CENTER_POLLERS:
+            current_interval = 30
         interval = st.selectbox(
             "Интервал (с)",
-            [2, 3, 4, 5],
-            index=[2, 3, 4, 5].index(st.session_state.get("exec_center_refresh_interval", 5)),
+            list(_EXECUTION_CENTER_POLLERS),
+            index=list(_EXECUTION_CENTER_POLLERS).index(current_interval),
             key="exec_center_refresh_interval",
         )
     with header_cols[2]:
         st.write("")
-        refresh_clicked = st.button("Обновить сейчас", icon=":material/refresh:", key="exec_center_refresh_now")
+        st.button("Обновить сейчас", icon=":material/refresh:", key="exec_center_refresh_now")
     with header_cols[3]:
         st.write("")
         st.caption(f"Обновлено: {st.session_state.get('exec_center_last_refreshed_at') or '—'}")
 
-    if refresh_clicked:
-        st.rerun()
+    # The button click has already caused this script run, so no second
+    # ``st.rerun`` is needed. The old explicit rerun doubled the repaint.
 
     # The autopilot surface renders *before* the poller fragment below, so its
     # controls stay interactive at a fixed position instead of being torn down
@@ -3349,6 +3447,7 @@ def build_commands() -> list[dict]:
     commands = [
         {"label": f"Перейти: {label}", "icon": icon, "action": ("nav", key)}
         for key, (label, icon) in NAV.items()
+        if key not in sidebar.HIDDEN_FROM_SIDEBAR
     ]
     commands.extend(
         {"label": f"Новая задача: {project}", "icon": ":material/add_task:", "action": ("new_task", project)}
@@ -3373,7 +3472,15 @@ tasks_by_id = {task["id"]: task for task in tasks}
 project_configs = project_config.load_project_configs()
 
 
-@st.dialog("Командная палитра", width="large")
+def _dismiss_command_palette() -> None:
+    st.session_state.show_command_palette = False
+
+
+@st.dialog(
+    "Командная палитра",
+    width="large",
+    on_dismiss=_dismiss_command_palette,
+)
 def _command_palette_dialog() -> None:
     query = st.text_input(
         "Поиск",
@@ -3417,7 +3524,7 @@ if st.session_state.show_command_palette:
 # it updates every 5 s on its own without blanking the page behind it. Rendered
 # before the page dispatch so it is visible on every page (pages that call
 # `st.stop()` have already mounted it by then).
-execution_strip.render_execution_strip(get_execution_center_api())
+execution_strip.render_execution_strip(get_execution_center_api(), ROOT)
 
 
 # --------------------------------------------------------------------------
@@ -4026,8 +4133,129 @@ def _latest_roadmap_report_text(project: str) -> str | None:
     return read_text(latest)
 
 
+def render_dashboard_analytics(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+) -> None:
+    """Compact cross-project analytics for the consolidated main dashboard."""
+    active_tasks = [task for task in tasks if task.get("status") != "Done"]
+    completed_tasks = [task for task in tasks if task.get("status") == "Done"]
+    blocked_tasks = [task for task in active_tasks if is_blocked(task, tasks_by_id)]
+    completion_rate = (
+        round(len(completed_tasks) / len(tasks) * 100) if tasks else 0
+    )
+
+    with st.container(horizontal=True):
+        st.metric("Всего задач", len(tasks), border=True)
+        st.metric("Активные", len(active_tasks), border=True)
+        st.metric("Заблокированные", len(blocked_tasks), border=True)
+        st.metric(
+            "Выполнено",
+            f"{len(completed_tasks)} ({completion_rate}%)",
+            border=True,
+        )
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("#### Проекты")
+        for project in models.PROJECT_IDS:
+            project_tasks = [
+                task
+                for task in tasks
+                if project_config.project_matches(task.get("project"), project)
+            ]
+            active = sum(1 for task in project_tasks if task.get("status") != "Done")
+            done = sum(1 for task in project_tasks if task.get("status") == "Done")
+            blocked = sum(
+                1
+                for task in project_tasks
+                if task.get("status") != "Done"
+                and is_blocked(task, tasks_by_id)
+            )
+            with st.container(border=True):
+                cols = st.columns([3, 1, 1, 1, 1])
+                cols[0].markdown(f"**{project}**")
+                cols[1].metric("Актив.", active)
+                cols[2].metric("Блок.", blocked)
+                cols[3].metric("Готово", done)
+                if cols[4].button(
+                    "Открыть",
+                    key=f"dashboard_analytics_project_{project}",
+                    icon=":material/arrow_forward:",
+                ):
+                    st.session_state.pending_nav = "projects"
+                    st.session_state.pending_project_browser = project
+                    st.rerun()
+
+    with right:
+        st.markdown("#### Приоритеты")
+        priority_counts = {
+            priority: sum(
+                1 for task in active_tasks if task.get("priority") == priority
+            )
+            for priority in task_view.kanban_priority_options(active_tasks)
+        }
+        if any(priority_counts.values()):
+            st.bar_chart(priority_counts)
+        else:
+            st.info("Нет активных задач.")
+
+        st.markdown("#### Фактическая загрузка агентов")
+        settings = task_pipeline.pipeline_settings.load_settings(ROOT)
+        load = scheduler.build_load_snapshot(api.db_path)
+        registry = scheduler.default_registry(
+            max_concurrency=settings.max_agent_concurrency
+        )
+        for agent in registry.all():
+            used = int(load.running_by_agent.get(agent.agent_id, 0))
+            free = max(0, agent.max_concurrency - used) if agent.available else 0
+            tone = "🟢" if agent.available and free else "🟠" if agent.available else "🔴"
+            st.caption(
+                f"{tone} `{agent.agent_id}` — {used}/{agent.max_concurrency}"
+                + (f" · свободно {free}" if agent.available else " · недоступен")
+            )
+
+    st.markdown("#### Требуют решения")
+    if not blocked_tasks:
+        st.success("Заблокированных задач нет.")
+    for task in blocked_tasks[:10]:
+        unmet = unmet_dependencies(task, tasks_by_id)
+        names = ", ".join(
+            tasks_by_id.get(dep_id, {}).get("title") or dep_id for dep_id in unmet
+        )
+        with st.container(border=True):
+            cols = st.columns([5, 1])
+            cols[0].markdown(
+                f"**{task.get('title') or 'Без названия'}** · {task.get('project')}"
+            )
+            cols[0].caption(f"Ожидает: {names or 'уточнения причины'}")
+            if cols[1].button(
+                "Kanban",
+                key=f"dashboard_blocked_{task.get('id')}",
+                icon=":material/view_kanban:",
+            ):
+                st.session_state.pending_nav = "kanban"
+                st.rerun()
+
+
 if page_key == "dashboard":
-    render_home_dashboard(get_execution_center_api(), tasks)
+    dashboard_api = get_execution_center_api()
+    dashboard_section = st.segmented_control(
+        "Раздел",
+        ["Обзор", "Аналитика", "Репозитории и артефакты"],
+        default="Обзор",
+        key="dashboard_section",
+    )
+    # Unlike ``st.tabs``, this renders only the selected section.  Repository
+    # discovery and analytics no longer execute invisibly on every overview
+    # refresh, which keeps the home page responsive on large workspaces.
+    if dashboard_section == "Аналитика":
+        render_dashboard_analytics(dashboard_api, tasks, tasks_by_id)
+    elif dashboard_section == "Репозитории и артефакты":
+        render_workspace_home_page(dashboard_api)
+    else:
+        render_home_dashboard(dashboard_api, tasks)
 
 
 # --------------------------------------------------------------------------
@@ -4048,7 +4276,7 @@ elif page_key == "workspace_home":
 # --------------------------------------------------------------------------
 
 elif page_key == "executive":
-    st.subheader("Исполнительная панель")
+    st.subheader("Исполнительная панель", anchor="executive")
 
     render_next_task_callout(
         tasks,
@@ -4190,7 +4418,7 @@ elif page_key == "executive":
 # --------------------------------------------------------------------------
 
 elif page_key == "create":
-    st.subheader("Создание AI-задачи")
+    st.subheader("Создание AI-задачи", anchor="create-task")
 
     open_tasks = [task for task in tasks if task.get("status") != "Done"]
 
@@ -4448,7 +4676,7 @@ elif page_key == "create":
 # --------------------------------------------------------------------------
 
 elif page_key == "chat":
-    st.subheader("Чат по проекту")
+    st.subheader("Чат по проекту", anchor="project-chat")
     # The chat now lives as the 'Чат' tab inside the project view; this page is
     # kept so an existing deep link still resolves, and delegates to the same
     # `render_project_chat` the tab uses. (task 02661825)
@@ -4466,28 +4694,31 @@ elif page_key == "waves":
     waves_panel.render_waves_page(tasks, tasks_by_id, ROOT, project=project_filter)
 
 elif page_key == "kanban":
-    st.subheader("Kanban")
+    st.subheader("Kanban", anchor="kanban")
 
     project_filter = project_selector.render_project_selector(tasks, key="kanban_project_selector")
     project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
     st.divider()
 
     project_configs = project_config.load_project_configs()
-    recommendations_panel.render_recommendations_panel(
-        tasks,
-        tasks_by_id,
-        ROOT,
-        get_execution_center_api(),
-        project_configs,
-        upsert_tasks,
-        project=project_filter,
-        key_prefix="kanban_reco",
-    )
-    st.divider()
-
-    backlog_reconcile_panel.render_backlog_reconcile_panel(
-        tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
-    )
+    with st.expander(
+        "Планирование и рекомендации",
+        icon=":material/auto_awesome:",
+        expanded=False,
+    ):
+        recommendations_panel.render_recommendations_panel(
+            tasks,
+            tasks_by_id,
+            ROOT,
+            get_execution_center_api(),
+            project_configs,
+            upsert_tasks,
+            project=project_filter,
+            key_prefix="kanban_reco",
+        )
+        backlog_reconcile_panel.render_backlog_reconcile_panel(
+            tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
+        )
     st.divider()
 
     # Options come from the tasks themselves (canonical priorities + any
@@ -4507,6 +4738,49 @@ elif page_key == "kanban":
     )
 
     kanban_git_status_cache: dict[str, dict] = {}
+    kanban_api = get_execution_center_api()
+    current_run_ids = [
+        task["current_run_id"]
+        for task in filtered_tasks
+        if task.get("current_run_id")
+    ]
+    completions_by_run = kanban_api.get_completions_for_runs(current_run_ids)
+    completions_by_task = {
+        row["task_id"]: row for row in completions_by_run.values()
+    }
+    current_run_id_set = set(current_run_ids)
+    current_runs_by_id = {
+        run["id"]: run
+        for run in kanban_api.list_runs(limit=200)
+        if run.get("id") in current_run_id_set
+    }
+    kanban_now = datetime.now()
+
+    def _kanban_live_progress(task: dict) -> tuple[int | None, str | None] | None:
+        run = current_runs_by_id.get(task.get("current_run_id"))
+        if run is None:
+            return None
+        status = session_view.derive_status(
+            run,
+            awaiting_handshake=session_view.is_awaiting_handshake(run),
+        )
+        estimate = task.get("estimate_hours")
+        reference_seconds = float(estimate) * 3600 if estimate else run.get(
+            "timeout_seconds"
+        )
+        return session_view.derive_live_progress(
+            status,
+            session_view.completion_view(
+                completions_by_task.get(task.get("id"))
+            ),
+            task_type=run.get("task_type") or task.get("task_type"),
+            elapsed_seconds=session_view.elapsed_seconds(
+                run.get("started_at"), run.get("completed_at"), kanban_now
+            ),
+            timeout_seconds=reference_seconds,
+            stage_progress=task.get("progress"),
+            stage_label=task.get("current_stage"),
+        )
 
     # Полноширинные вертикальные дорожки Kanban.
     # Горизонтальная разметка через st.columns сжимала карточки
@@ -4527,28 +4801,17 @@ elif page_key == "kanban":
                     tasks_by_id=tasks_by_id,
                     key_prefix=f"kanban_{task.get('id')}",
                     git_status_cache=kanban_git_status_cache,
+                    completion=completions_by_task.get(task.get("id")),
+                    live_progress=_kanban_live_progress(task),
                     show_kanban_controls=True,
                 )
-
-    st.divider()
-    queue_panel.render_execution_queue_panel(
-        tasks,
-        tasks_by_id,
-        ROOT,
-        get_execution_center_api(),
-        project_configs,
-        upsert_tasks,
-        project=project_filter,
-        key_prefix="kanban_queue",
-    )
-
 
 # --------------------------------------------------------------------------
 # AI Agents
 # --------------------------------------------------------------------------
 
 elif page_key == "agents":
-    st.subheader("AI-агенты")
+    st.subheader("AI-агенты", anchor="agents")
     st.caption("Каталог типов задач, поддерживаемых scripts/start-task.sh")
 
     generated_files = artifacts.list_markdown_files(GENERATED_DIR)
@@ -4606,7 +4869,7 @@ elif page_key == "agents":
 # --------------------------------------------------------------------------
 
 elif page_key == "execution_center":
-    st.subheader("Live Execution Center")
+    st.subheader("Live Execution Center", anchor="execution-center")
     st.caption(
         "Канонический монитор выполнения: реальные PID-отслеживаемые прогоны через "
         "v2 Session Supervisor (command_center.runtime) — источник истины для статуса "
@@ -4629,7 +4892,54 @@ elif page_key == "daily_audit":
 # --------------------------------------------------------------------------
 
 elif page_key == "runs":
-    st.subheader("Журнал запусков")
+    st.subheader("Журнал запусков", anchor="runs")
+    runs_view = st.segmented_control(
+        "Представление",
+        ["Список", "Таймлайн"],
+        default="Список",
+        key="runs_view_mode",
+    )
+    if runs_view == "Таймлайн":
+        project_filter = st.selectbox(
+            "Фильтр по проекту",
+            ["Все"] + models.PROJECT_IDS,
+            key="runs_timeline_project_filter",
+        )
+        events = build_timeline_events(
+            tasks,
+            runs=runs_read.list_unified_runs(
+                get_execution_center_api().db_path, root=ROOT
+            ),
+            activity_events=activity_log.load_activity(limit=200),
+            limit=200,
+        )
+        if project_filter != "Все":
+            events = [
+                event
+                for event in events
+                if project_config.project_matches(
+                    event.get("project"), project_filter
+                )
+            ]
+        if not events:
+            st.info("Событий пока нет.")
+        else:
+            current_date: str | None = None
+            for event in events[:150]:
+                event_date = datetime.fromtimestamp(event["ts"]).strftime(
+                    "%d.%m.%Y"
+                )
+                if event_date != current_date:
+                    current_date = event_date
+                    st.markdown(f"#### {current_date}")
+                time_str = datetime.fromtimestamp(event["ts"]).strftime("%H:%M")
+                project_tag = (
+                    f" · {event['project']}" if event.get("project") else ""
+                )
+                st.caption(
+                    f"{event['icon']} {time_str}{project_tag} — {event['label']}"
+                )
+        st.stop()
 
     # Unified runs (v2 runtime.db + legacy v1.2 journal) — the old
     # `agent_runner.load_runs()` read only the v1.2 journal, which is empty on
@@ -4796,7 +5106,7 @@ elif page_key == "runs":
 # --------------------------------------------------------------------------
 
 elif page_key == "timeline":
-    st.subheader("Таймлайн")
+    st.subheader("Таймлайн", anchor="timeline")
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="timeline_project_filter")
 
@@ -4828,7 +5138,7 @@ elif page_key == "timeline":
 # --------------------------------------------------------------------------
 
 elif page_key == "projects":
-    st.subheader("Проекты")
+    st.subheader("Проекты", anchor="projects")
 
     project_choice = st.selectbox("Проект", ["Все", *models.PROJECT_IDS], key="project_browser_select")
 
@@ -4847,6 +5157,14 @@ elif page_key == "projects":
             with st.container(border=True):
                 st.markdown(f"**{project_configs[overview_pid]['display_name']}** (`{overview_pid}`)")
                 st.caption(f"{len(pid_active)} активных · {len(pid_done)} завершено · всего {len(pid_tasks)}")
+                if st.button(
+                    "Открыть проект",
+                    key=f"project_overview_open_{overview_pid}",
+                    icon=":material/arrow_forward:",
+                    width="stretch",
+                ):
+                    st.session_state["pending_project_browser"] = overview_pid
+                    st.rerun()
         st.stop()
 
     selected_project = project_choice
@@ -5154,7 +5472,7 @@ elif page_key == "projects":
 # --------------------------------------------------------------------------
 
 elif page_key == "generated":
-    st.subheader("Сгенерированные задачи")
+    st.subheader("Сгенерированные задачи", anchor="generated-tasks")
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="gen_filter")
 
@@ -5191,7 +5509,7 @@ elif page_key == "generated":
 # --------------------------------------------------------------------------
 
 elif page_key == "reports":
-    st.subheader("Отчёты")
+    st.subheader("Отчёты", anchor="reports")
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="report_filter")
 
@@ -5236,7 +5554,7 @@ elif page_key == "reports":
 # --------------------------------------------------------------------------
 
 elif page_key == "context":
-    st.subheader("Глобальный контекст")
+    st.subheader("Глобальный контекст", anchor="context")
 
     for name in GLOBAL_FILES:
         path = ROOT / name
@@ -5249,7 +5567,7 @@ elif page_key == "context":
 # --------------------------------------------------------------------------
 
 elif page_key == "git_center":
-    st.subheader("Git Center")
+    st.subheader("Git Center", anchor="git-center")
 
     # Multi-repo: the portfolio spans several configured repositories, not just
     # the app's own cwd. Surface every project's configured repository_path
@@ -5358,7 +5676,7 @@ elif page_key == "git_center":
 # --------------------------------------------------------------------------
 
 elif page_key == "workspace":
-    st.subheader("Workspace Launcher")
+    st.subheader("Workspace Launcher", anchor="workspace-launcher")
     st.caption("Быстрый переход к рабочим пространствам проектов и обзор git worktree.")
 
     st.markdown("#### Git worktrees")
@@ -5433,7 +5751,7 @@ elif page_key == "focus":
         st.session_state.pending_nav = "dashboard"
         st.rerun()
 
-    st.subheader("Focus Mode")
+    st.subheader("Focus Mode", anchor="focus")
 
     active_tasks = [task for task in tasks if task.get("status") != "Done"]
 
@@ -5520,12 +5838,23 @@ elif page_key == "focus":
 # --------------------------------------------------------------------------
 
 elif page_key == "portfolio":
-    st.subheader("Portfolio Execution")
-    portfolio_panel.render_portfolio_execution_panel(
-        root=ROOT,
-        execution_center_api=get_execution_center_api(),
+    st.subheader("Портфель", anchor="portfolio")
+    portfolio_section = st.segmented_control(
+        "Раздел",
+        ["Обзор", "Исполнение"],
+        default="Исполнение",
+        key="portfolio_section",
     )
+    if portfolio_section == "Исполнение":
+        portfolio_panel.render_portfolio_execution_panel(
+            root=ROOT,
+            execution_center_api=get_execution_center_api(),
+        )
+    else:
+        portfolio_overview_panel.render_portfolio_overview_panel(root=ROOT)
 
 elif page_key == "portfolio_overview":
-    st.subheader("Portfolio Overview")
+    st.caption(
+        "Обзор портфеля объединён со страницей «Портфель»; этот адрес сохранён для старых закладок."
+    )
     portfolio_overview_panel.render_portfolio_overview_panel(root=ROOT)

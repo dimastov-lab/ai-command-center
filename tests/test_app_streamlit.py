@@ -1318,9 +1318,9 @@ def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_
     entries = execution_queue.enqueue([], task, {task["id"]: task})
     execution_queue.save_queue(data_dir, entries)
 
-    at = _at_on_page("kanban")
+    at = _at_on_page("execution_center")
     assert not at.exception
-    launch_ready_btn = next(b for b in at.button if b.key == "kanban_queue_launch_ready")
+    launch_ready_btn = next(b for b in at.button if b.key == "exec_queue_launch_ready")
     at = launch_ready_btn.click().run()
     assert not at.exception
     warnings = [w.value for w in at.warning]
@@ -1351,8 +1351,7 @@ def test_kanban_card_enqueue_button_adds_task_to_execution_queue():
 
     entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
     assert any(e["task_id"] == "seeded-task-1" for e in entries)
-    captions = [c.value for c in at.caption]
-    assert any("Готово к запуску" in c or "Ожидает зависимостей" in c for c in captions)
+    assert any("Добавлено в очередь запуска" in s.value for s in at.success)
 
 
 # --------------------------------------------------------------------------
@@ -1524,7 +1523,7 @@ def test_execution_queue_panel_launch_ready_button_present_once_queued():
     )
     execution_queue.save_queue(Path(os.environ["AICC_DATA_DIR"]), entries)
 
-    at = _at_on_page("kanban")
+    at = _at_on_page("execution_center")
     assert not at.exception
-    assert any(b.key == "kanban_queue_launch_ready" for b in at.button)
-    assert any(b.key == "kanban_queue_launch_next" for b in at.button)
+    assert any(b.key == "exec_queue_launch_ready" for b in at.button)
+    assert any(b.key == "exec_queue_launch_next" for b in at.button)
