@@ -22,13 +22,19 @@ module, or calls `create_app()`, touch the real database.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.webapi.serializers import serialize_home
 from command_center.workspace_home import build_workspace_home_snapshot
+
+# Repo root is three levels up from this file: <root>/command_center/webapi/app.py
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_WEB_DIST = _REPO_ROOT / "web" / "dist"
 
 
 def create_app() -> FastAPI:
@@ -47,5 +53,15 @@ def create_app() -> FastAPI:
         api = ExecutionCenterAPI()
         snapshot = build_workspace_home_snapshot(execution_center_api=api)
         return serialize_home(snapshot)
+
+    # Serve the built SPA (built via `web/`'s `npm run build`) from the same
+    # origin as the API, so production needs no CORS configuration. Mounted
+    # AFTER the `/api` routes so `/api/home` resolves before the catch-all
+    # static handler. Resolved relative to this file's location (not the
+    # process CWD) so it works regardless of where the server is launched
+    # from. Absent in dev (before a build, or under test), in which case the
+    # API-only app above is served as-is.
+    if _WEB_DIST.is_dir():
+        app.mount("/", StaticFiles(directory=_WEB_DIST, html=True), name="spa")
 
     return app
