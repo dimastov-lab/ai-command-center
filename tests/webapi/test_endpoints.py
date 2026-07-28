@@ -117,3 +117,29 @@ def test_home_endpoint_never_constructs_real_execution_center_api(monkeypatch):
 
     assert r.status_code == 200
     assert calls == ["api", "snapshot"]
+
+
+def test_home_endpoint_reuses_execution_center_api_across_requests(monkeypatch):
+    """`ExecutionCenterAPI` (whose constructor runs `db.migrate`) is built
+    once per app and cached on `app.state`, so repeated polls do not re-run
+    the migration. Two requests => one `api` construction, two snapshots."""
+    import command_center.webapi.app as appmod
+
+    calls: list[str] = []
+
+    def fake_snapshot(*, execution_center_api, **kwargs):
+        calls.append("snapshot")
+        return {}
+
+    def fake_api():
+        calls.append("api")
+        return object()
+
+    monkeypatch.setattr(appmod, "build_workspace_home_snapshot", fake_snapshot)
+    monkeypatch.setattr(appmod, "ExecutionCenterAPI", fake_api)
+
+    client = TestClient(create_app())
+    assert client.get("/api/home").status_code == 200
+    assert client.get("/api/home").status_code == 200
+
+    assert calls == ["api", "snapshot", "snapshot"]

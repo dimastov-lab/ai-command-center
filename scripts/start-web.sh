@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # scripts/start-web.sh — build the web dashboard frontend and serve it
-# together with the read-only API on http://localhost:8791 (single origin,
-# no CORS needed in prod).
+# together with the read-only API on http://localhost:${PORT:-8791} (single
+# origin, no CORS needed in prod).
 #
 # Respects an existing AICC_DATA_DIR env var (resolved by
 # command_center/storage.py); this script never sets or overrides it.
+# Override the listen port with PORT (defaults to 8791); the host stays
+# localhost — the API is deliberately not exposed off-box.
 #
 # Usage:
 #   pip install -r requirements-web.txt
-#   scripts/start-web.sh
+#   scripts/start-web.sh            # serves on :8791
+#   PORT=9000 scripts/start-web.sh  # serves on :9000
 
 set -euo pipefail
 
@@ -41,4 +44,4 @@ fi
 (cd web && npm run build)
 
 exec python -m uvicorn "command_center.webapi.app:create_app" --factory \
-  --host localhost --port 8791
+  --host localhost --port "${PORT:-8791}"
