@@ -96,3 +96,69 @@ def test_projection_is_idempotent():
     assert task_sync.sync_task_from_completion(task, completion) is True
     # Second application: no further mutation.
     assert task_sync.sync_task_from_completion(task, completion) is False
+
+
+# --- P0 remediation: a resolved task masking an explicit pipeline rejection (D3)
+# A `Done` task stays Done (its dependents remain released), but it must not keep
+# displaying a green terminal `launch_status` while its completion pipeline is in
+# an explicit rejection state (REVIEW_REJECTED / MERGE_BLOCKED / VALIDATION_FAILED
+# / REQUIRES_ATTENTION / …). A benign failed *re-run* that seeds no rejection
+# completion is NOT a regression and must be left untouched (preserves the
+# existing "does not reopen a Done task from a failed run" behavior).
+
+
+def test_done_task_masking_review_rejected_surfaces_attention():
+    task = _task(status="Done", launch_status="Completed", progress=100)
+    mutated = task_sync.flag_done_regression(task, {"completion_state": "REVIEW_REJECTED"})
+    assert mutated is True
+    assert task["launch_status"] == "Requires Attention"
+    assert task["regressed_after_done"] is True
+    assert task["status"] == "Done"  # dependents stay released
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["MERGE_BLOCKED", "VALIDATION_FAILED", "REQUIRES_ATTENTION", "PR_CLOSED_UNMERGED", "RECOVERY_FAILED"],
+)
+def test_done_task_masking_any_rejection_state_surfaces_attention(state):
+    task = _task(status="Done", launch_status="Needs Review", progress=100)
+    assert task_sync.flag_done_regression(task, {"completion_state": state}) is True
+    assert task["launch_status"] == "Requires Attention"
+
+
+def test_done_regression_is_idempotent():
+    task = _task(status="Done", launch_status="Completed", progress=100)
+    completion = {"completion_state": "REVIEW_REJECTED"}
+    assert task_sync.flag_done_regression(task, completion) is True
+    # Already surfaced — a later refresh must not re-flip or re-log.
+    assert task_sync.flag_done_regression(task, completion) is False
+
+
+def test_done_task_with_completed_completion_is_unchanged():
+    task = _task(status="Done", launch_status="Completed", progress=100)
+    assert task_sync.flag_done_regression(task, {"completion_state": "COMPLETED"}) is False
+    assert task["launch_status"] == "Completed"
+
+
+def test_done_task_with_no_completion_is_unchanged():
+    # A benign failed re-run (e.g. working_tree_unchanged) seeds no rejection
+    # completion — a genuinely-resolved task must stay "Completed".
+    task = _task(status="Done", launch_status="Completed", progress=100)
+    assert task_sync.flag_done_regression(task, None) is False
+    assert task["launch_status"] == "Completed"
+
+
+def test_non_done_task_is_never_flagged():
+    task = _task(status="Backlog", launch_status="Failed")
+    assert task_sync.flag_done_regression(task, {"completion_state": "REVIEW_REJECTED"}) is False
+
+
+def test_regressed_done_task_recovers_when_completion_returns_to_completed():
+    task = _task(
+        status="Done", launch_status="Requires Attention",
+        progress=100, regressed_after_done=True,
+    )
+    mutated = task_sync.flag_done_regression(task, {"completion_state": "COMPLETED"})
+    assert mutated is True
+    assert task["launch_status"] == "Completed"
+    assert task.get("regressed_after_done") in (False, None)

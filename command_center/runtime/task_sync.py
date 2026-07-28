@@ -65,6 +65,28 @@ _TERMINAL_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review", "Failed", "B
 # instead of leaving the task parked on a dead provider.
 _STRANDED_LAUNCH_STATUSES = frozenset({"Failed", "Requires Attention", "Blocked", "Incomplete"})
 
+# --- P0 remediation: a resolved task masking an explicit rejection (audit D3) -
+# Completion-pipeline states that are an explicit rejection/failure — the pipeline
+# judged the delivered work NOT acceptable. A `Done` task whose completion sits in
+# one of these has regressed *after* it was closed (e.g. a later review rejected
+# the change), so its board status must stop asserting a green terminal outcome.
+# Deliberately keyed on the completion pipeline's own verdict, not a raw run
+# `state`: a benign failed *re-run* (working_tree_unchanged) seeds no completion,
+# so a genuinely-resolved task keeps its green status.
+_COMPLETION_REJECTION_STATES = frozenset(
+    {
+        completion_states.CompletionState.VALIDATION_FAILED,
+        completion_states.CompletionState.REVIEW_REJECTED,
+        completion_states.CompletionState.PR_CLOSED_UNMERGED,
+        completion_states.CompletionState.MERGE_BLOCKED,
+        completion_states.CompletionState.REQUIRES_ATTENTION,
+        completion_states.CompletionState.RECOVERY_FAILED,
+    }
+)
+# Launch statuses that assert the delivered work landed. A rejected completion
+# must not be allowed to keep hiding behind one of these.
+_SUCCESS_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review"})
+
 
 def _resolve_target_launch_status(status: str, task: dict) -> str:
     """`status` is the process-level `session_view.derive_status` result.
@@ -400,6 +422,57 @@ def _seed_and_project_completion(
     return sync_task_from_completion(task, completion)
 
 
+def flag_done_regression(task: dict, completion: dict | None) -> bool:
+    """Keep a resolved (`status == "Done"`) task's `launch_status` truthful about
+    its completion pipeline, without ever un-resolving it.
+
+    A `Done` task deliberately stays Done so its dependents remain released (see
+    `project_completion_to_kanban`), and `sync_tasks` therefore skips the normal
+    run/completion projection for it. But that skip is exactly why a resolved
+    task could keep showing a green "Completed" while its completion pipeline has
+    since landed in an explicit rejection state (audit D3: 8 such tasks masking
+    REVIEW_REJECTED / MERGE_BLOCKED / REQUIRES_ATTENTION). This closes the gap in
+    the one safe way — it touches only the *display* `launch_status`, never
+    `status`, so no dependent is re-blocked:
+
+    - a completion in an explicit rejection state while the task still shows a
+      success status -> surface "Requires Attention" and record it once;
+    - a completion that returns to COMPLETED after a prior regression -> clear the
+      flag and restore "Completed".
+
+    A benign failed *re-run* (e.g. `working_tree_unchanged`) seeds no completion,
+    so `completion is None` and a genuinely-resolved task is left untouched.
+
+    Pure w.r.t. I/O: the caller supplies the already-fetched completion row, so
+    this never re-derives lifecycle state from a task field. Returns whether
+    `task` was mutated."""
+    if task.get("status") != "Done" or not completion:
+        return False
+    state = completion.get("completion_state")
+    if state in _COMPLETION_REJECTION_STATES:
+        if task.get("launch_status") not in _SUCCESS_LAUNCH_STATUSES:
+            return False  # already surfaced (or never green) — idempotent
+        task["launch_status"] = "Requires Attention"
+        task["regressed_after_done"] = True
+        models.append_timeline_event(
+            task,
+            "regressed_after_done",
+            f"Completion pipeline: {state} уже после закрытия задачи "
+            "— помечено «Требует внимания».",
+        )
+        task["updated_at"] = models.iso_now()
+        return True
+    if state == completion_states.CompletionState.COMPLETED and task.get("regressed_after_done"):
+        task["regressed_after_done"] = False
+        task["launch_status"] = "Completed"
+        models.append_timeline_event(
+            task, "regression_cleared", "Completion вернулся в COMPLETED — регрессия снята."
+        )
+        task["updated_at"] = models.iso_now()
+        return True
+    return False
+
+
 def sync_tasks(
     api: ExecutionCenterAPI,
     tasks: list[dict],
@@ -423,8 +496,17 @@ def sync_tasks(
         # after the operator or completion pipeline accepts the delivered
         # result. Historical run rows remain queryable, but a later refresh
         # must not project an older failed/review run back onto the resolved
-        # task and turn Completed into Failed/Needs Review again.
+        # task and turn Completed into Failed/Needs Review again — so the task
+        # stays Done and its dependents stay released. It must, however, stop
+        # asserting a green terminal status when its completion pipeline has
+        # since landed in an explicit rejection (audit D3): `flag_done_regression`
+        # surfaces that on the display `launch_status` only, never `status`.
         if task.get("status") == "Done":
+            task_id = task.get("id")
+            latest = api.get_latest_run_for_task(task_id) if task_id else None
+            completion = db.get_completion(api.db_path, latest["id"]) if latest else None
+            if flag_done_regression(task, completion):
+                mutated.append(task)
             continue
         run_id = task.get("current_run_id")
         if not run_id:
