@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -25,13 +26,19 @@ def _local_time(value: str | None) -> str:
 
 def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
     """Read launchd state without changing or restarting the service."""
-    result = subprocess.run(
-        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
+    launchctl = shutil.which("launchctl")
+    if launchctl is None:
+        return False, "launchd недоступен"
+    try:
+        result = subprocess.run(
+            [launchctl, "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "статус недоступен"
     if result.returncode != 0:
         return False, "не установлен"
     running = "\n\tstate = running\n" in result.stdout
