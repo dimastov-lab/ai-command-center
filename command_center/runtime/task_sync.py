@@ -8,8 +8,8 @@ the small set of display/bookkeeping fields (`current_run_id`,
 `latest_verdict`, `pull_request_url`) that already exist on every task
 record — and, as of this remediation, also `current_stage`/`progress` for a
 genuinely `Completed` run's terminal sync (see `_apply_terminal_fields`),
-mirroring the exact `models.set_current_stage` calls the v1 synchronous
-flow (`launch_service._apply_run_outcome_to_task`) already makes. Before
+mirroring the exact `models.set_current_stage` calls the retired v1
+synchronous launch flow made. Before
 this fix, progress/stage were *never* advanced for a v2-launched task: a
 task launched once (which sets stage to "Workspace Verified", progress 5 —
 see `launch.begin_launch`) stayed frozen at 5% forever, even after its run
@@ -132,8 +132,8 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
             pass  # cosmetic run-row enrichment only; the task fields above are already set
 
     # Advance `current_stage`/`progress` for a genuinely completed run —
-    # same rule v1's `launch_service._apply_run_outcome_to_task` already
-    # uses. Never for `Blocked`/`Incomplete`/`Failed`/`Cancelled`: none of
+    # same rule the retired v1 synchronous launch flow used. Never for
+    # `Blocked`/`Incomplete`/`Failed`/`Cancelled`: none of
     # those represent real forward progress, so `progress` must stay exactly
     # where it was (whatever stage the task was actually verified to reach),
     # not be nudged forward by a run that didn't deliver.
