@@ -5,7 +5,7 @@
 - **Acceptance criteria under test**: `docs/desktop/DESKTOP_INCREMENT_1.md` §2
 - **Verified against**: `main` @ `4fcc159` (branch `verify/desktop-d1-final-gate`, itself based on
   the `bd9f05b` finding)
-- **Date**: 2026-07-28
+- **Date**: 2026-07-28 (macOS leg re-verified same day; see re-verification note below)
 
 ## Result: PARTIAL — macOS leg passes; Windows leg not performed (no hardware available)
 
@@ -52,6 +52,27 @@ whoever runs it next, rather than being silently assumed done.
   offscreen QPA; exact width fidelity is a real-display concern verified at the D1 manual
   cross-platform gate."* Confirming exact-width fidelity therefore requires a human with an
   attached display performing the interactive checklist below.
+
+### Re-verification (same-day follow-up session)
+
+Re-ran the macOS leg from a fresh session on the same physical machine to confirm the result above
+still holds (PySide6 was reinstalled from `requirements-desktop.txt`/`requirements-dev.txt`, since
+the fresh environment did not have it pre-installed):
+
+- `pytest tests/desktop -q` → **28 passed** in 1.53s (unchanged).
+- `pytest -q` (full repository suite) → **2135 passed, 1 failed, 2 errors** in 5m20s. The failure
+  (`tests/test_task_pipeline_background_sync.py::test_background_sync_runs_tick_until_stopped`) and
+  one error (`tests/test_runtime_supervisor.py::test_unconfirmed_launch_cleanup_is_retried_until_ownership_is_released`)
+  match the pre-existing, unrelated flaky failures already documented above. A second, related
+  error appeared this run
+  (`tests/test_runtime_supervisor.py::test_background_thread_start_failure_is_supervised_and_reaps_child[run-timeout-]`),
+  in the same timing-sensitive background-thread-supervisor test file; consistent with the existing
+  finding that this file is flaky under load and unrelated to `command_center/desktop` or
+  `command_center/application`. No desktop/Qt test regressed.
+- `ruff check .` → all checks passed (unchanged).
+
+This confirms the macOS PASS result is stable and reproducible. The Windows leg below remains the
+sole blocker; this follow-up session also had no access to a real Windows 11 x64 machine.
 
 ## Windows 11 x64 — NOT PERFORMED
 
