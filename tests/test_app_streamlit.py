@@ -167,13 +167,13 @@ def test_kanban_launcher_present_but_never_calls_subprocess_on_render(monkeypatc
     _seed_task()
     at = _at_on_page("kanban")
     assert not at.exception
-    assert any(b.label == "Запустить Claude Code" for b in at.button)
+    assert any(b.label == "Запустить агента" for b in at.button)
 
 
 def test_kanban_launcher_confirmation_renders_as_dialog_not_inline_in_narrow_lane(monkeypatch, tmp_path):
     """P1 layout regression test. The Kanban board renders one narrow
     `st.columns(len(KANBAN_COLUMNS))` lane per status, and each task card's
-    "Запустить Claude Code" button used to expand its confirmation form
+    "Запустить агента" button used to expand its confirmation form
     (workspace metadata, a 3-column workspace-action row, a 2-column
     confirm/cancel row) *inline* into that single narrow lane — collapsing
     it into a barely-readable, word-wrapped sliver with the rest of the page
@@ -205,7 +205,7 @@ def test_kanban_launcher_confirmation_renders_as_dialog_not_inline_in_narrow_lan
     at = _at_on_page("kanban")
     assert not at.exception
 
-    open_button = next(b for b in at.button if b.label == "Запустить Claude Code")
+    open_button = next(b for b in at.button if b.label == "Запустить агента")
     at = open_button.click().run()
     assert not at.exception
 
@@ -227,7 +227,7 @@ def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
     at = _at_on_page("kanban")
     assert not at.exception
 
-    open_button = next(b for b in at.button if b.label == "Запустить Claude Code")
+    open_button = next(b for b in at.button if b.label == "Запустить агента")
     at = open_button.click().run()
     assert not at.exception
 
@@ -432,6 +432,20 @@ def test_focus_project_filter_includes_display_name_task_under_canonical_lane():
     assert not at_other.exception
     rendered_other = "\n".join([n.value for n in at_other.markdown] + [n.value for n in at_other.caption])
     assert "FocusDisplayNameTask" not in rendered_other
+
+
+def test_focus_mode_does_not_crash_on_a_non_canonical_task_status():
+    """Regression (audit M1): Focus Mode's status selectbox did
+    `KANBAN_COLUMNS.index(task["status"])` with no guard, so a task in a status
+    that is live but not a Kanban column (e.g. "Blocked") raised ValueError and
+    crashed the whole page."""
+    _seed_tasks(
+        [{"id": "AICC-BLK-001", "project": "AICC", "title": "BlockedFocusTask", "status": "Blocked"}]
+    )
+    at = _at_on_page("focus", focus_project_filter="AICC")
+    assert not at.exception
+    rendered = "\n".join(n.value for n in at.markdown)
+    assert "BlockedFocusTask" in rendered
 
 
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
@@ -1272,9 +1286,9 @@ def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_
     entries = execution_queue.enqueue([], task, {task["id"]: task})
     execution_queue.save_queue(data_dir, entries)
 
-    at = _at_on_page("kanban")
+    at = _at_on_page("execution_center")
     assert not at.exception
-    launch_ready_btn = next(b for b in at.button if b.key == "kanban_queue_launch_ready")
+    launch_ready_btn = next(b for b in at.button if b.key == "exec_queue_launch_ready")
     at = launch_ready_btn.click().run()
     assert not at.exception
     warnings = [w.value for w in at.warning]
@@ -1305,8 +1319,7 @@ def test_kanban_card_enqueue_button_adds_task_to_execution_queue():
 
     entries = execution_queue.load_queue(Path(os.environ["AICC_DATA_DIR"]))
     assert any(e["task_id"] == "seeded-task-1" for e in entries)
-    captions = [c.value for c in at.caption]
-    assert any("Готово к запуску" in c or "Ожидает зависимостей" in c for c in captions)
+    assert any("Добавлено в очередь запуска" in s.value for s in at.success)
 
 
 # --------------------------------------------------------------------------
@@ -1478,7 +1491,7 @@ def test_execution_queue_panel_launch_ready_button_present_once_queued():
     )
     execution_queue.save_queue(Path(os.environ["AICC_DATA_DIR"]), entries)
 
-    at = _at_on_page("kanban")
+    at = _at_on_page("execution_center")
     assert not at.exception
-    assert any(b.key == "kanban_queue_launch_ready" for b in at.button)
-    assert any(b.key == "kanban_queue_launch_next" for b in at.button)
+    assert any(b.key == "exec_queue_launch_ready" for b in at.button)
+    assert any(b.key == "exec_queue_launch_next" for b in at.button)

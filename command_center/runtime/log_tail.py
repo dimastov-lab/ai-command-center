@@ -46,6 +46,13 @@ def latest_event(db_path: Path, run_id: str) -> dict | None:
     return events[-1] if events else None
 
 
+def latest_events_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `latest_event` keyed by run_id — one query for a whole board
+    instead of one per run (audit H5 N+1). Thin passthrough to
+    `db.latest_events_for_runs`, keeping callers off `runtime.db` internals."""
+    return runtime_db.latest_events_for_runs(db_path, run_ids)
+
+
 # Every lifecycle event the Supervisor ever writes already covers the
 # mission's "Execution History" (Launch/Status changes/Completion/Failure/
 # Cancellation/Timeline) — see the `stream_parser.lifecycle_event(...)` call

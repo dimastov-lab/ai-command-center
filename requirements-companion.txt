@@ -1,0 +1,6 @@
+# Companion Sync Service dependencies — deliberately NOT merged into
+# requirements.txt. The desktop/Streamlit app must remain installable and
+# runnable without a web-server stack, exactly as requirements-desktop.txt
+# keeps the Qt dependency out of the base install.
+fastapi>=0.115
+uvicorn>=0.30

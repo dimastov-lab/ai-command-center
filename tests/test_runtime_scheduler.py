@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from command_center import executors
 from command_center.runtime import db, scheduler, supervisor
 
 NOW = "2026-07-23T12:00:00"
@@ -40,11 +41,38 @@ def _item(task_id: str, workspace: str, **kw) -> scheduler.WorkItem:
 
 
 def test_default_registry_only_registers_available_executors():
+    """The invariant is membership-by-existence, not membership-by-availability.
+
+    `default_registry` registers every executor that has a *provider* behind it
+    (`availability_check is not None`), carrying the live availability probe on
+    the `AgentSpec.available` flag rather than letting it decide membership.
+    That is the whole point: `executor.available` shells out to the provider CLI
+    and can report False for transient reasons (a slow probe, a restarting
+    daemon), so omitting such an executor would turn a self-healing
+    `agent_unavailable` into a structural `no_capable_agent`. An executor with no
+    provider at all is a genuine structural absence and stays omitted."""
     reg = _registry()
+    registered = {a.agent_id for a in reg.all()}
+    # Membership == "has a provider (availability_check is not None)", independent
+    # of whether the CLI happens to be installed on this host.
+    with_provider = {
+        eid for eid, exe in executors.EXECUTORS.items() if exe.availability_check is not None
+    }
+    assert registered == with_provider
+    # Live availability is a subset of membership, never the other way around.
+    available = {e.id for e in executors.EXECUTORS.values() if e.available}
+    assert available <= registered
+    # Claude is always installed in this suite, and a permanently-unavailable
+    # executor (no provider) must never be registered.
     assert reg.get("claude_code") is not None
-    # chatgpt/codex/gemini/human/remote_agent are all `available=False`.
     assert reg.get("chatgpt") is None
-    assert [a.agent_id for a in reg.all()] == ["claude_code"]
+
+
+def test_default_registry_does_not_offer_implementation_work_to_ollama():
+    ollama = _registry().get("ollama")
+    assert ollama is not None
+    assert ollama.can_run(scheduler.capabilities_for_task_type("architecture_review"))
+    assert not ollama.can_run(scheduler.capabilities_for_task_type("implementation"))
 
 
 def test_register_rejects_unknown_executor():
@@ -256,6 +284,45 @@ def test_workload_distribution_prefers_agent_with_most_spare_capacity():
     assert result.assignments()[0].agent_id == "idle"
 
 
+def test_workload_distribution_respects_authorized_agent_set():
+    reg = scheduler.AgentRegistry(
+        [
+            scheduler.AgentSpec("claude_code", "claude_code", frozenset({scheduler.CAP_ANY}), 2),
+            scheduler.AgentSpec("codex", "codex", frozenset({scheduler.CAP_ANY}), 2),
+        ]
+    )
+    load = scheduler.LoadSnapshot(running_by_agent={"claude_code": 1}, global_running=1)
+    result = scheduler.plan(
+        [
+            _item(
+                "t1",
+                "/repo/a",
+                allowed_agents=frozenset({"claude_code", "codex"}),
+            )
+        ],
+        registry=reg,
+        config=scheduler.SchedulerConfig(max_global_concurrency=10),
+        load=load,
+        now=NOW,
+    )
+    assert result.assignments()[0].agent_id == "codex"
+
+
+def test_workload_distribution_never_escapes_authorized_agent_set():
+    reg = scheduler.AgentRegistry(
+        [
+            scheduler.AgentSpec("claude_code", "claude_code", frozenset({scheduler.CAP_ANY}), 2),
+            scheduler.AgentSpec("codex", "codex", frozenset({scheduler.CAP_ANY}), 2),
+        ]
+    )
+    result = scheduler.plan(
+        [_item("t1", "/repo/a", allowed_agents=frozenset({"claude_code"}))],
+        registry=reg,
+        now=NOW,
+    )
+    assert result.assignments()[0].agent_id == "claude_code"
+
+
 def test_equal_capacity_and_weight_choose_lexicographically_first_agent():
     reg = scheduler.AgentRegistry(
         [
@@ -321,7 +388,10 @@ def test_classify_timeout_is_recoverable():
 
 
 def test_classify_blocked_is_terminal():
-    assert scheduler.classify_failure(state="FAILED", failure_reason="blocked:permission_denied") == scheduler.TERMINAL
+    # Uses a self-refusal rather than a permission denial: the latter is now a
+    # deliberate exception (environment policy changes between attempts, so a
+    # repeat is not an identical attempt), covered by its own test below.
+    assert scheduler.classify_failure(state="FAILED", failure_reason="blocked:final_response") == scheduler.TERMINAL
 
 
 def test_classify_cancelled_is_terminal():
@@ -402,6 +472,59 @@ def test_retry_budget_exhausted_is_blocked():
     item = _item(
         "t1", "/repo/a", attempts_made=2, last_state="FAILED", last_failure_reason="timeout",
         last_completed_at=_iso(NOW, seconds=-10000),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    assert result.decisions[0].action == scheduler.ACTION_BLOCKED
+    assert result.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED
+
+
+def test_provider_unavailable_failure_skips_retry_budget_and_assigns():
+    """A provider-unavailable failure (expired OAuth, exhausted quota, …) is
+    not a signal about the task — the configured executor cannot run it right
+    now. `task_sync` has already moved that executor to `failed_executors` and
+    the launch layer's `select_available_executor` will pick the next one, so
+    the prior attempt must NOT consume the retry budget: even at
+    attempts_made >= max_attempts the scheduler falls through to assignment
+    instead of blocking with `retry_exhausted`. Otherwise a `max_run_attempts=1`
+    config would strand the task before failover ever happens."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=1)
+    item = _item(
+        "t1", "/repo/a", attempts_made=3, last_state="FAILED",
+        last_failure_reason="session_expired",
+        last_completed_at=_iso(NOW, seconds=-10000),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    d = result.assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+
+
+def test_provider_unavailable_failure_skips_backoff_and_assigns_immediately():
+    """Provider failover also needs no backoff — a *different* executor is
+    tried, not the same one, so the prior failure carries no timing signal
+    about it. The task assigns immediately even within the backoff window."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(base_backoff_seconds=30, multiplier=2)
+    # Completed 1s ago; backoff 30s would normally defer — but a provider
+    # failure bypasses backoff and assigns now.
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED",
+        last_failure_reason="quota_limit", last_completed_at=_iso(NOW, seconds=-1),
+    )
+    result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
+    d = result.assignments()[0]
+    assert d.action == scheduler.ACTION_ASSIGN
+
+
+def test_non_provider_recoverable_failure_still_respects_budget():
+    """Sanity: a recoverable failure that is NOT provider-unavailable (e.g.
+    `timeout`) must still hit the retry budget and block — the exemption is
+    narrow to provider-unavailability reasons only."""
+    reg = _registry()
+    policy = scheduler.RetryPolicy(max_attempts=1)
+    item = _item(
+        "t1", "/repo/a", attempts_made=1, last_state="FAILED",
+        last_failure_reason="timeout", last_completed_at=_iso(NOW, seconds=-10000),
     )
     result = scheduler.plan([item], registry=reg, policy=policy, now=NOW)
     assert result.decisions[0].action == scheduler.ACTION_BLOCKED
@@ -490,12 +613,12 @@ def test_plan_is_deterministic_for_identical_inputs():
 # --------------------------------------------------------------------------
 
 
-def _make_running_row(db_path, *, repository_path):
+def _make_running_row(db_path, *, repository_path, provider_id="claude_code"):
     task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation")
     session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path=repository_path)
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
-        repository_path=repository_path, prompt="p", is_resume=False,
+        repository_path=repository_path, prompt="p", is_resume=False, provider_id=provider_id,
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(
@@ -515,6 +638,17 @@ def test_build_load_snapshot_reflects_active_runs(tmp_path):
     assert snap.busy_workspaces == frozenset({"/repo/a", "/repo/b"})
     assert len(snap.active_task_ids) == 2
     assert snap.running_by_agent == {"claude_code": 2}
+
+
+def test_build_load_snapshot_attributes_each_run_to_its_provider(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    _make_running_row(db_path, repository_path="/repo/a", provider_id="claude_code")
+    _make_running_row(db_path, repository_path="/repo/b", provider_id="codex")
+
+    snap = scheduler.build_load_snapshot(db_path)
+
+    assert snap.running_by_agent == {"claude_code": 1, "codex": 1}
 
 
 def test_active_task_cannot_be_assigned_again_in_a_different_workspace(tmp_path):
@@ -776,3 +910,87 @@ def test_f6_known_priority_marked_recognized():
     reg = _registry()
     d = scheduler.plan([_item("t1", "/repo/a", priority="Critical")], registry=reg, now=NOW).decisions[0]
     assert d.priority_recognized is True
+
+
+def test_a_probe_failure_is_transient_not_structural(monkeypatch):
+    """`executor.available` is a live subprocess probe, so it can report False
+    for reasons unrelated to the executor existing — a loaded machine missing
+    the timeout, a daemon restarting.
+
+    Omitting such an executor made the planner answer `no_capable_agent`: a
+    *structural* verdict meaning "no agent can ever run this", which tells a
+    human to change configuration. The honest answer is `agent_unavailable` —
+    transient, and self-healing on the next tick."""
+    from command_center import executors
+
+    class _Down:
+        id = "claude_code"
+        availability_check = staticmethod(lambda: None)
+        available = False
+
+    monkeypatch.setattr(executors, "EXECUTORS", {"claude_code": _Down()})
+    registry = scheduler.default_registry()
+
+    assert registry.get("claude_code") is not None, "a down executor must still be registered"
+    plan = scheduler.plan(
+        [scheduler.WorkItem(task_id="t", workspace="/tmp/w")],
+        registry=registry,
+        now="2026-07-24T10:00:00",
+    )
+    decision = plan.decisions[0]
+    assert decision.action == scheduler.ACTION_DEFER
+    assert decision.reason_code == scheduler.REASON_AGENT_UNAVAILABLE
+
+
+def test_an_executor_with_no_provider_is_still_structurally_absent(monkeypatch):
+    """A stub with nothing behind it can never run anything, so its absence is
+    a genuine structural fact rather than a transient one."""
+    from command_center import executors
+
+    class _Stub:
+        id = "chatgpt"
+        availability_check = None
+        available = False
+
+    monkeypatch.setattr(executors, "EXECUTORS", {"chatgpt": _Stub()})
+    assert scheduler.default_registry().all() == []
+
+
+def test_a_permission_denial_is_recoverable_not_terminal():
+    """`blocked:` refusals are terminal because repeating an identical attempt
+    cannot change the agent's own judgement. A *permission* denial is different
+    in kind: it records the environment's tool policy at the moment of the run,
+    and that policy is exactly what an operator changes in response to seeing
+    the failure. Treating it as terminal left tasks permanently unrunnable
+    after their permissions were fixed."""
+    assert scheduler.classify_failure(
+        state="FAILED", failure_reason="blocked:permission_denied:Glob,Read"
+    ) == scheduler.RECOVERABLE
+
+
+def test_an_agent_self_refusal_stays_terminal():
+    """The distinction has to cut both ways, or it is just a blanket retry."""
+    assert scheduler.classify_failure(
+        state="FAILED", failure_reason="blocked:final_response:blocked by policy"
+    ) == scheduler.TERMINAL
+
+
+def test_a_recoverable_permission_denial_is_still_bounded_by_the_retry_budget():
+    """Recoverable does not mean unbounded — a genuinely mis-permissioned task
+    must still stop rather than retry forever."""
+    plan = scheduler.plan(
+        [
+            scheduler.WorkItem(
+                task_id="t",
+                workspace="/tmp/w",
+                attempts_made=3,
+                last_state="FAILED",
+                last_failure_reason="blocked:permission_denied:Bash",
+                last_completed_at="2026-07-01T00:00:00",
+            )
+        ],
+        registry=scheduler.default_registry(),
+        policy=scheduler.RetryPolicy(max_attempts=3),
+        now="2026-07-24T10:00:00",
+    )
+    assert plan.decisions[0].reason_code == scheduler.REASON_RETRY_EXHAUSTED

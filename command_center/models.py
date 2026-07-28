@@ -18,6 +18,19 @@ from datetime import datetime
 PROJECT_IDS: list[str] = ["AICC", "AIOS", "AICOS", "PRODUCT", "ECOSYSTEM", "BANK", "LEGAL", "BUSINESS", "PERSONAL"]
 SENSITIVE_PROJECT_IDS: set[str] = {"BANK", "LEGAL"}
 
+# Non-canonical project labels that historically reached data/tasks.json from
+# outside the app (hand edits, external imports) and are NOT valid ids. Mapped
+# to their canonical PROJECT_IDS entry so `tasks_repository.validate_tasks` can
+# say "did you mean …?" and `tasks_repository.reconcile_project_aliases` can
+# migrate the live store. An unrecognised label with no entry here is left
+# alone and surfaced as an integrity issue, never silently guessed (audit
+# BLOCKER-4).
+PROJECT_ALIASES: dict[str, str] = {
+    "AI Command Center": "AICC",
+    "Ecosystem": "ECOSYSTEM",
+    "AIOS Product": "PRODUCT",
+}
+
 # --------------------------------------------------------------------------
 # Kanban status / task priority (single source of truth)
 #

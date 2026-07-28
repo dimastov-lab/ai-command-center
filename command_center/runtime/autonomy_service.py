@@ -1,6 +1,10 @@
 """Autonomy proposal orchestration — the side-effecting layer over the pure
 `autonomy` domain and the `db` persistence layer.
 
+Experimental foundation (AICC-AUTONOMY-002): no UI, no automated evidence
+collectors, no policy resolver, no background driver. See
+`docs/adr/0005-autonomy-proposal-foundation.md`.
+
 This is the AICC-AUTONOMY-002 analogue of `completion_service`: it drives a
 proposal through its lifecycle, writing an append-only audit event for every
 move, but it is deliberately *thinner* and *more restrained* than the completion

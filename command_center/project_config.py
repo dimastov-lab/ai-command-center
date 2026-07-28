@@ -38,6 +38,7 @@ OVERRIDABLE_FIELDS: list[str] = [
     "default_branch",
     "default_executor",
     "default_prompt",
+    "allowed_agents",
     "description",
     "status",
     "priority",
@@ -114,9 +115,14 @@ CONTEXT_FILES: dict[str, str] = {
     "LEGAL": "context/LEGAL_CONTEXT.md",
 }
 
-GLOBAL_CONTEXT_FILES: list[str] = ["CURRENT_STATE.md", "DECISIONS.md"]
+GLOBAL_CONTEXT_FILES: list[str] = ["CURRENT_STATE.md"]
 
 DEFAULT_ALLOWED_AGENTS: list[str] = ["claude_code"]
+EXECUTION_PROVIDER_IDS: frozenset[str] = frozenset({"claude_code", "codex", "ollama", "copilot_cli"})
+
+
+class ProviderAuthorizationError(ValueError):
+    """The selected execution provider is not authorized for the project."""
 
 
 def default_project_config(project_id: str) -> dict:
@@ -210,6 +216,58 @@ def load_project_configs() -> dict[str, dict]:
 
 def get_project_config(project_id: str) -> dict:
     return load_project_configs().get(project_id, default_project_config(project_id))
+
+
+def allowed_execution_providers(project_id: str) -> tuple[str, ...]:
+    """Return the project's explicitly authorized execution providers.
+
+    Missing policy is the legacy-safe Claude-only default. Malformed policy
+    and unknown identifiers fail closed instead of silently broadening access.
+    """
+    cfg = get_project_config(project_id)
+    raw = cfg.get("allowed_agents")
+    if raw is None:
+        return ("claude_code",)
+    if not isinstance(raw, list) or not raw or any(not isinstance(item, str) or not item for item in raw):
+        raise ProviderAuthorizationError(
+            f"Project {project_id!r} has malformed allowed_agents policy; execution is disabled."
+        )
+    unknown = sorted(set(raw) - EXECUTION_PROVIDER_IDS)
+    if unknown:
+        raise ProviderAuthorizationError(
+            f"Project {project_id!r} authorizes unknown execution provider(s): {unknown!r}."
+        )
+    return tuple(dict.fromkeys(raw))
+
+
+def require_execution_provider_allowed(project_id: str, provider_id: str) -> None:
+    allowed = allowed_execution_providers(project_id)
+    if provider_id not in allowed:
+        raise ProviderAuthorizationError(
+            f"Execution provider {provider_id!r} is not authorized for project {project_id!r}."
+        )
+
+
+def save_allowed_agents(project_id: str, allowed_agents: list[str]) -> None:
+    """Persist an explicit provider allow-list after validating it fail-closed."""
+    if project_id not in models.PROJECT_IDS:
+        raise ValueError(f"Unknown project: {project_id!r}")
+    if (
+        not isinstance(allowed_agents, list)
+        or not allowed_agents
+        or any(not isinstance(item, str) or not item for item in allowed_agents)
+    ):
+        raise ProviderAuthorizationError("allowed_agents must be a non-empty list of provider identifiers.")
+    unknown = sorted(set(allowed_agents) - EXECUTION_PROVIDER_IDS)
+    if unknown:
+        raise ProviderAuthorizationError(f"Unknown execution provider(s): {unknown!r}.")
+    overrides = _read_overrides()
+    project_override = overrides.get(project_id)
+    if not isinstance(project_override, dict):
+        project_override = {}
+    project_override["allowed_agents"] = list(dict.fromkeys(allowed_agents))
+    overrides[project_id] = project_override
+    storage.atomic_write_json(CONFIG_FILE, overrides)
 
 
 def validate_repository_path(path_str: str) -> tuple[bool, str]:

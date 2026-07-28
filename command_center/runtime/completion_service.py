@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from command_center import storage
 from command_center.runtime import db as runtime_db
 from command_center.runtime import git_ops, repo_state, validation
 from command_center.runtime.completion import (
@@ -61,16 +62,27 @@ EV_TASK_COMPLETED = "TASK_COMPLETED"
 EV_REQUIRES_ATTENTION = "REQUIRES_ATTENTION"
 EV_RECOVERY_FAILED = "RECOVERY_FAILED"
 EV_STATE_CHANGED = "STATE_CHANGED"
+# Independent review gate (blocking, before any pull request).
+EV_REVIEW_REQUESTED = "REVIEW_REQUESTED"
+EV_REVIEW_APPROVED = "REVIEW_APPROVED"
+EV_REVIEW_REJECTED = "REVIEW_REJECTED"
 # A same-state backoff re-check was scheduled (no state change). Kept distinct
 # from `STATE_CHANGED` so the audit trail never claims a transition happened
 # when only `next_retry_at`/`retry_count` moved.
 EV_RETRY_SCHEDULED = "RETRY_SCHEDULED"
+EV_MERGE_SLOT_BUSY = "MERGE_SLOT_BUSY"
+
+# Canonical independent-review verdicts persisted in `completion.review_verdict`.
+REVIEW_VERDICT_APPROVED = "approved"
+REVIEW_VERDICT_REJECTED = "rejected"
 
 _BACKOFF_BASE_SECONDS = 30
 _BACKOFF_CAP_SECONDS = 3600
 _MAX_STEPS_PER_ADVANCE = 8
 DEFAULT_REMOTE = "origin"
 DEFAULT_BASE_BRANCH = "main"
+MERGE_LOCK_FILE_NAME = "completion_merge.lock"
+MERGE_LOCK_TIMEOUT_SECONDS = 0.0
 
 
 def _now() -> datetime:
@@ -95,6 +107,14 @@ class AdvanceResult:
     changed: bool
 
 
+class ManualMergeError(RuntimeError):
+    """An explicit merge request was refused by a current safety gate."""
+
+
+class MergeSlotBusyError(RuntimeError):
+    """Another completion currently owns the one global merge slot."""
+
+
 class CompletionOrchestrator:
     """Advances completion rows. Dependencies (GitHub client, evaluator) are
     injected so tests can substitute in-memory doubles and a fixed clock."""
@@ -117,6 +137,7 @@ class CompletionOrchestrator:
         *,
         task: dict | None = None,
         project_cfg: dict | None = None,
+        policy_overrides: dict | None = None,
         now: datetime | None = None,
     ) -> dict | None:
         """Create the completion row for a terminally-`COMPLETED` run, if one
@@ -124,7 +145,11 @@ class CompletionOrchestrator:
         the run is not eligible (not a successful execution).
 
         Idempotent: a second call for the same run returns the existing row and
-        never creates a duplicate (the PK on run_id guarantees it)."""
+        never creates a duplicate (the PK on run_id guarantees it). Because the
+        policy is resolved *once*, at seeding, and then persisted in
+        `policy_json`, `policy_overrides` only affects rows this call actually
+        creates — an in-flight completion keeps the policy it was born with
+        rather than having the rules changed underneath it mid-pipeline."""
         run_id = run["id"]
         existing = runtime_db.get_completion(self.db_path, run_id)
         if existing is not None:
@@ -132,7 +157,9 @@ class CompletionOrchestrator:
         if run.get("state") != "COMPLETED":
             return None
 
-        policy = CompletionPolicy.resolve(task=task, project_cfg=project_cfg)
+        policy = CompletionPolicy.resolve(
+            task=task, project_cfg=project_cfg, overrides=policy_overrides
+        )
         repo = run["repository_path"]
         base_branch = (project_cfg or {}).get("default_branch") or DEFAULT_BASE_BRANCH
         # Head branch: prefer the live worktree branch, fall back to the run's
@@ -244,6 +271,8 @@ class CompletionOrchestrator:
                     row["run_id"], now=now, reason_code=ReasonCode.RETRY_LIMIT_REACHED,
                     message=f"Transient failure, will retry: {exc}",
                 )
+            except MergeSlotBusyError:
+                self._defer_for_merge_slot(row["run_id"], now=now)
             except Exception as exc:  # noqa: BLE001 - isolate one row's failure
                 fresh = runtime_db.get_completion(self.db_path, row["run_id"])
                 if fresh is None:
@@ -261,6 +290,80 @@ class CompletionOrchestrator:
                     recommended=f"Completion advance failed: {exc}",
                 )
         return results
+
+    def request_manual_merge(
+        self, run_id: str, *, confirmed: bool, now: datetime | None = None
+    ) -> dict:
+        """Perform exactly one user-confirmed merge through the normal gates."""
+        if not confirmed:
+            raise ManualMergeError("Нужно явно подтвердить слияние.")
+        now = now or _now()
+        row = runtime_db.get_completion(self.db_path, run_id)
+        if row is None:
+            raise ManualMergeError("Запись завершения задачи не найдена.")
+        policy = CompletionPolicy.from_json(row.get("policy_json"))
+        if policy.merge_mode != "manual":
+            raise ManualMergeError("Для этой задачи включён автоматический режим слияния.")
+        if (
+            row.get("completion_state") != CompletionState.AWAITING_MERGE
+            or row.get("last_reason_code") != ReasonCode.AWAITING_MANUAL_MERGE
+        ):
+            raise ManualMergeError("Задача ещё не дошла до ручного слияния.")
+        if (
+            policy.requires_independent_review
+            and row.get("review_verdict") != REVIEW_VERDICT_APPROVED
+        ):
+            raise ManualMergeError("Независимое ревью ещё не одобрило изменение.")
+
+        repo = Path(row["repository_path"])
+        repo_state.fetch(repo, row.get("remote") or DEFAULT_REMOTE)
+        pr = self._discover_pr(
+            repo, branch=row.get("branch"), base=row.get("base_branch")
+        )
+        if pr is None or not pr.is_open or not pr.number:
+            raise ManualMergeError("Открытый pull request не найден.")
+        if pr.checks_failing:
+            raise ManualMergeError("CI не прошёл — сначала будет запущена автодоработка.")
+        if pr.checks_pending:
+            raise ManualMergeError("CI ещё выполняется.")
+        if not pr.review_satisfied:
+            raise ManualMergeError("Запрошенные изменения ревью ещё не исправлены.")
+        if pr.mergeable == "CONFLICTING":
+            raise ManualMergeError("В pull request есть конфликт с целевой веткой.")
+
+        fresh = runtime_db.get_completion(self.db_path, run_id)
+        if fresh is None or fresh["version"] != row["version"]:
+            raise ManualMergeError("Состояние задачи изменилось — обновите экран.")
+        try:
+            self._merge(fresh, pr, policy=policy, now=now)
+        except MergeSlotBusyError as exc:
+            raise ManualMergeError(
+                "Сейчас сливается другая задача. Эта задача останется в ожидании."
+            ) from exc
+        self.advance(run_id, now=now)
+        return runtime_db.get_completion(self.db_path, run_id)
+
+    def _defer_for_merge_slot(self, run_id: str, *, now: datetime) -> None:
+        """Wait for the global merge slot without spending a failure retry."""
+        row = runtime_db.get_completion(self.db_path, run_id)
+        if row is None or row["completion_state"] in _TERMINAL:
+            return
+        runtime_db.append_completion_event(
+            self.db_path,
+            run_id,
+            EV_MERGE_SLOT_BUSY,
+            reason_code=ReasonCode.READY_TO_MERGE,
+            message="Another task owns the sequential merge slot.",
+        )
+        self._transition(
+            row,
+            state=row["completion_state"],
+            reason_code=ReasonCode.READY_TO_MERGE,
+            recommended="Ожидание: сейчас последовательно сливается другая задача.",
+            now=now,
+            next_retry_at=_iso(now + timedelta(seconds=5)),
+            progressed=False,
+        )
 
     def _schedule_retry(self, run_id: str, *, now: datetime, reason_code: str, message: str) -> None:
         """Keep the current state but back off and re-check later. Escalates to
@@ -304,9 +407,80 @@ class CompletionOrchestrator:
         if state in (CompletionState.MERGED, CompletionState.VERIFYING_TARGET_BRANCH):
             return self._step_verify(row, policy=policy, now=now)
 
+        # --- independent review gate (blocking, pre-pull-request) ----------
+        if policy.requires_independent_review and state in (
+            CompletionState.RESULT_VALID,
+            CompletionState.AWAITING_REVIEW,
+        ):
+            gated = self._step_review_gate(row, policy=policy, now=now)
+            if gated is not None:
+                return gated
+
         # --- PR phase (result valid / preparing / open / awaiting / blocked /
         #     closed-unmerged / recovery) ---------------------------------------
         return self._step_pull_request(row, policy=policy, now=now)
+
+    def _step_review_gate(self, row: dict, *, policy: CompletionPolicy, now: datetime):
+        """The blocking independent-review gate.
+
+        Returns `(row, progressed)` while the gate is in control, or `None` once
+        the review has been approved and the PR phase may proceed.
+
+        The orchestrator deliberately does **not** launch the reviewer itself —
+        it is the privileged actor that may push and merge, and launching agents
+        is the launch path's job. It only holds the row in `AWAITING_REVIEW` and
+        reads the verdict that `task_pipeline` writes back. That split is what
+        keeps this module free of any ability to start a process.
+
+        No verdict means *wait*, never *proceed*: a NULL `review_verdict` (which
+        is also what every pre-migration row has) leaves the gate closed."""
+        verdict = (row.get("review_verdict") or "").strip().lower()
+
+        if verdict == REVIEW_VERDICT_APPROVED:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_REVIEW_APPROVED,
+                reason_code=ReasonCode.REVIEW_APPROVED,
+                message=row.get("review_summary") or "Independent review approved the change.",
+            )
+            return None
+
+        if verdict == REVIEW_VERDICT_REJECTED:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_REVIEW_REJECTED,
+                reason_code=ReasonCode.REVIEW_REJECTED,
+                message=row.get("review_summary") or "Independent review rejected the change.",
+            )
+            self._transition(
+                row,
+                state=CompletionState.REVIEW_REJECTED,
+                reason_code=ReasonCode.REVIEW_REJECTED,
+                recommended=(
+                    "Независимая проверка не одобрила изменение: "
+                    + (row.get("review_summary") or "причина не указана")
+                ),
+                requires_human=True,
+                now=now,
+                progressed=False,
+            )
+            return runtime_db.get_completion(self.db_path, row["run_id"]), False
+
+        # No verdict yet. Enter/stay in the gate and wait for one.
+        if row["completion_state"] != CompletionState.AWAITING_REVIEW:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_REVIEW_REQUESTED,
+                reason_code=ReasonCode.REVIEW_PENDING,
+                message="Waiting for an independent review before opening a pull request.",
+            )
+            self._transition(
+                row,
+                state=CompletionState.AWAITING_REVIEW,
+                reason_code=ReasonCode.REVIEW_PENDING,
+                recommended="Ожидается независимая проверка перед созданием pull request.",
+                now=now,
+                progressed=True,
+            )
+            return runtime_db.get_completion(self.db_path, row["run_id"]), True
+        return runtime_db.get_completion(self.db_path, row["run_id"]), False
 
     def _step_validation(self, row: dict, *, policy: CompletionPolicy, now: datetime) -> tuple[dict, bool]:
         repo = row["repository_path"]
@@ -326,6 +500,32 @@ class CompletionOrchestrator:
         pre = self.evaluator.evaluate(task, run, state, None, validation=None, policy=policy)
         if pre.reason_code == ReasonCode.TARGET_VERIFIED:
             return self._complete(row, now=now, pr=self._pr_from_row(row))
+
+        # The agent runs sandboxed (no git-write tools), so its work is sitting
+        # uncommitted in its own isolated worktree. Commit it here — this is the
+        # missing link that let a run reach "COMPLETED" yet stall forever at
+        # UNCOMMITTED_CHANGES: the pipeline, which owns all git for the task,
+        # turns the agent's changes into a real commit on the task branch, then
+        # re-inspects and proceeds to validation → PR → merge. Only the task's
+        # own linked worktree is ever touched (isolation enforced upstream).
+        if pre.reason_code == ReasonCode.UNCOMMITTED_CHANGES:
+            try:
+                git_ops.commit_all(
+                    Path(repo),
+                    message=f"{(task or {}).get('title') or 'task'} (agent run {row['run_id'][:8]})",
+                )
+            except git_ops.GitOpsError:
+                self._apply_assessment(row, pre, now=now)
+                return runtime_db.get_completion(self.db_path, row["run_id"]), False
+            # Re-inspect after committing; fall through with the clean state.
+            state = repo_state.inspect_repository(
+                repo, base_branch=row.get("base_branch"), branch=row.get("branch"),
+                remote=row.get("remote") or DEFAULT_REMOTE, check_remote=False,
+            )
+            pre = self.evaluator.evaluate(task, run, state, None, validation=None, policy=policy)
+            if pre.reason_code == ReasonCode.TARGET_VERIFIED:
+                return self._complete(row, now=now, pr=self._pr_from_row(row))
+
         if pre.reason_code in (
             ReasonCode.UNCOMMITTED_CHANGES,
             ReasonCode.NO_TASK_COMMIT,
@@ -473,6 +673,16 @@ class CompletionOrchestrator:
         repo = Path(row["repository_path"])
         remote = row.get("remote") or DEFAULT_REMOTE
         merge_commit = row.get("merge_commit")
+        # A squash merge whose commit oid GitHub had not populated at merge time
+        # persists merge_commit=None. HEAD is not an ancestor of the squashed
+        # base, so verification then depends entirely on that oid — without it a
+        # genuinely-merged PR strands at REQUIRES_ATTENTION forever. Re-discover
+        # the PR once here to recover the oid before relying on it.
+        if not merge_commit and row.get("pull_request_number") and row.get("branch"):
+            refreshed = self._discover_pr(repo, branch=row["branch"], base=row.get("base_branch"))
+            if refreshed is not None and refreshed.merge_commit:
+                merge_commit = refreshed.merge_commit
+                row = {**row, "merge_commit": merge_commit}
         # Fetch so remote-tracking refs reflect the real merge, then check
         # reachability of head OR the merge commit (supports squash merges).
         repo_state.fetch(repo, remote)
@@ -536,12 +746,26 @@ class CompletionOrchestrator:
             self.db_path, row["run_id"], EV_REMOTE_BRANCH_PUBLISHED, reason_code=ReasonCode.PR_MISSING,
             message=f"Pushed branch {branch!r} to {remote}.",
         )
-        title, body = _pr_content(task, row, rstate, base_branch=base_branch, branch=branch)
-        pr = self.github.create_pull_request(repo, base=base_branch, head=branch, title=title, body=body)
-        runtime_db.append_completion_event(
-            self.db_path, row["run_id"], EV_PR_CREATED, reason_code=ReasonCode.PR_OPEN,
-            message=f"Opened pull request #{pr.number}.", metadata={"url": pr.url, "number": pr.number},
-        )
+        # Re-check for an existing PR immediately before creating one (audit M6).
+        # Two advancers (the optional autopilot thread plus an on-demand advance,
+        # or two processes) can both have seen no PR at discovery time and both
+        # reach here; without this they race on `gh pr create`, which refuses a
+        # second PR for the same head+base and errors the loser instead of
+        # adopting the PR that already exists. Discover-then-adopt collapses that.
+        pr = self._discover_pr(repo, branch=branch, base=base_branch)
+        if pr is not None:
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_PR_CREATED, reason_code=ReasonCode.PR_OPEN,
+                message=f"Pull request #{pr.number} already open for {branch!r}; adopting it.",
+                metadata={"url": pr.url, "number": pr.number},
+            )
+        else:
+            title, body = _pr_content(task, row, rstate, base_branch=base_branch, branch=branch)
+            pr = self.github.create_pull_request(repo, base=base_branch, head=branch, title=title, body=body)
+            runtime_db.append_completion_event(
+                self.db_path, row["run_id"], EV_PR_CREATED, reason_code=ReasonCode.PR_OPEN,
+                message=f"Opened pull request #{pr.number}.", metadata={"url": pr.url, "number": pr.number},
+            )
         self._transition(
             row,
             state=CompletionState.PULL_REQUEST_OPEN,
@@ -631,26 +855,46 @@ class CompletionOrchestrator:
         return runtime_db.get_completion(self.db_path, row["run_id"]), True
 
     def _merge(self, row, pr, *, policy, now) -> tuple[dict, bool]:
-        repo = Path(row["repository_path"])
-        runtime_db.append_completion_event(
-            self.db_path, row["run_id"], EV_MERGE_STARTED, reason_code=ReasonCode.READY_TO_MERGE,
-            message=f"Merging pull request #{pr.number} via {policy.merge_method}.",
-        )
-        merged = self.github.merge_pull_request(repo, number=pr.number, method=policy.merge_method)
-        runtime_db.append_completion_event(
-            self.db_path, row["run_id"], EV_PR_MERGED, reason_code=ReasonCode.PR_MERGED,
-            message=f"Merged pull request #{pr.number}.", metadata={"merge_commit": merged.merge_commit},
-        )
-        self._transition(
-            row,
-            state=CompletionState.MERGED,
-            reason_code=ReasonCode.PR_MERGED,
-            recommended="Pull request merged; verifying target branch.",
-            merge_commit=merged.merge_commit,
-            pull_request_state=merged.state,
-            now=now,
-            progressed=True,
-        )
+        lock_path = self.db_path.parent / MERGE_LOCK_FILE_NAME
+        try:
+            with storage.file_lock(
+                lock_path, timeout=MERGE_LOCK_TIMEOUT_SECONDS
+            ):
+                # The decision was made before lock acquisition. Re-read under
+                # the slot so a concurrent state transition cannot be merged
+                # from stale completion data.
+                fresh = runtime_db.get_completion(self.db_path, row["run_id"])
+                if fresh is None or fresh["version"] != row["version"]:
+                    raise runtime_db.LostUpdateError(
+                        f"Completion {row['run_id']!r} changed before merge."
+                    )
+                repo = Path(fresh["repository_path"])
+                runtime_db.append_completion_event(
+                    self.db_path, fresh["run_id"], EV_MERGE_STARTED,
+                    reason_code=ReasonCode.READY_TO_MERGE,
+                    message=f"Merging pull request #{pr.number} via {policy.merge_method}.",
+                )
+                merged = self.github.merge_pull_request(
+                    repo, number=pr.number, method=policy.merge_method
+                )
+                runtime_db.append_completion_event(
+                    self.db_path, fresh["run_id"], EV_PR_MERGED,
+                    reason_code=ReasonCode.PR_MERGED,
+                    message=f"Merged pull request #{pr.number}.",
+                    metadata={"merge_commit": merged.merge_commit},
+                )
+                self._transition(
+                    fresh,
+                    state=CompletionState.MERGED,
+                    reason_code=ReasonCode.PR_MERGED,
+                    recommended="Pull request merged; verifying target branch.",
+                    merge_commit=merged.merge_commit,
+                    pull_request_state=merged.state,
+                    now=now,
+                    progressed=True,
+                )
+        except storage.LockTimeoutError as exc:
+            raise MergeSlotBusyError("another task is being merged") from exc
         return runtime_db.get_completion(self.db_path, row["run_id"]), True
 
     def _complete(self, row, *, now, pr) -> tuple[dict, bool]:
@@ -668,6 +912,9 @@ class CompletionOrchestrator:
             reason_code=ReasonCode.TARGET_VERIFIED,
             recommended="Task completed and merged into the target branch.",
             now=now,
+            # Persist a merge commit recovered late in _step_verify; _transition
+            # ignores it when None, so the other call sites are unaffected.
+            merge_commit=row.get("merge_commit"),
             progressed=False,
         )
         return runtime_db.get_completion(self.db_path, row["run_id"]), False
@@ -835,6 +1082,7 @@ _TERMINAL = frozenset(
     {
         CompletionState.COMPLETED,
         CompletionState.VALIDATION_FAILED,
+        CompletionState.REVIEW_REJECTED,
         CompletionState.REQUIRES_ATTENTION,
         CompletionState.RECOVERY_FAILED,
     }
@@ -842,6 +1090,7 @@ _TERMINAL = frozenset(
 _ACTIVE = frozenset(
     {
         CompletionState.EXECUTION_FINISHED,
+        CompletionState.AWAITING_REVIEW,
         CompletionState.VALIDATING_RESULT,
         CompletionState.RESULT_VALID,
         CompletionState.PREPARING_PULL_REQUEST,

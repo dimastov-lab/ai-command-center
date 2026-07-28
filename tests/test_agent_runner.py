@@ -423,3 +423,16 @@ def test_resolve_report_path_rejects_absolute_escape(tmp_path, monkeypatch):
 def test_resolve_report_path_returns_none_when_missing():
     assert agent_runner.resolve_report_path({}) is None
     assert agent_runner.resolve_report_path({"report_path": None}) is None
+
+
+def test_timeout_for_task_is_200pct_of_estimate():
+    from command_center import agent_runner
+    # 0.5h estimate → 200% = 1h = 3600s (also the max cap)
+    assert agent_runner.timeout_for_task({"estimate_hours": 0.5}) == 3600
+    # 0.1h = 6min → 200% = 12min = 720s
+    assert agent_runner.timeout_for_task({"estimate_hours": 0.1}) == 720
+    # no estimate → default
+    assert agent_runner.timeout_for_task({}) == agent_runner.DEFAULT_TIMEOUT_SECONDS
+    assert agent_runner.timeout_for_task(None) == agent_runner.DEFAULT_TIMEOUT_SECONDS
+    # huge estimate clamps to the max
+    assert agent_runner.timeout_for_task({"estimate_hours": 10}) == agent_runner.MAX_TIMEOUT_SECONDS

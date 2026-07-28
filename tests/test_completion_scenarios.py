@@ -14,8 +14,18 @@ import pytest
 
 from command_center.runtime import db as runtime_db
 from command_center.runtime.completion import CompletionState
-from command_center.runtime.completion_service import CompletionOrchestrator
-from command_center.runtime.github import STATE_CLOSED, FakeGitHubClient, GitHubError, PullRequestState
+from command_center.runtime.completion_service import (
+    CompletionOrchestrator,
+    ManualMergeError,
+)
+from command_center.runtime.github import (
+    CHECKS_FAILING,
+    STATE_CLOSED,
+    STATE_OPEN,
+    FakeGitHubClient,
+    GitHubError,
+    PullRequestState,
+)
 from tests.completion_helpers import (
     build_repo,
     make_task_branch,
@@ -106,6 +116,45 @@ def test_scenario_a_manual_merge_awaits(env):
     assert gh.merged == []  # never auto-merged
 
 
+def test_manual_merge_action_merges_once_and_verifies_target(env):
+    db_path, remote, work, tmp = env
+    branch = "task/aicc-manual-button"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    gh = FakeGitHubClient(
+        on_merge=lambda pr: merge_into_main(
+            remote, tmp, pr.head_ref, squash=False
+        )
+    )
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg={"default_branch": "main"})
+    orch.advance(run["id"], now=NOW)
+
+    row = orch.request_manual_merge(run["id"], confirmed=True, now=NOW)
+
+    assert row["completion_state"] == CompletionState.COMPLETED
+    assert gh.merged == [row["pull_request_number"]]
+
+
+def test_manual_merge_rechecks_red_ci_and_refuses(env):
+    db_path, _remote, work, _tmp = env
+    branch = "task/aicc-manual-red-ci"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    gh = FakeGitHubClient()
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg={"default_branch": "main"})
+    orch.advance(run["id"], now=NOW)
+    gh._by_branch[branch].checks_state = CHECKS_FAILING
+
+    with pytest.raises(ManualMergeError, match="CI не прошёл"):
+        orch.request_manual_merge(run["id"], confirmed=True, now=NOW)
+
+    assert gh.merged == []
+
+
 # ============================================================================
 # Scenario B — closed PR without merge -> recovery
 # ============================================================================
@@ -132,6 +181,43 @@ def test_scenario_b_closed_pr_recovery(env):
     assert "PR_CLOSED_UNMERGED" in events
     assert "REMOTE_BRANCH_RECREATED" in events
     assert "REPLACEMENT_PR_CREATED" in events
+
+
+def test_open_pull_request_adopts_a_pr_opened_in_the_race_window(env):
+    """Audit M6: two advancers can both see no PR at discovery (step_pull_request)
+    and both reach _open_pull_request. The re-discovery just before `create` must
+    adopt the PR a peer opened in between rather than creating a duplicate (which
+    `gh pr create` would reject anyway, erroring the loser)."""
+    db_path, remote, work, tmp = env
+    branch = "task/aicc-m6-race"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    class _RaceGitHub(FakeGitHubClient):
+        # First discovery (the evaluator's, at step_pull_request) sees no PR; the
+        # second (inside _open_pull_request, just before create) sees the peer's.
+        def __init__(self, race_pr):
+            super().__init__()
+            self._race_pr = race_pr
+            self._discovers = 0
+
+        def discover_pull_request(self, repo, *, branch, base=None):
+            self._discovers += 1
+            return None if self._discovers == 1 else self._race_pr
+
+    race_pr = PullRequestState(
+        number=99, url="https://x/pull/99", state=STATE_OPEN,
+        mergeable="MERGEABLE", head_ref=branch, base_ref="main",
+    )
+    gh = _RaceGitHub(race_pr)
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg={"default_branch": "main"})
+    for _ in range(6):
+        orch.advance(run["id"], now=NOW)
+
+    row = runtime_db.get_completion(db_path, run["id"])
+    assert row["pull_request_number"] == 99  # adopted the peer's PR
+    assert gh.created == []  # never created a duplicate
 
 
 def test_scenario_b_recovery_disabled_requires_attention(env):
@@ -182,11 +268,15 @@ def test_scenario_c_validation_failure(env):
 # ============================================================================
 # Completion-evidence: dirty tree / no commit (service level)
 # ============================================================================
-def test_dirty_worktree_requires_attention(env):
+def test_agent_uncommitted_work_is_committed_and_pipeline_proceeds(env):
+    """The agent runs sandboxed (no git-write), so it leaves its work
+    uncommitted in its own isolated worktree. The pipeline now COMMITS that work
+    on the task branch and proceeds — it no longer stalls forever at
+    UNCOMMITTED_CHANGES (the missing link that stopped every run reaching merge)."""
     db_path, remote, work, tmp = env
     branch = "task/aicc-dirty"
     make_task_branch(work, branch)
-    (work / "uncommitted.py").write_text("y = 2\n")  # leave the tree dirty
+    (work / "uncommitted.py").write_text("y = 2\n")  # the agent's uncommitted work
     run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
 
     orch = CompletionOrchestrator(db_path, github=FakeGitHubClient())
@@ -194,8 +284,15 @@ def test_dirty_worktree_requires_attention(env):
     orch.advance(run["id"], now=NOW)
 
     row = runtime_db.get_completion(db_path, run["id"])
-    assert row["completion_state"] == CompletionState.REQUIRES_ATTENTION
-    assert row["last_reason_code"] == "UNCOMMITTED_CHANGES"
+    # The pipeline committed the work and moved past the uncommitted gate.
+    assert row["completion_state"] != CompletionState.REQUIRES_ATTENTION
+    assert row["last_reason_code"] != "UNCOMMITTED_CHANGES"
+    # The agent's file is now a real commit — it no longer shows as an
+    # uncommitted change (build artifacts like __pycache__ may appear afterwards
+    # from validation; those are not the agent's work and don't matter here).
+    from command_center.runtime import git_ops
+    status = git_ops.run_git_write(work, ["status", "--porcelain"])
+    assert "uncommitted.py" not in (status.stdout or ""), "agent work should be committed"
 
 
 def test_no_task_commit_requires_attention(env):
@@ -440,3 +537,35 @@ def test_begin_completion_skips_non_completed_run(env):
     orch = CompletionOrchestrator(db_path, github=FakeGitHubClient())
     assert orch.begin_completion(run, project_cfg=_auto_cfg()) is None
     assert runtime_db.get_completion(db_path, run["id"]) is None
+
+
+def test_step_verify_recovers_late_merge_commit_oid(env):
+    # M2: a squash merge whose commit oid GitHub has not populated at merge time
+    # persists merge_commit=None. HEAD is not an ancestor of the squashed base,
+    # so without the oid a genuinely-merged task strands at REQUIRES_ATTENTION.
+    # _step_verify must re-discover the PR, recover the oid, verify the real
+    # merge, and persist the recovered oid.
+    import dataclasses
+
+    db_path, remote, work, tmp = env
+    branch = "task/aicc-late-oid"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    class LateOidGitHub(FakeGitHubClient):
+        """merge() reports success but with no merge-commit oid; the stored PR
+        keeps the real oid, so a later discover() reveals it."""
+
+        def merge_pull_request(self, repo, *, number, method="squash"):
+            pr = super().merge_pull_request(repo, number=number, method=method)
+            return dataclasses.replace(pr, merge_commit=None)
+
+    gh = LateOidGitHub(on_merge=lambda pr: merge_into_main(remote, tmp, pr.head_ref, squash=True))
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg=_auto_cfg())
+    orch.advance(run["id"], now=NOW)
+
+    row = runtime_db.get_completion(db_path, run["id"])
+    assert row["completion_state"] == CompletionState.COMPLETED
+    # the oid recovered by the re-discovery was persisted, not left null
+    assert row["merge_commit"]

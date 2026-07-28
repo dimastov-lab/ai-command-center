@@ -39,7 +39,11 @@ class GitOpsError(Exception):
 
 def _assert_not_force(args: list[str]) -> None:
     for token in args:
-        if token in _FORCE_TOKENS or token.startswith("+"):
+        # `token in _FORCE_TOKENS` catches the bare `-f`; `startswith("--force")`
+        # additionally catches the equals-forms the tuple cannot enumerate
+        # (`--force-with-lease=<ref>`, `--force-if-includes`); a leading `+`
+        # forces a single ref inside a refspec.
+        if token in _FORCE_TOKENS or token.startswith("--force") or token.startswith("+"):
             raise GitOpsError(args, None, f"force-push is forbidden (offending token: {token!r})")
 
 
@@ -58,6 +62,40 @@ def run_git_write(repo: Path, args: list[str], *, timeout: int = _DEFAULT_TIMEOU
         )
     except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover - spawn failure
         raise GitOpsError(args, None, str(exc)) from exc
+
+
+def commit_all(repo: Path, *, message: str) -> subprocess.CompletedProcess | None:
+    """Stage every change in `repo` and commit it on the current branch.
+
+    This is how the *pipeline* commits the work an agent produced — the agent
+    runs sandboxed with no git-write tools, so it leaves its changes uncommitted
+    in its own isolated worktree, and the completion pipeline turns those into a
+    real commit on the task branch before validating and opening the pull
+    request. Only ever called on a task's own linked worktree (isolation is
+    enforced upstream), never on a primary tree.
+
+    Returns the commit `CompletedProcess`, or `None` when there was nothing to
+    commit (a clean tree — an idempotent no-op, not an error)."""
+    status = run_git_write(repo, ["status", "--porcelain"])
+    if status.returncode == 0 and not (status.stdout or "").strip():
+        return None  # nothing to commit
+    add = run_git_write(repo, ["add", "-A"])
+    if add.returncode != 0:
+        raise GitOpsError(["add", "-A"], add.returncode, add.stderr or "")
+    # `--no-verify` so a repo's own pre-commit hooks (lint/format) cannot block
+    # the pipeline from capturing the agent's work; validation runs separately.
+    # An explicit identity keeps the commit self-contained on hosts with no
+    # global git identity (e.g. CI runners), where a bare `git commit` would
+    # otherwise fail with "Author identity unknown" and stall the pipeline at
+    # REQUIRES_ATTENTION.
+    return run_git_write(
+        repo,
+        [
+            "-c", "user.email=aicc-pipeline@local",
+            "-c", "user.name=AI Command Center Pipeline",
+            "commit", "--no-verify", "-m", message,
+        ],
+    )
 
 
 def push_branch(

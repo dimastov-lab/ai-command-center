@@ -16,6 +16,11 @@ Env vars:
   the child/grandchild use the default SIGTERM action (immediate exit) so
   the test can also distinguish "died from SIGTERM" vs "needed SIGKILL" at
   the parent level specifically.
+- `FAKE_CLAUDE_TREE_DESCENDANTS_IGNORE_SIGTERM`: if "1", child and
+  grandchild ignore SIGTERM while the parent keeps the default action.
+- `FAKE_CLAUDE_TREE_PARENT_EXIT_AFTER_START`: if "1", the parent exits
+  naturally after reporting the tree, leaving its descendants alive unless
+  the Supervisor drains the process group before reaping the leader.
 """
 
 from __future__ import annotations
@@ -36,10 +41,14 @@ def _write_pid(pidfile_base: str, role: str, pid: int) -> None:
 
 
 def _run_grandchild() -> None:
+    if os.environ.get("FAKE_CLAUDE_TREE_DESCENDANTS_IGNORE_SIGTERM") == "1":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(60)
 
 
 def _run_child(pidfile_base: str) -> None:
+    if os.environ.get("FAKE_CLAUDE_TREE_DESCENDANTS_IGNORE_SIGTERM") == "1":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     grandchild = subprocess.Popen(
         [sys.executable, THIS_FILE, "--grandchild"],
         stdout=subprocess.DEVNULL,
@@ -67,6 +76,25 @@ def _run_parent(pidfile_base: str) -> None:
 
     print(json.dumps({"type": "result", "result": "tree started"}))
     sys.stdout.flush()
+
+    if os.environ.get("FAKE_CLAUDE_TREE_PARENT_EXIT_AFTER_START") == "1":
+        # Do not exit until the child has recorded the grandchild pid. This
+        # parent is the process-group leader, so the instant it exits the
+        # Supervisor may observe the leader exit and drain the whole group
+        # (residual SIGTERM -> SIGKILL) before the child has finished spawning
+        # the grandchild and writing `<base>.grandchild`. On a loaded runner
+        # that teardown wins the race, the grandchild pidfile never appears,
+        # and the test's pidfile poll times out. Gating the exit on the tree
+        # being fully materialised makes "whole tree up" happen-before "leader
+        # exits" happen-before "group drain" — deterministic on any load.
+        grandchild_pidfile = f"{pidfile_base}.grandchild"
+        # 10s deliberately mirrors the test helper `_wait_for_tree_pids`'s own
+        # poll deadline; keep them equal so this gate never gives up before the
+        # poll does.
+        deadline = time.monotonic() + 10.0
+        while not os.path.exists(grandchild_pidfile) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return
 
     time.sleep(60)
     child.wait()

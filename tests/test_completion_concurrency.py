@@ -24,15 +24,22 @@ from datetime import datetime
 
 import pytest
 
+from command_center import storage
 from command_center.runtime import db as runtime_db
-from command_center.runtime.completion import CompletionState
+from command_center.runtime.completion import CompletionPolicy, CompletionState
 from command_center.runtime.completion_service import (
     AdvanceResult,
     CompletionOrchestrator,
     EV_REQUIRES_ATTENTION,
     EV_STATE_CHANGED,
+    MERGE_LOCK_FILE_NAME,
+    MergeSlotBusyError,
 )
-from command_center.runtime.github import FakeGitHubClient
+from command_center.runtime.github import (
+    STATE_OPEN,
+    FakeGitHubClient,
+    PullRequestState,
+)
 
 NOW = datetime(2026, 7, 22, 12, 0, 0)
 
@@ -162,6 +169,29 @@ def test_non_stale_same_state_metadata_update_still_works(db_path):
     assert updated["completion_state"] == CompletionState.AWAITING_MERGE
     assert updated["retry_count"] == 4
     assert updated["version"] == row["version"] + 1
+
+
+def test_global_merge_slot_refuses_overlapping_merge(db_path):
+    orch = _orch(db_path)
+    run = _make_run(db_path)
+    row = _seed(db_path, run, CompletionState.AWAITING_MERGE)
+    pr = PullRequestState(
+        number=7,
+        state=STATE_OPEN,
+        mergeable="MERGEABLE",
+    )
+    lock_path = db_path.parent / MERGE_LOCK_FILE_NAME
+
+    with storage.file_lock(lock_path):
+        with pytest.raises(MergeSlotBusyError):
+            orch._merge(
+                row,
+                pr,
+                policy=CompletionPolicy(),
+                now=NOW,
+            )
+
+    assert "MERGE_STARTED" not in _events(db_path, run["id"])
 
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ from pathlib import Path
 import streamlit as st
 
 from command_center import execution_queue, recommendation_service
+from command_center.runtime import db as runtime_db
 from command_center.ui.launch_feedback import render_skipped_launch
 
 _QUEUED_STATE_LABELS: dict[str, str] = {
@@ -33,8 +34,9 @@ def render_recommendations_panel(
     key_prefix: str = "reco",
 ) -> None:
     queue_entries = execution_queue.reevaluate_and_persist(root, tasks_by_id)
+    active_runs = execution_center_api.list_runs(states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES)
     views = recommendation_service.build_recommendation_views(
-        tasks, tasks_by_id, project=project, queue_entries=queue_entries, limit=limit
+        tasks, tasks_by_id, project=project, queue_entries=queue_entries, limit=limit, active_runs=active_runs
     )
 
     st.markdown("#### Рекомендованные задачи")

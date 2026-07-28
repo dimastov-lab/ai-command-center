@@ -5,8 +5,10 @@ ADRs, and runtime operator documentation are authoritative if another document c
 description.
 
 The current product is a Streamlit application. The native PySide6 design under
-[`docs/desktop/`](docs/desktop/README.md) is a planned architecture only: no PySide6 client,
-desktop package, or native installer is implemented.
+[`docs/desktop/`](docs/desktop/README.md) has begun landing: Desktop Increment 1 — the
+`command_center.desktop` shell (navigation, theming, settings/geometry persistence) — is
+implemented and pytest-qt tested, while the data-adapter, platform-abstraction, and native
+packaging/installer increments are not yet built.
 
 ## 1. System context
 
@@ -32,11 +34,11 @@ flowchart LR
     Services --> Artifacts["reports and generated files"]
 
     Services --> Supervisor["Runtime Supervisor"]
-    Supervisor --> Claude["Local Claude CLI<br/>process group"]
+    Supervisor --> Claude["Local provider CLI<br/>process group<br/>(Claude default; Codex/Ollama/Copilot)"]
     Services --> Git["Local Git repositories<br/>branches and worktrees"]
     Services --> GitHub["GitHub through gh CLI"]
 
-    Streamlit -. "planned, not implemented" .-> Desktop["Native PySide6 client"]
+    Streamlit -. "D1 shell shipped; wiring & packaging planned" .-> Desktop["Native PySide6 client"]
 ```
 
 Streamlit itself serves HTTP and WebSocket traffic. The repository does not configure
@@ -58,10 +60,13 @@ authentication layer.
 - renders top-level pages through a flat `if/elif` route;
 - uses timed Streamlit fragments to poll execution and completion views.
 
-The 19 current navigation destinations are Dashboard, Workspace Home, Executive, Create Task,
-Project Chat, Kanban, AI Agents, Live Execution Center, Run Journal, Timeline, Projects,
-Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode, Portfolio
-Execution, and Portfolio Overview.
+`NAV` registers 20 page handlers: Dashboard, Workspace Home, Executive, Create Task,
+Project Chat, Kanban, Волны (Waves), AI Agents, Live Execution Center, Run Journal, Timeline,
+Projects, Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode, Portfolio
+Execution, and Portfolio Overview. The sidebar (`command_center/ui/sidebar.py`) renders 16 of
+them; Project Chat, Generated Files, Reports, and Context are held back by `HIDDEN_FROM_SIDEBAR`
+and open inside the project view, though the `if/elif` route and deep links still reach every
+handler.
 
 `app.py` remains a large presentation and orchestration surface. `command_center/ui/` contains
 selected extracted panels and components, including the execution queue, recommendations, project
@@ -93,7 +98,9 @@ Important service groups are:
 - `runtime/scheduler.py`: deterministic, read-only `ASSIGN`/`DEFER`/`BLOCKED` decisions; it does
   not claim or launch work;
 - `runtime/autonomy.py` and `runtime/autonomy_service.py`: persisted, evidence-backed proposal,
-  approval, and dispatch-boundary contracts; they have no UI, background driver, or executor;
+  approval, and dispatch-boundary contracts. An operator approve/reject inbox
+  (`ui/proposals_panel.py`, surfaced in `app.py`) reads and decides them, but there is
+  no background driver or executor that acts on an approval automatically;
 - `runtime/task_sync.py`: runtime/completion projection into planning tasks;
 - `runtime/completion.py` and `runtime/completion_service.py`: completion state machine and
   side-effect orchestrator;
@@ -104,7 +111,7 @@ Important service groups are:
 
 Subprocess-facing code uses fixed argument arrays and `shell=False`. The main adapters are:
 
-- Claude CLI execution;
+- Claude CLI execution, plus the pluggable Codex, Ollama, and Copilot CLI execution providers in `command_center/runtime/providers.py`;
 - read-only Git inspection;
 - worktree/branch orchestration;
 - completion Git push and branch recovery;
@@ -119,7 +126,7 @@ There is no single system-wide transactional store. Several authorities coexist:
 | Source | Authoritative for | Mutation model |
 |---|---|---|
 | `data/tasks.json` | Planning and Kanban tasks | Whole-file JSON; atomic replacement; thread/cross-process lock through `data/tasks.lock` |
-| `data/runtime.db` | Runtime tasks, sessions, runs, events, reports, completion, and autonomy proposals/evidence/events | SQLite schema version 7; WAL, busy timeout, foreign keys, guarded transitions, CAS versions, transactional exact-workspace exclusion |
+| `data/runtime.db` | Runtime tasks, sessions, runs, events, reports, completion, and autonomy proposals/evidence/events | SQLite schema version 11; WAL, busy timeout, foreign keys, guarded transitions, CAS versions, transactional exact-workspace exclusion |
 | `data/execution_queue.json` | Separate execution planning queue | Whole-file JSON with atomic replacement; application-owned RMW cycles use the same-host cooperative OS advisory lock in `data/execution_queue.lock`; raw primitives remain uncoordinated |
 | `data/runs.jsonl` | Legacy synchronous run journal | Append-only JSONL; latest record per run is folded on read |
 | `data/chats.json` | Active project chat conversations | Whole-file JSON |
@@ -132,10 +139,11 @@ There is no single system-wide transactional store. Several authorities coexist:
 | `generated/<PROJECT>/` | Legacy generated task files | Per-file artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative for
-execution, completion, and the autonomy-proposal lifecycle. Schema 7 contains the application
+execution, completion, and the autonomy-proposal lifecycle. Schema 11 contains the application
 tables `task`, `session`, `run`, `run_event`, and `report`; `completion`,
 `completion_validation`, and `completion_event`; and `proposal`, `proposal_evidence`, and
-`proposal_event`; `schema_version` tracks migrations. It contains no execution-queue or
+`proposal_event`; `schema_version` tracks migrations. It also holds a `queue_entry` mirror table
+(ADR 0007 dual-write); `execution_queue.json` remains the authoritative queue, and there is no
 scheduler-claim table. SQLite does not replace the active chat and activity stores, the legacy
 `runs.jsonl` journal, the execution queue, Portfolio registries, or artifact directories.
 
@@ -214,16 +222,26 @@ poller, automatic dispatcher, or persisted scheduling audit log.
 
 The Supervisor:
 
-- constructs a fixed Claude CLI argument list and launches with
+- resolves the selected execution provider (Claude by default; Codex, Ollama,
+  and Copilot CLIs are also available through `command_center/runtime/providers.py`)
+  and constructs that provider's fixed argument list, then launches with
   `Popen(shell=False, start_new_session=True)`;
-- records PID and process-identity evidence in SQLite;
+- fails closed before launch unless POSIX `waitid(WNOWAIT)` process-group
+  ownership is available;
+- records PID, process-identity evidence, `started_at`, and the `RUNNING`
+  transition atomically in SQLite;
 - retains the live `Popen`, pipes, reader threads, watchdog, and cancellation state in memory;
 - streams bounded stdout/stderr chunks into run events;
 - detects first output and process startup failures;
 - enforces timeout;
-- cancels the process group with terminate-then-kill escalation;
+- observes the process-group leader without reaping it, drains live
+  descendants, and only then releases the pinned PID/PGID;
+- serializes cancel, timeout, signal, exit observation, and reap decisions;
+- cancels the process group with terminate-then-kill escalation and records a
+  `*_sent` event only after the signal syscall succeeds;
 - classifies exit, cancellation, timeout, spawn, and supervision failures;
-- persists final run/session state and report metadata;
+- tracks process-group termination, durable terminal-state persistence, and
+  report finalization as separate milestones;
 - triggers task and completion reconciliation.
 
 The Supervisor owns live subprocess handles only within the hosting Python process. Persisted state
@@ -238,8 +256,13 @@ This is process-local durability, not distributed execution or remote-worker own
 
 User cancellation is an explicit confirmed action. The Supervisor targets the spawned process
 group, sends a graceful termination signal, waits a bounded interval, and escalates to kill if
-needed. Timeout uses the same ownership and classification machinery. State-transition guards and
+needed. A cancellation or timeout can win only while the owned process group is still live; a
+request arriving after physical leader exit is rejected and cannot retroactively relabel a
+successful result. Timeout uses the same ownership and classification machinery, but watches
+process exit rather than slower database/report finalization. State-transition guards and
 compare-and-swap updates prevent late worker threads from overwriting a newer terminal decision.
+Failed post-launch cleanup and failed terminal persistence retain ownership and are retried by a
+recovery thread, `wait_for_run`, and reconciliation.
 
 ### 4.5 Legacy execution
 
@@ -358,7 +381,7 @@ Git access is not globally read-only. Capabilities are separated:
 | Normal task-v2 workspace provisioning | Create or attach a worktree through `git worktree add` | Explicit confirmation precedes mutation; source repository, branch, isolation, and status are verified fail closed |
 | Portfolio worktree launcher | Create/attach branch and worktree | Exact repository validation, collision checks, explicit launch, bounded rollback |
 | Scheduling planner | Read-only planning | Snapshot-based advisory decisions; no claim, persistence, or launch |
-| Autonomy proposal service | Persist proposal decisions and return a dispatch plan | Closed default policy, evidence/action checks, approval gate; no UI, driver, or execution |
+| Autonomy proposal service | Persist proposal decisions and return a dispatch plan | Closed default policy, evidence/action checks, approval gate; operator approve/reject inbox, but no background driver or automatic execution |
 | Completion Git adapter | Push or recreate branch | Fixed argv, no force-push, policy and state-machine gates |
 | Completion GitHub adapter | Discover/create/optionally merge PR | Local authenticated `gh`, fixed argv, explicit project policy, manual merge default |
 | Validation adapter | Run configured checks | Executable allowlist, `shell=False`, timeout, captured bounded output |
@@ -410,10 +433,12 @@ real fake-process supervision, process-tree cancellation and timeout, restart re
 completion scenarios and races, Git/GitHub adapters, queue behavior, worktree creation and
 rollback, Portfolio parsing/launch/intelligence, read-model redaction, and Streamlit rendering.
 
-`requirements-dev.txt` declares both pytest and Ruff. No MyPy or other type checker is configured.
-`.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
-compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
-Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
+`requirements-dev.txt` declares both pytest and Ruff. MyPy is configured under `[tool.mypy]` in
+`pyproject.toml` as a permissive, opt-in checker, and CI runs it as an informational, non-blocking
+step. `.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff,
+byte compilation, and pytest as the blocking merge gate — with informational, non-blocking coverage
+and MyPy type-check steps alongside — for pull requests into `main`, pushes to `main`, and manual
+dispatches on Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
 ref.
 
 The workflow does not configure GitHub branch protection. Whether its result is a required merge
@@ -426,7 +451,7 @@ gate remains a repository-setting concern outside this codebase.
   active chat and activity stores remain separate from both.
 - Live Supervisor ownership is confined to one Python process.
 - `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
-- No static type checker is configured.
+- The MyPy type check is informational and non-blocking: it does not gate merges, and the codebase is not yet fully typed.
 - CI runs automatically, but required-check/branch-protection enforcement is not configured by
   repository code and cannot be inferred from the workflow alone.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
@@ -434,27 +459,36 @@ gate remains a repository-setting concern outside this codebase.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
   within-plan workspace decisions can race before explicit launch; only exact workspace exclusion
   is enforced transactionally by the runtime launch path.
-- The autonomy proposal layer has no UI, automated evidence collectors, per-project policy
-  resolver, background driver, or executor.
+- The autonomy proposal layer surfaces an operator approve/reject inbox
+  (`command_center/ui/proposals_panel.py`) but has no automated evidence collectors, per-project
+  policy resolver, background driver, or executor.
 - Fail-closed workspace verification is scoped to normal task-v2 paths that supply a
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
 - Streamlit can be exposed to the network unless it is explicitly bound to localhost.
 - There is no production-readiness guarantee, distributed execution, durable remote-worker
   ownership, or seamless process resumption.
 
-## 14. Planned desktop architecture
+## 14. Desktop architecture (Increment 1)
 
 The accepted desktop documents propose a PySide6/Qt Widgets client that reuses plain-Python domain
-and runtime services through application adapters. That target is deliberately outside the current
-runtime:
+and runtime services through application adapters. The first increment (Desktop Increment 1, D1)
+has landed: the `command_center.desktop` package is a working native shell — main window, sidebar,
+top bar, navigation, placeholder Home/Projects/Settings pages, theme switching, and
+settings/window-geometry persistence — launchable with `python -m command_center.desktop` and
+covered by an offscreen pytest-qt suite (`tests/desktop/`). It is a pure shell: it imports nothing
+from `app.py`/Streamlit and starts no HTTP listener.
 
-- no `command_center.desktop` package exists;
-- PySide6 is not a runtime dependency;
-- no desktop executable or installer is built;
-- no native packaging or update channel is implemented.
+What remains outside the current runtime:
 
-See [`docs/desktop/README.md`](docs/desktop/README.md) for the design status. Roadmap statements in
-that directory must not be read as current capability.
+- PySide6 is an optional dependency (`requirements-desktop.txt`), not part of the base install;
+- the data-adapter layer (`command_center.application`) that would bridge the shell to core read
+  models does not exist yet;
+- the platform-abstraction layer (`command_center.platform`) does not exist yet;
+- no desktop executable or installer is built, and no native packaging or update channel is
+  implemented.
+
+See [`docs/desktop/README.md`](docs/desktop/README.md) for the design status and the D1–D4 scope.
+Roadmap statements in that directory beyond D1 must not be read as current capability.
 
 ## 15. Related decisions and operator documentation
 
@@ -463,5 +497,7 @@ that directory must not be read as current capability.
 - [`docs/adr/0003-live-execution-center-v2-and-kanban-launch-bridge.md`](docs/adr/0003-live-execution-center-v2-and-kanban-launch-bridge.md)
 - [`docs/adr/0004-autonomous-task-completion-pipeline.md`](docs/adr/0004-autonomous-task-completion-pipeline.md)
 - [`docs/adr/0005-autonomy-proposal-foundation.md`](docs/adr/0005-autonomy-proposal-foundation.md)
+- [`docs/adr/0006-codex-cli-execution-provider.md`](docs/adr/0006-codex-cli-execution-provider.md)
+- [`docs/adr/0007-unify-task-and-queue-storage.md`](docs/adr/0007-unify-task-and-queue-storage.md)
 - [`docs/completion-pipeline.md`](docs/completion-pipeline.md)
 - [`CURRENT_STATE.md`](CURRENT_STATE.md)

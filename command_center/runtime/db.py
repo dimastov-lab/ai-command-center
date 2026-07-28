@@ -29,10 +29,12 @@ event write before it goes back to reading the next line of subprocess output.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TypeVar
 
@@ -167,6 +169,46 @@ class WorkspaceLockedError(Exception):
         )
 
 
+class TaskAlreadyActiveError(Exception):
+    """Raised by `create_run(..., enforce_workspace_lock=True)` when the same
+    `task_id` already has an active run (`EXECUTION_CENTER_ACTIVE_STATES`),
+    possibly in a *different* workspace than this launch resolved to.
+
+    The workspace lock alone (`WorkspaceLockedError`) only catches a second
+    launch that resolves to the SAME `repository_path`; if a task's configured
+    workspace/branch changes between two in-flight launches they can resolve to
+    different paths and both slip past it. This check runs inside the same
+    `BEGIN IMMEDIATE` transaction as the `INSERT`, so it is a true atomic
+    per-task invariant rather than a raceable pre-flight. Carries the
+    conflicting run for reporting."""
+
+    def __init__(self, conflicting_run: dict) -> None:
+        self.conflicting_run = conflicting_run
+        super().__init__(
+            f"Task {conflicting_run['task_id']!r} already has an active run "
+            f"({conflicting_run['id']!r}, state={conflicting_run['state']!r})."
+        )
+
+
+class GlobalConcurrencyLimitError(Exception):
+    """Raised by `create_run(..., max_global_concurrency=N)` when N runs are
+    already active (`EXECUTION_CENTER_ACTIVE_STATES`) across *all* workspaces.
+
+    Enforced inside `create_run`'s own `BEGIN IMMEDIATE` transaction (like the
+    workspace lock above), so the global cap is a true atomic invariant every
+    launch path shares — not an advisory pre-flight count that each entry point
+    (the scheduler, the queue's `launch_ready`, portfolio launches, the review
+    gate) has to remember to run and that a batch 'launch all READY' would race
+    straight past."""
+
+    def __init__(self, active_count: int, limit: int) -> None:
+        self.active_count = active_count
+        self.limit = limit
+        super().__init__(
+            f"Global concurrency limit reached ({active_count}/{limit} runs already active)."
+        )
+
+
 class UnknownRunFieldError(Exception):
     """Raised when `update_run_state`/`update_run_fields` is asked to set a
     column that isn't in `_UPDATABLE_RUN_FIELDS`."""
@@ -210,6 +252,12 @@ _UPDATABLE_RUN_FIELDS: frozenset[str] = frozenset(
         # here as a defense-in-depth allowlist entry like every other column.
         "commit_hash",
         "pull_request_url",
+        # Migration 11: short HEAD captured at launch so the post-run classifier
+        # can tell "the agent committed" (HEAD advanced) from "the agent left the
+        # tree clean without doing anything" — a committed change leaves the
+        # working tree clean, so the porcelain-status diff alone under-counts
+        # completed work (see `supervisor._supervise` and `outcome.classify_`).
+        "pre_run_head",
     }
 )
 
@@ -225,7 +273,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 11
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -376,6 +424,32 @@ def _migration_4_add_first_output_at(conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
         if "first_output_at" not in existing:
             conn.execute("ALTER TABLE run ADD COLUMN first_output_at TEXT")
+
+
+def _migration_9_add_execution_provider_fields(conn: sqlite3.Connection) -> None:
+    """Persist the selected provider and its redacted, deterministic launch metadata."""
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "provider_id" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'claude_code'")
+        if "provider_metadata_json" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN provider_metadata_json TEXT")
+
+
+def _migration_11_add_pre_run_head(conn: sqlite3.Connection) -> None:
+    """Capture the short HEAD at launch so the post-run outcome classifier can
+    distinguish "agent committed its work" (HEAD advanced, tree clean) from
+    "agent did nothing" (HEAD unchanged, tree clean). Without this, any agent
+    that commits — copilot_cli, claude_code — is mis-classified
+    `incomplete:working_tree_unchanged` and re-run forever (AICC-DESKTOP-017).
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2,
+    3, 4, 9 — safe to re-run and safe under concurrent first-application via
+    the `BEGIN IMMEDIATE` transaction in `migrate()`."""
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "pre_run_head" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN pre_run_head TEXT")
 
 
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
@@ -554,6 +628,61 @@ def _migration_7_add_proposal_parameters_json(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migration_8_add_independent_review_fields(conn: sqlite3.Connection) -> None:
+    """Add the independent-review verdict to `completion`.
+
+    The blocking review gate needs three facts per completion: which run
+    produced the verdict, what the verdict was, and the reviewer's reasoning.
+    They live on the completion row rather than in a side table because there is
+    exactly one review outcome per completion and it is read on the same access
+    path as every other completion field.
+
+    Existing schema-7 databases keep NULLs, which read as "no verdict yet" — the
+    same thing a brand-new row means. That is the safe direction: with the gate
+    enabled, no verdict means *wait*, never *proceed*. The check-and-add runs
+    under the same write lock as the earlier callable migrations, so concurrent
+    and repeated migration attempts are safe.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(completion)").fetchall()}
+        for column in ("review_verdict", "review_run_id", "review_summary"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE completion ADD COLUMN {column} TEXT")
+
+
+_SCHEMA_V10 = """
+-- ADR 0007 step 1: the execution queue's home in the execution-state store.
+--
+-- Mirrors `data/execution_queue.json`'s entry shape exactly, field for field,
+-- because during the dual-write phases the two must be comparable without any
+-- translation — a divergence check that had to normalise shapes first would be
+-- checking its own translation as much as the data.
+--
+-- `task_id` is deliberately NOT a foreign key. The task lives in tasks.json,
+-- which stays a human-editable file (see the ADR); the queue's reference to it
+-- is advisory, and an entry whose task has vanished resolves to `cancelled`
+-- with a reason, exactly as `evaluate_readiness` already does today.
+CREATE TABLE IF NOT EXISTS queue_entry (
+    id            TEXT PRIMARY KEY,
+    task_id       TEXT,
+    project       TEXT,
+    state         TEXT NOT NULL,
+    reason        TEXT,
+    run_id        TEXT,
+    added_at      TEXT,
+    evaluated_at  TEXT,
+    launched_at   TEXT,
+    -- Preserves the JSON file's list order, which is load-bearing: the queue is
+    -- displayed and planned in insertion order, and a set-shaped table would
+    -- silently reorder it.
+    position      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_entry_state ON queue_entry(state);
+CREATE INDEX IF NOT EXISTS idx_queue_entry_task ON queue_entry(task_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -565,6 +694,15 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (5, _SCHEMA_V5),
     (6, _SCHEMA_V6),
     (7, _migration_7_add_proposal_parameters_json),
+    (8, _migration_8_add_independent_review_fields),
+    # Renumbered from 6 on integration: the execution-provider branch and the
+    # autonomy/review work both grew migrations from a shared base of 5, so this
+    # one moves to the end of the sequence. Its content is unchanged and it is
+    # idempotent, so a database that already ran it under the old number simply
+    # finds the columns present.
+    (9, _migration_9_add_execution_provider_fields),
+    (10, _SCHEMA_V10),
+    (11, _migration_11_add_pre_run_head),
 ]
 
 
@@ -734,6 +872,79 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
+    # Optional, operator-opted-in retention: run after the migration connection
+    # above has closed so VACUUM (if enabled) does not contend with it. See
+    # `apply_runtime_retention`.
+    maybe_apply_runtime_retention(db_path)
+
+
+def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
+    """Delete `run_event` rows (and orphaned `report` rows) for runs that have
+    been terminal for longer than `retention_days`, returning the number of
+    `run_event` rows removed.
+
+    Bounded and conservative:
+      * only *terminal* runs are eligible (their events are historical audit
+        trail, not live state);
+      * the cutoff is computed in Python with the same naive-local ISO
+        convention every other timestamp in this app uses (`models.iso_now`),
+        so it never disagrees with `completed_at` by a UTC offset;
+      * the run row itself is kept (its `state`/`completed_at` remain visible
+        in the Execution Center and to reconciliation); only the bulky
+        per-output-event history is pruned;
+      * runs with a NULL `completed_at` are left untouched.
+
+    Does not VACUUM here — reclaiming disk is a separate, heavier, lock-holding
+    operation the operator should run deliberately (see `maybe_apply_runtime_retention`).
+    """
+    if retention_days <= 0:
+        return 0
+    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(timespec="seconds")
+    placeholders = ",".join("?" for _ in TERMINAL_STATES)
+    with connect(db_path) as conn:
+        with transaction(conn):
+            cur = conn.execute(
+                f"""
+                DELETE FROM run_event
+                 WHERE run_id IN (
+                    SELECT id FROM run
+                     WHERE state IN ({placeholders})
+                       AND completed_at IS NOT NULL
+                       AND completed_at < ?
+                 )
+                """,
+                (*TERMINAL_STATES, cutoff),
+            )
+            removed = cur.rowcount
+        # `report` rows cascade-delete with `run` via FK, but a terminal run's
+        # report file on disk is also historical; leave the DB row (the path is
+        # small) — only events are bulky.
+    return removed
+
+
+def maybe_apply_runtime_retention(db_path: Path) -> None:
+    """Apply retention iff the operator set `AICC_RUNTIME_RETENTION_DAYS` to a
+    positive integer. Default (unset / <= 0) is a no-op, so this never changes
+    behavior for existing installs or the test suite.
+
+    A companion `AICC_RUNTIME_VACUUM_ON_START=1` runs `VACUUM` after pruning to
+    reclaim disk. VACUUM rewrites the whole database under an exclusive lock, so
+    it is opt-in and should only be enabled on a single-host install that can
+    pause other writers briefly.
+    """
+    raw = os.environ.get("AICC_RUNTIME_RETENTION_DAYS")
+    if not raw:
+        return
+    try:
+        retention_days = int(raw)
+    except ValueError:
+        return
+    if retention_days <= 0:
+        return
+    apply_runtime_retention(db_path, retention_days=retention_days)
+    if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
+        with connect(db_path) as conn:
+            conn.execute("VACUUM")
 
 
 def current_schema_version(db_path: Path) -> int:
@@ -870,7 +1081,10 @@ def create_run(
     expected_branch: str | None = None,
     launch_source: str | None = None,
     prompt_version: int | None = None,
+    provider_id: str = "claude_code",
+    provider_metadata_json: str | None = None,
     enforce_workspace_lock: bool = False,
+    max_global_concurrency: int | None = None,
 ) -> dict:
     """`expected_branch`/`launch_source`/`prompt_version` are write-once, like
     `project`/`task_type`/`repository_path` above — resolved by the caller
@@ -901,6 +1115,37 @@ def create_run(
                 ).fetchone()
                 if conflict is not None:
                     raise WorkspaceLockedError(_row_to_dict(conflict))
+
+                # Task-id exclusivity (audit M1): the workspace lock above only
+                # catches a double-launch that resolves to the SAME workspace. If
+                # a task's configured workspace/branch changes between two
+                # in-flight launches they can resolve to *different* paths and
+                # slip past it — two agents running for one task. Checked in the
+                # same BEGIN IMMEDIATE transaction as the INSERT, so it cannot
+                # lose the race a separate pre-flight query can. Ordered after the
+                # workspace check so a same-workspace conflict still surfaces as
+                # WorkspaceLockedError (unchanged behaviour).
+                task_conflict = conn.execute(
+                    f"SELECT * FROM run WHERE task_id = ? AND state IN ({placeholders})",
+                    (task_id, *EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()
+                if task_conflict is not None:
+                    raise TaskAlreadyActiveError(_row_to_dict(task_conflict))
+
+            if max_global_concurrency is not None:
+                # Global cap as an atomic invariant, in the SAME transaction as
+                # the INSERT (like the workspace lock above): count every run
+                # currently active across all workspaces and refuse the launch if
+                # the cap is already met. Two concurrent launches serialize on the
+                # BEGIN IMMEDIATE write lock, so they cannot both slip past the
+                # count — the way per-caller pre-flight checks can.
+                placeholders = ", ".join("?" for _ in EXECUTION_CENTER_ACTIVE_STATES)
+                active_count = conn.execute(
+                    f"SELECT COUNT(*) AS n FROM run WHERE state IN ({placeholders})",
+                    tuple(EXECUTION_CENTER_ACTIVE_STATES),
+                ).fetchone()["n"]
+                if active_count >= max_global_concurrency:
+                    raise GlobalConcurrencyLimitError(active_count, max_global_concurrency)
 
             row = conn.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM run WHERE session_id = ?",
@@ -934,28 +1179,25 @@ def create_run(
                 "expected_branch": expected_branch,
                 "launch_source": launch_source,
                 "prompt_version": prompt_version,
+                "provider_id": provider_id,
+                "provider_metadata_json": provider_metadata_json,
                 "commit_hash": None,
                 "pull_request_url": None,
                 "version": 0,
                 "created_at": now,
                 "updated_at": now,
             }
+            # Build the column list from the table as it exists rather than
+            # from a fixed literal. A database migrated only part-way — which
+            # is exactly what the historical-schema migration tests construct —
+            # has no `provider_*` columns yet, and naming them unconditionally
+            # would make `create_run` unusable against any schema older than
+            # the one that introduced them.
+            table_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+            insert_columns = [name for name in record if name in table_columns]
             conn.execute(
-                """INSERT INTO run (
-                    id, session_id, task_id, sequence, is_resume, state, project, task_type,
-                    repository_path, prompt, command_json, timeout_seconds, pid,
-                    process_start_identity, pre_run_git_status, post_run_git_status,
-                    working_tree_changed, exit_code, cancel_requested, cancel_requested_at,
-                    started_at, completed_at, expected_branch, launch_source, prompt_version,
-                    commit_hash, pull_request_url, version, created_at, updated_at
-                ) VALUES (
-                    :id, :session_id, :task_id, :sequence, :is_resume, :state, :project, :task_type,
-                    :repository_path, :prompt, :command_json, :timeout_seconds, :pid,
-                    :process_start_identity, :pre_run_git_status, :post_run_git_status,
-                    :working_tree_changed, :exit_code, :cancel_requested, :cancel_requested_at,
-                    :started_at, :completed_at, :expected_branch, :launch_source, :prompt_version,
-                    :commit_hash, :pull_request_url, :version, :created_at, :updated_at
-                )""",
+                f"""INSERT INTO run ({", ".join(insert_columns)})
+                    VALUES ({", ".join(f":{name}" for name in insert_columns)})""",
                 record,
             )
     return record
@@ -964,6 +1206,25 @@ def create_run(
 def get_run(db_path: Path, run_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
+        return _row_to_dict(row)
+
+
+def get_latest_run_for_task(db_path: Path, task_id: str) -> dict | None:
+    """Newest run row for `task_id`, or None if the task has no runs.
+
+    Distinct from `list_runs(task_id=..., limit=1)`: that path orders only by
+    `created_at DESC`, and `created_at` is second-granularity (`iso_now()`),
+    so two runs created in the same second tie and SQLite returns them in
+    unspecified rowid order. We add `rowid DESC` as a stable tiebreak — rowid
+    is insertion order, so the higher rowid is the newer row — guaranteeing
+    the actually-newest run is returned. Used by `task_sync.sync_tasks` to
+    self-heal tasks whose `current_run_id` was orphaned by a lost update.
+    """
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM run WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
         return _row_to_dict(row)
 
 
@@ -1018,6 +1279,34 @@ def list_runs(
             f"SELECT * FROM run {where} ORDER BY created_at DESC{limit_clause}", params
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def count_runs(
+    db_path: Path,
+    *,
+    states: Iterable[str] | None = None,
+) -> int:
+    """Cheap `COUNT(*)` over `run` — the authoritative total run count without
+    materializing any rows. Used by the dashboard footer/health so "Всего" and
+    success-rate denominators are not silently truncated by the Live Board's
+    `limit=200` window (`list_runs(limit=200)` only ever sees the 200 newest
+    runs, which under-counts on busy installs). Accepts the same `states`
+    filter as `list_runs` for windowed counts (e.g. terminal runs in the last
+    sprint); `None` counts every run regardless of state."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if states is not None:
+        states_list = list(states)
+        if states_list:
+            placeholders = ", ".join("?" for _ in states_list)
+            clauses.append(f"state IN ({placeholders})")
+            params.extend(states_list)
+        else:
+            clauses.append("0")
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connect(db_path) as conn:
+        (n,) = conn.execute(f"SELECT COUNT(*) FROM run {where}", params).fetchone()
+        return int(n)
 
 
 def update_run_state(
@@ -1206,6 +1495,33 @@ def tail_run_events(db_path: Path, run_id: str, *, limit: int = 200) -> list[dic
         return events
 
 
+def latest_events_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """The single most recent event per run, keyed by run_id — one query for a
+    whole board instead of a `sqlite3.connect()` per run (audit H5 N+1). Same
+    shaping as `tail_run_events` (payload_json decoded into `payload`). Uses a
+    MAX(seq) join rather than a window function so it works on any SQLite the
+    rest of the module targets."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT e.run_id, e.seq, e.event_type, e.payload_json, e.created_at
+                FROM run_event e
+                JOIN (
+                    SELECT run_id, MAX(seq) AS mx FROM run_event
+                    WHERE run_id IN ({placeholders}) GROUP BY run_id
+                ) m ON e.run_id = m.run_id AND e.seq = m.mx""",
+            tuple(run_ids),
+        ).fetchall()
+    result: dict[str, dict] = {}
+    for row in rows:
+        event = dict(row)
+        event["payload"] = json.loads(event.pop("payload_json"))
+        result[event["run_id"]] = event
+    return result
+
+
 # --------------------------------------------------------------------------
 # Report (immutable, at most one per run)
 # --------------------------------------------------------------------------
@@ -1226,6 +1542,19 @@ def get_report(db_path: Path, run_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM report WHERE run_id = ?", (run_id,)).fetchone()
         return _row_to_dict(row)
+
+
+def get_reports_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `get_report` keyed by run_id — one query for a whole board
+    instead of a `sqlite3.connect()` per run (audit H5 N+1)."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM report WHERE run_id IN ({placeholders})", tuple(run_ids)
+        ).fetchall()
+    return {row["run_id"]: _row_to_dict(row) for row in rows}
 
 
 # --------------------------------------------------------------------------
@@ -1262,6 +1591,9 @@ _UPDATABLE_COMPLETION_FIELDS: frozenset[str] = frozenset(
         "is_recoverable",
         "recommended_action",
         "validation_summary",
+        "review_verdict",
+        "review_run_id",
+        "review_summary",
         "policy_json",
         "last_checked_at",
         "next_retry_at",
@@ -1381,12 +1713,35 @@ def get_completion(db_path: Path, run_id: str) -> dict | None:
         return _row_to_dict(row)
 
 
+def get_completions_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `get_completion` keyed by run_id — one query for a whole board
+    of runs instead of one `sqlite3.connect()` per run (audit H5 N+1). Runs with
+    no completion row are simply absent from the result."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM completion WHERE run_id IN ({placeholders})", tuple(run_ids)
+        ).fetchall()
+    return {row["run_id"]: _row_to_dict(row) for row in rows}
+
+
 def get_completion_by_task(db_path: Path, task_id: str) -> dict | None:
     """The most recently created completion row for a task (there is one per
-    run, and a task may have several runs over time)."""
+    run, and a task may have several runs over time).
+
+    `created_at` is an ISO timestamp at *second* resolution, so two completions
+    for the same task created within the same second tie, and a bare
+    `ORDER BY created_at DESC` would return an arbitrary one of them. That is
+    not hypothetical: an automatic rework relaunches a task as soon as its
+    failure is observed, so several completions per task is the normal case, and
+    a caller reading the stale row would act on a failure that has already been
+    superseded. `rowid` — monotonic per insert — breaks the tie in true
+    insertion order."""
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         return _row_to_dict(row)
@@ -2238,3 +2593,67 @@ def transition_proposal_atomic(
             _proposal_event_from_spec(conn, proposal_id, event, now=now)
             updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
             return dict(updated)
+
+
+# --------------------------------------------------------------------------
+# Execution queue (ADR 0007) — the SQLite home of `execution_queue.json`
+#
+# These are storage primitives only. Every rule about *what* a queue entry may
+# contain, when it becomes ready, and what launching it means stays in
+# `command_center.execution_queue`; this layer just stores and returns rows.
+# During the dual-write phases the JSON file remains authoritative, so nothing
+# here may raise on data the JSON store would have accepted.
+# --------------------------------------------------------------------------
+
+_QUEUE_ENTRY_COLUMNS: tuple[str, ...] = (
+    "id",
+    "task_id",
+    "project",
+    "state",
+    "reason",
+    "run_id",
+    "added_at",
+    "evaluated_at",
+    "launched_at",
+)
+
+
+def replace_queue_entries(db_path: Path, entries: list[dict]) -> None:
+    """Persist `entries` as the complete queue, in the given order.
+
+    Whole-list replacement rather than per-entry upsert, deliberately: that is
+    exactly the semantics `execution_queue.save_queue` has today, so during
+    dual-write the two stores cannot drift through a difference in *how* they
+    are written. `position` preserves list order, which the queue's display and
+    planning both depend on.
+
+    Unknown keys on an entry are ignored rather than rejected — the JSON store
+    accepts them, and a dual-write phase where SQLite is stricter than the
+    authoritative store would fail on data that is, by definition, valid."""
+    rows = [
+        {
+            **{column: entry.get(column) for column in _QUEUE_ENTRY_COLUMNS},
+            "position": index,
+        }
+        for index, entry in enumerate(entries)
+    ]
+    columns = ", ".join((*_QUEUE_ENTRY_COLUMNS, "position"))
+    placeholders = ", ".join(f":{name}" for name in (*_QUEUE_ENTRY_COLUMNS, "position"))
+    with connect(db_path) as conn:
+        with transaction(conn):
+            conn.execute("DELETE FROM queue_entry")
+            if rows:
+                conn.executemany(
+                    f"INSERT INTO queue_entry ({columns}) VALUES ({placeholders})", rows
+                )
+
+
+def list_queue_entries(db_path: Path) -> list[dict]:
+    """Every queue entry in stored order, shaped exactly like a JSON entry so a
+    divergence check can compare the two directly, with no translation step of
+    its own to be wrong about."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(_QUEUE_ENTRY_COLUMNS)} FROM queue_entry ORDER BY position ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]

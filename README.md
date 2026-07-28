@@ -4,8 +4,9 @@ AI Command Center is a local engineering control application for planning work, 
 observing AI-assisted engineering runs, coordinating Portfolio tasks, and completing guarded
 GitHub delivery workflows. The implemented user interface is a Streamlit application served by
 `app.py`; the native PySide6 desktop client described under
-[`docs/desktop/`](docs/desktop/README.md) is a planned architecture, not an implemented or
-packaged product.
+[`docs/desktop/`](docs/desktop/README.md) has shipped its first increment (Desktop Increment 1 — a
+navigable, themeable shell in `command_center.desktop`), but is not yet a data-wired or packaged
+product.
 
 This repository is not a production, distributed, or remote-worker execution platform. It is a
 single-host control plane whose durable state is local to the machine running Streamlit.
@@ -15,10 +16,11 @@ single-host control plane whose durable state is local to the machine running St
 | Classification | Capabilities |
 |---|---|
 | Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; current JSON/JSONL project-chat and activity stores; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; fail-closed task-workspace provisioning and verification; a persisted execution queue whose application-owned mutations are locked; Portfolio parsing, intelligence, and guarded worktree launch; completion-state seeding and read-only completion status |
-| Implemented service/API foundations, not autonomously driven | Deterministic read-only scheduling decisions through `ExecutionCenterAPI.plan_schedule`; persisted, evidence-backed autonomy proposals through the runtime API/domain layer. Neither capability has a Streamlit UI, background task driver, durable scheduling claim/lease, or automatic dispatcher |
+| Implemented service/API foundations, not autonomously driven | Deterministic read-only scheduling decisions through `ExecutionCenterAPI.plan_schedule`; persisted, evidence-backed autonomy proposals through the runtime API/domain layer, surfaced in an operator approve/reject inbox (`ui/proposals_panel.py`). Neither capability has a background task driver, durable scheduling claim/lease, or automatic dispatcher |
 | Implemented but opt-in | Completion autopilot through `AICC_COMPLETION_AUTOPILOT`; OpenAI project-chat provider when its package and environment variables are supplied; project-specific completion policies that permit automatic merge or recovery |
 | Legacy but still present | Synchronous Claude execution; `runs.jsonl` run journal; generated-task shell workflow |
-| Designed or planned, not implemented | Native PySide6 desktop client and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
+| Partially implemented | Native PySide6 desktop client: Desktop Increment 1 (the `command_center.desktop` shell — navigation, theming, settings/geometry persistence, pytest-qt tested) has shipped; its data-adapter, platform-abstraction, and native-packaging increments have not |
+| Designed or planned, not implemented | Native desktop data wiring and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
 
 Normal task launches require an explicit user action and confirmation. The scheduling API can
 return advisory `ASSIGN`, `DEFER`, or `BLOCKED` decisions from a point-in-time snapshot, but it
@@ -54,13 +56,13 @@ or:
 scripts/start-ui.sh
 ```
 
-`scripts/start-ui.sh` activates `.venv` when present and forwards additional Streamlit arguments.
-It does not install dependencies. Streamlit is an HTTP/WebSocket server and this repository does
-not configure `server.address`; explicitly bind it to localhost when the UI must not be reachable
-from the local network:
+`scripts/start-ui.sh` activates `.venv` when present, forwards additional Streamlit arguments,
+and binds the server to localhost by default (the application has no authentication, so it must
+not be reachable from the local network unless you explicitly opt in). It does not install
+dependencies. To override the bind address, pass an explicit `--server.address`:
 
 ```bash
-scripts/start-ui.sh --server.address localhost
+scripts/start-ui.sh --server.address 0.0.0.0   # explicitly expose (not recommended)
 ```
 
 There is no application authentication layer.
@@ -83,10 +85,12 @@ There is no application authentication layer.
 - [`tests/`](tests/) contains unit, integration, concurrency, subprocess, Git/worktree, Portfolio,
   completion, and Streamlit `AppTest` coverage.
 
-The current Streamlit navigation has 19 destinations: Dashboard, Workspace Home, Executive,
-Create Task, Project Chat, Kanban, AI Agents, Live Execution Center, Run Journal, Timeline,
-Projects, Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode,
-Portfolio Execution, and Portfolio Overview.
+The Streamlit navigation registers 20 page handlers: Dashboard, Workspace Home, Executive,
+Create Task, Project Chat, Kanban, Волны (Waves), AI Agents, Live Execution Center, Run Journal,
+Timeline, Projects, Generated Files, Reports, Context, Git Center, Workspace Launcher, Focus Mode,
+Portfolio Execution, and Portfolio Overview. The sidebar shows 16 of them: Project Chat, Generated
+Files, Reports, and Context are no longer standalone sidebar entries — they open inside the project
+view — though every handler stays reachable by deep link and the command palette.
 
 ## Persistence and sources of truth
 
@@ -95,7 +99,7 @@ AI Command Center deliberately has more than one persistence authority:
 | Store | Role |
 |---|---|
 | `data/tasks.json` | Planning and Kanban task store |
-| `data/runtime.db` | Authoritative SQLite schema 7 state for runtime tasks, sessions, runs, run events, reports, completion, and autonomy proposals/evidence/events |
+| `data/runtime.db` | Authoritative SQLite schema 11 state for runtime tasks, sessions, runs, run events, reports, completion, and autonomy proposals/evidence/events |
 | `data/execution_queue.json`, `data/execution_queue.lock` | Separate persisted planning/execution queue plus its same-host cooperative OS advisory lock |
 | `data/runs.jsonl` | Legacy append-only synchronous run journal |
 | `data/chats.json`, `data/activity.jsonl` | Currently used project-chat and activity stores, separate from SQLite |
@@ -106,20 +110,34 @@ AI Command Center deliberately has more than one persistence authority:
 | `generated/<PROJECT>/` | Generated legacy task artifacts |
 
 `data/tasks.json` remains the planning and Kanban task store. `data/runtime.db` is authoritative
-for execution, completion, and the autonomy-proposal lifecycle. Schema 7 contains the application
+for execution, completion, and the autonomy-proposal lifecycle. Schema 11 contains the application
 tables `task`, `session`, `run`, `run_event`, and `report`; the three completion tables; and
-`proposal`, `proposal_evidence`, and `proposal_event`; `schema_version` tracks migrations. It does
-not contain the execution queue or scheduler claims. The legacy `runs.jsonl` journal and the
+`proposal`, `proposal_evidence`, and `proposal_event`; `schema_version` tracks migrations. It also
+holds a `queue_entry` mirror table (ADR 0007 dual-write), but `execution_queue.json` stays the
+authoritative queue, and there is no scheduler-claim table. The legacy `runs.jsonl` journal and the
 current JSON/JSONL project-chat and activity stores coexist with SQLite, while
 `execution_queue.json` and Portfolio registries, reports, and generated artifacts are additional
 persisted boundaries. Reconciliation is therefore required: Execution Center refreshes project
 SQLite run/completion state back to Kanban tasks, and queue readiness is recomputed from the
 planning store. These are projections, not a single transactional database.
 
-Most local artifacts are excluded by the checked-in [`.gitignore`](.gitignore). `runtime.db` is
-local state and must remain untracked; the current checkout excludes it through repository-local
-Git metadata rather than a checked-in ignore rule. A fresh clone should verify that exclusion
-before running the application. Tests redirect data through `AICC_DATA_DIR`.
+Most local artifacts are excluded by the checked-in [`.gitignore`](.gitignore), which
+also covers `data/runtime.db` and its WAL/SHM sidecars. Tests redirect data through
+`AICC_DATA_DIR`.
+
+### Runtime history retention
+
+`data/runtime.db` grows with every run event. Retention is **off by default** and
+opt-in via environment variables, so existing installs and the test suite are
+unaffected:
+
+- `AICC_RUNTIME_RETENTION_DAYS=<N>` — on startup (after schema migration), delete
+  `run_event` rows for runs that have been terminal for longer than `N` days. The
+  terminal run row itself is kept (it remains visible in the Execution Center and
+  to reconciliation); only the bulky per-output event history is pruned.
+- `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` after pruning to reclaim disk.
+  VACUUM rewrites the database under an exclusive lock, so enable it only on a
+  single-host install that can briefly pause other writers.
 
 ## Execution lifecycle
 
@@ -139,11 +157,14 @@ The primary launch path is asynchronous:
    insertion, SQLite transactionally enforces exact-workspace exclusivity; task-id preflight is not
    a durable claim and can race with another launcher.
 6. The API persists task, session, and run records in `data/runtime.db`.
-7. The Supervisor starts the Claude CLI with `Popen(shell=False, start_new_session=True)`,
-   records PID identity and workspace-verification evidence, streams bounded stdout/stderr events,
-   and returns control to Streamlit.
-8. Reader and watchdog threads handle output, timeout, completion, and report persistence.
-9. Cancellation signals the process group, escalating from termination to kill when needed.
+7. On a POSIX host with `waitid(WNOWAIT)`, the Supervisor starts the Claude CLI with
+   `Popen(shell=False, start_new_session=True)` and atomically records PID identity plus the
+   `RUNNING` transition. Unsupported hosts fail closed before `Popen`.
+8. Reader and watchdog threads handle output and timeout while process-group exit, durable terminal
+   persistence, and report finalization remain separate milestones.
+9. Cancellation and timeout serialize signal/exit/reap decisions against the captured launch-time
+   PGID, drain descendants before reaping the leader, and escalate from termination to kill when
+   needed. A post-exit cancellation is rejected rather than relabelling a completed run.
 10. Run-to-task reconciliation updates the Kanban projection and seeds or advances completion
     state.
 
@@ -229,7 +250,10 @@ components do have write capabilities:
 - The GitHub adapter may discover, create, and—only when completion policy permits—merge pull
   requests through fixed `gh` argument lists.
 - Validation commands are parsed with `shell=False`, bounded by timeouts, and restricted to an
-  executable allowlist.
+  executable allowlist. The allowlist scopes the *entry binary* (it blocks direct `sh`/`rm`/`curl`
+  invocation); interpreter-class entries such as `python3`, `node`, `npx`, and `make` will run
+  whatever code the operator-supplied arguments specify, so `validation_commands` is trusted
+  operator configuration and must be reviewed like any other privileged setting.
 
 Launches and warnings require explicit UI confirmation. Normal completion defaults preserve
 manual merge. Commit, push, pull-request, and merge authority remains a privileged operational
@@ -266,21 +290,26 @@ repository settings must separately require the check if merges are to be blocke
 - Legacy synchronous/JSONL and current asynchronous/SQLite execution paths coexist.
 - Supervisor ownership is process-local; a server restart loses pipes and live `Popen` handles.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
-- There is no configured static type checker.
+- A static type checker is now configured (permissive, non-strict) via `pyproject.toml` and
+  surfaced as a non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
 - The checked-in CI workflow is automatic but does not itself enforce branch protection; the
   repository's current plan/settings must be checked before treating it as a required merge gate.
+  Enable "Require status checks to pass before merging" on `main` with the `Quality gates` check
+  to make the workflow a real gate.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
   it, and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
   within-plan workspace decisions can change before the separate explicit launch; only exact
   workspace exclusion is enforced transactionally by the runtime launch path.
-- The autonomy proposal layer has no Streamlit UI, automated evidence collectors, per-project
+- The autonomy proposal layer has an operator approve/reject inbox (`ui/proposals_panel.py`), but no
+  automated evidence collectors, per-project
   policy resolver, background driver, or executor; dispatch records and returns a plan but does not
   perform it.
 - Fail-closed workspace verification is scoped to normal task-v2 paths that supply a
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
-- Streamlit may be reachable beyond localhost unless explicitly bound; the application has no
-  authentication.
+- Streamlit is bound to localhost by default by `scripts/start-ui.sh`; passing an explicit
+  `--server.address` overrides that. The application has no authentication, so do not bind it
+  to a reachable interface.
 - The system does not provide distributed execution, remote-worker durability, or seamless
   process resumption.
 - Native desktop packaging is not implemented.

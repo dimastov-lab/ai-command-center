@@ -173,7 +173,6 @@ Read and treat the following files as authoritative context:
 - $CONTEXT_FILE
 - $PROJECT_FILE
 - $ROOT_DIR/CURRENT_STATE.md
-- $ROOT_DIR/DECISIONS.md
 
 Do not modify the Command Center files unless explicitly instructed.
 

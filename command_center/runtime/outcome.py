@@ -97,17 +97,106 @@ def detect_blocker_language(text: str | None) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------
+# Completion evidence — the counterpart to `detect_blocker_language`.
+#
+# A `REQUIRES_CHANGES_TASK_TYPES` run that exits 0 with an unchanged working
+# tree is `INCOMPLETE` by default: nothing the agent did left any mark on the
+# repository, so the run did not demonstrably do its job. That rule has one
+# recurring false negative: a task whose implementation *already landed* in an
+# earlier (often interrupted) run leaves a clean tree, so every subsequent
+# resume finds nothing to change and is wrongly recorded `FAILED`. The agent's
+# own final message is the only signal available at classification time that
+# distinguishes "already done" from "did nothing", and only when it carries
+# *explicit, positive test-pass evidence* — a bare "done"/"approved" verdict
+# is intentionally NOT enough (it carries no proof the work was actually
+# verified). This is deliberately a narrow, opt-in upgrade of a would-be
+# `INCOMPLETE` to `OK`; it can never turn a genuinely-failing run (no tests
+# run, or tests failing) into a false `COMPLETED`, because such a run's final
+# message will not match a positive test-pass pattern *and* fail the
+# failure-evidence guard below.
+# --------------------------------------------------------------------------
+_COMPLETION_EVIDENCE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\ball\s+\d+\s+tests?\s+pass(?:ed)?\b", re.I),
+    re.compile(r"\b\d+\s+tests?\s+pass(?:ed)?\b", re.I),
+    re.compile(r"\b\d+\s+passed\b", re.I),
+    # Count-less test-pass summaries: a run that ran the suite and every test
+    # passed, but the agent's final message phrases it without a digit ("all
+    # tests passed", "tests passed"). Still positive test-pass evidence — the
+    # failure-evidence guard below refuses the upgrade if anything failed.
+    re.compile(r"\ball\s+tests?\s+pass(?:ed)?\b", re.I),
+    re.compile(r"\btests?\s+pass(?:ed)?\b", re.I),
+]
+
+# Failure evidence — if *any* of these appear in the final message, the
+# completion-evidence upgrade is refused even when a "N passed" phrase also
+# appears: a summary like "2029 passed, 3 failed" is a failing run. Kept
+# intentionally literal (no negation handling): a phrase such as "no failing
+# tests" trips the guard and the run stays at the safe default `INCOMPLETE`
+# rather than risking a false `COMPLETED` on a misread negation.
+_FAILURE_EVIDENCE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\b\d+\s+failed\b", re.I),
+    re.compile(r"\btests?\s+failed\b", re.I),
+    re.compile(r"\bfailing\s+tests?\b", re.I),
+    re.compile(r"\btest\s+failure\b", re.I),
+    re.compile(r"\b\d+\s+errors?\b", re.I),
+]
+
+
+def detect_completion_evidence(text: str | None) -> str | None:
+    """Returns the matched phrase (lowercased) if `text` carries explicit,
+    positive test-pass evidence AND no failure evidence, else `None`.
+
+    The failure-evidence guard is applied to the *whole* text, not just the
+    vicinity of the pass phrase, so a mixed "passed, failed" summary never
+    upgrades to `OK`. Never raises — returns `None` for missing/empty text."""
+    if not text:
+        return None
+    if any(pattern.search(text) for pattern in _FAILURE_EVIDENCE_PATTERNS):
+        return None
+    for pattern in _COMPLETION_EVIDENCE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0).strip().lower()
+    return None
+
+
+# Git subcommands that a trusted implementation agent is *intentionally* denied
+# (the completion pipeline owns commit/push/merge, never the agent — see
+# `agent_runner.GIT_WRITE_DISALLOWED_TOOLS`). A denial of one of these is the
+# system working as designed, not a run that "could not do its work": the agent
+# poking at git it isn't allowed to touch, while its real work happened through
+# Read/Edit/Write/other Bash. Such denials must NOT fail an otherwise-productive
+# run. (`git stash` is included because the disallow pattern also catches the
+# read-only `git stash list` the agent sometimes runs to inspect state.)
+_EXPECTED_GIT_DENIAL_MARKERS: tuple[str, ...] = (
+    "git add", "git apply", "git checkout", "git restore", "git switch",
+    "git stash", "git commit", "git push", "git merge", "git reset",
+    "git rebase", "git clean", "git branch -d", "git branch -D",
+)
+
+
+def _is_expected_git_denial(entry: dict) -> bool:
+    """True when a denial is for one of the intentionally-blocked git-write
+    commands — expected and benign, not evidence the run was blocked."""
+    command = str((entry.get("tool_input") or {}).get("command") or "")
+    return any(marker in command for marker in _EXPECTED_GIT_DENIAL_MARKERS)
+
+
 def permission_denial_tool_names(permission_denials: list | None) -> list[str]:
     """Extracts the sorted, de-duplicated tool names from a `result` event's
     `permission_denials` array (each entry `{"tool_name": ..., ...}` per the
     real `claude -p --output-format json`/`stream-json` `result` event
-    shape). Never raises on a malformed/unexpected shape — returns `[]`."""
+    shape), **excluding intentionally-blocked git-write denials** (those are the
+    system working as designed, not a run that could not do its work — a run that
+    edited files and ran its tests but incidentally poked at `git` it is not
+    allowed to touch is not "blocked"). Never raises — returns `[]`."""
     if not permission_denials:
         return []
     names = {
         str(entry["tool_name"])
         for entry in permission_denials
-        if isinstance(entry, dict) and entry.get("tool_name")
+        if isinstance(entry, dict) and entry.get("tool_name") and not _is_expected_git_denial(entry)
     }
     return sorted(names)
 
@@ -118,6 +207,7 @@ def classify_process_result(
     result_text: str | None,
     permission_denials: list | None,
     working_tree_changed: bool,
+    provider_completion_valid: bool | None = None,
 ) -> tuple[str, str | None]:
     """The `EvaluatingResult` decision for a run whose process already exited
     0, was not cancelled, and did not time out.
@@ -132,7 +222,15 @@ def classify_process_result(
       consulted when there were no permission denials to report instead).
     - `(INCOMPLETE, reason)`: nothing was blocked, but `task_type` requires
       repository changes and the working tree did not change
-      (`reason == "working_tree_unchanged"`).
+      (`reason == "working_tree_unchanged"`) — *unless* the agent's own final
+      message carries explicit, positive test-pass evidence (see
+      `detect_completion_evidence`), in which case the run is treated as
+      `OK` (the work was already complete; the unchanged tree is not evidence
+      of incompleteness when the agent verified it). `provider_completion_valid`
+      is the provider's own "produced a final assistant message" flag (when a
+      provider exposes one); an explicit `False` disables the upgrade so a
+      provider that knows it did not finish cannot be talked into `OK` by
+      text alone.
 
     `reason` is always a short, machine-readable code suitable for
     `run.failure_reason` (never `None` when `outcome != OK`) — this is what
@@ -149,6 +247,15 @@ def classify_process_result(
         return BLOCKED, f"final_response:{blocker_phrase}"
 
     if task_type in REQUIRES_CHANGES_TASK_TYPES and not working_tree_changed:
+        # The recurring false negative: a task whose implementation already
+        # landed in an earlier (often interrupted) run leaves a clean tree, so
+        # every resume finds nothing to change. The agent's own final message
+        # is the only available signal that the work was *already done and
+        # verified*; `detect_completion_evidence` requires explicit test-pass
+        # evidence (and the absence of any failure evidence) before it will
+        # upgrade a would-be `INCOMPLETE` to `OK`.
+        if provider_completion_valid is not False and detect_completion_evidence(result_text):
+            return OK, None
         return INCOMPLETE, "working_tree_unchanged"
 
     return OK, None

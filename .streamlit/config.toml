@@ -4,6 +4,24 @@
 # menu can switch between them; there is no separate Python "engine" beyond
 # this file plus command_center/ui/theme.py's st.context.theme helper.
 
+[server]
+# The application has NO authentication layer yet performs privileged git/gh and
+# subprocess operations, so the console must never be reachable off-host. Pinning
+# localhost here makes it the default for EVERY launch path — including a bare
+# `streamlit run app.py`, which does not go through scripts/start-ui.sh. An
+# explicit `--server.address` CLI flag still overrides this for an intentional,
+# reviewed exposure (see README "Getting started").
+address = "localhost"
+
+[client]
+# Hide Streamlit's own developer toolbar — "Deploy", "Stop", the hamburger
+# menu and the accessibility affordance it carries. This is a local desktop
+# operator console launched by double-clicking a .command file: none of those
+# controls do anything meaningful here, and they read as part of our UI (the
+# accessibility glyph in particular was mistaken for one of our own icons).
+# "minimal" keeps genuinely necessary notices, such as a rerun prompt.
+toolbarMode = "minimal"
+
 [theme]
 showWidgetBorder = true
 showSidebarBorder = true

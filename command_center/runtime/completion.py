@@ -43,6 +43,10 @@ class CompletionState:
     EXECUTION_FINISHED = "EXECUTION_FINISHED"
     VALIDATING_RESULT = "VALIDATING_RESULT"
     RESULT_VALID = "RESULT_VALID"
+    # Independent review gate: the change is valid on its own terms, but a
+    # separate read-only reviewer has not yet approved it. Blocking by
+    # design — no pull request is opened from this state.
+    AWAITING_REVIEW = "AWAITING_REVIEW"
     PREPARING_PULL_REQUEST = "PREPARING_PULL_REQUEST"
     PULL_REQUEST_OPEN = "PULL_REQUEST_OPEN"
     AWAITING_MERGE = "AWAITING_MERGE"
@@ -56,6 +60,10 @@ class CompletionState:
     REQUIRES_ATTENTION = "REQUIRES_ATTENTION"
     RECOVERY_PENDING = "RECOVERY_PENDING"
     RECOVERY_FAILED = "RECOVERY_FAILED"
+    # The independent reviewer rejected the change. Not a failure of the
+    # machinery — a judgement about the work — so it is terminal here and is
+    # picked up by the pipeline's rework loop, exactly like VALIDATION_FAILED.
+    REVIEW_REJECTED = "REVIEW_REJECTED"
 
 
 ALL_STATES: frozenset[str] = frozenset(
@@ -63,6 +71,7 @@ ALL_STATES: frozenset[str] = frozenset(
         CompletionState.EXECUTION_FINISHED,
         CompletionState.VALIDATING_RESULT,
         CompletionState.RESULT_VALID,
+        CompletionState.AWAITING_REVIEW,
         CompletionState.PREPARING_PULL_REQUEST,
         CompletionState.PULL_REQUEST_OPEN,
         CompletionState.AWAITING_MERGE,
@@ -70,6 +79,7 @@ ALL_STATES: frozenset[str] = frozenset(
         CompletionState.VERIFYING_TARGET_BRANCH,
         CompletionState.COMPLETED,
         CompletionState.VALIDATION_FAILED,
+        CompletionState.REVIEW_REJECTED,
         CompletionState.PR_CLOSED_UNMERGED,
         CompletionState.MERGE_BLOCKED,
         CompletionState.REQUIRES_ATTENTION,
@@ -88,6 +98,7 @@ TERMINAL_STATES: frozenset[str] = frozenset(
     {
         CompletionState.COMPLETED,
         CompletionState.VALIDATION_FAILED,
+        CompletionState.REVIEW_REJECTED,
         CompletionState.REQUIRES_ATTENTION,
         CompletionState.RECOVERY_FAILED,
     }
@@ -140,6 +151,7 @@ COMPLETION_TRANSITIONS: dict[str, frozenset[str]] = {
     ),
     CompletionState.RESULT_VALID: frozenset(
         {
+            CompletionState.AWAITING_REVIEW,
             CompletionState.PREPARING_PULL_REQUEST,
             CompletionState.PULL_REQUEST_OPEN,
             CompletionState.AWAITING_MERGE,
@@ -148,6 +160,20 @@ COMPLETION_TRANSITIONS: dict[str, frozenset[str]] = {
             CompletionState.PR_CLOSED_UNMERGED,
             CompletionState.RECOVERY_PENDING,
             CompletionState.RECOVERY_FAILED,
+            CompletionState.COMPLETED,
+            CompletionState.REQUIRES_ATTENTION,
+        }
+    ),
+    # The gate itself. It may proceed to the pull-request phase (approved),
+    # terminate as REVIEW_REJECTED (the reviewer said no — the rework loop takes
+    # it from there), reach COMPLETED if the change turns out to be in the target
+    # branch already, or escalate. It may NOT go backwards to RESULT_VALID:
+    # re-entering the pre-gate state would let a second pass skip the gate.
+    CompletionState.AWAITING_REVIEW: frozenset(
+        {
+            CompletionState.PREPARING_PULL_REQUEST,
+            CompletionState.PULL_REQUEST_OPEN,
+            CompletionState.REVIEW_REJECTED,
             CompletionState.COMPLETED,
             CompletionState.REQUIRES_ATTENTION,
         }
@@ -235,6 +261,7 @@ COMPLETION_TRANSITIONS: dict[str, frozenset[str]] = {
     # Terminal — no outgoing transitions (defense in depth against reprocessing).
     CompletionState.COMPLETED: frozenset(),
     CompletionState.VALIDATION_FAILED: frozenset(),
+    CompletionState.REVIEW_REJECTED: frozenset(),
     CompletionState.REQUIRES_ATTENTION: frozenset(),
     CompletionState.RECOVERY_FAILED: frozenset(),
 }
@@ -296,6 +323,10 @@ class ReasonCode:
     RECOVERABLE = "RECOVERABLE"
     NO_PR_NOT_IN_TARGET = "NO_PR_NOT_IN_TARGET"
     RETRY_LIMIT_REACHED = "RETRY_LIMIT_REACHED"
+    # Independent review gate (blocking, pre-pull-request).
+    REVIEW_PENDING = "REVIEW_PENDING"
+    REVIEW_APPROVED = "REVIEW_APPROVED"
+    REVIEW_REJECTED = "REVIEW_REJECTED"
 
 
 # --------------------------------------------------------------------------
@@ -325,6 +356,10 @@ class CompletionPolicy:
     allow_local_only: bool = False
     allow_pr_recovery: bool = False
     validation_required: bool = True
+    # Blocking independent review before any pull request is opened. Off by
+    # default like every other automation gate: it costs an extra agent run
+    # per task, so it is a deliberate choice, never an implicit one.
+    requires_independent_review: bool = False
     merge_mode: str = MERGE_MANUAL
     merge_method: str = MERGE_METHOD_SQUASH
     max_retries: int = DEFAULT_MAX_RETRIES
@@ -349,6 +384,7 @@ class CompletionPolicy:
             "allow_local_only": self.allow_local_only,
             "allow_pr_recovery": self.allow_pr_recovery,
             "validation_required": self.validation_required,
+            "requires_independent_review": self.requires_independent_review,
             "merge_mode": self.merge_mode,
             "merge_method": self.merge_method,
             "max_retries": self.max_retries,
@@ -365,6 +401,7 @@ class CompletionPolicy:
             allow_local_only=bool(data.get("allow_local_only", False)),
             allow_pr_recovery=bool(data.get("allow_pr_recovery", False)),
             validation_required=bool(data.get("validation_required", True)),
+            requires_independent_review=bool(data.get("requires_independent_review", False)),
             merge_mode=str(data.get("merge_mode", MERGE_MANUAL)),
             merge_method=str(data.get("merge_method", MERGE_METHOD_SQUASH)),
             max_retries=int(data.get("max_retries", DEFAULT_MAX_RETRIES)),
@@ -380,16 +417,33 @@ class CompletionPolicy:
             return cls()
 
     @classmethod
-    def resolve(cls, *, task: dict | None = None, project_cfg: dict | None = None) -> "CompletionPolicy":
-        """Layer task config over project config over defaults. A task-level
-        key wins over the project-level one; absent keys keep the default."""
+    def resolve(
+        cls,
+        *,
+        task: dict | None = None,
+        project_cfg: dict | None = None,
+        overrides: dict | None = None,
+    ) -> "CompletionPolicy":
+        """Layer `overrides` over task config over project config over
+        defaults. A later layer's key wins over an earlier one's; absent keys
+        keep the default.
+
+        `overrides` is the operator layer: a machine-wide, explicitly persisted
+        opt-in (see `command_center.pipeline_settings`) that the desktop
+        pipeline applies when it seeds a completion row, so enabling
+        auto-merge once does not require editing every task. It is the highest
+        layer precisely because it is the most explicit — a human toggled it
+        this session — but it still only chooses a *policy*: whether a merge
+        actually happens remains the evaluator's decision, gated on checks,
+        review and mergeability."""
         merged: dict[str, Any] = {}
-        for source in (project_cfg or {}, task or {}):
+        for source in (project_cfg or {}, task or {}, overrides or {}):
             for key in (
                 "requires_pull_request",
                 "allow_local_only",
                 "allow_pr_recovery",
                 "validation_required",
+                "requires_independent_review",
                 "merge_mode",
                 "merge_method",
                 "max_retries",
@@ -657,12 +711,33 @@ class CompletionEvaluator:
                 evidence=evidence,
                 **common,
             )
-        if policy.requires_review_for_merge and not pr.review_satisfied:
+        # Nothing verified this change (audit M7). `checks_state` is NONE — the
+        # repo has no CI — *and* local validation was not required, so an
+        # auto-merge here would rest on no evidence at all. When validation ran —
+        # the normal case — NONE checks are fine: this phase is only reached after
+        # validation passed, so validation is the "successful check".
+        if not pr.checks_passing and not policy.validation_required:
+            return CompletionAssessment(
+                status=CompletionState.MERGE_BLOCKED,
+                action=CompletionAction.WAIT,
+                reason_code=ReasonCode.CHECKS_FAILING,
+                recommended_action=(
+                    "No CI checks and no local validation verified this change; "
+                    "will not auto-merge. Merge manually."
+                ),
+                requires_human=True,
+                evidence=evidence,
+                **common,
+            )
+        # A required review must be an *explicit* approval (audit M7): a missing
+        # review (review_decision is None) is not the same as an approved one, so
+        # `auto_after_checks_and_review` must not merge a PR nobody reviewed.
+        if policy.requires_review_for_merge and pr.review_decision != "APPROVED":
             return CompletionAssessment(
                 status=CompletionState.MERGE_BLOCKED,
                 action=CompletionAction.WAIT,
                 reason_code=ReasonCode.REVIEW_REQUIRED,
-                recommended_action="Required review is not satisfied; will not merge without approval.",
+                recommended_action="Required review is not an explicit approval; will not merge without it.",
                 evidence=evidence,
                 **common,
             )
@@ -673,6 +748,18 @@ class CompletionEvaluator:
                 reason_code=ReasonCode.PR_CONFLICTING,
                 recommended_action="Pull request has conflicts and is not mergeable. Resolve conflicts.",
                 requires_human=True,
+                evidence=evidence,
+                **common,
+            )
+        # Mergeability not yet confirmed (audit M8): GitHub returns UNKNOWN
+        # transiently on a fresh PR. Wait and re-check rather than attempting a
+        # merge we cannot prove is safe; a later tick sees MERGEABLE and proceeds.
+        if pr.mergeable != "MERGEABLE":
+            return CompletionAssessment(
+                status=CompletionState.AWAITING_MERGE,
+                action=CompletionAction.WAIT,
+                reason_code=ReasonCode.CHECKS_PENDING,
+                recommended_action="Mergeability is not yet confirmed (UNKNOWN); waiting to re-check before merging.",
                 evidence=evidence,
                 **common,
             )

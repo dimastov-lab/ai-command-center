@@ -1,18 +1,23 @@
 # AI Command Center — Current State
 
-Updated: 2026-07-23
+Updated: 2026-07-27
 
 ## 0. AI Command Center platform
 
 Status: Active, local Streamlit implementation
 
 Current position:
-- `app.py` hosts the implemented 19-destination Streamlit control application.
+- `app.py` hosts the implemented Streamlit control application: 20 page handlers, 16 shown in the
+  sidebar (chat, generated files, reports, and context open inside the project view).
 - `data/tasks.json` remains the planning and Kanban store.
-- `data/runtime.db` schema 7 is authoritative for asynchronous execution, completion and the
-  persisted autonomy-proposal lifecycle.
+- `data/runtime.db` schema 11 is authoritative for asynchronous execution, completion, the
+  persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
+  verdict, and the `queue_entry` mirror (ADR 0007 dual-write).
 - Execution Center provides process supervision, streaming events, cancellation, timeouts and
   restart reconciliation; live process handles remain owned by the hosting Python process.
+  Process-group supervision is fail-closed to POSIX `waitid(WNOWAIT)`, keeps the launch-time PGID
+  pinned until descendants are drained, and separates OS exit from terminal-state/report
+  finalization so slow persistence cannot cause a false timeout or late signal.
 - Normal task-v2 launches require explicit confirmation before any provisioning, may create an
   isolated worktree offline, and fail closed unless source repository, expected branch, worktree
   isolation and configured status policy verify before process launch.
@@ -20,16 +25,20 @@ Current position:
   the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
 - `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
   decisions. It creates no durable claim, queue entry or run and has no background driver.
-- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state,
-  but has no Streamlit UI, automated evidence collectors, project policy resolver, background
-  driver or executor.
+- The autonomy proposal domain/API persists evidence, policy, approval and dispatch-boundary state.
+  An operator approve/reject inbox (`ui/proposals_panel.py`) surfaces and decides proposals, but
+  there are no automated evidence collectors, project policy resolver, background driver or executor.
 - Portfolio Execution and Portfolio Overview provide guarded worktree launch plus read-only
   dependency, health, capacity and recommendation views.
 - The persisted completion pipeline supports validation, push, pull-request and merge workflows;
   completion autopilot and automatic merge policies are opt-in and disabled by conservative
   defaults.
 - Checked-in CI validates committed-diff whitespace, Ruff, byte compilation and pytest on Python
-  3.14.
+  3.14. Informational, non-blocking `mypy` and coverage steps run alongside the deterministic
+  quartet but do not gate the merge.
+- Runtime history retention is **off by default**: `AICC_RUNTIME_RETENTION_DAYS=<N>` prunes
+  `run_event` rows for terminal runs older than `N` days on startup, and
+  `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
 

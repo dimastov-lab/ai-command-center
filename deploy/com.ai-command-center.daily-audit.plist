@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-command-center.daily-audit</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PYTHON__</string>
+    <string>__ROOT__/scripts/daily_audit_daemon.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AICC_DAILY_AUDIT_ENABLED</key>
+    <string>1</string>
+    <key>AICC_COMPLETION_AUTOPILOT</key>
+    <string>1</string>
+    <key>AICC_DATA_DIR</key>
+    <string>__DATA_DIR__</string>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__ROOT__/data/daily-audit.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__ROOT__/data/daily-audit.stderr.log</string>
+</dict>
+</plist>

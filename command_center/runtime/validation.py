@@ -12,7 +12,12 @@ external input without validation"):
     `shell=False` — so shell metacharacters in an argument are passed literally
     and are inert (no pipes, expansion, or command substitution ever happen);
   * the leading executable must be in an allowlist of known validators, so a
-    misconfigured plan cannot invoke an arbitrary program;
+    misconfigured plan cannot invoke an arbitrary *program* directly (e.g. `sh`,
+    `rm`, `curl`). Note: interpreter-class entries in the allowlist (`python`,
+    `python3`, `node`, `npx`, `make`, …) will execute whatever code the
+    operator-configured arguments supply — the allowlist scopes the entry
+    binary, not the semantics, so `validation_commands` is trusted operator
+    configuration and must be reviewed like any other privileged config;
   * each command has an explicit timeout, and stdout/stderr are truncated to a
     bounded summary before they ever reach the database.
 """
@@ -27,9 +32,13 @@ from pathlib import Path
 
 from command_center.models import iso_now
 
-# Executables the pipeline is willing to run as validators. A conservative
-# allowlist keeps a misconfigured (or hostile) `validation_commands` value from
-# turning the pipeline into an arbitrary-command runner.
+# Executables the pipeline is willing to run as validators. This scopes the
+# *entry binary* a misconfigured (or hostile) `validation_commands` value may
+# launch — it blocks direct invocation of arbitrary programs (`sh`, `rm`, …).
+# Interpreter-class entries (`python`/`python3`/`node`/`npx`/`make`/`go`/…)
+# will run whatever code the operator-supplied arguments specify, so
+# `validation_commands` is trusted operator configuration: review it with the
+# same care as any other privileged setting. See the module docstring.
 SAFE_VALIDATOR_BINARIES: frozenset[str] = frozenset(
     {
         "python",

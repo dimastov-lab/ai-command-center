@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from command_center import workspace_provisioning
+from command_center import project_config, workspace_provisioning
 from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -63,6 +63,8 @@ class ExecutionCenterAPI:
         prompt_version: int | None = None,
         repository_already_validated: bool = False,
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
+        executor_id: str = "claude_code",
+        max_global_concurrency: int | None = None,
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -77,6 +79,7 @@ class ExecutionCenterAPI:
         `timeout_seconds` defaults to 900s; pass `None` explicitly to disable
         the automatic timeout for this run.
         """
+        project_config.require_execution_provider_allowed(project, executor_id)
         context = context_service.assemble_context(
             project_id=project,
             metadata=metadata,
@@ -93,7 +96,7 @@ class ExecutionCenterAPI:
             prompt=prompt,
             confirmed=confirmed,
             task_id=task_id,
-            title=title or instruction[:120],
+            title=title or ("Codex CLI run" if executor_id == "codex" else instruction[:120]),
             session_id=session_id,
             is_resume=is_resume,
             model=model,
@@ -103,6 +106,9 @@ class ExecutionCenterAPI:
             prompt_version=prompt_version,
             repository_already_validated=repository_already_validated,
             workspace_verification=workspace_verification,
+            executor_id=executor_id,
+            canonical_repository_path=project_config.get_project_config(project).get("repository_path"),
+            max_global_concurrency=max_global_concurrency,
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)
@@ -137,8 +143,17 @@ class ExecutionCenterAPI:
             limit=limit,
         )
 
+    def count_runs(self, *, states: Iterable[str] | None = None) -> int:
+        """Authoritative total run count without materializing rows (see
+        `db.count_runs`). Use this for dashboard totals/denominators so the
+        Live Board's `limit=200` window never silently under-counts."""
+        return db.count_runs(self.db_path, states=states)
+
     def get_run(self, run_id: str) -> dict | None:
         return db.get_run(self.db_path, run_id)
+
+    def get_latest_run_for_task(self, task_id: str) -> dict | None:
+        return db.get_latest_run_for_task(self.db_path, task_id)
 
     def get_events(self, run_id: str, *, after_seq: int = 0, limit: int = 1000) -> list[dict]:
         return db.list_run_events(self.db_path, run_id, after_seq=after_seq, limit=limit)
@@ -146,12 +161,20 @@ class ExecutionCenterAPI:
     def get_report(self, run_id: str) -> dict | None:
         return db.get_report(self.db_path, run_id)
 
+    def get_reports_for_runs(self, run_ids: list[str]) -> dict[str, dict]:
+        """Batch of `get_report` — one query for a board of runs (audit H5)."""
+        return db.get_reports_for_runs(self.db_path, run_ids)
+
     # ------------------------------------------------------------------
     # Completion pipeline (read-only projections + bounded advance)
     # ------------------------------------------------------------------
 
     def get_completion(self, run_id: str) -> dict | None:
         return db.get_completion(self.db_path, run_id)
+
+    def get_completions_for_runs(self, run_ids: list[str]) -> dict[str, dict]:
+        """Batch of `get_completion` — one query for a board of runs (audit H5)."""
+        return db.get_completions_for_runs(self.db_path, run_ids)
 
     def get_completion_by_task(self, task_id: str) -> dict | None:
         return db.get_completion_by_task(self.db_path, task_id)
@@ -166,6 +189,17 @@ class ExecutionCenterAPI:
         """Advance every due, non-terminal completion row once. Delegates to the
         Supervisor; safe to call on demand (bounded)."""
         return self.supervisor.advance_completions(now=now, limit=limit, github=github)
+
+    def request_manual_merge(
+        self, run_id: str, *, confirmed: bool, github=None
+    ) -> dict:
+        """Merge one task explicitly; the completion service re-checks every
+        gate and owns the global sequential merge slot."""
+        from command_center.runtime.completion_service import CompletionOrchestrator
+
+        return CompletionOrchestrator(
+            self.db_path, github=github
+        ).request_manual_merge(run_id, confirmed=confirmed)
 
     # ------------------------------------------------------------------
     # Autonomy proposals (AICC-AUTONOMY-002) — the pre-execution decision
