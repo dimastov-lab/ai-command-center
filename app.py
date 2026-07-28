@@ -46,6 +46,7 @@ from command_center.ui import (
     execution_metrics,
     execution_strip,
     home_dashboard,
+    inspector,
     live_board,
     waves_panel,
     content_area,
@@ -1145,6 +1146,13 @@ def render_task_card(
                     color="green" if passing else "red",
                 )
 
+        # Inspector select (UX-2c): one-tap to load this task into the
+        # top-bar Inspector pane without opening the full dialog.
+        with st.container(horizontal=True):
+            if st.button("🔍 В инспектор", key=f"{key_prefix}_inspect", icon=":material/search:", help="Открыть в Инспекторе"):
+                inspector.select_task(task_id)
+                st.rerun()
+
         _render_manual_merge_button(
             get_execution_center_api(),
             completion,
@@ -1845,6 +1853,10 @@ def _render_execution_center_card(
         header_cols = st.columns([3, 1])
         header_cols[0].markdown(f"##### {session['task_title']}")
         header_cols[1].badge(display_status, color=_execution_center_status_badge_color(display_status))
+        # Inspector select (UX-2c): load this run into the top-bar Inspector.
+        if st.button("🔍 В инспектор", key=f"exec_card_inspect_{run_id}", icon=":material/search:", help="Открыть прогон в Инспекторе"):
+            inspector.select_run(run_id)
+            st.rerun()
         # `display_status` is repeated here as plain caption text (not just
         # the `st.badge` pill above) so the run's display status stays
         # queryable in tests and screen readers alike.
@@ -3456,6 +3468,12 @@ def build_commands() -> list[dict]:
     return commands
 
 
+# Data loading happens before the shell render so the top command bar (search,
+# live glyph, Inspector) has the task map + api available without a second pass.
+tasks = load_tasks()
+tasks_by_id = {task["id"]: task for task in tasks}
+project_configs = project_config.load_project_configs()
+
 page_key = shell.render_shell(
     page_title="AI Command Center",
     page_icon="🧭",
@@ -3465,11 +3483,9 @@ page_key = shell.render_shell(
     nav=NAV,
     project_count=len(models.PROJECT_IDS),
     on_open_palette=_open_command_palette,
+    tasks_by_id=tasks_by_id,
+    api=get_execution_center_api(),
 )
-
-tasks = load_tasks()
-tasks_by_id = {task["id"]: task for task in tasks}
-project_configs = project_config.load_project_configs()
 
 
 def _dismiss_command_palette() -> None:
@@ -4562,19 +4578,50 @@ elif page_key == "create":
     st.divider()
     st.markdown("#### Импорт пакета задач")
     st.caption(
-        "Загрузите JSON-файл со списком задач (например, пакет от Founder-аудита) — "
-        "поддерживаются как «конверт» `{schema_version, package_id, tasks}`, так и "
-        "простой список задач. Ничего не записывается в `data/tasks.json` до нажатия "
-        "«Импортировать задачи»."
+        "Загрузите файл или вставьте пакет задач (например, пакет от Founder-аудита). "
+        "Поддерживаются JSON, YAML, Markdown и простой текст, в двух формах: «конверт» "
+        "`{schema_version, package_id, tasks}` или простой список задач. Ничего не "
+        "записывается в `data/tasks.json` до нажатия «Импортировать задачи»."
     )
     uploaded_package = st.file_uploader(
-        "JSON-пакет задач", type=["json"], key="import_task_package_uploader"
+        "Файл пакета задач (JSON / YAML / Markdown / текст)",
+        type=list(task_import.SUPPORTED_IMPORT_SUFFIXES),
+        key="import_task_package_uploader",
     )
+    pasted_package = st.text_area(
+        "…или вставьте пакет сюда",
+        key="import_task_package_paste",
+        height=120,
+        placeholder='{"tasks": [ … ]}   ·   YAML   ·   Markdown c ```json / ```yaml-блоком',
+    )
+    paste_format = st.selectbox(
+        "Формат вставленного текста",
+        ("авто", "json", "yaml", "markdown"),
+        key="import_task_package_paste_format",
+        help="«авто» распознаёт JSON или YAML. Для вставленного Markdown выберите его явно.",
+    )
+
+    parsed_package = None
+    import_parse_error: task_import.TaskImportError | None = None
     if uploaded_package is not None:
+        # Pass the real filename so the parser can pick YAML/Markdown by
+        # extension, not just sniff JSON/YAML out of the raw bytes.
         try:
-            parsed_package = task_import.parse_task_package(uploaded_package.getvalue())
+            parsed_package = task_import.parse_task_package(
+                uploaded_package.getvalue(), filename=uploaded_package.name
+            )
         except task_import.TaskImportError as exc:
-            st.error(f"Ошибка разбора пакета: {exc}")
+            import_parse_error = exc
+    elif pasted_package.strip():
+        fmt = None if paste_format == "авто" else paste_format
+        try:
+            parsed_package = task_import.parse_task_package(pasted_package, fmt=fmt)
+        except task_import.TaskImportError as exc:
+            import_parse_error = exc
+
+    if import_parse_error is not None or parsed_package is not None:
+        if import_parse_error is not None:
+            st.error(f"Ошибка разбора пакета: {import_parse_error}")
         else:
             import_validation = task_import.validate_task_package(parsed_package)
             import_preview = task_import.build_import_preview(ROOT, parsed_package, import_validation)

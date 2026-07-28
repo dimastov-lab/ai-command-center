@@ -972,6 +972,38 @@ def test_import_task_package_reimport_shows_zero_new_and_all_duplicates():
     assert any("Нет новых задач" in i.value for i in at.info)
 
 
+def _upload_markdown_package(at, tasks, filename="package.md"):
+    body = "# Task package\n\nSome prose.\n\n```json\n" + json.dumps(tasks) + "\n```\n"
+    at.file_uploader(key="import_task_package_uploader").set_value(
+        (filename, body.encode("utf-8"), "text/markdown")
+    )
+    return at.run()
+
+
+def test_import_task_package_accepts_markdown_by_filename():
+    # A .md file parses only because the uploaded filename routes it to the
+    # Markdown handler — the plain-text sniffer parses JSON/YAML, not Markdown —
+    # so this proves the widened uploader plus filename passing, not the sniffer.
+    at = _at_on_page("create", create_task_project="AIOS")
+    at = _upload_markdown_package(at, [_import_task(id="MD-001")])
+    assert not at.exception
+    metric_values = [m.value for m in at.metric]
+    assert metric_values[:5] == ["1", "1", "0", "0", "0"]
+    assert any(b.key == "import_task_package_confirm_btn" for b in at.button)
+
+
+def test_import_task_package_from_pasted_text():
+    at = _at_on_page("create", create_task_project="AIOS")
+    at.text_area(key="import_task_package_paste").set_value(
+        json.dumps([_import_task(id="PASTE-001")])
+    )
+    at = at.run()
+    assert not at.exception
+    metric_values = [m.value for m in at.metric]
+    assert metric_values[:5] == ["1", "1", "0", "0", "0"]
+    assert any(b.key == "import_task_package_confirm_btn" for b in at.button)
+
+
 def test_import_task_package_malformed_json_shows_error():
     at = _at_on_page("create", create_task_project="AIOS")
     at.file_uploader(key="import_task_package_uploader").set_value(("bad.json", b"not json", "application/json"))
