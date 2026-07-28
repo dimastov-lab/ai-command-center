@@ -507,6 +507,27 @@ def test_merge_policy_upgraded_only_on_the_explicit_opt_in(tmp_path, git_repo, a
     assert task_pipeline.EV_MERGE_POLICY_APPLIED in events
 
 
+def test_enabling_auto_merge_clears_the_manual_wait_timer(tmp_path, git_repo, api):
+    row = _seed_completion(
+        api,
+        git_repo,
+        completion_state=completion_domain.CompletionState.AWAITING_MERGE,
+    )
+    waiting = runtime_db.update_completion(
+        api.db_path,
+        row["run_id"],
+        expected_version=row["version"],
+        fields={"next_retry_at": "2026-07-28T17:43:59", "retry_count": 14},
+    )
+
+    task_pipeline.apply_merge_policy(api.db_path, {"a": _task(id="a")}, {}, opt_in=True)
+
+    fresh = runtime_db.get_completion(api.db_path, waiting["run_id"])
+    assert fresh["merge_mode"] == completion_domain.MERGE_AUTO_AFTER_CHECKS
+    assert fresh["next_retry_at"] is None
+    assert fresh["retry_count"] == 0
+
+
 def test_merge_policy_is_idempotent_across_repeated_ticks(tmp_path, git_repo, api):
     row = _seed_completion(api, git_repo)
     task_pipeline.apply_merge_policy(api.db_path, {"a": _task(id="a")}, {}, opt_in=True)
