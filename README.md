@@ -67,6 +67,29 @@ scripts/start-ui.sh --server.address 0.0.0.0   # explicitly expose (not recommen
 
 There is no application authentication layer.
 
+## Web dashboard
+
+A read-only web dashboard (React SPA + FastAPI backend, `web/` and
+`command_center/webapi/`) is also available as a lighter-weight, single-page
+alternative to the Streamlit UI's Workspace Home view. Install and run it with:
+
+```bash
+pip install -r requirements-web.txt
+scripts/start-web.sh
+```
+
+Then open <http://localhost:8791>. `scripts/start-web.sh` installs the frontend's
+npm dependencies if `web/node_modules` is missing, builds the SPA
+(`web/dist`), and serves it together with the read-only `/api/home` endpoint
+from a single FastAPI process — no separate frontend dev server or CORS
+configuration needed in this mode. The dashboard has a language toggle
+(EN/RU) and a background switcher in its header.
+
+Like the Streamlit UI, the web dashboard binds to `localhost` only and has no
+authentication layer, so it must not be exposed beyond the local machine. It
+honors an existing `AICC_DATA_DIR` override the same way the rest of the
+application does; the launch script does not set or change it.
+
 ## Application structure
 
 - [`app.py`](app.py) is the direct Streamlit entry point. It configures the page, loads local

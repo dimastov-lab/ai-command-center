@@ -1,0 +1,98 @@
+/* Home dashboard: layout/animation CSS that can't be expressed as inline
+   styles (keyframes, pseudo-elements, media queries, hover states).
+   Colors/surfaces come from theme/tokens.css. */
+
+@keyframes orb-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.orb {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, var(--accent-1), var(--accent-2), var(--teal), var(--accent-1));
+  animation: orb-spin 14s linear infinite;
+  box-shadow: 0 0 20px rgba(124, 92, 255, 0.4);
+}
+
+.orb::after {
+  content: '';
+  position: absolute;
+  inset: 5px;
+  border-radius: 50%;
+  background: var(--glass);
+}
+
+.nav-item {
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.mark {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: conic-gradient(from 210deg, #7c5cff, #4d9fff, #33e0c0, #7c5cff);
+  box-shadow: 0 6px 22px -6px #4d9fff;
+  position: relative;
+  flex: none;
+}
+
+.mark::after {
+  content: '';
+  position: absolute;
+  inset: 9px;
+  border-radius: 6px;
+  background: #0d1122;
+}
+
+.bg-swatch {
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.bg-swatch:hover {
+  transform: translateY(-2px);
+}
+
+.bg-swatch.active {
+  box-shadow: 0 0 0 2px var(--accent-2);
+}
+
+.layout-grid {
+  display: grid;
+  grid-template-columns: 220px 1fr 300px;
+  gap: 1.25rem;
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .layout-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+
+@media (max-width: 720px) {
+  .kpi-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.split-grid {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 1.25rem;
+}
+
+@media (max-width: 720px) {
+  .split-grid {
+    grid-template-columns: 1fr;
+  }
+}
