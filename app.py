@@ -4541,35 +4541,39 @@ elif page_key == "create":
         elif task_type not in TASK_TYPES:
             st.error("Неизвестный тип задачи.")
         else:
+            final_executor = (
+                None if override_executor == "(унаследовано из проекта)" else override_executor
+            )
+            create_task(
+                project,
+                title_clean,
+                task_type,
+                initial_status,
+                goal=objective_clean,
+                notes=notes.strip(),
+                priority=priority,
+                owner=owner.strip(),
+                estimate_hours=float(estimate),
+                depends_on=dependencies,
+                workspace_path=override_workspace.strip() or inherited["workspace_path"],
+                branch=override_branch.strip() or inherited["branch"],
+                executor=final_executor or inherited["executor"],
+                prompt=override_prompt.strip() or inherited["prompt"],
+            )
+            st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
+
             with st.spinner("Выполняется scripts/start-task.sh..."):
                 ok, stdout, stderr = run_start_task_script(project, task_type, objective_clean)
 
             if ok:
-                final_executor = (
-                    None if override_executor == "(унаследовано из проекта)" else override_executor
-                )
-                create_task(
-                    project,
-                    title_clean,
-                    task_type,
-                    initial_status,
-                    goal=objective_clean,
-                    notes=notes.strip(),
-                    priority=priority,
-                    owner=owner.strip(),
-                    estimate_hours=float(estimate),
-                    depends_on=dependencies,
-                    workspace_path=override_workspace.strip() or inherited["workspace_path"],
-                    branch=override_branch.strip() or inherited["branch"],
-                    executor=final_executor or inherited["executor"],
-                    prompt=override_prompt.strip() or inherited["prompt"],
-                )
-                st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
                 if stdout:
                     with st.expander("Вывод скрипта"):
                         st.code(stdout, language=None)
             else:
-                st.error("Не удалось выполнить scripts/start-task.sh.")
+                st.warning(
+                    "Задача сохранена в Kanban, но scripts/start-task.sh не смог "
+                    "сгенерировать Markdown-файл."
+                )
                 details = stderr or stdout
                 if details:
                     with st.expander("Подробности ошибки", expanded=True):
