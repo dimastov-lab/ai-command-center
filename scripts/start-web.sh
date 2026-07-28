@@ -15,7 +15,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-(cd web && [ -d node_modules ] || npm ci)
+(
+  cd web || exit 1
+  [ -d node_modules ] || npm ci
+)
 (cd web && npm run build)
 
 exec python -m uvicorn "command_center.webapi.app:create_app" --factory \

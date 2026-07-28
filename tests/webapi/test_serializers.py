@@ -14,6 +14,7 @@ output DTO field is derived from these real keys.
 from __future__ import annotations
 
 from command_center.webapi.serializers import serialize_home
+from command_center.workspace_home import _ACTIVITY_ALLOWED_FIELDS, _RUN_ALLOWED_FIELDS
 
 
 def _snapshot(**overrides):
@@ -207,3 +208,96 @@ def test_serialize_home_handles_empty_snapshot():
     assert out["queue"] == []
     assert out["activity"] == []
     assert out["status"] == []
+
+
+def test_serialize_home_sensitive_run_queue_and_activity_expose_only_allowlisted_fields():
+    """Pins the redaction intent documented in `serializers.py`: `queue`/`activity`
+    carry no per-serializer filtering of their own for run/activity entries — they
+    rely entirely on `workspace_home.sanitize_workspace_project_entry` having already
+    reduced any *sensitive* project's run/activity dicts down to
+    `_RUN_ALLOWED_FIELDS`/`_ACTIVITY_ALLOWED_FIELDS` before they ever reach the
+    snapshot's `active_runs`/`recent_activity`. This fixture mirrors that real,
+    already-sanitized shape (built from the actual allowlists, not guessed) — no
+    `title`, no `message`, no prompt/report body — the way a genuine BANK/LEGAL run
+    would look by the time it reaches this module.
+
+    This test passes today; it exists to catch a regression where `queue`/`activity`
+    start deriving fields from something other than the fixed, safe field set below
+    (e.g. a future `r.get("message")`/`r.get("prompt")` fallback added to
+    `_serialize_queue`), which would defeat the upstream allowlist for this surface.
+    """
+    sensitive_run = {
+        "run_id": "bank-r9",
+        "source": "v2",
+        "project": "BANK",
+        "task_type": "implementation",
+        "state": "RUNNING",
+        "status": None,
+        "created_at": "2026-07-28T11:00:00",
+        "started_at": "2026-07-28T11:00:00",
+        "completed_at": None,
+        "exit_code": None,
+        "duration_seconds": None,
+        "failure_reason": None,
+    }
+    # Fixture uses ONLY fields the upstream allowlist ever lets through for a
+    # sensitive project's run — no raw title/message/prompt/report-body field
+    # is even representable here, exactly as `sanitize_workspace_project_entry`
+    # guarantees for a real BANK/LEGAL run.
+    assert set(sensitive_run) <= _RUN_ALLOWED_FIELDS
+
+    sensitive_activity = {
+        "project": "BANK",
+        "event_type": "run_completed",
+        "ts": "2026-07-28T11:05:00",
+        "run_id": "bank-r9",
+        "task_id": "bank-t9",
+    }
+    assert set(sensitive_activity) <= _ACTIVITY_ALLOWED_FIELDS
+
+    snap = {
+        "projects": [
+            {
+                "id": "BANK",
+                "display_name": "Bank",
+                "sensitive": True,
+                "repository_state": "ok",
+                "task_count": 40,
+                "active_run_count": 7,
+            },
+        ],
+        "active_runs": [sensitive_run],
+        "recent_runs": [],
+        "recent_activity": [sensitive_activity],
+        "artifacts": [],
+        "reports": [],
+    }
+
+    out = serialize_home(snap)
+
+    # queue[] entry: only the fixed, safe DTO fields — the fallback chain
+    # (task_type, since no "title" key exists) resolves to a category label,
+    # never anything resembling raw prompt/report content.
+    assert len(out["queue"]) == 1
+    queue_entry = out["queue"][0]
+    assert set(queue_entry.keys()) == {"title", "project", "progress", "state"}
+    assert queue_entry["title"] == "implementation"
+    assert queue_entry["project"] == "BANK"
+    assert queue_entry["state"] == "RUNNING"
+    for forbidden in ("message", "prompt", "report", "body", "text", "summary"):
+        assert forbidden not in queue_entry
+
+    # activity[] is a direct passthrough of `recent_activity` in this module
+    # (see serializers.py's `_overview`/`serialize_home` docs) — so it must
+    # carry only what the upstream allowlist already produced.
+    assert len(out["activity"]) == 1
+    activity_entry = out["activity"][0]
+    assert set(activity_entry.keys()) <= _ACTIVITY_ALLOWED_FIELDS
+    for forbidden in ("message", "prompt", "report", "body", "text", "title"):
+        assert forbidden not in activity_entry
+
+    # The project's own rollup entry stays fully redacted, as covered by the
+    # existing tests above — asserted here too since this fixture is BANK-only.
+    bank = next(p for p in out["projects"] if p["id"] == "BANK")
+    assert bank["redacted"] is True
+    assert "health" not in bank

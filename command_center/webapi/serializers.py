@@ -83,6 +83,32 @@ def _active_runs(snap: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _serialize_queue(active_runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # INTENTIONAL POLICY: `queue` (like `activity`/`status`/`overview.recent_
+    # activity_count`/`reviews` below) does no per-serializer field filtering
+    # of its own for a sensitive project's run. It inherits the upstream
+    # field-allowlist in `command_center/workspace_home.py`
+    # (`_RUN_ALLOWED_FIELDS`/`_ACTIVITY_ALLOWED_FIELDS`, applied by
+    # `sanitize_workspace_project_entry`) as the *authoritative* redaction
+    # boundary — that allowlist already permits project/task_type/state/
+    # run_id/timestamps to reach here for BANK/LEGAL runs, matching what the
+    # existing Streamlit Workspace Home page shows today. See
+    # `tests/webapi/test_serializers.py::
+    # test_serialize_home_sensitive_run_queue_and_activity_expose_only_allowlisted_fields`
+    # for the regression test pinning this.
+    #
+    # This is DELIBERATELY asymmetric with `kpis.agents`/`kpis.tasks` and the
+    # per-project raw counts in `_serialize_projects`/`_kpis` below, which
+    # ADDITIONALLY exclude sensitive projects entirely (not merely allowlist
+    # their fields) — because those are aggregates where a sensitive project's
+    # raw number could otherwise be recovered by subtraction (see `_kpis`).
+    # No such subtraction risk exists for `queue`/`activity`/`status`/
+    # `reviews`, since they only ever carry already-allowlisted per-entry
+    # fields, never a raw count to subtract from.
+    #
+    # Fully excluding sensitive-project rows from `queue`/`activity` (rather
+    # than allowlisting their fields) would be a *stricter* policy than what
+    # workspace_home.py's own Streamlit page does — that's a future policy
+    # decision, not something this module changes unilaterally.
     queue = []
     for r in active_runs:
         queue.append(
@@ -131,6 +157,12 @@ def _kpis(snap: dict[str, Any], raw_projects: list[dict[str, Any]], active_runs:
 
     total_tasks = sum(p.get("task_count", 0) for p in non_sensitive_projects)
 
+    # `reviews` (like `queue`/`activity`/`status` — see the policy comment
+    # above `_serialize_queue`) is a count over already-allowlisted `reports`
+    # entries (`_REPORT_ALLOWED_FIELDS` in workspace_home.py for sensitive
+    # projects); it is intentionally NOT excluded per-project the way
+    # `agents`/`tasks` above are, since a count alone carries no subtractable
+    # raw per-project number.
     reports = snap.get("reports") or []
     total_reviews = len(reports)
     pending_reviews = sum(1 for r in reports if not models.is_passing_verdict(r.get("verdict")))
@@ -181,6 +213,11 @@ def _health(raw_projects: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _overview(snap: dict[str, Any]) -> dict[str, Any]:
+    # `recent_activity_count` is a `len()` over the same upstream-allowlisted
+    # `recent_activity` list used for `activity` below — see the policy
+    # comment above `_serialize_queue`. Same reasoning: a bare count, so
+    # nothing sensitive is added or excluded here beyond what the allowlist
+    # already did.
     return {
         "reports_count": len(snap.get("reports") or []),
         "artifacts_count": len(snap.get("artifacts") or []),
