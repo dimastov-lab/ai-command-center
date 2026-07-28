@@ -8,6 +8,17 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### D1 final gate — cross-platform smoke pass (partial)
+
+- **Verification record added**: `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md` records the D1 final gate
+  (`docs/desktop/IMPLEMENTATION_ROADMAP.md` §"D1 final gate") smoke pass against
+  `DESKTOP_INCREMENT_1.md` §2's acceptance criteria. macOS Apple Silicon (real hardware): pass —
+  `pytest-qt` desktop suite green (28/28), `ruff check .` clean, real native-Qt launch with no
+  `streamlit`/`app.py` import on the startup path, and window-geometry/theme persistence verified
+  across a simulated restart. Windows 11 x64: not performed — no such machine was reachable from
+  this session, so the gate remains open (`AICC-D1-GATE` stays **Review**, not **Done**) pending a
+  Windows-hardware pass.
+
 ### Integrated runtime safety and architecture reconciliation
 
 #### Added
