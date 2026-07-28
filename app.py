@@ -21,6 +21,7 @@ from command_center import (
     launch_service,
     models,
     project_config,
+    read_model,
     recommend,
     report_parser,
     storage,
@@ -1262,10 +1263,11 @@ def render_task_card(
 
         if show_kanban_controls:
             current_status = task.get("status", KANBAN_COLUMNS[0])
+            status_options = task_view.kanban_status_options(current_status)
             new_status = st.selectbox(
                 "Статус",
-                KANBAN_COLUMNS,
-                index=KANBAN_COLUMNS.index(current_status) if current_status in KANBAN_COLUMNS else 0,
+                status_options,
+                index=status_options.index(current_status),
                 key=f"{key_prefix}_status_select",
                 label_visibility="collapsed",
             )
@@ -3472,6 +3474,7 @@ def build_commands() -> list[dict]:
 # live glyph, Inspector) has the task map + api available without a second pass.
 tasks = load_tasks()
 tasks_by_id = {task["id"]: task for task in tasks}
+task_counts = read_model.task_snapshot(tasks)
 project_configs = project_config.load_project_configs()
 
 page_key = shell.render_shell(
@@ -3640,7 +3643,11 @@ _ACTIVITY_LABELS: dict[str, str] = {
 }
 
 
-def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+def render_home_dashboard(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    counts: read_model.TaskSnapshot,
+) -> None:
     """The Home dashboard from the approved design — KPI tiles, execution queue,
     project health, recent activity, a Kanban overview and quick actions, with an
     AI-Supervisor side panel. Pure presentation over the live task/run state via
@@ -3658,11 +3665,12 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         s["display_status"] = _execution_center_display_status(s)
     board = live_board.split_board(sessions, display_status="display_status")
 
-    active = [t for t in tasks if t.get("status") != "Done"]
-    done = [t for t in tasks if t.get("status") == "Done"]
     running = board[live_board.BUCKET_LIVE]
-    needs_review = [t for t in tasks if t.get("launch_status") == "Needs Review"]
-    projects_with_tasks = {t.get("project") for t in active if t.get("project")}
+    projects_with_tasks = {
+        project_config.canonical_project_id(t.get("project")) or t.get("project")
+        for t in tasks
+        if t.get("project")
+    }
     attention = board[live_board.BUCKET_ATTENTION]
 
     greeting = f"{_home_greeting()} {owner}" if owner else _home_greeting()
@@ -3720,11 +3728,29 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
     # than a duplicated, misleading one.
     home_dashboard.kpi_tiles([
         home_dashboard.Kpi("Проекты", len(projects_with_tasks),
-                           "все активны" if not attention else f"{len(attention)} требуют внимания",
+                           (
+                               f"{counts.attention} задач требуют внимания"
+                               if counts.attention
+                               else "нет задач, требующих внимания"
+                           ),
                            "📁", "violet", ()),
         home_dashboard.Kpi("Агенты", len(running), runs_delta_txt, "🤖", "blue", ()),
-        home_dashboard.Kpi("Задачи", len(active), f"{len(done)} завершено", "✓", "green", ()),
-        home_dashboard.Kpi("Ревью", len(needs_review), f"{len(needs_review)} ожидают", "★", "amber", ()),
+        home_dashboard.Kpi(
+            "Задачи",
+            counts.total,
+            f"{counts.active} активных · {counts.done} завершено",
+            "✓",
+            "green",
+            (),
+        ),
+        home_dashboard.Kpi(
+            "Ревью",
+            counts.by_lane["Review"],
+            f"{counts.by_lane['Review']} в колонке Review",
+            "★",
+            "amber",
+            (),
+        ),
     ])
 
     # Clickable KPI deep-links (UX-2b): the inert HTML tiles above cannot host
@@ -3794,7 +3820,7 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
             # 200-capped run list. The old `len(running)*20` / `len(attention)*10`
             # multipliers were magic numbers dressing up counts as percentages.
             window_success = _window_success_rate(runs)
-            task_ratio = int(100 * len(done) / len(tasks)) if tasks else 0
+            task_ratio = int(100 * counts.done / counts.total) if counts.total else 0
             if window_success is None:
                 home_dashboard.health_gauge(0, "Нет данных за неделю", accent="slate")
             else:
@@ -3834,18 +3860,21 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
 
         with col_k:
             home_dashboard.card_open("Обзор Kanban", "Доска")
-            accents = ["slate", "blue", "green", "amber", "violet"]
-            cols = []
-            for i, lane in enumerate(models.KANBAN_STATUSES):
-                n = sum(1 for t in tasks if t.get("status") == lane)
-                cols.append((lane, n, accents[i % len(accents)]))
+            accents = ["slate", "blue", "green", "amber", "red", "violet"]
+            overview_lanes = list(read_model.CANONICAL_LANES)
+            cols = [
+                (lane, counts.by_lane[lane], accents[i % len(accents)])
+                for i, lane in enumerate(overview_lanes)
+            ]
+            if counts.other:
+                cols.append(("Другие", counts.other, "amber"))
             home_dashboard.kanban_overview(cols)
             home_dashboard.card_close()
             # Clickable Kanban columns (UX-2b): each lane count deep-links to the
             # Kanban board (the page-level filter defaults to "Все", so the
             # operator lands on the full board and can filter further).
-            kbtns = st.columns(len(models.KANBAN_STATUSES))
-            for i, lane in enumerate(models.KANBAN_STATUSES):
+            kbtns = st.columns(len(overview_lanes))
+            for i, lane in enumerate(overview_lanes):
                 with kbtns[i]:
                     if st.button(
                         f"→ {lane}",
@@ -3891,10 +3920,16 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         home_dashboard.card_open("Проекты")
         proj_rows = []
         for p in sorted(projects_with_tasks):
-            p_active = [t for t in active if project_config.project_matches(t.get("project"), p)]
+            project_tasks = [
+                t for t in tasks if project_config.project_matches(t.get("project"), p)
+            ]
+            project_counts = read_model.task_snapshot(project_tasks)
+            p_active = [
+                t for t in project_tasks if t.get("status") in read_model.ACTIVE_LANES
+            ]
             p_att = [t for t in p_active if t.get("launch_status") in ("Failed", "Requires Attention", "Blocked")]
             proj_rows.append({
-                "icon": "▪", "name": p, "meta": f"{len(p_active)} активных",
+                "icon": "▪", "name": p, "meta": f"{project_counts.active} активных",
                 "right": "Внимание" if p_att else "OK", "right_accent": "amber" if p_att else "green",
             })
         home_dashboard.simple_rows(proj_rows or [{"icon": "▪", "name": "Нет активных проектов", "meta": ""}])
@@ -4153,24 +4188,27 @@ def render_dashboard_analytics(
     api: runtime_api.ExecutionCenterAPI,
     tasks: list[dict],
     tasks_by_id: dict[str, dict],
+    counts: read_model.TaskSnapshot,
 ) -> None:
     """Compact cross-project analytics for the consolidated main dashboard."""
-    active_tasks = [task for task in tasks if task.get("status") != "Done"]
-    completed_tasks = [task for task in tasks if task.get("status") == "Done"]
-    blocked_tasks = [task for task in active_tasks if is_blocked(task, tasks_by_id)]
+    active_tasks = [task for task in tasks if task.get("status") in read_model.ACTIVE_LANES]
+    blocked_tasks = [task for task in tasks if task.get("status") == "Blocked"]
     completion_rate = (
-        round(len(completed_tasks) / len(tasks) * 100) if tasks else 0
+        round(counts.done / counts.total * 100) if counts.total else 0
     )
 
     with st.container(horizontal=True):
-        st.metric("Всего задач", len(tasks), border=True)
-        st.metric("Активные", len(active_tasks), border=True)
-        st.metric("Заблокированные", len(blocked_tasks), border=True)
+        st.metric("Всего задач", counts.total, border=True)
+        st.metric("Активные", counts.active, border=True)
+        st.metric("В статусе Blocked", counts.blocked, border=True)
         st.metric(
             "Выполнено",
-            f"{len(completed_tasks)} ({completion_rate}%)",
+            f"{counts.done} ({completion_rate}%)",
             border=True,
         )
+        if counts.other:
+            st.metric("Другие статусы", counts.other, border=True)
+        st.metric("Требуют внимания", counts.attention, border=True)
 
     left, right = st.columns([3, 2])
     with left:
@@ -4181,20 +4219,13 @@ def render_dashboard_analytics(
                 for task in tasks
                 if project_config.project_matches(task.get("project"), project)
             ]
-            active = sum(1 for task in project_tasks if task.get("status") != "Done")
-            done = sum(1 for task in project_tasks if task.get("status") == "Done")
-            blocked = sum(
-                1
-                for task in project_tasks
-                if task.get("status") != "Done"
-                and is_blocked(task, tasks_by_id)
-            )
+            project_counts = read_model.task_snapshot(project_tasks)
             with st.container(border=True):
                 cols = st.columns([3, 1, 1, 1, 1])
                 cols[0].markdown(f"**{project}**")
-                cols[1].metric("Актив.", active)
-                cols[2].metric("Блок.", blocked)
-                cols[3].metric("Готово", done)
+                cols[1].metric("Актив.", project_counts.active)
+                cols[2].metric("Blocked", project_counts.blocked)
+                cols[3].metric("Готово", project_counts.done)
                 if cols[4].button(
                     "Открыть",
                     key=f"dashboard_analytics_project_{project}",
@@ -4267,11 +4298,11 @@ if page_key == "dashboard":
     # discovery and analytics no longer execute invisibly on every overview
     # refresh, which keeps the home page responsive on large workspaces.
     if dashboard_section == "Аналитика":
-        render_dashboard_analytics(dashboard_api, tasks, tasks_by_id)
+        render_dashboard_analytics(dashboard_api, tasks, tasks_by_id, task_counts)
     elif dashboard_section == "Репозитории и артефакты":
         render_workspace_home_page(dashboard_api)
     else:
-        render_home_dashboard(dashboard_api, tasks)
+        render_home_dashboard(dashboard_api, tasks, task_counts)
 
 
 # --------------------------------------------------------------------------
@@ -4299,18 +4330,25 @@ elif page_key == "executive":
         active_runs=get_execution_center_api().list_runs(states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES),
     )
 
-    active_tasks = [task for task in tasks if task.get("status") != "Done"]
-    completed_tasks = [task for task in tasks if task.get("status") == "Done"]
-    blocked_tasks = [task for task in active_tasks if is_blocked(task, tasks_by_id)]
-    blocked_ids = {task["id"] for task in blocked_tasks}
-    completion_rate = f"{(len(completed_tasks) / len(tasks) * 100):.0f}%" if tasks else "—"
+    active_tasks = [
+        task for task in tasks if task.get("status") in read_model.ACTIVE_LANES
+    ]
+    blocked_tasks = [task for task in tasks if task.get("status") == "Blocked"]
+    completion_rate = (
+        f"{(task_counts.done / task_counts.total * 100):.0f}%"
+        if task_counts.total
+        else "—"
+    )
     total_estimate = sum(task.get("estimate_hours", 0.0) for task in active_tasks)
 
     with st.container(horizontal=True):
-        st.metric("Всего задач", len(tasks), border=True)
-        st.metric("Активные", len(active_tasks), border=True)
-        st.metric("Заблокированные", len(blocked_tasks), border=True)
-        st.metric("Выполнено", f"{len(completed_tasks)} ({completion_rate})", border=True)
+        st.metric("Всего задач", task_counts.total, border=True)
+        st.metric("Активные", task_counts.active, border=True)
+        st.metric("В статусе Blocked", task_counts.blocked, border=True)
+        st.metric("Выполнено", f"{task_counts.done} ({completion_rate})", border=True)
+        if task_counts.other:
+            st.metric("Другие статусы", task_counts.other, border=True)
+        st.metric("Требуют внимания", task_counts.attention, border=True)
         st.metric("Оценка нагрузки", format_estimate(total_estimate), border=True)
 
     st.divider()
@@ -4324,18 +4362,16 @@ elif page_key == "executive":
             # Canonical-id match (shared helper) so display-name tasks count
             # under their project — consistent with the Kanban lane and pill.
             project_tasks = [task for task in tasks if project_config.project_matches(task.get("project"), project)]
-            p_active = sum(1 for task in project_tasks if task.get("status") != "Done")
-            p_blocked = sum(1 for task in project_tasks if task["id"] in blocked_ids)
-            p_done = sum(1 for task in project_tasks if task.get("status") == "Done")
+            project_counts = read_model.task_snapshot(project_tasks)
             status_file = project_status_file_path(project)
 
             with st.container(border=True):
                 header_cols = st.columns([2, 1, 1, 1])
                 header_cols[0].markdown(f"**{project}**")
                 header_cols[0].caption(statuses.get(project, "—"))
-                header_cols[1].metric("Активн.", p_active)
-                header_cols[2].metric("Блок.", p_blocked)
-                header_cols[3].metric("Готово", p_done)
+                header_cols[1].metric("Активн.", project_counts.active)
+                header_cols[2].metric("Blocked", project_counts.blocked)
+                header_cols[3].metric("Готово", project_counts.done)
                 st.caption(f"Статус-файл обновлён: {format_mtime(status_file)}")
 
     with right:
@@ -4756,6 +4792,7 @@ elif page_key == "kanban":
     filtered_tasks = task_view.filter_kanban_tasks(
         tasks, project=project_filter, priorities=priority_filter
     )
+    filtered_counts = read_model.task_snapshot(filtered_tasks)
 
     kanban_git_status_cache: dict[str, dict] = {}
     kanban_api = get_execution_center_api()
@@ -4805,16 +4842,37 @@ elif page_key == "kanban":
     # Полноширинные вертикальные дорожки Kanban.
     # Горизонтальная разметка через st.columns сжимала карточки
     # и делала заголовки и элементы управления нечитаемыми.
-    for status in KANBAN_COLUMNS:
+    for status in read_model.CANONICAL_LANES:
         with st.container(border=True):
             status_tasks = [task for task in filtered_tasks if task.get("status") == status]
             st.markdown(f"**{status}**")
-            st.caption(f"{len(status_tasks)} задач")
+            st.caption(f"{filtered_counts.by_lane[status]} задач")
 
             if not status_tasks:
                 st.caption("Пусто")
 
             for task in status_tasks:
+                render_task_card(
+                    task,
+                    tasks=tasks,
+                    tasks_by_id=tasks_by_id,
+                    key_prefix=f"kanban_{task.get('id')}",
+                    git_status_cache=kanban_git_status_cache,
+                    completion=completions_by_task.get(task.get("id")),
+                    live_progress=_kanban_live_progress(task),
+                    show_kanban_controls=True,
+                )
+
+    if filtered_counts.other:
+        with st.container(border=True):
+            other_tasks = [
+                task
+                for task in filtered_tasks
+                if task.get("status") not in read_model.CANONICAL_LANES
+            ]
+            st.markdown("**Другие статусы**")
+            st.caption(f"{filtered_counts.other} задач")
+            for task in other_tasks:
                 render_task_card(
                     task,
                     tasks=tasks,
@@ -4839,8 +4897,7 @@ elif page_key == "agents":
     for task_type in TASK_TYPES:
         meta = AGENT_ROLES[task_type]
         type_tasks = [task for task in tasks if task.get("task_type") == task_type]
-        active_count = sum(1 for task in type_tasks if task.get("status") != "Done")
-        done_count = len(type_tasks) - active_count
+        type_counts = read_model.task_snapshot(type_tasks)
         generated_count = sum(1 for path in generated_files if artifacts.infer_task_type_from_filename(path) == task_type)
 
         with st.container(border=True):
@@ -4848,8 +4905,8 @@ elif page_key == "agents":
             st.caption(f"`{task_type}` · {meta['summary']}")
 
             metric_cols = st.columns(3)
-            metric_cols[0].metric("Активные задачи", active_count)
-            metric_cols[1].metric("Завершено", done_count)
+            metric_cols[0].metric("Активные задачи", type_counts.active)
+            metric_cols[1].metric("Завершено", type_counts.done)
             metric_cols[2].metric("Сгенерировано файлов", generated_count)
 
             with st.expander("Правила выполнения"):
@@ -5720,18 +5777,19 @@ elif page_key == "workspace":
     for project in models.PROJECT_IDS:
         project_file = project_status_file_path(project)
         context_name = CONTEXT_FILES.get(project)
-        project_active = sum(
-            1
+        project_tasks = [
+            task
             for task in tasks
-            if project_config.project_matches(task.get("project"), project) and task.get("status") != "Done"
-        )
+            if project_config.project_matches(task.get("project"), project)
+        ]
+        project_counts = read_model.task_snapshot(project_tasks)
         project_generated = artifacts.list_markdown_files(GENERATED_DIR / project)
         last_activity = format_mtime(project_generated[0]) if project_generated else "—"
 
         with st.container(border=True):
             header_cols = st.columns([3, 1, 1])
             header_cols[0].markdown(f"**{project}**")
-            header_cols[1].metric("Активные", project_active)
+            header_cols[1].metric("Активные", project_counts.active)
             header_cols[2].caption(f"Активность: {last_activity}")
 
             st.code(str(project_file), language=None)
@@ -5829,14 +5887,13 @@ elif page_key == "focus":
                 st.divider()
 
                 _focus_status = task.get("status", "Backlog")
+                _focus_status_options = task_view.kanban_status_options(_focus_status)
                 new_status = st.selectbox(
                     "Статус",
-                    KANBAN_COLUMNS,
-                    # Guard like the task card / Kanban do: a non-canonical status
-                    # (e.g. "Blocked", which the board treats as live but is not a
-                    # column) would make .index() raise ValueError and crash Focus
-                    # Mode (audit M1). Fall back to the first column instead.
-                    index=KANBAN_COLUMNS.index(_focus_status) if _focus_status in KANBAN_COLUMNS else 0,
+                    _focus_status_options,
+                    # Preserve a legacy/unknown value while viewing the page;
+                    # selecting another option is the explicit migration.
+                    index=_focus_status_options.index(_focus_status),
                     key=f"focus_status_{task_id}",
                 )
                 if new_status != task.get("status"):

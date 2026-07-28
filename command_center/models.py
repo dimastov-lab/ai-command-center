@@ -199,6 +199,7 @@ EXECUTION_STAGES: list[str] = [
     "Validation",
     "Tests Passed",
     "PR Ready",
+    "Completed Locally",
     "Merged",
 ]
 
@@ -211,6 +212,7 @@ STAGE_PROGRESS: dict[str, int] = {
     "Validation": 75,
     "Tests Passed": 90,
     "PR Ready": 95,
+    "Completed Locally": 100,
     "Merged": 100,
 }
 

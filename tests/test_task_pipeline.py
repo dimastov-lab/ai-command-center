@@ -571,7 +571,9 @@ def test_terminal_completion_rows_are_never_repolicied(tmp_path, git_repo, api):
 # --------------------------------------------------------------------------
 
 
-def test_verified_completion_moves_the_task_to_done(tmp_path, git_repo, api):
+def test_local_only_completion_moves_the_task_to_done_without_claiming_merge(
+    tmp_path, git_repo, api
+):
     row = _seed_completion(api, git_repo)
     runtime_db.update_completion(
         api.db_path,
@@ -587,8 +589,9 @@ def test_verified_completion_moves_the_task_to_done(tmp_path, git_repo, api):
     persisted = {t["id"]: t for t in tasks_repository.load_tasks(tmp_path)}
     assert persisted["a"]["status"] == "Done"
     assert persisted["a"]["launch_status"] == "Completed"
-    assert persisted["a"]["current_stage"] == "Merged"
+    assert persisted["a"]["current_stage"] == "Completed Locally"
     assert persisted["a"]["progress"] == 100
+    assert persisted["a"].get("pull_request_status") != "merged"
 
 
 def test_verified_completion_repairs_stale_execution_fields_on_done_task(
@@ -599,7 +602,14 @@ def test_verified_completion_repairs_stale_execution_fields_on_done_task(
         api.db_path,
         row["run_id"],
         expected_version=row["version"],
-        fields={"completion_state": completion_domain.CompletionState.COMPLETED},
+        fields={
+            "completion_state": completion_domain.CompletionState.COMPLETED,
+            # A genuinely *verified* completion reaches COMPLETED only after its
+            # merge is confirmed in the target branch, so it always carries the
+            # merged-PR evidence. Without it this would be an `allow_local_only`
+            # completion, which must NOT be labelled "merged" (audit D4).
+            "pull_request_url": "https://github.com/x/y/pull/1",
+        },
     )
     task = _task(
         id="a",
