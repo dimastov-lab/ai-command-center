@@ -139,6 +139,10 @@ def test_attention_triage_fix_relaunches_a_failed_task(git_repo, configure_proje
     runs_for_task = [r for r in runtime_db.list_runs(api.db_path, limit=50) if r.get("task_id") == task["id"]]
     assert len(runs_for_task) >= 2, "Исправить must create a new attempt for the task"
     newest = max(runs_for_task, key=lambda r: r.get("created_at") or "")
+    assert newest["task_type"] == "remediation", (
+        "Исправить must launch a write-capable remediation attempt even when "
+        "the failed task itself was a read-only review"
+    )
     _wait_for_report(api.db_path, newest["id"])
 
 
