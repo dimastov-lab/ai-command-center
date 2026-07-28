@@ -890,13 +890,14 @@ def apply_merge_policy(
     """Reconcile every pre-merge completion row's persisted merge *policy* with
     the current opt-in, and return one audit record per row actually changed.
 
-    This function decides nothing about whether a PR may merge. It writes
-    `merge_mode`/`policy_json` and nothing else; every real gate — checks
-    passing, a required review, mergeability, conflicts, the closed-unmerged
-    recovery rules — stays where it already is, in `CompletionEvaluator`. A row
-    whose policy already matches is left completely untouched (no write, no
-    version bump, no audit event), which is what makes calling this twice per
-    tick free."""
+    This function decides nothing about whether a PR may merge. It writes the
+    policy only, except that a row upgraded from manual to automatic is made
+    immediately due by clearing the manual wait's retry timer and counter.
+    Every real gate — checks passing, a required review, mergeability,
+    conflicts, the closed-unmerged recovery rules — stays where it already is,
+    in `CompletionEvaluator`. A row whose policy already matches is left
+    completely untouched (no write, no version bump, no audit event), which is
+    what makes calling this twice per tick free."""
     updates: list[dict] = []
     rows = runtime_db.list_completions(
         db_path, states=sorted(_REPOLICIABLE_STATES), limit=COMPLETION_SCAN_LIMIT
@@ -907,12 +908,26 @@ def apply_merge_policy(
         if policy.merge_mode == desired and row.get("merge_mode") == desired:
             continue
         updated_policy = CompletionPolicy.from_dict({**policy.to_dict(), "merge_mode": desired})
+        fields: dict[str, object] = {
+            "merge_mode": desired,
+            "policy_json": updated_policy.to_json(),
+        }
+        if (
+            policy.merge_mode == completion_domain.MERGE_MANUAL
+            and desired != completion_domain.MERGE_MANUAL
+        ):
+            # Manual waiting deliberately backs off for an hour. Retaining that
+            # timer after an explicit auto-merge opt-in makes the switch appear
+            # broken and also carries a large manual-poll retry count into the
+            # automatic policy. The next completion advance must evaluate the
+            # PR now, with a fresh retry budget.
+            fields.update({"next_retry_at": None, "retry_count": 0})
         try:
             runtime_db.update_completion(
                 db_path,
                 row["run_id"],
                 expected_version=row["version"],
-                fields={"merge_mode": desired, "policy_json": updated_policy.to_json()},
+                fields=fields,
             )
         except (runtime_db.LostUpdateError, KeyError):
             # A concurrent advancer moved (or removed) the row between the list
