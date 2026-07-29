@@ -36,7 +36,7 @@ from command_center import (
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
 from command_center.runtime import db as runtime_db
-from command_center.runtime import log_tail, project_overview, runs_read, scheduler, session_view, task_sync
+from command_center.runtime import log_tail, project_overview, runs_read, scheduler, session_view
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
@@ -3111,12 +3111,14 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # board.
     tick_result = _maybe_run_autopilot_tick(api)
 
-    def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
-        return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
-
-    tasks, _mutated_tasks = tasks_repository.mutate_tasks(
-        ROOT, _sync_mutator, persist_if=lambda result: bool(result[1])
-    )
+    # Reconcile live runs + re-project execution state, then project every
+    # *verified* completion onto the Kanban `Done` lane. The completion
+    # projection previously ran only inside the (default-off) autopilot tick, so
+    # a merge verified present in the target branch never reached the board
+    # unless autopilot was enabled — stranding genuinely merged tasks in Backlog
+    # with their dependents blocked (audit DATA-D2). `sync_on_refresh` is
+    # idempotent and persists only on change, so it is safe on every refresh.
+    tasks, _projected_done_ids = task_pipeline.sync_on_refresh(ROOT, api)
 
     # Queue readiness has no poller of its own (see `execution_queue`'s
     # module docstring — no hidden scheduler); it piggybacks on this

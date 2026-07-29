@@ -796,7 +796,16 @@ class CodexProvider:
         availability = self.availability()
         if not availability.available or not availability.executable:
             raise RuntimeError(availability.message)
-        sandbox = "read-only" if task_type in agent_runner.READ_ONLY_TASK_TYPES else "workspace-write"
+        # Provenance-aware sandbox (audit SEC-D-01): resolve the same execution
+        # profile the Claude path uses, so an untrusted (imported) non-read-only
+        # task is downgraded to the read-only sandbox — no command execution, no
+        # worktree writes — unless an operator has explicitly elevated it. Keying
+        # the sandbox on `task_type` alone let a prompt-injected imported task
+        # obtain `workspace-write` just by being run through the Codex executor.
+        profile = agent_runner.profile_for_task(
+            task_type, untrusted=untrusted, operator_elevated=operator_elevated
+        )
+        sandbox = "read-only" if profile == agent_runner.PROFILE_READ_ONLY else "workspace-write"
         argv = [
             availability.executable,
             "exec",

@@ -654,6 +654,57 @@ def test_projecting_completions_is_idempotent(tmp_path, git_repo, api):
     assert task_pipeline.project_verified_completions(tmp_path, db_path=api.db_path) == []
 
 
+def test_refresh_sync_projects_verified_completion_without_autopilot(
+    tmp_path, git_repo, api
+):
+    """Audit DATA-D2: a verified (COMPLETED) merge must reach the board on the
+    ordinary refresh tick, not only under the default-off autopilot. The refresh
+    entry point (`sync_on_refresh`) both reconciles execution state and projects
+    verified completions, so a genuinely merged task can never stay stuck in
+    Backlog with its dependents blocked."""
+    row = _seed_completion(api, git_repo)
+    runtime_db.update_completion(
+        api.db_path,
+        row["run_id"],
+        expected_version=row["version"],
+        fields={"completion_state": completion_domain.CompletionState.COMPLETED},
+    )
+    task = _task(id="a", workspace_path=str(git_repo))
+    tasks_repository.save_tasks(tmp_path, [task])
+
+    tasks, moved = task_pipeline.sync_on_refresh(tmp_path, api)
+
+    assert moved == ["a"]
+    assert {t["id"]: t for t in tasks}["a"]["status"] == "Done"
+    # Idempotent: a second refresh tick moves nothing and rewrites nothing.
+    _tasks2, moved2 = task_pipeline.sync_on_refresh(tmp_path, api)
+    assert moved2 == []
+
+
+def test_unverified_done_ids_flags_done_without_a_verified_completion(
+    tmp_path, git_repo, api
+):
+    """Audit DATA-D1: a task the board shows as `Done` but with no engine-
+    verified (`COMPLETED`) completion — moved there by a manual lane change or a
+    verbatim import — is reported as unverified, so the UI can mark it 'not
+    verified' instead of rendering it as an indistinguishable real merged result.
+    A Done task backed by a COMPLETED completion, and any non-Done task, are
+    excluded."""
+    row = _seed_completion(api, git_repo)
+    runtime_db.update_completion(
+        api.db_path,
+        row["run_id"],
+        expected_version=row["version"],
+        fields={"completion_state": completion_domain.CompletionState.COMPLETED},
+    )
+    verified = _task(id="a", workspace_path=str(git_repo), status="Done")
+    manual = _task(id="manual", status="Done")
+    backlog = _task(id="b", status="Backlog")
+    tasks_repository.save_tasks(tmp_path, [verified, manual, backlog])
+
+    assert task_pipeline.unverified_done_ids(tmp_path, db_path=api.db_path) == ["manual"]
+
+
 # --------------------------------------------------------------------------
 # Result serialization (the audit trail / UI render model)
 # --------------------------------------------------------------------------

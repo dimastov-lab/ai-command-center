@@ -1769,6 +1769,63 @@ def project_verified_completions(root: Path, *, db_path: Path) -> list[str]:
     return result[0]
 
 
+def sync_on_refresh(root: Path, api) -> tuple[list[dict], list[str]]:
+    """The data work of one dashboard refresh tick, independent of Streamlit so
+    it can be tested and reused.
+
+    Two steps, in order: (1) reconcile live runs and re-project execution state
+    onto every task (`task_sync.reconcile_and_sync`), then (2) project every
+    *verified* completion onto the Kanban `Done` lane
+    (`project_verified_completions`).
+
+    Step 2 previously ran only inside the desktop-autopilot tick, so a merge that
+    was verified present in the target branch never reached `Done` unless
+    autopilot (default-off) was enabled — leaving a genuinely merged task stuck
+    in Backlog with its dependents blocked (audit DATA-D2). Both steps are
+    idempotent and only persist on change, so the always-on refresh can call this
+    on every tick regardless of autopilot.
+
+    Returns the freshly loaded task list and the ids moved to `Done` this tick."""
+
+    def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
+        return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
+
+    tasks, _mutated = tasks_repository.mutate_tasks(
+        root, _sync_mutator, persist_if=lambda result: bool(result[1])
+    )
+    moved = project_verified_completions(root, db_path=api.db_path)
+    if moved:
+        tasks = tasks_repository.load_tasks(root)
+    return tasks, moved
+
+
+def unverified_done_ids(root: Path, *, db_path: Path) -> list[str]:
+    """Ids of tasks the board shows as `Done` that are NOT backed by a verified
+    (engine-`COMPLETED`) completion.
+
+    A task reaches `Done` three ways the board cannot tell apart (audit DATA-D1):
+    the gated projection of a completion whose merge is verified present in the
+    target branch, an operator's manual lane change, and a verbatim import. This
+    returns exactly the `Done` tasks whose completion has not reached
+    `COMPLETED` — a manual/administrative close, or a merge only reported but
+    never verified — so the UI can mark them 'not verified' rather than render an
+    unverified close as an indistinguishable real merged result."""
+    unverified: list[str] = []
+    for task in tasks_repository.load_tasks(root):
+        if task.get("status") != "Done":
+            continue
+        task_id = task.get("id")
+        if not task_id:
+            continue
+        row = runtime_db.get_completion_by_task(db_path, task_id)
+        if (
+            row is None
+            or row.get("completion_state") != completion_domain.CompletionState.COMPLETED
+        ):
+            unverified.append(task_id)
+    return unverified
+
+
 def mutate_moved(root: Path, mutator) -> list[str]:
     """`tasks_repository.mutate_tasks` with a persist-only-if-something-moved
     guard, so an idle tick costs an (uncontended) lock acquisition but no disk

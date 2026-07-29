@@ -64,7 +64,13 @@ def task_snapshot(tasks: list[dict]) -> TaskSnapshot:
             by_lane[status] += 1
         else:
             other += 1
-        if task.get("launch_status") == "Requires Attention" or task.get("regressed_after_done"):
+        # A resolved (Done) task must not also be counted as attention on the
+        # strength of a stale `launch_status` — that renders one task as both
+        # Done and needing-attention on adjacent widgets (audit DATA-D4). A Done
+        # task needs attention only via an explicit post-Done regression flag.
+        if task.get("regressed_after_done") or (
+            status != "Done" and task.get("launch_status") == "Requires Attention"
+        ):
             attention += 1
     return TaskSnapshot(
         total=len(tasks),

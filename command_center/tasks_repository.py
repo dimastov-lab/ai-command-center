@@ -279,6 +279,7 @@ def new_task_record(
     branch: str | None = None,
     executor: str | None = None,
     prompt: str | None = None,
+    untrusted_import: bool = False,
 ) -> dict:
     """`title` is the short, dedicated heading (Название задачи); `goal`
     (Цель задачи) is the independent objective description. If `goal` is
@@ -326,6 +327,12 @@ def new_task_record(
         record["agent"] = executor
     if prompt:
         record["prompt"] = prompt
+    if untrusted_import:
+        # App-set provenance flag: the task originates from untrusted content
+        # (an imported package, or a candidate parsed from an agent report) and
+        # must run read-only by default. `agent_runner.is_untrusted_task` gates
+        # on exactly this flag (audit D7 / SEC-1 / SEC-D-02).
+        record["untrusted_import"] = True
     models.append_timeline_event(record, "task_created", f"Задача создана: {title}")
     return record
 
@@ -416,8 +423,15 @@ def update_task_status(root: Path, task_id: str, new_status: str) -> dict | None
                 task["status"] = new_status
                 task["updated_at"] = models.iso_now()
                 if new_status == "Done":
-                    models.set_current_stage(task, "Merged")
-                    models.append_timeline_event(task, "merged", "Задача перемещена в статус Done.")
+                    # A manual/administrative move to Done is NOT evidence of a
+                    # merge — only the completion projection (gated on a target-
+                    # verified merge) may claim "Merged". Record the move
+                    # truthfully and leave the execution stage untouched, so a
+                    # stale "Merged" is never stamped onto a task that nothing
+                    # actually merged (audit DATA-D3).
+                    models.append_timeline_event(
+                        task, "status_changed", f"Задача переведена в статус {new_status}."
+                    )
                 return task
         return None
 
