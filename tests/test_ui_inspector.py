@@ -85,22 +85,42 @@ def test_selecting_task_via_button_updates_inspector_selection():
 
 
 def test_top_bar_live_status_glyph_aggregates_counts():
-    """The glyph is computed from `count_runs`; stub the api to return counts."""
+    """The glyph is computed from the non-superseded run snapshot (audit D5);
+    stub `list_runs` to return the raw run rows."""
     from command_center.ui import top_bar
 
     class _FakeAPI:
-        def count_runs(self, *, states=None):
-            counts = {
-                frozenset(["RUNNING", "QUEUED", "PREPARED"]): 3,
-                frozenset(["QUEUED", "PREPARED"]): 1,
-                frozenset(["FAILED"]): 2,
-            }
-            return counts.get(frozenset(states or []), 0)
+        def list_runs(self, *, limit=None):
+            return [
+                {"id": "r1", "task_id": "A", "started_at": "1", "state": "RUNNING"},
+                {"id": "r2", "task_id": "B", "started_at": "1", "state": "RUNNING"},
+                {"id": "r3", "task_id": "C", "started_at": "1", "state": "RUNNING"},
+                {"id": "r4", "task_id": "D", "started_at": "1", "state": "QUEUED"},
+                {"id": "r5", "task_id": "E", "started_at": "1", "state": "FAILED"},
+                {"id": "r6", "task_id": "F", "started_at": "1", "state": "FAILED"},
+            ]
 
     glyph = top_bar._live_status_glyph(_FakeAPI())
     assert "⏺ 3" in glyph
     assert "⏸ 1" in glyph
     assert "⚠ 2" in glyph
+
+
+def test_top_bar_live_status_glyph_ignores_superseded_failures():
+    """A failed run a task has since retried must not keep counting as attention
+    in the header — it agrees with the strip/supervisor (audit D5)."""
+    from command_center.ui import top_bar
+
+    class _FakeAPI:
+        def list_runs(self, *, limit=None):
+            return [
+                {"id": "old", "task_id": "T", "started_at": "1", "state": "FAILED"},
+                {"id": "new", "task_id": "T", "started_at": "2", "state": "RUNNING"},
+            ]
+
+    glyph = top_bar._live_status_glyph(_FakeAPI())
+    assert "⚠" not in glyph
+    assert "⏺ 1" in glyph
 
 
 def test_top_bar_glyph_empty_when_no_api():
