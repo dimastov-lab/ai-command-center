@@ -279,6 +279,7 @@ def new_task_record(
     branch: str | None = None,
     executor: str | None = None,
     prompt: str | None = None,
+    untrusted_import: bool = False,
 ) -> dict:
     """`title` is the short, dedicated heading (Название задачи); `goal`
     (Цель задачи) is the independent objective description. If `goal` is
@@ -326,6 +327,12 @@ def new_task_record(
         record["agent"] = executor
     if prompt:
         record["prompt"] = prompt
+    if untrusted_import:
+        # App-set provenance flag: the task originates from untrusted content
+        # (an imported package, or a candidate parsed from an agent report) and
+        # must run read-only by default. `agent_runner.is_untrusted_task` gates
+        # on exactly this flag (audit D7 / SEC-1 / SEC-D-02).
+        record["untrusted_import"] = True
     models.append_timeline_event(record, "task_created", f"Задача создана: {title}")
     return record
 
