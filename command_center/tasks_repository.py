@@ -84,6 +84,9 @@ def normalize_task(task: dict) -> dict:
     task.setdefault("updated_at", task.get("created_at", ""))
     models.normalize_task_workflow(task)
     models.normalize_task_execution(task)
+    # Heal a legacy unbounded timeline on read; the next save persists the bound
+    # (perf root cause — see models.MAX_TIMELINE_EVENTS).
+    models.trim_timeline(task)
     return task
 
 
