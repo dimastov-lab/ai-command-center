@@ -61,6 +61,17 @@ def test_attention_counts_requires_attention_and_regressed_after_done():
     assert snap.attention == 2
 
 
+def test_done_task_with_stale_requires_attention_is_not_double_counted():
+    """A task in the Done lane whose stale `launch_status` is "Requires Attention"
+    (its completion was rejected but the lane never moved) must NOT also be
+    counted as attention — that is one task rendered as both Done and needing-
+    attention on adjacent widgets (audit DATA-D4). Only an explicit
+    `regressed_after_done` flag makes a resolved (Done) task need attention."""
+    snap = read_model.task_snapshot([{"status": "Done", "launch_status": "Requires Attention"}])
+    assert snap.done == 1
+    assert snap.attention == 0
+
+
 def test_empty_task_list_is_all_zeros():
     snap = read_model.task_snapshot([])
     assert snap.total == 0
