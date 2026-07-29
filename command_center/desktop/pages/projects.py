@@ -7,6 +7,7 @@ the existing ``project_config`` functions verbatim). D1 states this honestly.
 
 from __future__ import annotations
 
+from .. import i18n
 from ..components.empty_state import EmptyState
 from .base_page import BasePage
 
@@ -15,14 +16,12 @@ class ProjectsPage(BasePage):
     def __init__(self, parent=None) -> None:
         super().__init__(
             "projects",
-            "Projects",
-            "Repository status, worktrees, and per-project configuration.",
+            i18n.PROJECTS_TITLE,
+            i18n.PROJECTS_SUBTITLE,
             parent,
         )
         empty = EmptyState(
-            "Project configuration is not wired yet",
-            "Viewing and editing each project's repository path, and its worktree "
-            "and repository state, will appear here. This activates in a later "
-            "increment, backed by the existing project configuration service.",
+            i18n.PROJECTS_EMPTY_TITLE,
+            i18n.PROJECTS_EMPTY_BODY,
         )
         self.add_content(empty, stretch=1)

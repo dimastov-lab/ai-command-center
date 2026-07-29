@@ -13,6 +13,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QButtonGroup, QLabel, QVBoxLayout, QWidget
 
 from . import tokens
+from . import i18n
 from .navigation_item import NavigationItem
 from .sections import SECTIONS, Section
 
@@ -24,7 +25,7 @@ class Sidebar(QWidget):
         super().__init__(parent)
         self.setObjectName("Sidebar")
         self.setFixedWidth(220)
-        self.setAccessibleName("Primary navigation")
+        self.setAccessibleName(i18n.NAV_ACCESSIBLE)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(
@@ -32,7 +33,7 @@ class Sidebar(QWidget):
         )
         layout.setSpacing(tokens.SPACE_XS)
 
-        title = QLabel("SECTIONS")
+        title = QLabel(i18n.NAV_HEADER)
         title.setObjectName("SidebarTitle")
         layout.addWidget(title)
 

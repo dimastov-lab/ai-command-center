@@ -13,15 +13,15 @@ from __future__ import annotations
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QButtonGroup, QGroupBox, QRadioButton, QVBoxLayout
 
-from .. import tokens
+from .. import i18n, tokens
 from ..components.empty_state import EmptyState
 from ..theme import ThemeMode
 from .base_page import BasePage
 
 _MODE_LABELS: tuple[tuple[ThemeMode, str], ...] = (
-    (ThemeMode.LIGHT, "Light"),
-    (ThemeMode.DARK, "Dark"),
-    (ThemeMode.SYSTEM, "System (follow OS appearance)"),
+    (ThemeMode.LIGHT, i18n.THEME_LIGHT),
+    (ThemeMode.DARK, i18n.THEME_DARK),
+    (ThemeMode.SYSTEM, i18n.THEME_SYSTEM),
 )
 
 
@@ -31,13 +31,13 @@ class SettingsPage(BasePage):
     def __init__(self, current_mode: ThemeMode, parent=None) -> None:
         super().__init__(
             "settings",
-            "Settings",
-            "Appearance, window, and workspace preferences.",
+            i18n.SETTINGS_TITLE,
+            i18n.SETTINGS_SUBTITLE,
             parent,
         )
 
-        appearance = QGroupBox("Appearance")
-        appearance.setAccessibleName("Appearance settings")
+        appearance = QGroupBox(i18n.SETTINGS_APPEARANCE_GROUP)
+        appearance.setAccessibleName(i18n.SETTINGS_APPEARANCE_ACCESSIBLE)
         box = QVBoxLayout(appearance)
         box.setContentsMargins(
             tokens.SPACE_LG, tokens.SPACE_LG, tokens.SPACE_LG, tokens.SPACE_LG
@@ -49,7 +49,7 @@ class SettingsPage(BasePage):
         self._buttons: dict[ThemeMode, QRadioButton] = {}
         for mode, label in _MODE_LABELS:
             radio = QRadioButton(label)
-            radio.setAccessibleName(f"{label} theme")
+            radio.setAccessibleName(i18n.theme_accessible_name(label))
             radio.setChecked(mode is current_mode)
             radio.toggled.connect(
                 lambda checked, m=mode: checked and self.theme_mode_changed.emit(m)
@@ -61,9 +61,8 @@ class SettingsPage(BasePage):
         self.add_content(appearance)
 
         placeholder = EmptyState(
-            "More preferences are coming",
-            "Density, window-geometry reset, and workspace preferences will appear "
-            "here in a later increment.",
+            i18n.SETTINGS_MORE_TITLE,
+            i18n.SETTINGS_MORE_BODY,
         )
         self.add_content(placeholder, stretch=1)
 

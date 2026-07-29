@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 
+from .. import i18n
 from ..components.empty_state import EmptyState
 from .base_page import BasePage
 
@@ -20,16 +21,14 @@ class HomePage(BasePage):
     def __init__(self, parent=None) -> None:
         super().__init__(
             "home",
-            "Home",
-            "Cross-project rollup of projects, runs, and activity.",
+            i18n.HOME_TITLE,
+            i18n.HOME_SUBTITLE,
             parent,
         )
         empty = EmptyState(
-            "Workspace Home is not wired yet",
-            "Your cross-project rollup — projects, active runs, recent activity, "
-            "artifacts and reports — will appear here. Live data wiring lands in a "
-            "later increment. For now, configure a project to get started.",
-            action_label="Go to Projects",
+            i18n.HOME_EMPTY_TITLE,
+            i18n.HOME_EMPTY_BODY,
+            action_label=i18n.HOME_EMPTY_ACTION,
             on_action=lambda: self.navigate_requested.emit("projects"),
         )
         self.add_content(empty, stretch=1)
