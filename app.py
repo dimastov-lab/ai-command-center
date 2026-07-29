@@ -796,7 +796,7 @@ def render_agent_launcher(
         # elevation to full development capability (Bash) at the point of launch.
         elevate_trust = False
         untrusted_import = bool(
-            task_for_launch and agent_runner.is_untrusted_source(task_for_launch.get("source"))
+            task_for_launch and agent_runner.is_untrusted_task(task_for_launch)
         ) and task_type not in agent_runner.READ_ONLY_TASK_TYPES
         if untrusted_import:
             st.warning(

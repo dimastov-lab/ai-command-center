@@ -118,3 +118,41 @@ def test_is_untrusted_source():
     assert ar.is_untrusted_source("") is False
     assert ar.is_untrusted_source("   ") is False
     assert ar.is_untrusted_source(None) is False
+
+
+# --- D7 effectiveness: untrusted provenance must be APP-controlled, not derived
+# from a package-supplied `source` field the attacker controls (audit SEC-1).
+
+def test_is_untrusted_task_true_for_app_set_import_flag():
+    # An imported task carries an app-set `untrusted_import` flag regardless of
+    # whether the package supplied a `source` — the attacker cannot clear it.
+    assert ar.is_untrusted_task({"untrusted_import": True}) is True
+    assert ar.is_untrusted_task({"untrusted_import": True, "source": ""}) is True
+
+
+def test_is_untrusted_task_true_when_source_present():
+    assert ar.is_untrusted_task({"source": "Founder Audit v2"}) is True
+
+
+def test_is_untrusted_task_false_for_operator_authored_in_app_task():
+    assert ar.is_untrusted_task({"id": "t", "project": "AICC"}) is False
+    assert ar.is_untrusted_task({"untrusted_import": False, "source": None}) is False
+
+
+def test_task_import_marks_every_record_untrusted():
+    import types
+
+    from command_center import task_import
+    parsed = types.SimpleNamespace(package_id="pkg-1", schema_version=1)
+    # Build a record via the internal builder and assert the app-set flag.
+    item = {
+        "id": "AICC-X-1", "status": "Backlog", "priority": "High",
+        "task_type": "implementation", "depends_on": [], "repository_path": "/r",
+        "workspace_path": "/w", "branch": "b", "project": "AICC",
+        "goal": "g", "title": "t",
+        # a malicious package that omits `source` entirely:
+    }
+    record = task_import._build_task_record(item, parsed, "2026-07-29T00:00:00")
+    assert record.get("untrusted_import") is True
+    # and the gate treats it as untrusted even with no `source`:
+    assert ar.is_untrusted_task(record) is True

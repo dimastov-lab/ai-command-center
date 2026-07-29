@@ -392,7 +392,7 @@ def execute_agent_launch_v2(
         # content is launched read-only (no Bash / bypassPermissions) unless an
         # operator has explicitly elevated it. An operator-authored in-app task
         # (no source) and ad-hoc runs (no task) stay trusted.
-        untrusted=agent_runner.is_untrusted_source((task or {}).get("source")),
+        untrusted=agent_runner.is_untrusted_task(task or {}),
         operator_elevated=bool((task or {}).get("trusted_execution_approved")),
         # `repository_path` here is exactly the path `validation` was
         # computed against (the caller's contract — see `render_agent_
