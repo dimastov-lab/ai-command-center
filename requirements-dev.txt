@@ -18,3 +18,9 @@ pytest-qt>=4.4,<5.0
 # FastAPI/Starlette's TestClient dependency. The production API does not need
 # this package, but clean CI environments need it to collect endpoint tests.
 httpx2>=2.9,<3.0
+# Real-browser E2E driver (tests/test_e2e_status_projection.py). The package
+# alone lets the suite collect and *skip* the E2E when no browser is present
+# (the required gate); the informational CI E2E step installs Chromium
+# (`python -m playwright install chromium`) so it actually runs there. Held to
+# the validated 1.x line.
+playwright>=1.55,<2.0
