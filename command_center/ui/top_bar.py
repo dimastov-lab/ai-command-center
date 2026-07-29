@@ -12,26 +12,29 @@ from __future__ import annotations
 
 import streamlit as st
 
-from command_center.runtime import db as runtime_db
+from command_center import read_model
 from command_center.ui import inspector
 
 
 def _live_status_glyph(api) -> str:
     """Compact ``⏺N ⏸M ⚠K`` summary of live execution — the one piece of
-    cross-page context an operator glances at the top bar for. Cheap: three
-    ``count_runs`` queries, no row materialization."""
+    cross-page context an operator glances at the top bar for. Counts the
+    *non-superseded* latest attempt of each task through the shared read-model,
+    so ⚠ agrees with the Execution Strip and the AI-Supervisor caption instead of
+    showing an all-time FAILED tally that overstated attention (audit D5). One
+    bounded `list_runs` replaces the three all-time `count_runs` queries."""
     if api is None:
         return ""
-    running = api.count_runs(states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES)
-    waiting = api.count_runs(states=["QUEUED", "PREPARED"])
-    failed = api.count_runs(states=["FAILED"])
+    runs = api.list_runs(limit=200)
+    live = [r for r in runs if r.get("id") not in read_model.superseded_run_ids(runs)]
+    snapshot = read_model.run_snapshot(live)
     parts = []
-    if running:
-        parts.append(f"⏺ {running}")
-    if waiting:
-        parts.append(f"⏸ {waiting}")
-    if failed:
-        parts.append(f"⚠ {failed}")
+    if snapshot.running:
+        parts.append(f"⏺ {snapshot.running}")
+    if snapshot.queued:
+        parts.append(f"⏸ {snapshot.queued}")
+    if snapshot.attention:
+        parts.append(f"⚠ {snapshot.attention}")
     return " · ".join(parts)
 
 
