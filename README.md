@@ -33,6 +33,10 @@ Create an environment and install the declared runtime and test dependencies:
 
 Supported Python: **3.14** (the version CI runs and the app is validated against).
 
+Current application version: **2.0.0**. The canonical runtime value is
+`command_center.__version__`; Git release tags are created from validated commits
+after the corresponding version change reaches `main`.
+
 ```bash
 python3.14 -m venv .venv
 source .venv/bin/activate

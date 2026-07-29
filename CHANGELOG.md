@@ -8,6 +8,13 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Version contract
+
+- **Canonical application version**: `command_center.__version__` now exposes the
+  current `2.0.0` release line. The historical `v2.0.0-sprint1` tag remains an
+  immutable prerelease milestone; the final `v2.0.0` tag is created only from a
+  validated commit after this change reaches `main`.
+
 ### Integrated runtime safety and architecture reconciliation
 
 #### Added
