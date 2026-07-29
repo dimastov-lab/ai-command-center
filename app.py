@@ -414,6 +414,10 @@ def update_task_status(task_id: str, new_status: str) -> dict | None:
 
 def delete_task(task_id: str) -> None:
     tasks_repository.delete_task(ROOT, task_id)
+    # Also remove the task's runtime.db footprint (session/run/event/report/
+    # completion cascade) so a deleted Kanban card leaves no orphan rows in the
+    # unified Runs/Timeline/metrics views (audit AR-1).
+    get_execution_center_api().delete_task(task_id)
 
 
 def task_label(task: dict) -> str:
@@ -1020,7 +1024,13 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
                 workflow_stage=next_stage,
             )
             run["next_task_id"] = new_task["id"]
-            agent_runner.append_run(run)
+            # Only the v1.2 journal is writable here. A v2 run lives in runtime.db;
+            # re-appending it would write a duplicate/stale v2 snapshot into the
+            # legacy runs.jsonl and let the two stores diverge (audit AR-3). The
+            # new task still carries `parent_task_id`/`prior_run_id`, so the
+            # forward linkage is preserved regardless of the run's store.
+            if run.get("source") == "v1.2":
+                agent_runner.append_run(run)
             activity_log.log_event(
                 "next_task_created", project=project, task_id=new_task["id"], run_id=run["id"],
                 message=f"Создана задача из запуска {run['id'][:8]}",
