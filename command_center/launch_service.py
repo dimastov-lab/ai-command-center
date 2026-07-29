@@ -30,6 +30,7 @@ from pathlib import Path
 
 from command_center import (
     activity_log,
+    agent_runner,
     git_info,
     launch,
     models,
@@ -386,6 +387,13 @@ def execute_agent_launch_v2(
         launch_source="kanban_task" if task is not None else "execution_center_adhoc",
         prompt_version=(task or {}).get("prompt_version"),
         max_global_concurrency=max_global_concurrency,
+        # Provenance-based capability gating (audit D7): a task imported from an
+        # external package carries that package as its `source`; such untrusted
+        # content is launched read-only (no Bash / bypassPermissions) unless an
+        # operator has explicitly elevated it. An operator-authored in-app task
+        # (no source) and ad-hoc runs (no task) stay trusted.
+        untrusted=agent_runner.is_untrusted_source((task or {}).get("source")),
+        operator_elevated=bool((task or {}).get("trusted_execution_approved")),
         # `repository_path` here is exactly the path `validation` was
         # computed against (the caller's contract — see `render_agent_
         # launcher`), already checked for existence/is-a-directory/is-a-

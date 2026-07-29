@@ -791,6 +791,24 @@ def render_agent_launcher(
                 action_ok, action_message = launch.copy_to_clipboard(full_prompt)
                 (st.success if action_ok else st.error)(action_message)
 
+        # Provenance-based capability gating (audit D7): an imported (untrusted)
+        # task runs read-only by default. Offer the operator an explicit, per-task
+        # elevation to full development capability (Bash) at the point of launch.
+        elevate_trust = False
+        untrusted_import = bool(
+            task_for_launch and agent_runner.is_untrusted_source(task_for_launch.get("source"))
+        ) and task_type not in agent_runner.READ_ONLY_TASK_TYPES
+        if untrusted_import:
+            st.warning(
+                "Импортированная (недоверенная) задача — по умолчанию запускается "
+                "в безопасном read-only режиме (без Bash и изменения файлов)."
+            )
+            elevate_trust = st.checkbox(
+                "Доверять этой задаче: запустить с полными правами разработки (Bash). "
+                "Включайте только для задач из проверенного источника.",
+                value=bool(task_for_launch.get("trusted_execution_approved")),
+                key=f"{key_prefix}_elevate_trust",
+            )
         confirmed = st.checkbox(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
@@ -824,6 +842,22 @@ def render_agent_launcher(
 
         if not launch_clicked:
             return
+
+        # Persist the operator's D7 elevation decision for this untrusted task so
+        # the launch below — and every later launch — runs with the chosen
+        # capability. Set on the in-memory record too, since that is what the
+        # launch path reads this run. Absent/False keeps it read-only.
+        if untrusted_import:
+            task_for_launch["trusted_execution_approved"] = elevate_trust
+            elevate_task_id = task_for_launch.get("id")
+            if elevate_task_id:
+
+                def _persist_trust(tasks_list, _tid=elevate_task_id, _value=elevate_trust):
+                    for candidate in tasks_list:
+                        if candidate.get("id") == _tid:
+                            candidate["trusted_execution_approved"] = _value
+
+                tasks_repository.mutate_tasks(ROOT, _persist_trust)
 
         # Defense in depth: `disabled=` on the button above is the primary
         # gate, but a launch this consequential should not depend solely on

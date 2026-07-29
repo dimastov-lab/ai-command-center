@@ -147,6 +147,31 @@ def profile_for_task_type(task_type: str) -> str:
     not the other way around)."""
     return PROFILE_READ_ONLY if task_type in READ_ONLY_TASK_TYPES else PROFILE_TRUSTED_DEVELOPMENT
 
+
+def is_untrusted_source(source: str | None) -> bool:
+    """Whether a task's provenance is untrusted. An imported task package
+    (`task_import`) records the originating package as the task's `source`; an
+    operator-authored in-app task has none. A non-empty `source` therefore marks
+    external, attacker-influenceable input that must not be auto-granted Bash +
+    bypassPermissions (audit D7)."""
+    return bool(source and source.strip())
+
+
+def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevated: bool = False) -> str:
+    """Provenance-aware execution profile (audit D7).
+
+    Read-only task types are always `PROFILE_READ_ONLY` (they have no dangerous
+    capability). A non-read-only task from an *untrusted* source is downgraded to
+    `PROFILE_READ_ONLY` (no Bash, no `bypassPermissions`) unless an operator has
+    explicitly elevated it — so a malicious imported task cannot silently obtain
+    arbitrary local shell. A trusted (operator-authored) task is unchanged, so
+    with `untrusted=False` this is identical to `profile_for_task_type`."""
+    if task_type in READ_ONLY_TASK_TYPES:
+        return PROFILE_READ_ONLY
+    if untrusted and not operator_elevated:
+        return PROFILE_READ_ONLY
+    return PROFILE_TRUSTED_DEVELOPMENT
+
 # The *complete* available tool set for read-only task types, passed via `--tools`
 # (not `--allowedTools`/`--disallowedTools`). Per `claude --help`, `--tools` replaces
 # the built-in tool set outright rather than layering a permission rule on top of it,
