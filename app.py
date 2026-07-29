@@ -414,6 +414,10 @@ def update_task_status(task_id: str, new_status: str) -> dict | None:
 
 def delete_task(task_id: str) -> None:
     tasks_repository.delete_task(ROOT, task_id)
+    # Also remove the task's runtime.db footprint (session/run/event/report/
+    # completion cascade) so a deleted Kanban card leaves no orphan rows in the
+    # unified Runs/Timeline/metrics views (audit AR-1).
+    get_execution_center_api().delete_task(task_id)
 
 
 def task_label(task: dict) -> str:

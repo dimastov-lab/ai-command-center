@@ -126,6 +126,12 @@ class ExecutionCenterAPI:
     def list_tasks(self, *, project: str | None = None) -> list[dict]:
         return db.list_tasks(self.db_path, project=project)
 
+    def delete_task(self, task_id: str) -> bool:
+        """Remove a task's runtime.db footprint (session/run/event/report/
+        completion cascade). Call alongside `tasks_repository.delete_task` so a
+        deleted Kanban card leaves no orphan runtime rows (audit AR-1)."""
+        return db.delete_task(self.db_path, task_id)
+
     def list_sessions(self, *, task_id: str | None = None) -> list[dict]:
         return db.list_sessions(self.db_path, task_id=task_id)
 
