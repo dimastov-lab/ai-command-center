@@ -12,30 +12,13 @@ The stylesheet is generated once per effective palette from the tokens in
 
 from __future__ import annotations
 
-from enum import Enum
-
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 
+from command_center.platform.preferences import DensityMode, ThemeMode
+
 from . import tokens
 from .tokens import Palette
-
-
-class ThemeMode(str, Enum):
-    """User-selectable theme preference. Values are stable strings suitable for
-    persistence via ``QSettings`` (`DESIGN_SYSTEM.md` §2)."""
-
-    LIGHT = "light"
-    DARK = "dark"
-    SYSTEM = "system"
-
-    @classmethod
-    def from_value(cls, value: object, default: "ThemeMode") -> "ThemeMode":
-        """Coerce a persisted value back to a mode, tolerating unknown/None."""
-        try:
-            return cls(str(value))
-        except ValueError:
-            return default
 
 
 def resolve_palette(mode: ThemeMode, os_scheme: Qt.ColorScheme) -> Palette:
@@ -55,13 +38,29 @@ def resolve_palette(mode: ThemeMode, os_scheme: Qt.ColorScheme) -> Palette:
     return tokens.LIGHT
 
 
-def build_stylesheet(p: Palette) -> str:
+def build_stylesheet(
+    p: Palette, density: DensityMode = DensityMode.COMFORTABLE
+) -> str:
     """Return the application-wide Qt stylesheet for palette ``p``.
 
     Object names referenced here (``#AppShell``, ``#Sidebar`` …) are set by the
     corresponding widgets so the rules target them without leaking colours into
     the widgets' own code.
     """
+    control_height = (
+        tokens.CONTROL_HEIGHT_MD
+        if density is DensityMode.COMPACT
+        else tokens.CONTROL_HEIGHT_LG
+    )
+    control_padding = (
+        tokens.SPACE_XS if density is DensityMode.COMPACT else tokens.SPACE_SM
+    )
+    button_content_height = (
+        control_height - (2 * control_padding) - (2 * tokens.BORDER_HAIRLINE_PX)
+    )
+    combo_content_height = (
+        control_height - (2 * tokens.SPACE_XS) - (2 * tokens.BORDER_HAIRLINE_PX)
+    )
     return f"""
     QWidget {{
         color: {p.text_primary};
@@ -91,7 +90,8 @@ def build_stylesheet(p: Palette) -> str:
         background-color: {p.surface};
         border: {tokens.BORDER_HAIRLINE_PX}px solid {p.border};
         border-radius: {tokens.RADIUS_MD}px;
-        padding: {tokens.SPACE_XS}px {tokens.SPACE_MD}px;
+        min-height: {button_content_height}px;
+        padding: {control_padding}px {tokens.SPACE_MD}px;
         color: {p.text_primary};
     }}
     QPushButton:hover:enabled, QToolButton:hover:enabled {{ background-color: {p.hover_bg}; }}
@@ -105,6 +105,7 @@ def build_stylesheet(p: Palette) -> str:
         border-radius: {tokens.RADIUS_MD}px;
         padding: {tokens.SPACE_XS}px {tokens.SPACE_SM}px;
         color: {p.text_primary};
+        min-height: {combo_content_height}px;
     }}
     QComboBox:disabled {{ color: {p.text_disabled}; }}
 
@@ -192,16 +193,26 @@ class ThemeController(QObject):
 
     palette_changed = Signal(object)  # emits the newly-applied Palette
 
-    def __init__(self, app: QGuiApplication, mode: ThemeMode = ThemeMode.SYSTEM) -> None:
+    def __init__(
+        self,
+        app: QGuiApplication,
+        mode: ThemeMode = ThemeMode.SYSTEM,
+        density: DensityMode = DensityMode.COMFORTABLE,
+    ) -> None:
         super().__init__(app)
         self._app = app
         self._mode = mode
+        self._density = density
         self._palette: Palette | None = None
         app.styleHints().colorSchemeChanged.connect(self._on_os_scheme_changed)
 
     @property
     def mode(self) -> ThemeMode:
         return self._mode
+
+    @property
+    def density(self) -> DensityMode:
+        return self._density
 
     @property
     def palette(self) -> Palette | None:
@@ -212,13 +223,17 @@ class ThemeController(QObject):
         self._mode = mode
         self.apply()
 
+    def set_density(self, density: DensityMode) -> None:
+        self._density = density
+        self.apply()
+
     def apply(self) -> None:
         """Resolve the effective palette for the current mode + OS scheme and
         install it as the application stylesheet."""
         os_scheme = self._app.styleHints().colorScheme()
         palette = resolve_palette(self._mode, os_scheme)
         self._palette = palette
-        self._app.setStyleSheet(build_stylesheet(palette))
+        self._app.setStyleSheet(build_stylesheet(palette, self._density))
         self.palette_changed.emit(palette)
 
     def _on_os_scheme_changed(self, _scheme: Qt.ColorScheme) -> None:
