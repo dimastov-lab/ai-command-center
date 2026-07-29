@@ -83,6 +83,51 @@ PROJECTS_EMPTY_BODY = (
     "а также состояние его worktree и репозитория. Раздел активируется в "
     "следующем инкременте на основе существующего сервиса настройки проектов."
 )
+PROJECTS_REPOSITORY_GROUP = "Репозиторий"
+PROJECTS_PATH_LABEL = "Путь к репозиторию"
+PROJECTS_PATH_PLACEHOLDER = "Укажите абсолютный путь к каталогу"
+PROJECTS_SAVE_ACTION = "Сохранить"
+PROJECTS_CLEAR_ACTION = "Очистить"
+PROJECTS_PATH_NOT_CONFIGURED = "Путь пока не настроен."
+PROJECTS_PATH_SAVED = "Путь сохранён."
+PROJECTS_PATH_CLEARED = "Путь очищен."
+PROJECTS_SAVE_ERROR = "Не удалось сохранить путь. Повторите попытку."
+PROJECTS_LOAD_ERROR_TITLE = "Не удалось загрузить проекты"
+PROJECTS_LOAD_ERROR_BODY = (
+    "Проверьте доступность файла конфигурации и повторно откройте раздел."
+)
+PROJECT_DISPLAY_NAMES_RU: dict[str, str] = {
+    "AICC": APP_TITLE,
+    "AIOS": "AIOS",
+    "AICOS": "AICOS",
+    "PRODUCT": "Продукт AIOS",
+    "ECOSYSTEM": "Экосистема",
+    "BANK": "Банковская стратегия",
+    "LEGAL": "Юридические вопросы",
+    "BUSINESS": "Бизнес",
+    "PERSONAL": "Личное",
+}
+
+
+def project_display_name(project_id: str, fallback: str) -> str:
+    """Russian presentation name while preserving canonical product acronyms."""
+    return PROJECT_DISPLAY_NAMES_RU.get(project_id, fallback)
+
+
+def project_editor_accessible_name(display_name: str) -> str:
+    return f"Настройка проекта «{display_name}»"
+
+
+def project_path_accessible_name(display_name: str) -> str:
+    return f"Путь к репозиторию проекта «{display_name}»"
+
+
+def project_save_accessible_name(display_name: str) -> str:
+    return f"Сохранить путь проекта «{display_name}»"
+
+
+def project_clear_accessible_name(display_name: str) -> str:
+    return f"Очистить путь проекта «{display_name}»"
 
 # --- Settings page --------------------------------------------------------
 SETTINGS_TITLE = "Настройки"
