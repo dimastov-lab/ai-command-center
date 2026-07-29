@@ -537,16 +537,30 @@ def get_run(run_id: str) -> dict | None:
 REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
 
 
+# Path components are restricted to this conservative charset so a hand-authored
+# or imported `task_id`/`project`/`agent` cannot introduce a path separator or a
+# `..` segment and walk the report *write* out of REPORTS_ROOT (audit SEC-2).
+# `.` is deliberately excluded so no component can become `.` or `..`.
+_SAFE_PATH_COMPONENT = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def _safe_path_component(value: str, fallback: str) -> str:
+    cleaned = "".join(c if c in _SAFE_PATH_COMPONENT else "_" for c in value)
+    return cleaned or fallback
+
+
 def report_path_for(run: dict) -> Path:
-    project = run.get("project") or "UNKNOWN"
+    project = _safe_path_component(run.get("project") or "UNKNOWN", "UNKNOWN")
     started = run.get("started_at") or run.get("created_at") or models.iso_now()
     try:
         started_dt = datetime.fromisoformat(started)
     except ValueError:
         started_dt = datetime.now()
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
-    task_part = (run.get("task_id") or "adhoc")[:12]
-    agent = run.get("agent") or "agent"
+    task_part = _safe_path_component(run.get("task_id") or "adhoc", "adhoc")[:12]
+    agent = _safe_path_component(run.get("agent") or "agent", "agent")
     filename = f"{timestamp}_{task_part}_{agent}.md"
     return REPORTS_ROOT / project / filename
 
