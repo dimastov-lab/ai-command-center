@@ -1769,6 +1769,36 @@ def project_verified_completions(root: Path, *, db_path: Path) -> list[str]:
     return result[0]
 
 
+def sync_on_refresh(root: Path, api) -> tuple[list[dict], list[str]]:
+    """The data work of one dashboard refresh tick, independent of Streamlit so
+    it can be tested and reused.
+
+    Two steps, in order: (1) reconcile live runs and re-project execution state
+    onto every task (`task_sync.reconcile_and_sync`), then (2) project every
+    *verified* completion onto the Kanban `Done` lane
+    (`project_verified_completions`).
+
+    Step 2 previously ran only inside the desktop-autopilot tick, so a merge that
+    was verified present in the target branch never reached `Done` unless
+    autopilot (default-off) was enabled — leaving a genuinely merged task stuck
+    in Backlog with its dependents blocked (audit DATA-D2). Both steps are
+    idempotent and only persist on change, so the always-on refresh can call this
+    on every tick regardless of autopilot.
+
+    Returns the freshly loaded task list and the ids moved to `Done` this tick."""
+
+    def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
+        return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
+
+    tasks, _mutated = tasks_repository.mutate_tasks(
+        root, _sync_mutator, persist_if=lambda result: bool(result[1])
+    )
+    moved = project_verified_completions(root, db_path=api.db_path)
+    if moved:
+        tasks = tasks_repository.load_tasks(root)
+    return tasks, moved
+
+
 def mutate_moved(root: Path, mutator) -> list[str]:
     """`tasks_repository.mutate_tasks` with a persist-only-if-something-moved
     guard, so an idle tick costs an (uncontended) lock acquisition but no disk

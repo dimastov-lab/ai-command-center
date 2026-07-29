@@ -654,6 +654,33 @@ def test_projecting_completions_is_idempotent(tmp_path, git_repo, api):
     assert task_pipeline.project_verified_completions(tmp_path, db_path=api.db_path) == []
 
 
+def test_refresh_sync_projects_verified_completion_without_autopilot(
+    tmp_path, git_repo, api
+):
+    """Audit DATA-D2: a verified (COMPLETED) merge must reach the board on the
+    ordinary refresh tick, not only under the default-off autopilot. The refresh
+    entry point (`sync_on_refresh`) both reconciles execution state and projects
+    verified completions, so a genuinely merged task can never stay stuck in
+    Backlog with its dependents blocked."""
+    row = _seed_completion(api, git_repo)
+    runtime_db.update_completion(
+        api.db_path,
+        row["run_id"],
+        expected_version=row["version"],
+        fields={"completion_state": completion_domain.CompletionState.COMPLETED},
+    )
+    task = _task(id="a", workspace_path=str(git_repo))
+    tasks_repository.save_tasks(tmp_path, [task])
+
+    tasks, moved = task_pipeline.sync_on_refresh(tmp_path, api)
+
+    assert moved == ["a"]
+    assert {t["id"]: t for t in tasks}["a"]["status"] == "Done"
+    # Idempotent: a second refresh tick moves nothing and rewrites nothing.
+    _tasks2, moved2 = task_pipeline.sync_on_refresh(tmp_path, api)
+    assert moved2 == []
+
+
 # --------------------------------------------------------------------------
 # Result serialization (the audit trail / UI render model)
 # --------------------------------------------------------------------------
