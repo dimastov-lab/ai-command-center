@@ -47,6 +47,7 @@ class HomePage(BasePage):
         super().__init__("home", i18n.HOME_TITLE, i18n.HOME_SUBTITLE, parent)
         self._adapter = adapter
         self._palette: Palette | None = None
+        self._loading = False
         self._reset_registries()
 
         self._scroll = QScrollArea()
@@ -111,6 +112,19 @@ class HomePage(BasePage):
             on_action=lambda: self.navigate_requested.emit("projects"),
         )
         self._content_layout.addWidget(empty, stretch=1)
+        self._loading = False
+
+    def _show_loading_state(self) -> None:
+        self._clear_content()
+        loading = QLabel(i18n.HOME_LOADING)
+        loading.setObjectName("SectionTitle")
+        self._content_layout.addWidget(loading)
+        self._content_layout.addStretch(1)
+        self._loading = True
+
+    def is_loading(self) -> bool:
+        """True while a load is in flight and no snapshot has rendered yet."""
+        return self._loading
 
     def apply_palette(self, palette: Palette) -> None:
         """Colour every badge-bearing component; re-applied after each render."""
@@ -122,6 +136,7 @@ class HomePage(BasePage):
     def render_snapshot(self, snapshot: dict) -> None:
         """Rebuild the populated Workspace Home from ``snapshot`` (idempotent)."""
         self._clear_content()
+        self._loading = False
         self._content_layout.addWidget(self._build_metric_strip(snapshot))
         self._content_layout.addWidget(self._build_projects_section(snapshot))
         self._content_layout.addWidget(
@@ -258,6 +273,7 @@ class HomePage(BasePage):
             return None
         from PySide6.QtCore import QThreadPool
 
+        self._show_loading_state()
         runnable = AdapterCallRunnable(adapter.snapshot, cancel_event=cancel_event)
         runnable.signals.result.connect(self.render_snapshot)
         runnable.signals.error.connect(self._on_load_error)
@@ -266,6 +282,7 @@ class HomePage(BasePage):
 
     def _on_load_error(self, exc: Exception) -> None:
         self._clear_content()
+        self._loading = False
         message = QLabel(i18n.HOME_LOAD_ERROR)
         message.setObjectName("SectionTitle")
         detail = QLabel(str(exc))  # raw technical detail, shown under the RU message
