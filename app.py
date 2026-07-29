@@ -796,7 +796,7 @@ def render_agent_launcher(
         # elevation to full development capability (Bash) at the point of launch.
         elevate_trust = False
         untrusted_import = bool(
-            task_for_launch and agent_runner.is_untrusted_source(task_for_launch.get("source"))
+            task_for_launch and agent_runner.is_untrusted_task(task_for_launch)
         ) and task_type not in agent_runner.READ_ONLY_TASK_TYPES
         if untrusted_import:
             st.warning(
@@ -3257,20 +3257,23 @@ def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: lis
 
     header_cols = st.columns([1.4, 1, 1, 2])
     with header_cols[0]:
+        # session_state (seeded by the v2 migration above) is the single source
+        # of truth for this keyed widget; passing `value=` alongside a
+        # session-state-set key is what Streamlit warns about, so it is omitted.
         auto_refresh = st.toggle(
             "Режим мониторинга",
-            value=st.session_state.get("exec_center_auto_refresh", False),
             key="exec_center_auto_refresh",
             help="Периодически обновляет всю доску. Выключите во время работы с карточками.",
         )
     with header_cols[1]:
-        current_interval = st.session_state.get("exec_center_refresh_interval", 30)
-        if current_interval not in _EXECUTION_CENTER_POLLERS:
-            current_interval = 30
+        # Sanitize any stale/invalid stored value, then let the keyed widget read
+        # it directly — no `index=` default, which Streamlit forbids alongside a
+        # session-state-set key.
+        if st.session_state.get("exec_center_refresh_interval") not in _EXECUTION_CENTER_POLLERS:
+            st.session_state["exec_center_refresh_interval"] = 30
         interval = st.selectbox(
             "Интервал (с)",
             list(_EXECUTION_CENTER_POLLERS),
-            index=list(_EXECUTION_CENTER_POLLERS).index(current_interval),
             key="exec_center_refresh_interval",
         )
     with header_cols[2]:

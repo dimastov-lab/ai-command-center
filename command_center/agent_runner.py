@@ -149,12 +149,23 @@ def profile_for_task_type(task_type: str) -> str:
 
 
 def is_untrusted_source(source: str | None) -> bool:
-    """Whether a task's provenance is untrusted. An imported task package
-    (`task_import`) records the originating package as the task's `source`; an
-    operator-authored in-app task has none. A non-empty `source` therefore marks
-    external, attacker-influenceable input that must not be auto-granted Bash +
-    bypassPermissions (audit D7)."""
+    """Secondary heuristic: a non-empty `source` string is treated as untrusted
+    provenance. Kept for legacy data that carries a provenance label, but NOT the
+    primary signal — `source` on a task package is attacker-supplied, so a
+    malicious package could simply omit it. `is_untrusted_task` is the real gate;
+    it also honours the app-set `untrusted_import` flag `task_import` stamps on
+    every import (audit D7 / SEC-1)."""
     return bool(source and source.strip())
+
+
+def is_untrusted_task(task: dict) -> bool:
+    """Whether a task must run with reduced capabilities by default (audit D7).
+
+    True when the task carries the **app-set** `untrusted_import` flag (stamped by
+    `task_import` on every imported task, independent of package content — an
+    attacker cannot clear it), or, for legacy data, when it has a non-empty
+    `source`. Operator-authored in-app tasks have neither and are trusted."""
+    return bool(task.get("untrusted_import")) or is_untrusted_source(task.get("source"))
 
 
 def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevated: bool = False) -> str:
