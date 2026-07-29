@@ -139,7 +139,27 @@ def build_stylesheet(p: Palette) -> str:
     #EmptyStateTitle {{ font-size: {tokens.TYPE_TITLE_PT}pt; font-weight: 600; }}
     #EmptyStateBody {{ color: {p.text_secondary}; }}
 
-    QRadioButton {{ color: {p.text_primary}; }}
+    QRadioButton {{
+        color: {p.text_primary};
+        spacing: {tokens.SPACE_SM}px;
+    }}
+    QRadioButton::indicator {{
+        width: {tokens.ICON_SM}px;
+        height: {tokens.ICON_SM}px;
+        border: {tokens.BORDER_FOCUS_PX}px solid {p.text_secondary};
+        border-radius: {tokens.SPACE_SM}px;
+        background-color: {p.surface};
+    }}
+    QRadioButton::indicator:hover {{
+        border-color: {p.accent_emphasis};
+    }}
+    QRadioButton::indicator:checked {{
+        border: {tokens.BORDER_FOCUS_PX}px solid {p.accent_emphasis};
+        background-color: {p.accent};
+    }}
+    QRadioButton:focus {{
+        color: {p.accent_emphasis};
+    }}
 
     /* Labels never paint their own background, so a card's surface shows through
        cleanly (§1.7 border-forward elevation). */

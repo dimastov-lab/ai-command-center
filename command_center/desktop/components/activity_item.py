@@ -5,6 +5,7 @@ Shows a Russian event description + project + timestamp, all read defensively.
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from .. import i18n, tokens
@@ -19,6 +20,7 @@ class ActivityItem(QFrame):
     def __init__(self, event: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("ActivityItem")
+        self.setFocusPolicy(Qt.StrongFocus)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(
@@ -35,6 +37,9 @@ class ActivityItem(QFrame):
         layout.addWidget(self._desc)
         layout.addStretch(1)
         layout.addWidget(self._detail)
+        self.setAccessibleName(
+            ", ".join(part for part in (self._detail.text(), self._desc.text()) if part)
+        )
 
     def description_text(self) -> str:
         return self._desc.text()

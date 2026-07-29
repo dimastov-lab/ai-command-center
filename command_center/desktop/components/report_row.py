@@ -9,6 +9,7 @@ renders without a verdict badge rather than a misleading blank one.
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from command_center import models
@@ -35,6 +36,7 @@ class ReportRow(QFrame):
     def __init__(self, report: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("ReportRow")
+        self.setFocusPolicy(Qt.StrongFocus)
         run_id = report.get("run_id")
         verdict = report.get("verdict")
         self.is_unmatched: bool = run_id is None
@@ -62,6 +64,10 @@ class ReportRow(QFrame):
             variant, label = verdict_badge(verdict)
             self.verdict_badge_widget = StatusBadge(label, variant)
             layout.addWidget(self.verdict_badge_widget)
+        accessible_parts = [self._summary.text()]
+        if self.verdict_badge_widget is not None:
+            accessible_parts.append(self.verdict_badge_widget.text())
+        self.setAccessibleName(", ".join(part for part in accessible_parts if part))
 
     def summary_text(self) -> str:
         return self._summary.text()

@@ -49,6 +49,7 @@ class ProjectCard(QFrame):
     def __init__(self, project: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("Card")
+        self.setFocusPolicy(Qt.StrongFocus)
         self.project_id: str = project["id"]
         self._badges: list[StatusBadge] = []
 
@@ -89,6 +90,13 @@ class ProjectCard(QFrame):
             stats_row.addWidget(stat)
         stats_row.addStretch(1)
         root.addLayout(stats_row)
+
+        accessible_parts = [self.title_label.text()]
+        if project.get("sensitive"):
+            accessible_parts.append(i18n.BADGE_SENSITIVE)
+        accessible_parts.append(label)
+        accessible_parts.extend(stat.text() for stat in self._stats)
+        self.setAccessibleName(", ".join(accessible_parts))
 
         self.configure_button: QPushButton | None = None
         if project.get("repository_state") == "unconfigured":

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import threading
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLabel
 
 from command_center.desktop import i18n
+from command_center.desktop.components.loading_skeleton import LoadingSkeleton
 from command_center.desktop.components.status_badge import StatusVariant
 from command_center.desktop.pages.home import HomePage
 
@@ -70,8 +72,17 @@ def test_loading_state_is_shown_until_the_snapshot_arrives(qtbot):
     runnable = page.load(_SlowAdapter())
     assert page.is_loading() is True
     assert page.project_cards() == []
+    skeleton = page.loading_skeleton()
+    assert isinstance(skeleton, LoadingSkeleton)
+    assert skeleton.focusPolicy() == Qt.NoFocus
+    assert skeleton.property("busy") is True
+    assert skeleton.accessibleName() == i18n.HOME_LOADING
+    assert skeleton.accessibleDescription() == i18n.HOME_LOADING_ACCESSIBLE_DESCRIPTION
+    assert skeleton.row_heights() == [40] * 5
 
     with qtbot.waitSignal(runnable.signals.finished, timeout=2000):
         release.set()
     qtbot.waitUntil(lambda: not page.is_loading(), timeout=2000)
+    assert page.loading_skeleton() is None
+    assert page.findChild(LoadingSkeleton) is None
     assert len(page.project_cards()) == 6

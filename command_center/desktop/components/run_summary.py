@@ -9,6 +9,7 @@ state field is absent.
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from .. import i18n, tokens
@@ -38,6 +39,7 @@ class RunSummary(QFrame):
     def __init__(self, run: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("RunSummary")
+        self.setFocusPolicy(Qt.StrongFocus)
         self.run_key: tuple = (run.get("source"), run.get("run_id"))
 
         layout = QHBoxLayout(self)
@@ -58,6 +60,14 @@ class RunSummary(QFrame):
             variant, label = run_state_badge(state)
             self.state_badge = StatusBadge(label, variant)
             layout.addWidget(self.state_badge)
+        accessible_parts = [
+            str(value)
+            for value in (run.get("source"), run.get("project"), run.get("task_type"))
+            if value
+        ]
+        if self.state_badge is not None:
+            accessible_parts.append(self.state_badge.text())
+        self.setAccessibleName(", ".join(accessible_parts))
 
     def title_text(self) -> str:
         return self._title.text()

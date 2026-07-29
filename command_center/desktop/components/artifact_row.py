@@ -7,6 +7,7 @@ simply has no path to show — it never fabricates or reconstructs one.
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from .. import tokens
@@ -16,6 +17,7 @@ class ArtifactRow(QFrame):
     def __init__(self, artifact: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("ArtifactRow")
+        self.setFocusPolicy(Qt.StrongFocus)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(
@@ -40,6 +42,10 @@ class ArtifactRow(QFrame):
             self._path_label.setObjectName("RowMeta")
             layout.addStretch(1)
             layout.addWidget(self._path_label)
+        visible_parts = [str(artifact.get("project") or ""), self._summary.text()]
+        if self._path_label is not None:
+            visible_parts.append(self._path_label.text())
+        self.setAccessibleName(", ".join(part for part in visible_parts if part))
 
     def summary_text(self) -> str:
         return self._summary.text()

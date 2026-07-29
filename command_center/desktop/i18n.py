@@ -64,6 +64,9 @@ HOME_SECTION_REPORTS = "Отчёты"
 HOME_SECTION_ACTIVITY = "Активность"
 HOME_SECTION_EMPTY = "Нет данных"
 HOME_LOADING = "Загрузка данных…"
+HOME_LOADING_ACCESSIBLE_DESCRIPTION = (
+    "Содержимое главной страницы обновляется. Дождитесь окончания загрузки."
+)
 HOME_LOAD_ERROR = "Не удалось загрузить данные"
 METRIC_PROJECTS = "Проекты"
 METRIC_ACTIVE_RUNS = "Активные запуски"

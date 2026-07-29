@@ -30,6 +30,7 @@ from .. import i18n, tokens
 from ..components.activity_item import ActivityItem
 from ..components.artifact_row import ArtifactRow
 from ..components.empty_state import EmptyState
+from ..components.loading_skeleton import LoadingSkeleton
 from ..components.metric_card import MetricCard
 from ..components.project_card import ProjectCard
 from ..components.report_row import ReportRow
@@ -48,6 +49,7 @@ class HomePage(BasePage):
         self._adapter = adapter
         self._palette: Palette | None = None
         self._loading = False
+        self._loading_skeleton: LoadingSkeleton | None = None
         self._reset_registries()
 
         self._scroll = QScrollArea()
@@ -102,6 +104,7 @@ class HomePage(BasePage):
                 widget.setParent(None)
                 widget.deleteLater()
         self._reset_registries()
+        self._loading_skeleton = None
 
     def _show_empty_state(self) -> None:
         self._clear_content()
@@ -116,11 +119,16 @@ class HomePage(BasePage):
 
     def _show_loading_state(self) -> None:
         self._clear_content()
-        loading = QLabel(i18n.HOME_LOADING)
-        loading.setObjectName("SectionTitle")
-        self._content_layout.addWidget(loading)
+        self._loading_skeleton = LoadingSkeleton(
+            row_count=5,
+            row_height=tokens.CONTROL_HEIGHT_LG,
+        )
+        self._content_layout.addWidget(self._loading_skeleton)
         self._content_layout.addStretch(1)
         self._loading = True
+
+    def loading_skeleton(self) -> LoadingSkeleton | None:
+        return self._loading_skeleton
 
     def is_loading(self) -> bool:
         """True while a load is in flight and no snapshot has rendered yet."""
