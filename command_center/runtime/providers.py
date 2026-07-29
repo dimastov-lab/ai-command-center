@@ -1252,6 +1252,20 @@ class CopilotProvider:
         if is_resume:
             raise ValueError("Copilot CLI resume is not supported by this provider increment.")
         self.validate_prompt(prompt)
+        # Provenance gate (audit SEC-1/D-01): Copilot launches with a hardcoded
+        # `--allow-all-tools --no-ask-user` and has no read-only tool mode wired
+        # here, so it cannot honour the untrusted->read-only downgrade the other
+        # providers apply. Fail closed rather than grant full, unattended tool
+        # access to attacker-influenced (imported) input, unless the operator has
+        # explicitly elevated this task.
+        if untrusted and not operator_elevated:
+            raise RuntimeError(
+                "Copilot cannot run an untrusted (imported) task: it has no "
+                "read-only tool mode, so it fails closed instead of granting "
+                "--allow-all-tools to untrusted input (audit SEC-1/D-01). Elevate "
+                "the task explicitly or run it with a provider that supports a "
+                "read-only profile."
+            )
         environment = dict(os.environ)
         _sensitive_environment_values(environment)
         availability = self.availability()
