@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 
+from command_center.desktop import i18n
 from command_center.desktop.components.activity_item import ActivityItem
 from command_center.desktop.components.artifact_row import ArtifactRow
 from command_center.desktop.components.project_card import ProjectCard
@@ -68,7 +69,7 @@ def test_workspace_rows_are_focusable_and_have_combined_accessible_names(qtbot):
         assert row.focusPolicy() == Qt.StrongFocus
         assert row.accessibleName().strip()
 
-    assert "v2" in rows[0].accessibleName()
+    assert i18n.RUN_SOURCE_LABELS["v2"] in rows[0].accessibleName()
     assert "Выполняется" in rows[0].accessibleName()
     assert "Запуск завершён" in rows[1].accessibleName()
     assert "/tmp/result.md" in rows[2].accessibleName()

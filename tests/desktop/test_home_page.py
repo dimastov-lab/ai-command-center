@@ -10,6 +10,13 @@ never blocked.
 
 from __future__ import annotations
 
+import gc
+import threading
+import weakref
+
+from PySide6.QtCore import QThreadPool
+from PySide6.QtWidgets import QLabel
+
 from command_center.desktop import i18n, tokens
 from command_center.desktop.components.empty_state import EmptyState
 from command_center.desktop.components.worktree_row import WorktreeRow
@@ -143,3 +150,106 @@ def test_load_without_adapter_is_a_noop(qtbot):
     qtbot.addWidget(page)
     assert page.load() is None
     assert page.findChild(EmptyState) is not None
+
+
+def test_page_keeps_runnable_alive_until_finished_even_after_gc(qtbot):
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowAdapter:
+        def snapshot(self):
+            started.set()
+            release.wait(2.0)
+            return _snapshot()
+
+    pool = QThreadPool()
+    page = HomePage()
+    qtbot.addWidget(page)
+    runnable = page.load(_SlowAdapter(), pool=pool)
+    assert runnable is not None
+    assert started.wait(2.0)
+    runnable_ref = weakref.ref(runnable)
+    del runnable
+    gc.collect()
+
+    assert runnable_ref() is not None
+    assert page.active_worker_count() == 1
+    release.set()
+    qtbot.waitUntil(lambda: page.active_worker_count() == 0, timeout=2000)
+    assert pool.waitForDone(2000)
+
+
+def test_newer_refresh_wins_when_older_result_finishes_later(qtbot):
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = 0
+
+    class _OutOfOrderAdapter:
+        def snapshot(self):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                release_first.wait(2.0)
+                return _snapshot(projects=[{**_snapshot()["projects"][0], "id": "OLD"}])
+            return _snapshot(projects=[{**_snapshot()["projects"][0], "id": "NEW"}])
+
+    pool = QThreadPool()
+    pool.setMaxThreadCount(2)
+    adapter = _OutOfOrderAdapter()
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.load(adapter, pool=pool)
+    assert first_started.wait(2.0)
+    page.load(adapter, pool=pool)
+    qtbot.waitUntil(
+        lambda: [card.project_id for card in page.project_cards()] == ["NEW"],
+        timeout=2000,
+    )
+    release_first.set()
+    assert pool.waitForDone(2000)
+    qtbot.wait(50)
+    assert [card.project_id for card in page.project_cards()] == ["NEW"]
+
+
+def test_shutdown_drops_queued_worker_delivery(qtbot):
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowAdapter:
+        def snapshot(self):
+            started.set()
+            release.wait(2.0)
+            return _snapshot()
+
+    pool = QThreadPool()
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.load(_SlowAdapter(), pool=pool)
+    assert started.wait(2.0)
+    page.shutdown_workers()
+    release.set()
+    assert pool.waitForDone(2000)
+    qtbot.wait(50)
+    assert page.project_cards() == []
+    assert page.load(_SlowAdapter(), pool=pool) is None
+
+
+def test_adapter_error_is_redacted_from_ui(qtbot):
+    secret = "token=super-secret"
+
+    class _FailingAdapter:
+        def snapshot(self):
+            raise RuntimeError(secret)
+
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.load(_FailingAdapter())
+    qtbot.waitUntil(
+        lambda: any(
+            label.text() == i18n.HOME_LOAD_ERROR_DETAIL
+            for label in page.findChildren(QLabel)
+        ),
+        timeout=2000,
+    )
+    assert all(secret not in label.text() for label in page.findChildren(QLabel))

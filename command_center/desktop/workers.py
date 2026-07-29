@@ -20,6 +20,9 @@ from typing import Any
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
+_RUNNABLE_KEEPALIVE: set["AdapterCallRunnable"] = set()
+_RUNNABLE_KEEPALIVE_LOCK = threading.Lock()
+
 
 class WorkerSignals(QObject):
     """Signals emitted by :class:`AdapterCallRunnable`.
@@ -54,12 +57,19 @@ class AdapterCallRunnable(QRunnable):
         self._fn = fn
         self._args = args
         self._kwargs = kwargs
-        self._cancel = cancel_event if cancel_event is not None else threading.Event()
+        self._cancel = threading.Event()
+        self._external_cancel = cancel_event
         self.signals = WorkerSignals()
         # Keep Python ownership: the caller holds this runnable until `finished`,
         # so Qt must not delete the C++ object (and its signal holder) out from
         # under a queued signal still in flight.
         self.setAutoDelete(False)
+        # A QThreadPool does not provide Python ownership when auto-delete is
+        # disabled. Keep the wrapper alive until the queued ``finished`` signal
+        # has reached the GUI thread, including during a bounded shutdown.
+        with _RUNNABLE_KEEPALIVE_LOCK:
+            _RUNNABLE_KEEPALIVE.add(self)
+        self.signals.finished.connect(self._release_keepalive)
 
     def cancel(self) -> None:
         """Request cooperative cancellation (idempotent, thread-safe)."""
@@ -67,19 +77,25 @@ class AdapterCallRunnable(QRunnable):
 
     @property
     def is_cancelled(self) -> bool:
-        return self._cancel.is_set()
+        return self._cancel.is_set() or (
+            self._external_cancel is not None and self._external_cancel.is_set()
+        )
+
+    def _release_keepalive(self) -> None:
+        with _RUNNABLE_KEEPALIVE_LOCK:
+            _RUNNABLE_KEEPALIVE.discard(self)
 
     def run(self) -> None:  # executes on a worker thread
         try:
-            if self._cancel.is_set():  # checkpoint: superseded before we began
+            if self.is_cancelled:  # checkpoint: superseded before we began
                 return
             try:
                 result = self._fn(*self._args, **self._kwargs)
             except Exception as exc:  # §12: never swallow an adapter error
-                if not self._cancel.is_set():
+                if not self.is_cancelled:
                     self.signals.error.emit(exc)
                 return
-            if self._cancel.is_set():  # checkpoint: superseded while working
+            if self.is_cancelled:  # checkpoint: superseded while working
                 return
             self.signals.result.emit(result)
         finally:

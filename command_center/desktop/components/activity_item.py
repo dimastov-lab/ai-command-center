@@ -12,8 +12,10 @@ from .. import i18n, tokens
 
 
 def activity_label(event_type: str | None) -> str:
-    """Russian label for an activity ``event_type`` (falls back to the raw type)."""
-    return i18n.ACTIVITY_EVENT_LABELS.get(event_type, event_type or "")
+    """Russian label for an activity type without exposing a raw enum."""
+    if not event_type:
+        return ""
+    return i18n.ACTIVITY_EVENT_LABELS.get(event_type, i18n.UNKNOWN_ACTIVITY_EVENT)
 
 
 class ActivityItem(QFrame):

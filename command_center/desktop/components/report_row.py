@@ -29,7 +29,7 @@ def verdict_badge(verdict: str | None) -> tuple[StatusVariant, str]:
         return StatusVariant.SUCCESS, models.VERDICT_LABELS.get(verdict, verdict)
     if verdict in models.VERDICT_LABELS:
         return StatusVariant.DANGER, models.VERDICT_LABELS[verdict]
-    return StatusVariant.NEUTRAL, (verdict or "")
+    return StatusVariant.NEUTRAL, i18n.UNKNOWN_REPORT_VERDICT
 
 
 class ReportRow(QFrame):

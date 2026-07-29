@@ -10,7 +10,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
-from .. import tokens
+from .. import i18n, tokens
 
 
 class ArtifactRow(QFrame):
@@ -27,7 +27,10 @@ class ArtifactRow(QFrame):
 
         summary_parts = [
             str(p)
-            for p in (artifact.get("task_type"), artifact.get("created_at"))
+            for p in (
+                i18n.task_type_label(artifact.get("task_type")),
+                artifact.get("created_at"),
+            )
             if p not in (None, "")
         ]
         self._summary = QLabel(" · ".join(summary_parts))

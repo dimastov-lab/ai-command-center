@@ -37,7 +37,7 @@ _HEALTH_VARIANTS: dict[str, StatusVariant] = {
 def repository_health(state: str) -> tuple[StatusVariant, str]:
     """Map a ``repository_state`` to its badge variant and Russian label (§3)."""
     return _HEALTH_VARIANTS.get(state, StatusVariant.NEUTRAL), i18n.REPO_STATE_LABELS.get(
-        state, state
+        state, i18n.UNKNOWN_REPOSITORY_STATE
     )
 
 
@@ -60,7 +60,10 @@ class ProjectCard(QFrame):
         root.setSpacing(tokens.SPACE_SM)
 
         header = QHBoxLayout()
-        self.title_label = QLabel(project.get("display_name") or project["id"])
+        display_name = project.get("display_name") or i18n.project_display_name(
+            project["id"], project["id"]
+        )
+        self.title_label = QLabel(display_name)
         self.title_label.setObjectName("CardTitle")
         header.addWidget(self.title_label)
         header.addStretch(1)

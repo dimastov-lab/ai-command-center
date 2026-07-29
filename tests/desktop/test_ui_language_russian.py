@@ -15,6 +15,9 @@ import re
 
 from PySide6.QtWidgets import QWidget
 
+from command_center.desktop import i18n
+from command_center.desktop.pages.home import HomePage
+
 # Latin tokens allowed to appear without Cyrillic (proper noun + conventional
 # abbreviations kept Latin per the UI-language policy).
 _ALLOWED_LATIN = {
@@ -82,3 +85,60 @@ def test_all_shell_strings_are_russian(shell):
     assert not offenders, "Непереведённые (английские) строки в UI:\n" + "\n".join(
         f"  {where}: {value!r}" for where, value in offenders
     )
+
+
+def _assert_widget_tree_is_russian(root: QWidget) -> None:
+    offenders = [
+        (where, value)
+        for where, value in _collect_user_visible_strings(root)
+        if not _is_russian_or_allowed(value)
+    ]
+    assert not offenders, "Непереведённые строки в динамическом UI:\n" + "\n".join(
+        f"  {where}: {value!r}" for where, value in offenders
+    )
+
+
+def test_home_dynamic_populated_state_is_russian(qtbot):
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.render_snapshot(
+        {
+            "projects": [{
+                "id": "AIOS",
+                "display_name": "AIOS",
+                "repository_state": "future_state",
+                "task_count": 1,
+                "active_run_count": 1,
+            }],
+            "worktrees_by_project": {},
+            "active_runs": [{
+                "source": "v2",
+                "run_id": "r1",
+                "project": "AIOS",
+                "task_type": "future_task",
+                "state": "FUTURE_STATE",
+            }],
+            "recent_runs": [],
+            "artifacts": [{"project": "AIOS", "task_type": "future_task"}],
+            "reports": [{
+                "run_id": "r1",
+                "project": "AIOS",
+                "verdict": "FUTURE_VERDICT",
+            }],
+            "recent_activity": [{
+                "event_type": "future_event",
+                "project": "AIOS",
+            }],
+        }
+    )
+    _assert_widget_tree_is_russian(page)
+
+
+def test_home_dynamic_loading_and_error_states_are_russian(qtbot):
+    page = HomePage()
+    qtbot.addWidget(page)
+    page._show_loading_state()
+    _assert_widget_tree_is_russian(page)
+    page._on_load_error()
+    _assert_widget_tree_is_russian(page)
+    assert i18n.HOME_LOAD_ERROR_DETAIL

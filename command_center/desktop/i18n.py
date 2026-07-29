@@ -68,6 +68,13 @@ HOME_LOADING_ACCESSIBLE_DESCRIPTION = (
     "Содержимое главной страницы обновляется. Дождитесь окончания загрузки."
 )
 HOME_LOAD_ERROR = "Не удалось загрузить данные"
+HOME_LOAD_ERROR_DETAIL = (
+    "Внутренняя ошибка скрыта из соображений безопасности. Повторите обновление."
+)
+UNKNOWN_REPOSITORY_STATE = "Неизвестное состояние репозитория"
+UNKNOWN_RUN_STATE = "Неизвестное состояние запуска"
+UNKNOWN_ACTIVITY_EVENT = "Неизвестное событие"
+UNKNOWN_REPORT_VERDICT = "Неизвестный результат проверки"
 METRIC_PROJECTS = "Проекты"
 METRIC_ACTIVE_RUNS = "Активные запуски"
 METRIC_RECENT_RUNS = "Недавние запуски"
@@ -191,9 +198,32 @@ ACTIVITY_EVENT_LABELS: dict[str, str] = {
     "run_failed": "Запуск завершился ошибкой",
 }
 
+TASK_TYPE_LABELS: dict[str, str] = {
+    "implementation": "Реализация",
+    "review": "Проверка",
+    "audit": "Аудит",
+    "testing": "Тестирование",
+}
+RUN_SOURCE_LABELS: dict[str, str] = {
+    "v2": "Новый контур выполнения",
+    "legacy": "Прежний контур выполнения",
+}
+
 # A report file with no linked run (WORKSPACE_HOME_SPEC.md §8) — shown without a
 # verdict badge rather than a misleading blank one.
 REPORT_UNMATCHED_NOTE = "Без привязки к запуску"
+
+
+def task_type_label(task_type: str | None) -> str:
+    if not task_type:
+        return ""
+    return TASK_TYPE_LABELS.get(task_type, "Задача")
+
+
+def run_source_label(source: str | None) -> str:
+    if not source:
+        return ""
+    return RUN_SOURCE_LABELS.get(source, "Источник выполнения")
 
 
 def page_accessible_name(title: str) -> str:

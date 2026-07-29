@@ -15,6 +15,7 @@ projects), and the Active/Recent runs, Artifacts, Reports, and Activity sections
 from __future__ import annotations
 
 import threading
+import weakref
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -50,6 +51,9 @@ class HomePage(BasePage):
         self._palette: Palette | None = None
         self._loading = False
         self._loading_skeleton: LoadingSkeleton | None = None
+        self._request_id = 0
+        self._active_runnables: dict[int, AdapterCallRunnable] = {}
+        self._accept_worker_signals = True
         self._reset_registries()
 
         self._scroll = QScrollArea()
@@ -277,23 +281,65 @@ class HomePage(BasePage):
         adapter cannot complete before the render slot is attached.
         """
         adapter = adapter if adapter is not None else self._adapter
-        if adapter is None:
+        if adapter is None or not self._accept_worker_signals:
             return None
         from PySide6.QtCore import QThreadPool
 
         self._show_loading_state()
+        self._request_id += 1
+        request_id = self._request_id
+        for old_request_id, old_runnable in tuple(self._active_runnables.items()):
+            if old_request_id != request_id:
+                old_runnable.cancel()
         runnable = AdapterCallRunnable(adapter.snapshot, cancel_event=cancel_event)
-        runnable.signals.result.connect(self.render_snapshot)
-        runnable.signals.error.connect(self._on_load_error)
+        self._active_runnables[request_id] = runnable
+        page_ref = weakref.ref(self)
+
+        def deliver_result(snapshot: dict) -> None:
+            page = page_ref()
+            if (
+                page is not None
+                and page._accept_worker_signals
+                and request_id == page._request_id
+            ):
+                page.render_snapshot(snapshot)
+
+        def deliver_error(_exc: Exception) -> None:
+            page = page_ref()
+            if (
+                page is not None
+                and page._accept_worker_signals
+                and request_id == page._request_id
+            ):
+                page._on_load_error()
+
+        def release_runnable() -> None:
+            page = page_ref()
+            if page is not None:
+                page._active_runnables.pop(request_id, None)
+
+        runnable.signals.result.connect(deliver_result)
+        runnable.signals.error.connect(deliver_error)
+        runnable.signals.finished.connect(release_runnable)
         (pool if pool is not None else QThreadPool.globalInstance()).start(runnable)
         return runnable
 
-    def _on_load_error(self, exc: Exception) -> None:
+    def shutdown_workers(self) -> None:
+        """Stop accepting callbacks and cooperatively cancel every page request."""
+        self._accept_worker_signals = False
+        self._request_id += 1  # invalidates already-queued result/error callbacks
+        for runnable in tuple(self._active_runnables.values()):
+            runnable.cancel()
+
+    def active_worker_count(self) -> int:
+        return len(self._active_runnables)
+
+    def _on_load_error(self) -> None:
         self._clear_content()
         self._loading = False
         message = QLabel(i18n.HOME_LOAD_ERROR)
         message.setObjectName("SectionTitle")
-        detail = QLabel(str(exc))  # raw technical detail, shown under the RU message
+        detail = QLabel(i18n.HOME_LOAD_ERROR_DETAIL)
         detail.setObjectName("RowMeta")
         detail.setWordWrap(True)
         self._content_layout.addWidget(message)

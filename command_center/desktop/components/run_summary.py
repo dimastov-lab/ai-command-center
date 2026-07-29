@@ -31,7 +31,7 @@ _RUN_STATE_VARIANTS: dict[str, StatusVariant] = {
 def run_state_badge(state: str | None) -> tuple[StatusVariant, str]:
     """Map a run ``state`` to its badge variant and Russian label (§5)."""
     return _RUN_STATE_VARIANTS.get(state, StatusVariant.NEUTRAL), i18n.RUN_STATE_LABELS.get(
-        state, state or ""
+        state, i18n.UNKNOWN_RUN_STATE
     )
 
 
@@ -48,7 +48,11 @@ class RunSummary(QFrame):
         )
         layout.setSpacing(tokens.SPACE_MD)
 
-        parts = [str(p) for p in (run.get("project"), run.get("task_type")) if p]
+        parts = [
+            str(p)
+            for p in (run.get("project"), i18n.task_type_label(run.get("task_type")))
+            if p
+        ]
         self._title = QLabel(" · ".join(parts))
         self._title.setObjectName("RowTitle")
         layout.addWidget(self._title)
@@ -62,7 +66,11 @@ class RunSummary(QFrame):
             layout.addWidget(self.state_badge)
         accessible_parts = [
             str(value)
-            for value in (run.get("source"), run.get("project"), run.get("task_type"))
+            for value in (
+                i18n.run_source_label(run.get("source")),
+                run.get("project"),
+                i18n.task_type_label(run.get("task_type")),
+            )
             if value
         ]
         if self.state_badge is not None:

@@ -215,6 +215,7 @@ class AppShell(QWidget):
         cancellation, waits up to ``timeout_ms`` for the global thread pool to
         drain, then persists state. Returns whether the pool drained in time."""
         self._cancel_event.set()
+        self._home.shutdown_workers()
         drained = QThreadPool.globalInstance().waitForDone(timeout_ms)
         self._persist_state()
         return drained

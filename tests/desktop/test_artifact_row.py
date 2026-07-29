@@ -8,6 +8,7 @@ has no raw path to display — it must not fabricate one.
 
 from __future__ import annotations
 
+from command_center.desktop import i18n
 from command_center.desktop.components.artifact_row import ArtifactRow
 
 
@@ -16,7 +17,7 @@ def test_artifact_row_shows_task_type_and_created_at(qtbot):
         {"project": "AIOS", "task_type": "implementation", "created_at": 1730000000, "path": "/gen/x.md"}
     )
     qtbot.addWidget(row)
-    assert "implementation" in row.summary_text()
+    assert i18n.TASK_TYPE_LABELS["implementation"] in row.summary_text()
 
 
 def test_artifact_row_shows_path_when_present(qtbot):

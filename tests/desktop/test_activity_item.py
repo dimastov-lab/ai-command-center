@@ -15,8 +15,8 @@ def test_activity_label_maps_known_events_to_russian():
     assert activity_label("run_failed") == i18n.ACTIVITY_EVENT_LABELS["run_failed"]
 
 
-def test_activity_label_falls_back_to_raw_event_type():
-    assert activity_label("some_future_event") == "some_future_event"
+def test_activity_label_does_not_expose_raw_event_type():
+    assert activity_label("some_future_event") == i18n.UNKNOWN_ACTIVITY_EVENT
 
 
 def test_activity_item_shows_description_project_and_timestamp(qtbot):
