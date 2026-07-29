@@ -16,6 +16,7 @@ from . import tokens
 from . import i18n
 from .navigation_item import NavigationItem
 from .sections import SECTIONS, Section
+from command_center.platform import DensityMode
 
 
 class Sidebar(QWidget):
@@ -72,6 +73,18 @@ class Sidebar(QWidget):
         item = self._items.get(key)
         if item is not None and item.isEnabled():
             item.setChecked(True)
+
+    def apply_density(self, density: DensityMode) -> None:
+        height = (
+            tokens.CONTROL_HEIGHT_MD
+            if density is DensityMode.COMPACT
+            else tokens.CONTROL_HEIGHT_LG
+        )
+        spacing = tokens.SPACE_MD if density is DensityMode.COMPACT else tokens.SPACE_LG
+        self.layout().setSpacing(spacing)
+        for item in self._items.values():
+            item.setMinimumHeight(height)
+            item.setMaximumHeight(height)
 
     @property
     def current_key(self) -> str | None:

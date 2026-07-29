@@ -137,11 +137,23 @@ SETTINGS_APPEARANCE_ACCESSIBLE = "Настройки внешнего вида"
 THEME_LIGHT = "Светлая"
 THEME_DARK = "Тёмная"
 THEME_SYSTEM = "Системная (как в macOS)"
-SETTINGS_MORE_TITLE = "Скоро появятся дополнительные настройки"
-SETTINGS_MORE_BODY = (
-    "Плотность интерфейса, сброс геометрии окна и параметры рабочего "
-    "пространства появятся здесь в следующем инкременте."
+SETTINGS_DENSITY_GROUP = "Плотность интерфейса"
+SETTINGS_DENSITY_ACCESSIBLE = "Настройки плотности интерфейса"
+DENSITY_COMFORTABLE = "Комфортная"
+DENSITY_COMPACT = "Компактная"
+SETTINGS_WINDOW_GROUP = "Окно"
+SETTINGS_RESET_GEOMETRY = "Сбросить размер и положение окна"
+SETTINGS_RESET_GEOMETRY_DESCRIPTION = (
+    "Вернуть стандартные размер и положение окна при следующем запуске"
 )
+SETTINGS_WORKSPACE_GROUP = "Рабочее пространство"
+SETTINGS_SELECTED_PROJECT_LABEL = "Проект по умолчанию"
+SETTINGS_SELECTED_PROJECT_DESCRIPTION = (
+    "Идентификатор проекта, который будет выбран при следующем запуске"
+)
+SETTINGS_SELECTED_PROJECT_PLACEHOLDER = "Например, проект-1"
+SETTINGS_SAVE_WORKSPACE = "Сохранить параметры рабочего пространства"
+SETTINGS_SAVED = "Параметры сохранены"
 
 
 # --- Status badges / project cards (D2C) ----------------------------------
@@ -192,3 +204,7 @@ def page_accessible_name(title: str) -> str:
 def theme_accessible_name(label: str) -> str:
     """Accessible name for a theme radio given its (already-Russian) label."""
     return f"Тема: {label}"
+
+
+def density_accessible_name(label: str) -> str:
+    return f"Плотность интерфейса: {label}"

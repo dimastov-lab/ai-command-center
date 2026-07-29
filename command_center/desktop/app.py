@@ -27,7 +27,11 @@ def build_shell(
     offscreen ``QApplication`` and inject an isolated :class:`SettingsStore`.
     """
     store = settings or SettingsStore()
-    theme = ThemeController(app, mode=store.theme_mode())
+    theme = ThemeController(
+        app,
+        mode=store.theme_mode(),
+        density=store.density_mode(),
+    )
     theme.apply()
     shell = AppShell(store, theme)
     return shell, theme
