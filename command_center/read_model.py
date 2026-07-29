@@ -113,3 +113,22 @@ def run_snapshot(runs: list[dict]) -> RunSnapshot:
         queued=sum(1 for r in runs if r.get("state") in RUN_WAITING_STATES),
         attention=sum(1 for r in runs if r.get("state") in RUN_ATTENTION_STATES),
     )
+
+
+def superseded_run_ids(runs: list[dict]) -> frozenset[str]:
+    """Ids of runs that are NOT their task's latest attempt. Pass these to filter
+    a run list so a failed run a task has since retried is not double-counted as
+    still needing attention (audit D5 — the same rule the Execution Strip and the
+    AI-Supervisor caption use). Ad-hoc runs (no `task_id`) stand alone and are
+    never superseded; ties on `started_at` break by `id` for determinism."""
+    latest_by_task: dict[str, dict] = {}
+    for run in runs:
+        task_id = run.get("task_id")
+        if not task_id:
+            continue
+        current = latest_by_task.get(task_id)
+        key = (run.get("started_at") or "", run.get("id") or "")
+        if current is None or key > (current.get("started_at") or "", current.get("id") or ""):
+            latest_by_task[task_id] = run
+    latest_ids = {r.get("id") for r in latest_by_task.values()}
+    return frozenset(r.get("id") for r in runs if r.get("task_id") and r.get("id") not in latest_ids)

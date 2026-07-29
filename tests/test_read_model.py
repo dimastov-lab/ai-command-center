@@ -102,6 +102,29 @@ def test_run_snapshot_empty_is_zeros():
     assert snap.total == snap.running == snap.queued == snap.attention == 0
 
 
+def test_superseded_run_ids_marks_all_but_the_latest_attempt_per_task():
+    runs = [
+        {"id": "a1", "task_id": "T", "started_at": "2026-01-01T00:00:00"},
+        {"id": "a2", "task_id": "T", "started_at": "2026-01-02T00:00:00"},  # latest for T
+        {"id": "b1", "task_id": "U", "started_at": "2026-01-01T00:00:00"},  # only run for U
+        {"id": "adhoc", "task_id": None, "started_at": "2026-01-01T00:00:00"},  # no task → stands alone
+    ]
+    assert read_model.superseded_run_ids(runs) == frozenset({"a1"})
+
+
+def test_run_snapshot_over_nonsuperseded_counts_latest_attempt_only():
+    # Task T failed then was retried and is running now; its old FAILED attempt
+    # must not still count as "needs attention".
+    runs = [
+        {"id": "a1", "task_id": "T", "started_at": "2026-01-01T00:00:00", "state": "FAILED"},
+        {"id": "a2", "task_id": "T", "started_at": "2026-01-02T00:00:00", "state": "RUNNING"},
+    ]
+    live = [r for r in runs if r["id"] not in read_model.superseded_run_ids(runs)]
+    snap = read_model.run_snapshot(live)
+    assert snap.attention == 0
+    assert snap.running == 1
+
+
 def test_run_attention_states_match_execution_strip():
     """Guard against drift: the canonical run buckets must stay identical to the
     Execution Strip's, so the strip banner and the Supervisor caption can never
