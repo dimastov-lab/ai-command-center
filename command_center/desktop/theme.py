@@ -140,6 +140,25 @@ def build_stylesheet(p: Palette) -> str:
     #EmptyStateBody {{ color: {p.text_secondary}; }}
 
     QRadioButton {{ color: {p.text_primary}; }}
+
+    /* Labels never paint their own background, so a card's surface shows through
+       cleanly (§1.7 border-forward elevation). */
+    QLabel {{ background-color: transparent; }}
+
+    /* Workspace Home (D2C) — cards, metric tiles, list rows, section headers. */
+    #Card, #MetricCard {{
+        background-color: {p.surface};
+        border: {tokens.BORDER_HAIRLINE_PX}px solid {p.border};
+        border-radius: {tokens.RADIUS_MD}px;
+    }}
+    #CardTitle {{ font-size: {tokens.TYPE_TITLE_PT}pt; font-weight: 600; }}
+    #CardStat, #RowMeta {{ color: {p.text_secondary}; font-size: {tokens.TYPE_CAPTION_PT}pt; }}
+    #MetricValue {{ font-size: {tokens.TYPE_DISPLAY_PT}pt; font-weight: 600; }}
+    #MetricCaption {{ color: {p.text_secondary}; font-size: {tokens.TYPE_CAPTION_PT}pt; }}
+    #SectionTitle {{ font-size: {tokens.TYPE_TITLE_PT}pt; font-weight: 600; }}
+    #RunSummary, #ActivityItem, #ArtifactRow, #ReportRow, #WorktreeRow {{
+        border-bottom: {tokens.BORDER_HAIRLINE_PX}px solid {p.border};
+    }}
     """
 
 

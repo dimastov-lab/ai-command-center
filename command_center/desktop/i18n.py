@@ -55,6 +55,21 @@ HOME_EMPTY_BODY = (
 )
 HOME_EMPTY_ACTION = "Перейти к проектам"
 
+# Workspace Home section titles + header-metric captions (D2C §1).
+HOME_SECTION_PROJECTS = "Проекты"
+HOME_SECTION_ACTIVE_RUNS = "Активные запуски"
+HOME_SECTION_RECENT_RUNS = "Недавние запуски"
+HOME_SECTION_ARTIFACTS = "Артефакты"
+HOME_SECTION_REPORTS = "Отчёты"
+HOME_SECTION_ACTIVITY = "Активность"
+HOME_SECTION_EMPTY = "Нет данных"
+HOME_LOAD_ERROR = "Не удалось загрузить данные"
+METRIC_PROJECTS = "Проекты"
+METRIC_ACTIVE_RUNS = "Активные запуски"
+METRIC_RECENT_RUNS = "Недавние запуски"
+METRIC_ARTIFACTS = "Артефакты"
+METRIC_REPORTS = "Отчёты"
+
 # --- Projects page --------------------------------------------------------
 PROJECTS_TITLE = "Проекты"
 PROJECTS_SUBTITLE = "Статус репозитория, worktree и настройка по каждому проекту."

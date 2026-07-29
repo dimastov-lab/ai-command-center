@@ -54,9 +54,11 @@ class AppShell(QWidget):
         super().__init__(parent)
         self._settings = settings
         self._theme = theme
-        # Cooperative-cancellation flag shared with future background workers
+        # Cooperative-cancellation flag shared with background workers
         # (`ARCHITECTURE.md` §11). Set on shutdown; workers poll it at checkpoints.
         self._cancel_event = threading.Event()
+        # Workspace Home data adapter, wired by :meth:`load_workspace_home`.
+        self._adapter: object | None = None
 
         self.setObjectName("AppShell")
         self.setWindowTitle(WINDOW_TITLE)
@@ -93,6 +95,12 @@ class AppShell(QWidget):
 
         home = HomePage()
         home.navigate_requested.connect(self.navigate_to)
+        self._home = home
+        # Keep the Home page's dynamic badges in step with the theme, and colour
+        # them for the palette already applied before this shell was constructed.
+        self._theme.palette_changed.connect(home.apply_palette)
+        if self._theme.palette is not None:
+            home.apply_palette(self._theme.palette)
         self._add_page(home)
 
         self._add_page(ProjectsPage())
@@ -140,11 +148,17 @@ class AppShell(QWidget):
         self._theme.set_mode(mode)
         self._settings.set_theme_mode(mode)
 
-    # --- refresh -----------------------------------------------------------
+    # --- data / refresh ----------------------------------------------------
+    def load_workspace_home(self, adapter: object) -> None:
+        """Wire the Workspace Home data adapter and start the first async load."""
+        self._adapter = adapter
+        self._home.load(adapter, cancel_event=self._cancel_event)
+
     def _on_refresh(self) -> None:
-        # D1 has no page-level data adapter to re-run; this is the seam D2 wires
-        # the active page's Workspace Home refresh onto. Re-emit so callers/tests
-        # can observe the user's intent.
+        # Re-run the active page's data load when an adapter is wired; always
+        # re-emit so callers/tests can observe the user's refresh intent.
+        if self._adapter is not None:
+            self._home.load(self._adapter, cancel_event=self._cancel_event)
         self.refresh_requested.emit()
 
     # --- geometry / lifecycle ---------------------------------------------
