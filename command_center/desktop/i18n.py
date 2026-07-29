@@ -96,6 +96,30 @@ REPO_STATE_LABELS: dict[str, str] = {
 }
 
 
+# Run states (WORKSPACE_HOME_SPEC.md §5/§6), keyed by runtime.db state strings.
+RUN_STATE_LABELS: dict[str, str] = {
+    "PREPARED": "Подготовлен",
+    "QUEUED": "В очереди",
+    "RUNNING": "Выполняется",
+    "COMPLETED": "Завершён",
+    "FAILED": "Ошибка",
+    "CANCELLED": "Отменён",
+    "INTERRUPTED": "Прерван",
+    "UNKNOWN": "Неизвестно",
+}
+
+# Activity events (WORKSPACE_HOME_SPEC.md §6), keyed by activity_log event_type.
+ACTIVITY_EVENT_LABELS: dict[str, str] = {
+    "run_started": "Запуск начат",
+    "run_completed": "Запуск завершён",
+    "run_failed": "Запуск завершился ошибкой",
+}
+
+# A report file with no linked run (WORKSPACE_HOME_SPEC.md §8) — shown without a
+# verdict badge rather than a misleading blank one.
+REPORT_UNMATCHED_NOTE = "Без привязки к запуску"
+
+
 def page_accessible_name(title: str) -> str:
     """Accessible name for a page given its (already-Russian) visible title."""
     return f"Страница «{title}»"
