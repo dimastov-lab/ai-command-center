@@ -147,15 +147,18 @@ def test_review_final_gate_and_architecture_review_share_the_identical_policy():
 
 
 @pytest.mark.parametrize("task_type", ["implementation", "remediation"])
-def test_implementation_and_remediation_keep_bash_but_block_git_writes(task_type):
+def test_implementation_and_remediation_allow_local_commit_but_block_dangerous_git_writes(task_type):
     command = agent_runner.build_command("implement this", task_type=task_type)
     tools = _tools_argument(command)
     assert tools == [], "implementation/remediation must not be tool-set-restricted (they need Bash/Edit/Write)"
     disallowed = _disallowed_tools_argument(command)
     for pattern in agent_runner.GIT_WRITE_DISALLOWED_TOOLS:
         assert pattern in disallowed
-    # Explicitly confirm every git-write operation named in the remediation spec is covered.
-    required_git_ops = ["add", "apply", "checkout", "restore", "switch", "stash", "commit", "push", "merge", "reset", "rebase", "clean"]
+    assert not any("git add" in pattern for pattern in disallowed)
+    assert not any("git commit" in pattern for pattern in disallowed)
+    # The task agent owns its local task commit. History/branch/remote mutation
+    # remains outside its authority.
+    required_git_ops = ["apply", "checkout", "restore", "switch", "stash", "push", "merge", "reset", "rebase", "clean"]
     for op in required_git_ops:
         assert any(f"git {op}" in pattern for pattern in disallowed), f"missing disallow pattern for git {op}"
     assert any("branch -d" in pattern.lower() for pattern in disallowed)
