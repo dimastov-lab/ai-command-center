@@ -80,6 +80,22 @@ SETTINGS_MORE_BODY = (
 )
 
 
+# --- Status badges / project cards (D2C) ----------------------------------
+BADGE_SENSITIVE = "Конфиденциально"
+PROJECT_TASKS_LABEL = "Задачи"
+PROJECT_ACTIVE_RUNS_LABEL = "Активные запуски"
+PROJECT_CONFIGURE_ACTION = "Настроить путь к репозиторию"
+
+# Repository health labels, keyed by `_discover_worktrees`'s repository_state
+# (WORKSPACE_HOME_SPEC.md §3 — this mapping must not drift).
+REPO_STATE_LABELS: dict[str, str] = {
+    "unconfigured": "Не настроен",
+    "invalid_path": "Путь недействителен",
+    "not_git_repo": "Не git-репозиторий",
+    "ok": "Настроен",
+}
+
+
 def page_accessible_name(title: str) -> str:
     """Accessible name for a page given its (already-Russian) visible title."""
     return f"Страница «{title}»"
