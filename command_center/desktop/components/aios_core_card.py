@@ -15,6 +15,22 @@ _VARIANTS = {
     "error": StatusVariant.DANGER,
     "contract_pending": StatusVariant.INFO,
 }
+_MAX_VISIBLE_ITEMS = 5
+_WRAP_CHUNK = 24
+
+
+def _wrap_identifier(value: str) -> str:
+    return "\u200b".join(
+        value[index : index + _WRAP_CHUNK]
+        for index in range(0, len(value), _WRAP_CHUNK)
+    )
+
+
+def _display_items(values: list[str] | tuple[str, ...]) -> str:
+    visible = [_wrap_identifier(value) for value in values[:_MAX_VISIBLE_ITEMS]]
+    if len(values) > _MAX_VISIBLE_ITEMS:
+        visible.append(f"ещё {len(values) - _MAX_VISIBLE_ITEMS}")
+    return ", ".join(visible) or "не подтверждены"
 
 
 class AIOSCoreCard(QWidget):
@@ -57,7 +73,7 @@ class AIOSCoreCard(QWidget):
         layout.addWidget(health)
         capabilities = QLabel(
             i18n.AIOS_CORE_CAPABILITIES.format(
-                items=", ".join(status.get("capabilities") or ()) or "не подтверждены"
+                items=_display_items(status.get("capabilities") or ())
             )
         )
         capabilities.setObjectName("RowMeta")
@@ -65,7 +81,7 @@ class AIOSCoreCard(QWidget):
         layout.addWidget(capabilities)
         gates = QLabel(
             i18n.AIOS_CORE_GATES.format(
-                items=", ".join(status.get("gates") or ()) or "не подтверждены"
+                items=_display_items(status.get("gates") or ())
             )
         )
         gates.setObjectName("RowMeta")
@@ -82,9 +98,8 @@ class AIOSCoreCard(QWidget):
             detail.setWordWrap(True)
             layout.addWidget(detail)
         self.setAccessibleName(f"{i18n.AIOS_CORE_TITLE}: {state_text}")
-        self.setAccessibleDescription(
-            f"{source.text()}. {health.text()}. {capabilities.text()}. {gates.text()}."
-        )
+        description = f"{source.text()}. {health.text()}. {capabilities.text()}. {gates.text()}."
+        self.setAccessibleDescription(description[:1_024])
 
     def apply_palette(self, palette: Palette) -> None:
         self.status_badge.apply_palette(palette)

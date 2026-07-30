@@ -122,6 +122,36 @@ def test_home_shows_separate_russian_aios_core_card_with_source_and_evidence(qtb
     assert card.accessibleName().startswith("AIOS Core:")
 
 
+def test_aios_core_card_bounds_long_contract_values_at_desktop_width(qtbot):
+    page = HomePage()
+    qtbot.addWidget(page)
+    long_id = "x" * 256
+    page.render_snapshot(
+        _snapshot(
+            aios_core={
+                "readiness": "ready",
+                "source": "AIOS API",
+                "version": "1.0",
+                "health": "healthy",
+                "capabilities": [long_id] * 10,
+                "gates": [long_id] * 10,
+                "evidence": ["build:abc"],
+                "detail": None,
+            }
+        )
+    )
+    page.resize(900, 700)
+    page.show()
+    qtbot.wait(20)
+
+    card = page.aios_core_card()
+    assert card is not None
+    assert card.minimumSizeHint().width() <= 818
+    assert len(card.accessibleDescription()) <= 1_024
+    visible_text = " ".join(label.text() for label in card.findChildren(QLabel))
+    assert "ещё 5" in visible_text
+
+
 def test_render_snapshot_populates_all_sections(qtbot):
     page = HomePage()
     qtbot.addWidget(page)

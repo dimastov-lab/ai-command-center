@@ -189,15 +189,23 @@ class HTTPAIOSStatusClient:
             return None
         if not isinstance(value, str) or len(value) > MAX_TEXT_LENGTH:
             raise ValueError("invalid text")
-        return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("blank text")
+        return normalized
 
     @staticmethod
     def _bounded_text_list(value: object) -> tuple[str, ...]:
         if not isinstance(value, list) or len(value) > MAX_ITEMS:
             raise ValueError("invalid list")
-        if any(not isinstance(item, str) or len(item) > MAX_TEXT_LENGTH for item in value):
+        if any(
+            not isinstance(item, str)
+            or len(item) > MAX_TEXT_LENGTH
+            or not item.strip()
+            for item in value
+        ):
             raise ValueError("invalid list item")
-        return tuple(value)
+        return tuple(item.strip() for item in value)
 
     @staticmethod
     def _safe_evidence(value: object) -> tuple[str, ...]:
@@ -211,6 +219,7 @@ class HTTPAIOSStatusClient:
             if (
                 kind not in SAFE_EVIDENCE_KINDS
                 or not isinstance(reference, str)
+                or not reference
                 or not reference.isascii()
                 or len(reference) > MAX_TEXT_LENGTH
                 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in reference)
