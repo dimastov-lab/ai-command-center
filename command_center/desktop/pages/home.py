@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from .. import i18n, tokens
 from ..components.activity_item import ActivityItem
+from ..components.aios_core_card import AIOSCoreCard
 from ..components.artifact_row import ArtifactRow
 from ..components.empty_state import EmptyState
 from ..components.loading_skeleton import LoadingSkeleton
@@ -85,6 +86,7 @@ class HomePage(BasePage):
         self._activity_items: list[ActivityItem] = []
         self._artifact_rows: list[ArtifactRow] = []
         self._report_rows: list[ReportRow] = []
+        self._aios_core_card: AIOSCoreCard | None = None
 
     def project_cards(self) -> list[ProjectCard]:
         return list(self._project_cards)
@@ -103,6 +105,9 @@ class HomePage(BasePage):
 
     def report_rows(self) -> list[ReportRow]:
         return list(self._report_rows)
+
+    def aios_core_card(self) -> AIOSCoreCard | None:
+        return self._aios_core_card
 
     # --- content management -----------------------------------------------
     def _clear_content(self) -> None:
@@ -156,6 +161,9 @@ class HomePage(BasePage):
         """Rebuild the populated Workspace Home from ``snapshot`` (idempotent)."""
         self._clear_content()
         self._loading = False
+        if snapshot.get("aios_core") is not None:
+            self._aios_core_card = AIOSCoreCard(snapshot["aios_core"])
+            self._content_layout.addWidget(self._aios_core_card)
         self._content_layout.addWidget(self._build_metric_strip(snapshot))
         self._content_layout.addWidget(self._build_projects_section(snapshot))
         self._content_layout.addWidget(

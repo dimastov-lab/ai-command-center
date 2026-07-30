@@ -87,6 +87,33 @@ def test_render_snapshot_metric_strip_reflects_counts(qtbot):
     assert metrics[i18n.METRIC_REPORTS] == "1"
 
 
+def test_home_shows_separate_russian_aios_core_card_with_source_and_evidence(qtbot):
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.render_snapshot(
+        _snapshot(
+            aios_core={
+                "readiness": "contract_pending",
+                "source": "configuration",
+                "version": None,
+                "health": None,
+                "capabilities": [],
+                "gates": [],
+                "evidence": ["Публичный контракт AIOS Core ожидается"],
+                "detail": None,
+            }
+        )
+    )
+
+    card = page.aios_core_card()
+    assert card is not None
+    visible_text = " ".join(label.text() for label in card.findChildren(QLabel))
+    assert "AIOS Core" in visible_text
+    assert "Контракт ожидается" in visible_text
+    assert "Источник: конфигурация" in visible_text
+    assert "Публичный контракт AIOS Core ожидается" in visible_text
+
+
 def test_render_snapshot_populates_all_sections(qtbot):
     page = HomePage()
     qtbot.addWidget(page)
