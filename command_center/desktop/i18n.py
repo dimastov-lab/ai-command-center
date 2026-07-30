@@ -69,6 +69,7 @@ AIOS_CORE_VERSION = "Версия: {version}"
 AIOS_CORE_HEALTH = "Здоровье: {health}"
 AIOS_CORE_CAPABILITIES = "Возможности: {items}"
 AIOS_CORE_GATES = "Гейты приёмки: {items}"
+AIOS_CORE_EVIDENCE = "Доказательства: {items}"
 HOME_LOADING = "Загрузка данных…"
 HOME_LOADING_ACCESSIBLE_DESCRIPTION = (
     "Содержимое главной страницы обновляется. Дождитесь окончания загрузки."

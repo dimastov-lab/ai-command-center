@@ -115,7 +115,7 @@ def test_home_shows_separate_russian_aios_core_card_with_source_and_evidence(qtb
     assert "Здоровье: исправен" in visible_text
     assert "Возможности: memory-api" in visible_text
     assert "Гейты приёмки: contract-tests" in visible_text
-    assert "Публичный контракт AIOS Core ожидается" in visible_text
+    assert "Публичный контракт AIOS Core ожидается" in visible_text.replace("\u200b", "")
     badge = card.findChild(StatusBadge)
     assert badge is not None
     assert badge.variant is StatusVariant.INFO
@@ -135,7 +135,7 @@ def test_aios_core_card_bounds_long_contract_values_at_desktop_width(qtbot):
                 "health": "healthy",
                 "capabilities": [long_id] * 10,
                 "gates": [long_id] * 10,
-                "evidence": ["build:abc"],
+                "evidence": [f"build:{long_id}"] * 100,
                 "detail": None,
             }
         )
@@ -148,6 +148,7 @@ def test_aios_core_card_bounds_long_contract_values_at_desktop_width(qtbot):
     assert card is not None
     assert card.minimumSizeHint().width() <= 818
     assert len(card.accessibleDescription()) <= 1_024
+    assert len(card.findChildren(QLabel)) <= 10
     visible_text = " ".join(label.text() for label in card.findChildren(QLabel))
     assert "ещё 5" in visible_text
 

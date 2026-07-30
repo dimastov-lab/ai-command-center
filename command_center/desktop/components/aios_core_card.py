@@ -87,11 +87,14 @@ class AIOSCoreCard(QWidget):
         gates.setObjectName("RowMeta")
         gates.setWordWrap(True)
         layout.addWidget(gates)
-        for text in status.get("evidence") or ():
-            evidence = QLabel(str(text))
-            evidence.setObjectName("RowMeta")
-            evidence.setWordWrap(True)
-            layout.addWidget(evidence)
+        evidence = QLabel(
+            i18n.AIOS_CORE_EVIDENCE.format(
+                items=_display_items(status.get("evidence") or ())
+            )
+        )
+        evidence.setObjectName("RowMeta")
+        evidence.setWordWrap(True)
+        layout.addWidget(evidence)
         if status.get("detail"):
             detail = QLabel(str(status["detail"]))
             detail.setObjectName("RowMeta")
