@@ -88,7 +88,6 @@ class WorkspaceHomeAdapter:
                 "display_name": item.display_name,
                 "readiness": item.readiness.value,
                 "provenance": item.provenance,
-                "executable_path": item.executable_path,
                 "detail": item.detail,
             }
             for item in self._provider_capability_client.list_capabilities()

@@ -79,6 +79,8 @@ _PROVIDER_READINESS_LABELS = {
     "auth_unknown": "установлен, авторизация не подтверждена",
     "login_required": "установлен, требуется вход",
     "daemon_unavailable": "служба недоступна",
+    "no_models": "служба доступна, модели не найдены",
+    "status_unavailable": "статус недоступен",
     "not_installed": "не установлен",
     "contract_pending": "контракт AIOS ожидается",
 }

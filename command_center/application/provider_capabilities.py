@@ -22,6 +22,8 @@ class ProviderReadiness(str, Enum):
     AUTH_UNKNOWN = "auth_unknown"
     LOGIN_REQUIRED = "login_required"
     DAEMON_UNAVAILABLE = "daemon_unavailable"
+    NO_MODELS = "no_models"
+    STATUS_UNAVAILABLE = "status_unavailable"
     NOT_INSTALLED = "not_installed"
     CONTRACT_PENDING = "contract_pending"
 
@@ -32,7 +34,6 @@ class ProviderCapability:
     display_name: str
     readiness: ProviderReadiness
     provenance: str
-    executable_path: str | None = None
     detail: str | None = None
 
 
@@ -45,6 +46,8 @@ def _probe_ollama_models() -> tuple[str, ...] | None:
         with urlopen("http://127.0.0.1:11434/api/tags", timeout=0.5) as response:
             payload = json.loads(response.read(65_537))
     except (OSError, TimeoutError, URLError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
         return None
     models = payload.get("models")
     if not isinstance(models, list):
@@ -94,17 +97,24 @@ class CompatibilityProviderCapabilityClient:
             readiness = installed_state
             detail = None
             if provider_id == "ollama":
-                models = self._ollama_probe()
-                if models is not None:
+                try:
+                    models = self._ollama_probe()
+                except Exception:
+                    models = None
+                    readiness = ProviderReadiness.STATUS_UNAVAILABLE
+                    detail = "Статус службы получить не удалось"
+                if models:
                     readiness = ProviderReadiness.AVAILABLE
                     detail = f"Доступно моделей: {len(models)}"
+                elif models == ():
+                    readiness = ProviderReadiness.NO_MODELS
+                    detail = "Служба доступна, модели не найдены"
             result.append(
                 ProviderCapability(
                     provider_id,
                     display_name,
                     readiness,
-                    "локальный исполняемый файл",
-                    executable_path=path,
+                    f"локальный PATH ({binary})",
                     detail=detail,
                 )
             )

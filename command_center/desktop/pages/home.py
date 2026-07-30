@@ -446,6 +446,19 @@ class HomePage(BasePage):
                     page._active_runnables.pop(provider_key, None)
 
             provider_runnable.signals.result.connect(deliver_providers)
+            provider_runnable.signals.error.connect(
+                lambda _exc: deliver_providers(
+                    [
+                        {
+                            "provider_id": "providers",
+                            "display_name": "Провайдеры",
+                            "readiness": "status_unavailable",
+                            "provenance": "адаптер совместимости",
+                            "detail": "Не удалось получить статусы провайдеров",
+                        }
+                    ]
+                )
+            )
             provider_runnable.signals.finished.connect(release_provider_runnable)
             (pool if pool is not None else QThreadPool.globalInstance()).start(
                 provider_runnable
