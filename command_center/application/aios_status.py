@@ -136,8 +136,17 @@ class HTTPAIOSStatusClient:
             capabilities = self._bounded_text_list(payload.get("capabilities", []))
             gates = self._bounded_text_list(payload.get("gates", []))
             evidence = self._safe_evidence(payload.get("evidence", []))
+            readiness = AIOSCoreReadiness(payload["readiness"])
+            if readiness is AIOSCoreReadiness.READY and (
+                health != "healthy"
+                or not version
+                or not capabilities
+                or not gates
+                or not evidence
+            ):
+                raise ValueError("incomplete readiness proof")
             return AIOSCoreStatus(
-                readiness=AIOSCoreReadiness(payload["readiness"]),
+                readiness=readiness,
                 source="AIOS API",
                 version=version,
                 health=health,

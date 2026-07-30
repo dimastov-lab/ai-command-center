@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QLabel
 
 from command_center.desktop import i18n, tokens
 from command_center.desktop.components.empty_state import EmptyState
+from command_center.desktop.components.status_badge import StatusBadge, StatusVariant
 from command_center.desktop.components.worktree_row import WorktreeRow
 from command_center.desktop.pages.home import HomePage
 
@@ -96,9 +97,9 @@ def test_home_shows_separate_russian_aios_core_card_with_source_and_evidence(qtb
                 "readiness": "contract_pending",
                 "source": "configuration",
                 "version": None,
-                "health": None,
-                "capabilities": [],
-                "gates": [],
+                "health": "healthy",
+                "capabilities": ["memory-api"],
+                "gates": ["contract-tests"],
                 "evidence": ["Публичный контракт AIOS Core ожидается"],
                 "detail": None,
             }
@@ -111,7 +112,14 @@ def test_home_shows_separate_russian_aios_core_card_with_source_and_evidence(qtb
     assert "AIOS Core" in visible_text
     assert "Контракт ожидается" in visible_text
     assert "Источник: конфигурация" in visible_text
+    assert "Здоровье: исправен" in visible_text
+    assert "Возможности: memory-api" in visible_text
+    assert "Гейты приёмки: contract-tests" in visible_text
     assert "Публичный контракт AIOS Core ожидается" in visible_text
+    badge = card.findChild(StatusBadge)
+    assert badge is not None
+    assert badge.variant is StatusVariant.INFO
+    assert card.accessibleName().startswith("AIOS Core:")
 
 
 def test_render_snapshot_populates_all_sections(qtbot):
@@ -205,6 +213,44 @@ def test_load_fetches_via_adapter_without_blocking_gui(qtbot):
     runnable = page.load(_StubAdapter())
     assert runnable is not None
     qtbot.waitUntil(lambda: len(page.project_cards()) == 2, timeout=2000)
+
+
+def test_slow_aios_status_does_not_delay_or_replace_local_home(qtbot):
+    status_started = threading.Event()
+    release_status = threading.Event()
+
+    class _Adapter:
+        def snapshot(self):
+            return _snapshot()
+
+        def aios_core_status(self):
+            status_started.set()
+            release_status.wait(2.0)
+            return {
+                "readiness": "offline",
+                "source": "AIOS API",
+                "version": None,
+                "health": None,
+                "capabilities": [],
+                "gates": [],
+                "evidence": [],
+                "detail": "Публичный API AIOS Core недоступен",
+            }
+
+    pool = QThreadPool()
+    pool.setMaxThreadCount(2)
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.load(_Adapter(), pool=pool)
+
+    assert status_started.wait(1.0)
+    qtbot.waitUntil(lambda: len(page.project_cards()) == 2, timeout=1000)
+    assert page.aios_core_card() is None
+
+    release_status.set()
+    qtbot.waitUntil(lambda: page.aios_core_card() is not None, timeout=1000)
+    assert len(page.project_cards()) == 2
+    assert pool.waitForDone(2000)
 
 
 def test_load_without_adapter_is_a_noop(qtbot):

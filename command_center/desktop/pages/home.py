@@ -56,6 +56,8 @@ class HomePage(BasePage):
         self._request_id = 0
         self._active_runnables: dict[int, AdapterCallRunnable] = {}
         self._accept_worker_signals = True
+        self._has_snapshot = False
+        self._last_aios_status: dict | None = None
         self._reset_registries()
 
         self._scroll = QScrollArea()
@@ -159,10 +161,14 @@ class HomePage(BasePage):
     # --- rendering ---------------------------------------------------------
     def render_snapshot(self, snapshot: dict) -> None:
         """Rebuild the populated Workspace Home from ``snapshot`` (idempotent)."""
+        if self._last_aios_status is not None and "aios_core" not in snapshot:
+            snapshot = {**snapshot, "aios_core": self._last_aios_status}
         self._clear_content()
         self._loading = False
+        self._has_snapshot = True
         if snapshot.get("aios_core") is not None:
             self._aios_core_card = AIOSCoreCard(snapshot["aios_core"])
+            self._badged.append(self._aios_core_card)
             self._content_layout.addWidget(self._aios_core_card)
         self._content_layout.addWidget(self._build_metric_strip(snapshot))
         self._content_layout.addWidget(self._build_projects_section(snapshot))
@@ -178,6 +184,22 @@ class HomePage(BasePage):
         self._content_layout.addStretch(1)
         if self._palette is not None:
             self.apply_palette(self._palette)
+
+    def render_aios_core(self, status: dict) -> None:
+        """Update only the remote AIOS projection, preserving local Home data."""
+        self._last_aios_status = dict(status)
+        if not self._has_snapshot:
+            return
+        if self._aios_core_card is not None:
+            self._badged = [item for item in self._badged if item is not self._aios_core_card]
+            self._content_layout.removeWidget(self._aios_core_card)
+            self._aios_core_card.setParent(None)
+            self._aios_core_card.deleteLater()
+        self._aios_core_card = AIOSCoreCard(status)
+        self._badged.append(self._aios_core_card)
+        self._content_layout.insertWidget(0, self._aios_core_card)
+        if self._palette is not None:
+            self._aios_core_card.apply_palette(self._palette)
 
     def _section(self, title: str, rows: list[QWidget]) -> QWidget:
         box = QWidget()
@@ -300,7 +322,8 @@ class HomePage(BasePage):
             return None
         from PySide6.QtCore import QThreadPool
 
-        self._show_loading_state()
+        if not self._has_snapshot:
+            self._show_loading_state()
         self._request_id += 1
         request_id = self._request_id
         for old_request_id, old_runnable in tuple(self._active_runnables.items()):
@@ -337,6 +360,45 @@ class HomePage(BasePage):
         runnable.signals.error.connect(deliver_error)
         runnable.signals.finished.connect(release_runnable)
         (pool if pool is not None else QThreadPool.globalInstance()).start(runnable)
+
+        status_method = getattr(adapter, "aios_core_status", None)
+        if callable(status_method):
+            status_key = -request_id
+            status_runnable = AdapterCallRunnable(status_method, cancel_event=cancel_event)
+            self._active_runnables[status_key] = status_runnable
+
+            def deliver_status(status: dict) -> None:
+                page = page_ref()
+                if (
+                    page is not None
+                    and page._accept_worker_signals
+                    and request_id == page._request_id
+                ):
+                    page.render_aios_core(status)
+
+            def deliver_status_error(_exc: Exception) -> None:
+                deliver_status(
+                    {
+                        "readiness": "error",
+                        "source": "AIOS API",
+                        "version": None,
+                        "health": None,
+                        "capabilities": [],
+                        "gates": [],
+                        "evidence": [],
+                        "detail": "Не удалось получить статус AIOS Core",
+                    }
+                )
+
+            def release_status_runnable() -> None:
+                page = page_ref()
+                if page is not None:
+                    page._active_runnables.pop(status_key, None)
+
+            status_runnable.signals.result.connect(deliver_status)
+            status_runnable.signals.error.connect(deliver_status_error)
+            status_runnable.signals.finished.connect(release_status_runnable)
+            (pool if pool is not None else QThreadPool.globalInstance()).start(status_runnable)
         return runnable
 
     def shutdown_workers(self) -> None:
@@ -350,6 +412,9 @@ class HomePage(BasePage):
         return len(self._active_runnables)
 
     def _on_load_error(self) -> None:
+        if self._has_snapshot:
+            self._loading = False
+            return
         self._clear_content()
         self._loading = False
         message = QLabel(i18n.HOME_LOAD_ERROR)

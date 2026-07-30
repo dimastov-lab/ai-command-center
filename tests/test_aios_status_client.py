@@ -173,6 +173,32 @@ def test_boolean_contract_version_is_not_accepted_as_integer_version_one():
     assert status.readiness is AIOSCoreReadiness.ERROR
 
 
+def test_ready_requires_complete_health_capability_gate_and_evidence_proof():
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self, *_args):
+            return (
+                b'{"contract":"aios.core.status","contract_version":1,'
+                b'"tenant_id":"bank-a","readiness":"ready","health":"healthy",'
+                b'"capabilities":[],"gates":[],"evidence":[]}'
+            )
+
+    status = HTTPAIOSStatusClient(
+        "https://aios.invalid/v1/core/status",
+        bearer_token="secret",
+        tenant_id="bank-a",
+        allowed_hosts=frozenset({"aios.invalid"}),
+        opener=lambda *_args, **_kwargs: _Response(),
+    ).get_core_status()
+
+    assert status.readiness is AIOSCoreReadiness.ERROR
+
+
 def test_factory_rejects_plain_http_and_unapproved_hosts():
     common = {
         "AICC_AIOS_STATUS_ENABLED": "1",

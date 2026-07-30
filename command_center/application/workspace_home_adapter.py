@@ -57,17 +57,18 @@ class WorkspaceHomeAdapter:
             artifacts_limit=artifacts_limit,
             reports_limit=reports_limit,
         )
+        return snapshot
+
+    def aios_core_status(self) -> dict:
+        """Fetch AIOS independently so remote latency cannot block local Home."""
         status = self._aios_status_client.get_core_status()
         return {
-            **snapshot,
-            "aios_core": {
-                "readiness": status.readiness.value,
-                "source": status.source,
-                "version": status.version,
-                "health": status.health,
-                "capabilities": list(status.capabilities),
-                "gates": list(status.gates),
-                "evidence": list(status.evidence),
-                "detail": status.detail,
-            },
+            "readiness": status.readiness.value,
+            "source": status.source,
+            "version": status.version,
+            "health": status.health,
+            "capabilities": list(status.capabilities),
+            "gates": list(status.gates),
+            "evidence": list(status.evidence),
+            "detail": status.detail,
         }

@@ -20,7 +20,6 @@ from command_center.application.workspace_home_adapter import WorkspaceHomeAdapt
 from command_center.runtime.api import ExecutionCenterAPI
 
 SNAPSHOT_KEYS = {
-    "aios_core",
     "projects",
     "worktrees_by_project",
     "active_runs",
@@ -29,10 +28,6 @@ SNAPSHOT_KEYS = {
     "artifacts",
     "reports",
 }
-
-
-def _without_aios_core(snapshot: dict) -> dict:
-    return {key: value for key, value in snapshot.items() if key != "aios_core"}
 
 
 @pytest.fixture
@@ -56,7 +51,7 @@ def test_adapter_returns_read_model_snapshot_unchanged_empty_state(tmp_path):
 
     actual = WorkspaceHomeAdapter(execution_center_api=api).snapshot()
 
-    assert _without_aios_core(actual) == expected
+    assert actual == expected
     assert set(actual) == SNAPSHOT_KEYS
 
 
@@ -82,7 +77,7 @@ def test_adapter_preserves_every_field_on_populated_state(
     expected = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
     actual = WorkspaceHomeAdapter(execution_center_api=api).snapshot()
 
-    assert _without_aios_core(actual) == expected
+    assert actual == expected
     assert set(actual) == SNAPSHOT_KEYS
 
 
@@ -96,7 +91,7 @@ def test_adapter_passes_limits_through(tmp_path):
         active_runs_limit=1, reports_limit=3
     )
 
-    assert _without_aios_core(actual) == expected
+    assert actual == expected
 
 
 def test_adapter_owns_the_injected_execution_center_api(tmp_path):
@@ -105,7 +100,7 @@ def test_adapter_owns_the_injected_execution_center_api(tmp_path):
     assert adapter.execution_center_api is api
 
 
-def test_adapter_adds_aios_core_status_from_dedicated_public_port(tmp_path, monkeypatch):
+def test_adapter_exposes_aios_core_status_through_independent_public_port(tmp_path, monkeypatch):
     class _AIOSClient:
         def get_core_status(self):
             return AIOSCoreStatus(
@@ -120,12 +115,15 @@ def test_adapter_adds_aios_core_status_from_dedicated_public_port(tmp_path, monk
         lambda **_kwargs: {"projects": []},
     )
 
-    snapshot = WorkspaceHomeAdapter(
+    adapter = WorkspaceHomeAdapter(
         execution_center_api=_api(tmp_path),
         aios_status_client=_AIOSClient(),
-    ).snapshot()
+    )
+    snapshot = adapter.snapshot()
+    status = adapter.aios_core_status()
 
-    assert snapshot["aios_core"] == {
+    assert "aios_core" not in snapshot
+    assert status == {
         "readiness": "ready",
         "source": "AIOS API",
         "version": "0.3.0",
@@ -135,6 +133,23 @@ def test_adapter_adds_aios_core_status_from_dedicated_public_port(tmp_path, monk
         "evidence": ["build:abc123"],
         "detail": None,
     }
+
+
+def test_local_snapshot_does_not_wait_for_or_call_aios_status(tmp_path, monkeypatch):
+    class _RaisingAIOSClient:
+        def get_core_status(self):
+            raise RuntimeError("remote unavailable")
+
+    monkeypatch.setattr(
+        "command_center.application.workspace_home_adapter.build_workspace_home_snapshot",
+        lambda **_kwargs: {"projects": [{"id": "AIOS"}]},
+    )
+    adapter = WorkspaceHomeAdapter(
+        execution_center_api=_api(tmp_path),
+        aios_status_client=_RaisingAIOSClient(),
+    )
+
+    assert adapter.snapshot() == {"projects": [{"id": "AIOS"}]}
 
 
 def test_adapter_constructs_a_single_default_api_when_none_injected(monkeypatch):

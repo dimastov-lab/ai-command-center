@@ -66,6 +66,9 @@ HOME_SECTION_EMPTY = "Нет данных"
 AIOS_CORE_TITLE = "AIOS Core"
 AIOS_CORE_SOURCE = "Источник: {source}"
 AIOS_CORE_VERSION = "Версия: {version}"
+AIOS_CORE_HEALTH = "Здоровье: {health}"
+AIOS_CORE_CAPABILITIES = "Возможности: {items}"
+AIOS_CORE_GATES = "Гейты приёмки: {items}"
 HOME_LOADING = "Загрузка данных…"
 HOME_LOADING_ACCESSIBLE_DESCRIPTION = (
     "Содержимое главной страницы обновляется. Дождитесь окончания загрузки."
@@ -103,6 +106,12 @@ def aios_readiness_label(value: object) -> str:
 
 def aios_source_label(value: object) -> str:
     return _AIOS_SOURCE_LABELS.get(str(value or ""), str(value or "не указан"))
+
+
+def aios_health_label(value: object) -> str:
+    return {"healthy": "исправен", "degraded": "ограничен"}.get(
+        str(value or ""), str(value or "не подтверждено")
+    )
 
 # --- Projects page --------------------------------------------------------
 PROJECTS_TITLE = "Проекты"
