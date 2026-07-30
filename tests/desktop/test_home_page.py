@@ -14,7 +14,7 @@ import gc
 import threading
 import weakref
 
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import QThreadPool, Qt
 from PySide6.QtWidgets import QLabel
 
 from command_center.desktop import i18n, tokens
@@ -111,6 +111,41 @@ def test_render_snapshot_is_idempotent(qtbot):
     page.render_snapshot(_snapshot())
     page.render_snapshot(_snapshot())  # re-render must not accumulate
     assert len(page.project_cards()) == 2
+
+
+def test_home_never_requires_horizontal_scrolling_at_supported_widths(qtbot):
+    """Long repository data must not make the main page wider than its viewport."""
+    page = HomePage()
+    qtbot.addWidget(page)
+    snapshot = _snapshot(
+        worktrees_by_project={
+            "AIOS": {
+                "state": "ok",
+                "worktrees": [{
+                    "path": "/very/" + ("long-directory/" * 30),
+                    "branch": "feature/" + ("long-branch-" * 20),
+                    "head": "abc1234567",
+                }],
+            },
+            "BANK": {"state": "unconfigured", "worktrees": []},
+        },
+        artifacts=[{
+            "project": "AIOS",
+            "task_type": "implementation",
+            "created_at": 1730000000,
+            "nav_target": "AIOS/artifacts",
+            "path": "/generated/" + ("long-artifact-name-" * 30) + ".md",
+        }],
+    )
+    page.render_snapshot(snapshot)
+
+    for width in (620, 900):
+        page.resize(width, 700)
+        page.show()
+        qtbot.wait(20)
+        assert page._scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+        assert page._scroll.horizontalScrollBar().maximum() == 0
+        assert page._content.width() <= page._scroll.viewport().width()
 
 
 def test_configure_action_emits_navigate_to_projects(qtbot):

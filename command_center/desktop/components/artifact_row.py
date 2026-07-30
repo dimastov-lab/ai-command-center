@@ -8,7 +8,7 @@ simply has no path to show — it never fabricates or reconstructs one.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from .. import i18n, tokens
 
@@ -43,8 +43,11 @@ class ArtifactRow(QFrame):
         if self.has_path:
             self._path_label = QLabel(str(path))
             self._path_label.setObjectName("RowMeta")
+            self._path_label.setMinimumWidth(0)
+            self._path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            self._path_label.setToolTip(self._path_label.text())
             layout.addStretch(1)
-            layout.addWidget(self._path_label)
+            layout.addWidget(self._path_label, 1)
         visible_parts = [str(artifact.get("project") or ""), self._summary.text()]
         if self._path_label is not None:
             visible_parts.append(self._path_label.text())

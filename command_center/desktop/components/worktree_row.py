@@ -9,7 +9,7 @@ truth for that state. Missing keys degrade to empty strings rather than raising.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
+from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from .. import tokens
 
@@ -32,10 +32,14 @@ class WorktreeRow(QFrame):
         self._branch.setObjectName("WorktreeBranch")
         self._head = QLabel(worktree.get("head", ""))
         self._head.setObjectName("WorktreeHead")
+        for label in (self._path, self._branch):
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            label.setToolTip(label.text())
 
-        layout.addWidget(self._path)
+        layout.addWidget(self._path, 3)
         layout.addStretch(1)
-        layout.addWidget(self._branch)
+        layout.addWidget(self._branch, 2)
         layout.addWidget(self._head)
         self.setAccessibleName(
             ", ".join(

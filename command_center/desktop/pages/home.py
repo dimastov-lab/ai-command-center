@@ -17,12 +17,13 @@ from __future__ import annotations
 import threading
 import weakref
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -60,7 +61,13 @@ class HomePage(BasePage):
         self._scroll.setObjectName("HomeScroll")
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # Workspace data can contain arbitrarily long repository paths and
+        # branch names.  The page follows the window width; individual rows
+        # elide/clamp their metadata rather than growing the canvas sideways.
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._content = QWidget()
+        self._content.setMinimumWidth(0)
+        self._content.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
         self._content_layout.setSpacing(tokens.SPACE_LG)

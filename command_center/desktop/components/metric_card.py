@@ -6,7 +6,7 @@ count and an already-Russian caption. Purely presentational — no data access.
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from .. import tokens
 
@@ -26,6 +26,9 @@ class MetricCard(QFrame):
         self._value.setObjectName("MetricValue")
         self._label = QLabel(label)
         self._label.setObjectName("MetricCaption")
+        self._label.setWordWrap(True)
+        self._label.setMinimumWidth(0)
+        self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout.addWidget(self._value)
         layout.addWidget(self._label)
 
