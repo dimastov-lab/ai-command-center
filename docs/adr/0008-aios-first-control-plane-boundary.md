@@ -26,7 +26,9 @@ The first integration is read-only Core status:
 - evidence references.
 
 Network transport is disabled by default. It is enabled only when
-`AICC_AIOS_STATUS_ENABLED=1` and `AICC_AIOS_STATUS_URL` are both configured.
+`AICC_AIOS_STATUS_ENABLED=1`, an HTTPS `AICC_AIOS_STATUS_URL`, bearer token,
+tenant identifier and explicit host allowlist are all configured. Redirects are
+accepted only when their final URL still satisfies the same HTTPS allowlist.
 Offline and invalid-contract responses are rendered as explicit states. There
 is no fallback to `command_center.runtime`, no dual-write and no management
 command.
@@ -40,8 +42,10 @@ versioned contract, the UI must show **«Контракт ожидается»**
 version, health, capabilities, gates or evidence.
 
 Required AIOS dependency: publish an authenticated, tenant-safe, versioned,
-read-only Core-status contract with bounded payloads and stable readiness
-semantics.
+read-only Core-status contract with bounded payloads, structured non-sensitive
+evidence references and stable readiness semantics. A response is accepted only
+when its `contract`, `contract_version` and `tenant_id` match the configured
+expectations.
 
 ## Consequences
 
