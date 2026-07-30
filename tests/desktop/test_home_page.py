@@ -129,10 +129,10 @@ def test_aios_core_card_bounds_long_contract_values_at_desktop_width(qtbot):
     page.render_snapshot(
         _snapshot(
             aios_core={
-                "readiness": "ready",
+                "readiness": "not_ready",
                 "source": "AIOS API",
-                "version": "1.0",
-                "health": "healthy",
+                "version": "v" * 256,
+                "health": "h" * 256,
                 "capabilities": [long_id] * 10,
                 "gates": [long_id] * 10,
                 "evidence": [f"build:{long_id}"] * 100,

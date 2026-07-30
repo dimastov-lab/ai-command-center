@@ -61,15 +61,22 @@ class AIOSCoreCard(QWidget):
         layout.addWidget(source)
 
         if status.get("version"):
-            version = QLabel(i18n.AIOS_CORE_VERSION.format(version=status["version"]))
+            version = QLabel(
+                i18n.AIOS_CORE_VERSION.format(
+                    version=_wrap_identifier(str(status["version"]))
+                )
+            )
             version.setObjectName("RowMeta")
+            version.setWordWrap(True)
             layout.addWidget(version)
+        health_text = i18n.aios_health_label(status.get("health"))
         health = QLabel(
             i18n.AIOS_CORE_HEALTH.format(
-                health=i18n.aios_health_label(status.get("health"))
+                health=_wrap_identifier(health_text)
             )
         )
         health.setObjectName("RowMeta")
+        health.setWordWrap(True)
         layout.addWidget(health)
         capabilities = QLabel(
             i18n.AIOS_CORE_CAPABILITIES.format(
