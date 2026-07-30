@@ -14,6 +14,10 @@ from command_center.application.aios_status import (
     AIOSStatusClient,
     create_aios_status_client,
 )
+from command_center.application.provider_capabilities import (
+    ProviderCapabilityPort,
+    create_provider_capability_client,
+)
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.workspace_home import build_workspace_home_snapshot
 
@@ -30,9 +34,13 @@ class WorkspaceHomeAdapter:
         *,
         execution_center_api: ExecutionCenterAPI | None = None,
         aios_status_client: AIOSStatusClient | None = None,
+        provider_capability_client: ProviderCapabilityPort | None = None,
     ) -> None:
         self._api = execution_center_api if execution_center_api is not None else ExecutionCenterAPI()
         self._aios_status_client = aios_status_client or create_aios_status_client()
+        self._provider_capability_client = (
+            provider_capability_client or create_provider_capability_client()
+        )
 
     @property
     def execution_center_api(self) -> ExecutionCenterAPI:
@@ -72,3 +80,16 @@ class WorkspaceHomeAdapter:
             "evidence": list(status.evidence),
             "detail": status.detail,
         }
+
+    def provider_capabilities(self) -> list[dict]:
+        return [
+            {
+                "provider_id": item.provider_id,
+                "display_name": item.display_name,
+                "readiness": item.readiness.value,
+                "provenance": item.provenance,
+                "executable_path": item.executable_path,
+                "detail": item.detail,
+            }
+            for item in self._provider_capability_client.list_capabilities()
+        ]

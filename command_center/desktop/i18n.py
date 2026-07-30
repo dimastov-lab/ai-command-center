@@ -70,6 +70,18 @@ AIOS_CORE_HEALTH = "Здоровье: {health}"
 AIOS_CORE_CAPABILITIES = "Возможности: {items}"
 AIOS_CORE_GATES = "Гейты приёмки: {items}"
 AIOS_CORE_EVIDENCE = "Доказательства: {items}"
+PROVIDERS_TITLE = "Провайдеры ИИ"
+PROVIDERS_ACCESSIBLE_DESCRIPTION = (
+    "Доступность провайдеров по подтверждённым локальным признакам."
+)
+_PROVIDER_READINESS_LABELS = {
+    "available": "доступен",
+    "auth_unknown": "установлен, авторизация не подтверждена",
+    "login_required": "установлен, требуется вход",
+    "daemon_unavailable": "служба недоступна",
+    "not_installed": "не установлен",
+    "contract_pending": "контракт AIOS ожидается",
+}
 HOME_LOADING = "Загрузка данных…"
 HOME_LOADING_ACCESSIBLE_DESCRIPTION = (
     "Содержимое главной страницы обновляется. Дождитесь окончания загрузки."
@@ -113,6 +125,10 @@ def aios_health_label(value: object) -> str:
     return {"healthy": "исправен", "degraded": "ограничен"}.get(
         str(value or ""), str(value or "не подтверждено")
     )
+
+
+def provider_readiness_label(value: object) -> str:
+    return _PROVIDER_READINESS_LABELS.get(str(value or ""), "статус неизвестен")
 
 # --- Projects page --------------------------------------------------------
 PROJECTS_TITLE = "Проекты"

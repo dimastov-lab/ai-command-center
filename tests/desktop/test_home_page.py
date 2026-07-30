@@ -284,6 +284,41 @@ def test_slow_aios_status_does_not_delay_or_replace_local_home(qtbot):
     assert pool.waitForDone(2000)
 
 
+def test_home_displays_provider_readiness_without_claiming_unknown_auth(qtbot):
+    class _Adapter:
+        def snapshot(self):
+            return _snapshot()
+
+        def provider_capabilities(self):
+            return [
+                {
+                    "provider_id": "antigravity",
+                    "display_name": "Antigravity",
+                    "readiness": "login_required",
+                    "provenance": "локальный исполняемый файл",
+                    "detail": None,
+                },
+                {
+                    "provider_id": "ollama",
+                    "display_name": "Ollama",
+                    "readiness": "available",
+                    "provenance": "локальная служба Ollama",
+                    "detail": "Доступно моделей: 6",
+                },
+            ]
+
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.load(_Adapter())
+    qtbot.waitUntil(lambda: page.provider_capabilities_card() is not None, timeout=2000)
+    card = page.provider_capabilities_card()
+    assert card is not None
+    text = " ".join(label.text() for label in card.findChildren(QLabel))
+    assert "Antigravity — установлен, требуется вход" in text
+    assert "Ollama — доступен" in text
+    assert "Доступно моделей: 6" in text
+
+
 def test_load_without_adapter_is_a_noop(qtbot):
     page = HomePage()
     qtbot.addWidget(page)

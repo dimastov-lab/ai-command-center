@@ -55,5 +55,12 @@ expectations.
 - Each later migration slice maps one legacy capability to an accepted AIOS
   contract, verifies parity, cuts reads or commands over behind a flag, and only
   then retires the duplicate implementation.
+- Provider availability is also an AIOS-owned future contract. Until it exists,
+  `AICC_PROVIDER_STATUS_ENABLED` may enable a read-only compatibility probe that
+  checks binary presence and the local Ollama tags endpoint only. It never
+  launches a provider. Binary presence never proves authentication: Claude,
+  Codex and Copilot remain «авторизация не подтверждена», while OpenCode and
+  Antigravity remain «требуется вход» until an explicit safe auth contract is
+  available.
 - AML and Golden Record development remain outside this work and blocked until
   AIOS Core acceptance.
