@@ -103,6 +103,12 @@ class CompatibilityProviderCapabilityClient:
                     models = None
                     readiness = ProviderReadiness.STATUS_UNAVAILABLE
                     detail = "Статус службы получить не удалось"
+                if models is not None:
+                    models = tuple(
+                        model.strip()
+                        for model in models
+                        if isinstance(model, str) and model.strip()
+                    )
                 if models:
                     readiness = ProviderReadiness.AVAILABLE
                     detail = f"Доступно моделей: {len(models)}"

@@ -49,6 +49,13 @@ def test_ollama_daemon_without_models_is_not_reported_available():
     assert ollama.detail == "Служба доступна, модели не найдены"
     assert "/Users/" not in repr(ollama)
 
+    blank_model = CompatibilityProviderCapabilityClient(
+        which=lambda name: "/opt/homebrew/bin/ollama" if name == "ollama" else None,
+        ollama_probe=lambda: (" ",),
+    )
+    blank = {item.provider_id: item for item in blank_model.list_capabilities()}["ollama"]
+    assert blank.readiness is ProviderReadiness.NO_MODELS
+
 
 def test_unexpected_ollama_probe_error_is_isolated_to_ollama():
     client = CompatibilityProviderCapabilityClient(
