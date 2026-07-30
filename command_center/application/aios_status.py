@@ -9,9 +9,9 @@ import os
 from collections.abc import Mapping
 from ipaddress import ip_address
 from typing import Callable, Protocol
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 MAX_RESPONSE_BYTES = 65_536
 MAX_ITEMS = 100
@@ -19,6 +19,17 @@ MAX_TEXT_LENGTH = 256
 CONTRACT_NAME = "aios.core.status"
 CONTRACT_VERSION = 1
 SAFE_EVIDENCE_KINDS = frozenset({"build", "test", "attestation"})
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    """Fail before urllib can create or send a redirected request."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HTTPError(req.full_url, code, "AIOS status redirects are disabled", headers, fp)
+
+
+def _open_without_redirects(request: Request, *, timeout: float):
+    return build_opener(NoRedirectHandler()).open(request, timeout=timeout)
 
 
 class AIOSCoreReadiness(str, Enum):
@@ -66,7 +77,7 @@ class HTTPAIOSStatusClient:
         bearer_token: str = "",
         tenant_id: str = "",
         allowed_hosts: frozenset[str] | None = None,
-        opener: Callable[..., object] = urlopen,
+        opener: Callable[..., object] = _open_without_redirects,
         timeout_seconds: float = 2.0,
     ) -> None:
         self._endpoint = endpoint

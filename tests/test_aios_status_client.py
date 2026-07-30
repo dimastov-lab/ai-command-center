@@ -1,9 +1,11 @@
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
 from command_center.application.aios_status import (
     AIOSCoreReadiness,
     DisabledAIOSStatusClient,
     HTTPAIOSStatusClient,
+    NoRedirectHandler,
     create_aios_status_client,
 )
 
@@ -160,6 +162,33 @@ def test_factory_rejects_plain_http_and_unapproved_hosts():
         ),
         DisabledAIOSStatusClient,
     )
+    assert isinstance(
+        create_aios_status_client(
+            {**common, "AICC_AIOS_STATUS_URL": "https://other.example/v1/core/status"}
+        ),
+        DisabledAIOSStatusClient,
+    )
+
+
+def test_redirect_is_rejected_before_a_second_request_can_forward_credentials():
+    handler = NoRedirectHandler()
+
+    try:
+        handler.redirect_request(
+            req=Request(
+                "https://aios.example/v1/core/status",
+                headers={"Authorization": "Bearer secret", "X-Aios-Tenant-Id": "bank-a"},
+            ),
+            fp=None,
+            code=302,
+            msg="Found",
+            headers={},
+            newurl="http://169.254.169.254/latest/meta-data",
+        )
+    except HTTPError as exc:
+        assert exc.code == 302
+    else:
+        raise AssertionError("redirect must be rejected before network I/O")
 
 
 def test_oversized_or_unexpected_transport_response_is_isolated_as_error():
@@ -190,9 +219,3 @@ def test_oversized_or_unexpected_transport_response_is_isolated_as_error():
     ).get_core_status()
 
     assert broken.readiness is AIOSCoreReadiness.ERROR
-    assert isinstance(
-        create_aios_status_client(
-            {**common, "AICC_AIOS_STATUS_URL": "https://other.example/v1/core/status"}
-        ),
-        DisabledAIOSStatusClient,
-    )
