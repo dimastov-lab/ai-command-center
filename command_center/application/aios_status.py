@@ -126,6 +126,7 @@ class HTTPAIOSStatusClient:
         try:
             if (
                 payload["contract"] != CONTRACT_NAME
+                or type(payload["contract_version"]) is not int
                 or payload["contract_version"] != CONTRACT_VERSION
                 or payload["tenant_id"] != self._tenant_id
             ):
