@@ -37,15 +37,31 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
 
 
+# Sanitize each user-influenced path component so an imported/hand-authored
+# `project` or run `id` like "../../root" cannot walk the report *write* out of
+# REPORTS_ROOT (audit MAJOR-9). Mirrors `agent_runner._safe_path_component`,
+# which contained the sibling report-path builder under SEC-2; `.` and path
+# separators are excluded so no component can become `.` or `..`. (A future
+# refactor could centralize the two duplicated copies.)
+_SAFE_PATH_COMPONENT = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def _safe_path_component(value: str, fallback: str) -> str:
+    cleaned = "".join(c if c in _SAFE_PATH_COMPONENT else "_" for c in value)
+    return cleaned or fallback
+
+
 def report_path_for(run: dict) -> Path:
-    project = run.get("project") or "UNKNOWN"
+    project = _safe_path_component(run.get("project") or "UNKNOWN", "UNKNOWN")
     started = run.get("started_at") or run.get("created_at") or iso_now()
     try:
         started_dt = datetime.fromisoformat(started)
     except (ValueError, TypeError):
         started_dt = datetime.now()
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
-    run_part = (run.get("id") or "unknown")[:12]
+    run_part = _safe_path_component(run.get("id") or "unknown", "unknown")[:12]
     return REPORTS_ROOT / project / f"{timestamp}_{run_part}.md"
 
 
