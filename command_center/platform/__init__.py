@@ -10,6 +10,7 @@ from .preferences import (
     ThemeMode,
     settings_handle,
 )
+from .resources import resource, resource_path
 from .theme import SystemThemeMonitor, system_theme
 
 __all__ = [
@@ -24,6 +25,8 @@ __all__ = [
     "log_dir",
     "platform_name",
     "reveal_in_file_manager",
+    "resource",
+    "resource_path",
     "settings_handle",
     "system_theme",
 ]

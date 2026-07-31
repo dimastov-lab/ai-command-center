@@ -49,6 +49,10 @@ __pycache__/
 .venv/
 .venv-*/
 venv/
+
+# PyInstaller desktop build output (packaging/*; produced by scripts/build-desktop-*)
+build/
+dist/
 # Local backup artifacts
 data/backups/
 roadmap/*.zip
