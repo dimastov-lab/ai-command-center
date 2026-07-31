@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QLabel
 
 from command_center.desktop import i18n, tokens
 from command_center.desktop.components.empty_state import EmptyState
+from command_center.desktop.components.status_badge import StatusBadge, StatusVariant
 from command_center.desktop.components.worktree_row import WorktreeRow
 from command_center.desktop.pages.home import HomePage
 
@@ -85,6 +86,71 @@ def test_render_snapshot_metric_strip_reflects_counts(qtbot):
     assert metrics[i18n.METRIC_PROJECTS] == "2"
     assert metrics[i18n.METRIC_ACTIVE_RUNS] == "1"
     assert metrics[i18n.METRIC_REPORTS] == "1"
+
+
+def test_home_shows_separate_russian_aios_core_card_with_source_and_evidence(qtbot):
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.render_snapshot(
+        _snapshot(
+            aios_core={
+                "readiness": "contract_pending",
+                "source": "configuration",
+                "version": None,
+                "health": "healthy",
+                "capabilities": ["memory-api"],
+                "gates": ["contract-tests"],
+                "evidence": ["Публичный контракт AIOS Core ожидается"],
+                "detail": None,
+            }
+        )
+    )
+
+    card = page.aios_core_card()
+    assert card is not None
+    visible_text = " ".join(label.text() for label in card.findChildren(QLabel))
+    assert "AIOS Core" in visible_text
+    assert "Контракт ожидается" in visible_text
+    assert "Источник: конфигурация" in visible_text
+    assert "Здоровье: исправен" in visible_text
+    assert "Возможности: memory-api" in visible_text
+    assert "Гейты приёмки: contract-tests" in visible_text
+    assert "Публичный контракт AIOS Core ожидается" in visible_text.replace("\u200b", "")
+    badge = card.findChild(StatusBadge)
+    assert badge is not None
+    assert badge.variant is StatusVariant.INFO
+    assert card.accessibleName().startswith("AIOS Core:")
+
+
+def test_aios_core_card_bounds_long_contract_values_at_desktop_width(qtbot):
+    page = HomePage()
+    qtbot.addWidget(page)
+    long_id = "x" * 256
+    page.render_snapshot(
+        _snapshot(
+            aios_core={
+                "readiness": "not_ready",
+                "source": "AIOS API",
+                "version": "v" * 256,
+                "health": "h" * 256,
+                "capabilities": [long_id] * 10,
+                "gates": [long_id] * 10,
+                "evidence": [f"build:{long_id}"] * 100,
+                "detail": None,
+            }
+        )
+    )
+    page.resize(900, 700)
+    page.show()
+    qtbot.wait(20)
+
+    card = page.aios_core_card()
+    assert card is not None
+    assert card.minimumSizeHint().width() <= 818
+    assert len(card.accessibleDescription()) <= 1_024
+    assert len(card.findChildren(QLabel)) <= 10
+    visible_text = " ".join(label.text() for label in card.findChildren(QLabel))
+    assert "ещё 5" in visible_text
 
 
 def test_render_snapshot_populates_all_sections(qtbot):
@@ -178,6 +244,79 @@ def test_load_fetches_via_adapter_without_blocking_gui(qtbot):
     runnable = page.load(_StubAdapter())
     assert runnable is not None
     qtbot.waitUntil(lambda: len(page.project_cards()) == 2, timeout=2000)
+
+
+def test_slow_aios_status_does_not_delay_or_replace_local_home(qtbot):
+    status_started = threading.Event()
+    release_status = threading.Event()
+
+    class _Adapter:
+        def snapshot(self):
+            return _snapshot()
+
+        def aios_core_status(self):
+            status_started.set()
+            release_status.wait(2.0)
+            return {
+                "readiness": "offline",
+                "source": "AIOS API",
+                "version": None,
+                "health": None,
+                "capabilities": [],
+                "gates": [],
+                "evidence": [],
+                "detail": "Публичный API AIOS Core недоступен",
+            }
+
+    pool = QThreadPool()
+    pool.setMaxThreadCount(2)
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.load(_Adapter(), pool=pool)
+
+    assert status_started.wait(1.0)
+    qtbot.waitUntil(lambda: len(page.project_cards()) == 2, timeout=1000)
+    assert page.aios_core_card() is None
+
+    release_status.set()
+    qtbot.waitUntil(lambda: page.aios_core_card() is not None, timeout=1000)
+    assert len(page.project_cards()) == 2
+    assert pool.waitForDone(2000)
+
+
+def test_home_displays_provider_readiness_without_claiming_unknown_auth(qtbot):
+    class _Adapter:
+        def snapshot(self):
+            return _snapshot()
+
+        def provider_capabilities(self):
+            return [
+                {
+                    "provider_id": "antigravity",
+                    "display_name": "Antigravity",
+                    "readiness": "login_required",
+                    "provenance": "локальный исполняемый файл",
+                    "detail": None,
+                },
+                {
+                    "provider_id": "ollama",
+                    "display_name": "Ollama",
+                    "readiness": "available",
+                    "provenance": "локальная служба Ollama",
+                    "detail": "Доступно моделей: 6",
+                },
+            ]
+
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.load(_Adapter())
+    qtbot.waitUntil(lambda: page.provider_capabilities_card() is not None, timeout=2000)
+    card = page.provider_capabilities_card()
+    assert card is not None
+    text = " ".join(label.text() for label in card.findChildren(QLabel))
+    assert "Antigravity — установлен, требуется вход" in text
+    assert "Ollama — доступен" in text
+    assert "Доступно моделей: 6" in text
 
 
 def test_load_without_adapter_is_a_noop(qtbot):

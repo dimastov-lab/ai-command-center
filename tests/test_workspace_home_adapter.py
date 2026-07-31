@@ -1,9 +1,9 @@
 """Tests for `command_center/application/workspace_home_adapter.py` (Desktop D2A).
 
-The adapter is a thin *application-layer* wrapper over the existing
-`build_workspace_home_snapshot` read model. Its contract: own the single
-`ExecutionCenterAPI` and return the read model's snapshot UNCHANGED — it must not
-drop, add, or alter any field (`docs/desktop/IMPLEMENTATION_ROADMAP.md` D2A).
+The adapter is an *application-layer* composition boundary over the existing
+`build_workspace_home_snapshot` read model and the separate read-only AIOS Core
+status port. It preserves every existing read-model field and adds `aios_core`
+without treating the local runtime as evidence about AIOS.
 
 Plain pytest: no `QApplication`, and the adapter module must not import Qt.
 """
@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from command_center import activity_log, project_config, workspace_home
+from command_center.application.aios_status import AIOSCoreReadiness, AIOSCoreStatus
 from command_center.application.workspace_home_adapter import WorkspaceHomeAdapter
 from command_center.runtime.api import ExecutionCenterAPI
 
@@ -97,6 +98,58 @@ def test_adapter_owns_the_injected_execution_center_api(tmp_path):
     api = _api(tmp_path)
     adapter = WorkspaceHomeAdapter(execution_center_api=api)
     assert adapter.execution_center_api is api
+
+
+def test_adapter_exposes_aios_core_status_through_independent_public_port(tmp_path, monkeypatch):
+    class _AIOSClient:
+        def get_core_status(self):
+            return AIOSCoreStatus(
+                readiness=AIOSCoreReadiness.READY,
+                source="AIOS API",
+                version="0.3.0",
+                evidence=("build:abc123",),
+            )
+
+    monkeypatch.setattr(
+        "command_center.application.workspace_home_adapter.build_workspace_home_snapshot",
+        lambda **_kwargs: {"projects": []},
+    )
+
+    adapter = WorkspaceHomeAdapter(
+        execution_center_api=_api(tmp_path),
+        aios_status_client=_AIOSClient(),
+    )
+    snapshot = adapter.snapshot()
+    status = adapter.aios_core_status()
+
+    assert "aios_core" not in snapshot
+    assert status == {
+        "readiness": "ready",
+        "source": "AIOS API",
+        "version": "0.3.0",
+        "health": None,
+        "capabilities": [],
+        "gates": [],
+        "evidence": ["build:abc123"],
+        "detail": None,
+    }
+
+
+def test_local_snapshot_does_not_wait_for_or_call_aios_status(tmp_path, monkeypatch):
+    class _RaisingAIOSClient:
+        def get_core_status(self):
+            raise RuntimeError("remote unavailable")
+
+    monkeypatch.setattr(
+        "command_center.application.workspace_home_adapter.build_workspace_home_snapshot",
+        lambda **_kwargs: {"projects": [{"id": "AIOS"}]},
+    )
+    adapter = WorkspaceHomeAdapter(
+        execution_center_api=_api(tmp_path),
+        aios_status_client=_RaisingAIOSClient(),
+    )
+
+    assert adapter.snapshot() == {"projects": [{"id": "AIOS"}]}
 
 
 def test_adapter_constructs_a_single_default_api_when_none_injected(monkeypatch):

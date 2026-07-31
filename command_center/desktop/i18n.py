@@ -63,6 +63,27 @@ HOME_SECTION_ARTIFACTS = "Артефакты"
 HOME_SECTION_REPORTS = "Отчёты"
 HOME_SECTION_ACTIVITY = "Активность"
 HOME_SECTION_EMPTY = "Нет данных"
+AIOS_CORE_TITLE = "AIOS Core"
+AIOS_CORE_SOURCE = "Источник: {source}"
+AIOS_CORE_VERSION = "Версия: {version}"
+AIOS_CORE_HEALTH = "Здоровье: {health}"
+AIOS_CORE_CAPABILITIES = "Возможности: {items}"
+AIOS_CORE_GATES = "Гейты приёмки: {items}"
+AIOS_CORE_EVIDENCE = "Доказательства: {items}"
+PROVIDERS_TITLE = "Провайдеры ИИ"
+PROVIDERS_ACCESSIBLE_DESCRIPTION = (
+    "Доступность провайдеров по подтверждённым локальным признакам."
+)
+_PROVIDER_READINESS_LABELS = {
+    "available": "доступен",
+    "auth_unknown": "установлен, авторизация не подтверждена",
+    "login_required": "установлен, требуется вход",
+    "daemon_unavailable": "служба недоступна",
+    "no_models": "служба доступна, модели не найдены",
+    "status_unavailable": "статус недоступен",
+    "not_installed": "не установлен",
+    "contract_pending": "контракт AIOS ожидается",
+}
 HOME_LOADING = "Загрузка данных…"
 HOME_LOADING_ACCESSIBLE_DESCRIPTION = (
     "Содержимое главной страницы обновляется. Дождитесь окончания загрузки."
@@ -80,6 +101,36 @@ METRIC_ACTIVE_RUNS = "Активные запуски"
 METRIC_RECENT_RUNS = "Недавние запуски"
 METRIC_ARTIFACTS = "Артефакты"
 METRIC_REPORTS = "Отчёты"
+
+_AIOS_READINESS_LABELS = {
+    "ready": "Готов",
+    "not_ready": "Не готов",
+    "offline": "Нет связи",
+    "error": "Ошибка контракта",
+    "contract_pending": "Контракт ожидается",
+}
+_AIOS_SOURCE_LABELS = {
+    "configuration": "конфигурация",
+    "AIOS API": "AIOS API",
+}
+
+
+def aios_readiness_label(value: object) -> str:
+    return _AIOS_READINESS_LABELS.get(str(value or ""), "Статус неизвестен")
+
+
+def aios_source_label(value: object) -> str:
+    return _AIOS_SOURCE_LABELS.get(str(value or ""), str(value or "не указан"))
+
+
+def aios_health_label(value: object) -> str:
+    return {"healthy": "исправен", "degraded": "ограничен"}.get(
+        str(value or ""), str(value or "не подтверждено")
+    )
+
+
+def provider_readiness_label(value: object) -> str:
+    return _PROVIDER_READINESS_LABELS.get(str(value or ""), "статус неизвестен")
 
 # --- Projects page --------------------------------------------------------
 PROJECTS_TITLE = "Проекты"
