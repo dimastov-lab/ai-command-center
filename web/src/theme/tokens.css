@@ -1,0 +1,10 @@
+:root{
+  --accent-1:#7c5cff; --accent-2:#4d9fff; --teal:#33e0c0;
+  --run:#4d9fff; --ok:#3ddc84; --warn:#f5b23a; --bad:#ff5d6f;
+  --glass:rgba(17,22,38,.55); --gline:rgba(255,255,255,.09);
+  --tx:#eef2fb; --tx2:#aab3c9; --tx3:#7c85a0;
+  --font-sans:-apple-system,"SF Pro Text","Inter",system-ui,sans-serif;
+  --font-mono:"SF Mono","JetBrains Mono",ui-monospace,monospace;
+}
+.glass{background:var(--glass);backdrop-filter:blur(22px) saturate(140%);
+  -webkit-backdrop-filter:blur(22px) saturate(140%);border:1px solid var(--gline);border-radius:18px}
