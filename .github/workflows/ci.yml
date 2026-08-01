@@ -164,18 +164,21 @@ jobs:
       - name: Compile validation
         run: python -m compileall -q command_center scripts tests app.py
 
-      # The desktop pytest-qt suite is the deterministic Windows-relevant
-      # signal. This is informational for the merge gate (not required) but
-      # mirrors the ubuntu job's coverage so Windows regressions surface early.
+      # The desktop pytest-qt suite is the deterministic Windows-relevant signal
+      # for the D1 desktop gate. Kept informational for the merge gate (not
+      # required) but mirrors the ubuntu job's coverage so Windows regressions
+      # surface early. This is exactly the automated half WINDOWS_RUNBOOK.md
+      # Step 2 calls for (ruff · compile · `pytest tests/desktop`).
       - name: Desktop pytest-qt suite
         run: pytest tests/desktop -q
 
-      # Informational, non-blocking. The full repository suite on Windows is
-      # exercised for early signal; it does not gate merges.
-      - name: Full pytest suite (informational)
-        continue-on-error: true
-        run: pytest -q
-
+      # Real-browser E2E of the status projection. Informational/non-blocking,
+      # matching the ubuntu job. The full repository `pytest -q` is deliberately
+      # NOT run here: ~200 of its non-desktop tests are POSIX-only by design
+      # (process-group supervision via waitid(WNOWAIT)) and others hit the
+      # Windows console `charmap` codec, so a Windows full-suite run is pure
+      # noise plus ~23 min of runtime that risks cancelling the job. The
+      # desktop gate signal is the `tests/desktop` suite above.
       - name: Real-browser E2E (informational)
         continue-on-error: true
         run: |
