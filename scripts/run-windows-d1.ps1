@@ -273,8 +273,7 @@ if ($SkipInteractive) {
     [void]$md.AppendLine("- ПРОПУЩЕН (SkipInteractive)")
 } else {
     foreach ($k in ($r.Checklist.Keys | Sort-Object)) {
-        [void]$md.AppendLine("- Пункт ${k}: $($r.Checklist[$k])"
-            -replace "System.Collections.Generic.Dictionary")
+        [void]$md.AppendLine("- Пункт ${k}: $($r.Checklist[$k])")
     }
 }
 [void]$md.AppendLine("")
