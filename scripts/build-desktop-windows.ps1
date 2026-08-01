@@ -24,20 +24,26 @@ $pythonBin = if ($env:DESKTOP_PYTHON) {
 }
 
 if (-not (Test-Path -LiteralPath $pythonBin)) {
-    Write-Error @"
-Не найден Python desktop-окружения: $pythonBin
+    Write-Host @"
+ERROR: Не найден Python desktop-окружения: $pythonBin
 Задайте DESKTOP_PYTHON или создайте .venv-desktop.
-"@
+"@ -ForegroundColor Red
     exit 2
 }
 
-$machine = & $pythonBin -c "import platform; print(platform.machine())"
-if ($LASTEXITCODE -ne 0 -or $machine -ne "AMD64") {
-    Write-Error "D4B требует Python x64 (получено: $machine). Целевая платформа — Windows 11 x64."
+$pyiPrevEAP = $ErrorActionPreference   # = "Stop"; relaxed around native calls
+$ErrorActionPreference = "Continue"
+try {
+    $machine = (& $pythonBin -c "import platform; print(platform.machine())" 2>&1) -join ""
+    $machineOK = ($LASTEXITCODE -eq 0 -and $machine.Trim() -eq "AMD64")
+} finally {
+    $ErrorActionPreference = $pyiPrevEAP
+}
+if (-not $machineOK) {
+    Write-Host "ERROR: D4B требует Python x64 (получено: '$machine'). Целевая платформа — Windows 11 x64." -ForegroundColor Red
     exit 2
 }
 
-$pyiPrevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
     & $pythonBin -m PyInstaller `
@@ -52,7 +58,7 @@ try {
 }
 
 if ($pyiExit -ne 0) {
-    Write-Error "Сборка PyInstaller завершилась с кодом $pyiExit."
+    Write-Host "ERROR: Сборка PyInstaller завершилась с кодом $pyiExit." -ForegroundColor Red
     exit $pyiExit
 }
 
