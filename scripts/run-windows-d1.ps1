@@ -1,4 +1,4 @@
-﻿<#
+﻿﻿<#
 .SYNOPSIS
   Windows 11 x64 — исполнитель D1-GATE + D4B (Desktop Increment 1).
   Автоматизирует Шаги 1, 2, 4, 6 из docs/desktop/WINDOWS_RUNBOOK.md
@@ -74,28 +74,35 @@ if (-not $arch) { Fail "Нужна x64 ОС; скрипт сборки пров�
 if (-not [System.Environment]::Is64BitProcess) {
     Write-Log "Процесс 32-битный — перезапусти в 64-битном PowerShell." }
 
-# найдём python (x64)
-if ($PythonExe -ne "") {
-    $py = $PythonExe
-} else {
-    $py = $null
-    foreach ($cand in @("py -3.12", "py -3.13", "py", "python")) {
-        $exe, $args = $cand -split ' ',2
-        if (Get-Command $exe -ErrorAction SilentlyContinue) {
-            $py = $cand; break
-        }
+# найдём python (x64). Перебираем кандидатов и проверяем, что реально запускается.
+$py = $null
+if ($PythonExe -ne "") { $py = $PythonExe }
+if (-not $py) {
+    foreach ($cand in @("py -3.12", "py -3.13", "py -3", "py", "python", "python3")) {
+        try {
+            $out = & powershell -NoProfile -Command "$cand -c 'import sys; sys.stdout.write(str(sys.version_info[:2]))'" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $out -match '^\(\d') {
+                $py = $cand
+                Write-Log "Найден Python через: $cand ($out)"
+                break
+            }
+        } catch { }
     }
-    if (-not $py) { Fail "Python не найден. Установи Python 3.12/3.13 x64 и py launcher." }
+}
+if (-not $py) {
+    Fail ("Python не найден. Установи Python 3.12 или 3.13 x64 (https://www.python.org/downloads/windows/) " +
+          "и ПРИ УСТАНОВКЕ поставь галочку 'Add python.exe to PATH'. " +
+          "Либо запусти скрипт с -PythonExe <полный_путь_к_python.exe>.")
 }
 Write-Log "Используем Python: $py"
 
 # проверим, что python x64
-$pyArch = & $py -c "import platform,sys; sys.stdout.write(platform.machine())" 2>$null
+$pyArch = & powershell -NoProfile -Command "$py -c 'import platform,sys; sys.stdout.write(platform.machine())'" 2>$null
 Write-Log "platform.machine() = $pyArch"
 if ($pyArch -ne "AMD64") {
     Fail "Python не x64 (AMD64): '$pyArch'. Поставь x64-сборку Python."
 }
-$pyVer = & $py -c "import sys; sys.stdout.write('%d.%d.%d'%sys.version_info[:3])" 2>$null
+$pyVer = & powershell -NoProfile -Command "$py -c 'import sys; sys.stdout.write(\"%d.%d.%d\"%sys.version_info[:3])'" 2>$null
 $Report.PythonVersion = $pyVer
 Write-Log "Python $pyVer x64 — OK"
 
@@ -121,7 +128,7 @@ if (-not (Test-Path $Target)) { Fail "Каталог репо не найден:
 $VenvPy = Join-Path $Target ".venv-desktop\Scripts\python.exe"
 if (-not (Test-Path $VenvPy)) {
     Write-Log "Создаю venv .venv-desktop"
-    & $py -m venv (Join-Path $Target ".venv-desktop"); Check-Exitcode "venv"
+    & powershell -NoProfile -Command "$py -m venv '$(Join-Path $Target '.venv-desktop')'" ; Check-Exitcode "venv"
 }
 
 Write-Log "Установка зависимостей (может занять несколько минут)…"
