@@ -92,10 +92,18 @@ if (-not $py) {
 }
 Write-Log "Using Python: $py"
 
-$pyArch = & powershell -NoProfile -Command "$py -c 'import platform,sys; sys.stdout.write(platform.machine())'" 2>$null
+# Resolve to the real python.exe path so we can call it directly (no nested quoting).
+$realPy = (Invoke-Expression "$py -c 'import sys; print(sys.executable)'" 2>$null)
+if ($realPy) { $realPy = $realPy.Trim() }
+if (-not $realPy -or -not (Test-Path $realPy)) {
+    Fail "Could not resolve python.exe path from '$py'. Run with -PythonExe <full path to python.exe>."
+}
+Write-Log "Resolved python.exe: $realPy"
+
+$pyArch = & $realPy -c "import platform,sys; sys.stdout.write(platform.machine())" 2>$null
 Write-Log "platform.machine() = $pyArch"
 if ($pyArch -ne "AMD64") { Fail "Python is not x64 (AMD64): '$pyArch'. Install an x64 build." }
-$pyVer = & powershell -NoProfile -Command "$py -c 'import sys; sys.stdout.write(\"%d.%d.%d\"%sys.version_info[:3])'" 2>$null
+$pyVer = & $realPy -c "import sys; sys.stdout.write('%d.%d.%d'%sys.version_info[:3])" 2>$null
 $Report.PythonVersion = $pyVer
 Write-Log "Python $pyVer x64 - OK"
 
@@ -120,7 +128,7 @@ if (-not (Test-Path $Target)) { Fail "Repo dir not found: $Target" }
 $VenvPy = Join-Path $Target ".venv-desktop\Scripts\python.exe"
 if (-not (Test-Path $VenvPy)) {
     Write-Log "Creating venv .venv-desktop"
-    & powershell -NoProfile -Command "$py -m venv '$(Join-Path $Target '.venv-desktop')'"; Check-ExitCode "venv"
+    & $realPy -m venv (Join-Path $Target ".venv-desktop"); Check-ExitCode "venv"
 }
 
 Write-Log "Installing dependencies (may take a few minutes)..."
