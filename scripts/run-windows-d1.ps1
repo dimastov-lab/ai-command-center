@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Windows 11 x64 — исполнитель D1-GATE + D4B (Desktop Increment 1).
   Автоматизирует Шаги 1, 2, 4, 6 из docs/desktop/WINDOWS_RUNBOOK.md
