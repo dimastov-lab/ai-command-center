@@ -143,3 +143,15 @@ def test_home_endpoint_reuses_execution_center_api_across_requests(monkeypatch):
     assert client.get("/api/home").status_code == 200
 
     assert calls == ["api", "snapshot", "snapshot"]
+
+
+def test_execution_endpoint_is_read_only_and_reuses_cached_api(monkeypatch):
+    _install_fakes(monkeypatch)
+    client = TestClient(create_app())
+
+    assert client.get("/api/home").status_code == 200
+    response = client.get("/api/execution")
+
+    assert response.status_code == 200
+    assert set(response.json()) == {"summary", "state_counts", "runs"}
+    assert response.json()["runs"][0]["id"] == "r1"

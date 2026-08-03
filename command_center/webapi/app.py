@@ -1,9 +1,9 @@
 """FastAPI app factory for the AI Command Center web dashboard's backend.
 
-Read-only for this slice: the only route is `GET /api/home`, which builds the
+Read-only for this slice: `GET /api/home` and `GET /api/execution` build the
 Workspace Home read model (`workspace_home.build_workspace_home_snapshot`,
 already redacted for BANK/LEGAL at the run/report/artifact/activity level)
-and maps it onto the frontend's DTO via `serializers.serialize_home` (which
+and map it onto frontend DTOs via pure serializers (which
 additionally closes the one redaction gap that function leaves open — see
 `serializers.py`'s module docstring). No mutation, no other routes.
 
@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from command_center.runtime.api import ExecutionCenterAPI
-from command_center.webapi.serializers import serialize_home
+from command_center.webapi.serializers import serialize_execution, serialize_home
 from command_center.workspace_home import build_workspace_home_snapshot
 
 # Repo root is three levels up from this file: <root>/command_center/webapi/app.py
@@ -66,6 +66,15 @@ def create_app() -> FastAPI:
             app.state.execution_center_api = api
         snapshot = build_workspace_home_snapshot(execution_center_api=api)
         return serialize_home(snapshot)
+
+    @app.get("/api/execution")
+    def execution() -> dict:  # read-only, no mutation
+        api = getattr(app.state, "execution_center_api", None)
+        if api is None:
+            api = ExecutionCenterAPI()
+            app.state.execution_center_api = api
+        snapshot = build_workspace_home_snapshot(execution_center_api=api)
+        return serialize_execution(snapshot)
 
     # Serve the built SPA (built via `web/`'s `npm run build`) from the same
     # origin as the API, so production needs no CORS configuration. Mounted
