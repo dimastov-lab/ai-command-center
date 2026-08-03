@@ -20,16 +20,23 @@ import os
 import socket
 import sqlite3
 import sys
+import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from command_center.runtime import db as runtime_db
 
 DEFAULT_INTERVAL = timedelta(days=1)
 DEFAULT_LEASE = timedelta(hours=12)
+DEFAULT_FAILURE_RETRY = timedelta(hours=1)
+MAX_FAILURE_RETRY = timedelta(days=1)
+DEFAULT_RUN_TIMEOUT_SECONDS = 3_600
+DEFAULT_GIT_TIMEOUT_SECONDS = 120
+DEFAULT_VALIDATION_TIMEOUT_SECONDS = 900
+DEFAULT_COMPLETION_TIMEOUT_SECONDS = 6 * 3_600
 PROJECT = "AICC"
 
 
@@ -38,7 +45,9 @@ def utc_now() -> datetime:
 
 
 def iso(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+    # Keep sub-second precision when present.  Truncating lease timestamps to
+    # whole seconds can make a short lease expire immediately after renewal.
+    return value.astimezone(timezone.utc).isoformat()
 
 
 def parse_time(value: str) -> datetime:
@@ -63,15 +72,29 @@ class DailyAuditConfig:
         ("python", "-m", "compileall", "-q", "command_center", "scripts"),
         ("python", "-m", "pytest"),
     )
+    run_timeout_seconds: int = DEFAULT_RUN_TIMEOUT_SECONDS
+    git_timeout_seconds: int = DEFAULT_GIT_TIMEOUT_SECONDS
+    validation_timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS
+    completion_timeout_seconds: int = DEFAULT_COMPLETION_TIMEOUT_SECONDS
+    lease_heartbeat_seconds: float | None = None
 
     @classmethod
     def from_environment(cls, repository_path: Path) -> "DailyAuditConfig":
         enabled = os.environ.get("AICC_DAILY_AUDIT_ENABLED", "").strip().lower()
         rounds = int(os.environ.get("AICC_DAILY_AUDIT_MAX_REMEDIATION_ROUNDS", "5"))
+        run_timeout = int(
+            os.environ.get("AICC_DAILY_AUDIT_RUN_TIMEOUT_SECONDS", str(DEFAULT_RUN_TIMEOUT_SECONDS))
+        )
+        completion_timeout = int(
+            os.environ.get(
+                "AICC_DAILY_AUDIT_COMPLETION_TIMEOUT_SECONDS",
+                str(DEFAULT_COMPLETION_TIMEOUT_SECONDS),
+            )
+        )
         return cls(
             repository_path=repository_path.resolve(),
             enabled=enabled in {"1", "true", "yes", "on"},
-            max_remediation_rounds=max(1, rounds),
+            max_remediation_rounds=max(1, min(rounds, 10)),
             validation_commands=(
                 (sys.executable, "-m", "ruff", "check", "."),
                 (
@@ -84,6 +107,8 @@ class DailyAuditConfig:
                 ),
                 (sys.executable, "-m", "pytest"),
             ),
+            run_timeout_seconds=max(30, min(run_timeout, 3_600)),
+            completion_timeout_seconds=max(60, min(completion_timeout, 12 * 3_600)),
         )
 
 
@@ -94,6 +119,13 @@ class CampaignRequest:
     max_remediation_rounds: int
     merge_mode: str
     validation_commands: tuple[tuple[str, ...], ...]
+    run_timeout_seconds: int = DEFAULT_RUN_TIMEOUT_SECONDS
+    git_timeout_seconds: int = DEFAULT_GIT_TIMEOUT_SECONDS
+    validation_timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS
+    completion_timeout_seconds: int = DEFAULT_COMPLETION_TIMEOUT_SECONDS
+    lease_owner: str | None = None
+    abort_event: threading.Event | None = field(default=None, repr=False, compare=False)
+    lease_check: Callable[[], bool] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -102,6 +134,14 @@ class CampaignResult:
     summary: str
     target_verified: bool = False
     pull_request_url: str | None = None
+
+
+class CampaignBackendError(RuntimeError):
+    """Backend failure with an optional provider-supplied retry boundary."""
+
+    def __init__(self, message: str, *, retry_at: datetime | None = None) -> None:
+        super().__init__(message)
+        self.retry_at = retry_at
 
 
 class CampaignBackend(Protocol):
@@ -145,6 +185,7 @@ class DailyAuditStore:
                     lease_owner TEXT,
                     lease_until TEXT,
                     active_campaign_id TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS daily_audit_campaign (
@@ -158,6 +199,15 @@ class DailyAuditStore:
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(daily_audit_schedule)").fetchall()
+            }
+            if "consecutive_failures" not in columns:
+                connection.execute(
+                    """ALTER TABLE daily_audit_schedule
+                       ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"""
+                )
 
     def ensure_schedule(self, now: datetime) -> None:
         with self._connect() as connection:
@@ -183,6 +233,15 @@ class DailyAuditStore:
             if not due or not lease_expired:
                 connection.rollback()
                 return None
+            abandoned = row["active_campaign_id"]
+            if abandoned:
+                connection.execute(
+                    """UPDATE daily_audit_campaign
+                       SET status = 'interrupted', finished_at = ?,
+                           summary = 'Lease expired before the previous campaign finished.'
+                       WHERE id = ? AND status = 'running'""",
+                    (iso(now), abandoned),
+                )
             cursor = connection.execute(
                 """UPDATE daily_audit_schedule
                    SET lease_owner = ?, lease_until = ?, active_campaign_id = ?, updated_at = ?
@@ -206,16 +265,104 @@ class DailyAuditStore:
             connection.commit()
             return campaign_id
 
+    def renew_lease(
+        self,
+        campaign_id: str,
+        *,
+        owner: str,
+        now: datetime,
+        lease_duration: timedelta,
+    ) -> bool:
+        """Extend only the lease still owned by this exact campaign and owner.
+
+        Completion may have granted a longer publication-action fence in the
+        same row.  A normal scheduler heartbeat must never shorten that fence,
+        so the update is a monotonic max rather than an unconditional write.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT lease_until FROM daily_audit_schedule
+                   WHERE singleton = 1 AND active_campaign_id = ? AND lease_owner = ?""",
+                (campaign_id, owner),
+            ).fetchone()
+            if row is None or not row["lease_until"]:
+                connection.rollback()
+                return False
+            current_until = parse_time(row["lease_until"])
+            if current_until <= now:
+                connection.rollback()
+                return False
+            extended_until = max(current_until, now + lease_duration)
+            cursor = connection.execute(
+                """UPDATE daily_audit_schedule
+                   SET lease_until = ?, updated_at = ?
+                   WHERE singleton = 1 AND active_campaign_id = ? AND lease_owner = ?
+                     AND lease_until = ?""",
+                (
+                    iso(extended_until),
+                    iso(now),
+                    campaign_id,
+                    owner,
+                    row["lease_until"],
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+
+    def owns_lease(
+        self,
+        campaign_id: str,
+        *,
+        owner: str,
+        now: datetime,
+    ) -> bool:
+        """Read the current fencing state immediately before a backend side effect."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT active_campaign_id, lease_owner, lease_until
+                   FROM daily_audit_schedule WHERE singleton = 1"""
+            ).fetchone()
+        return bool(
+            row
+            and row["active_campaign_id"] == campaign_id
+            and row["lease_owner"] == owner
+            and row["lease_until"]
+            and parse_time(row["lease_until"]) > now
+        )
+
     def finish(
         self,
         campaign_id: str,
         result: CampaignResult,
         *,
+        owner: str,
         now: datetime,
         interval: timedelta,
-    ) -> None:
+    ) -> bool:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            schedule = connection.execute(
+                """SELECT active_campaign_id, lease_owner, lease_until
+                   FROM daily_audit_schedule WHERE singleton = 1"""
+            ).fetchone()
+            owns_lease = bool(
+                schedule
+                and schedule["active_campaign_id"] == campaign_id
+                and schedule["lease_owner"] == owner
+                and schedule["lease_until"]
+                and parse_time(schedule["lease_until"]) > now
+            )
+            if not owns_lease:
+                connection.execute(
+                    """UPDATE daily_audit_campaign
+                       SET status = 'interrupted', finished_at = ?,
+                           summary = 'Campaign finished after losing its scheduler lease.'
+                       WHERE id = ? AND status = 'running'""",
+                    (iso(now), campaign_id),
+                )
+                connection.commit()
+                return False
             connection.execute(
                 """UPDATE daily_audit_campaign
                    SET status = ?, finished_at = ?, summary = ?,
@@ -233,21 +380,125 @@ class DailyAuditStore:
             connection.execute(
                 """UPDATE daily_audit_schedule
                    SET next_run_at = ?, lease_owner = NULL, lease_until = NULL,
-                       active_campaign_id = NULL, updated_at = ?
+                       active_campaign_id = NULL, consecutive_failures = 0, updated_at = ?
                    WHERE singleton = 1 AND active_campaign_id = ?""",
                 (iso(now + interval), iso(now), campaign_id),
             )
             connection.commit()
+            return True
 
     def fail(
-        self, campaign_id: str, message: str, *, now: datetime, retry_after: timedelta
-    ) -> None:
-        self.finish(
-            campaign_id,
-            CampaignResult(status="failed", summary=message),
-            now=now,
-            interval=retry_after,
-        )
+        self,
+        campaign_id: str,
+        message: str,
+        *,
+        owner: str,
+        now: datetime,
+        retry_after: timedelta = DEFAULT_FAILURE_RETRY,
+        max_retry_after: timedelta = MAX_FAILURE_RETRY,
+        retry_at: datetime | None = None,
+    ) -> datetime | None:
+        """Persist failure and atomically schedule bounded exponential backoff."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            schedule = connection.execute(
+                "SELECT * FROM daily_audit_schedule WHERE singleton = 1"
+            ).fetchone()
+            owns_live_lease = bool(
+                schedule
+                and schedule["active_campaign_id"] == campaign_id
+                and schedule["lease_owner"] == owner
+                and schedule["lease_until"]
+                and parse_time(schedule["lease_until"]) > now
+            )
+            if not owns_live_lease:
+                connection.execute(
+                    """UPDATE daily_audit_campaign
+                       SET status = 'interrupted', finished_at = COALESCE(finished_at, ?),
+                           summary = COALESCE(
+                               summary,
+                               'Campaign lost its scheduler lease before failure was persisted.'
+                           )
+                       WHERE id = ? AND status = 'running'""",
+                    (iso(now), campaign_id),
+                )
+                connection.commit()
+                return None
+            connection.execute(
+                """UPDATE daily_audit_campaign
+                   SET status = 'failed', finished_at = ?, summary = ?
+                   WHERE id = ?""",
+                (iso(now), message, campaign_id),
+            )
+            failures = int(schedule["consecutive_failures"] or 0) + 1
+            multiplier = 2 ** min(failures - 1, 10)
+            delay_seconds = min(
+                retry_after.total_seconds() * multiplier,
+                max_retry_after.total_seconds(),
+            )
+            next_run = now + timedelta(seconds=delay_seconds)
+            if retry_at is not None:
+                normalized_retry_at = (
+                    retry_at.astimezone(timezone.utc)
+                    if retry_at.tzinfo
+                    else retry_at.replace(tzinfo=timezone.utc)
+                )
+                next_run = max(next_run, normalized_retry_at)
+            connection.execute(
+                """UPDATE daily_audit_schedule
+                   SET next_run_at = ?, lease_owner = NULL, lease_until = NULL,
+                       active_campaign_id = NULL, consecutive_failures = ?, updated_at = ?
+                   WHERE singleton = 1 AND active_campaign_id = ?""",
+                (iso(next_run), failures, iso(now), campaign_id),
+            )
+            connection.commit()
+            return next_run
+
+    def interrupt(
+        self,
+        campaign_id: str,
+        message: str,
+        *,
+        owner: str,
+        now: datetime,
+    ) -> bool:
+        """Persist an operator shutdown without disturbing a replacement owner.
+
+        A live campaign is released with its existing due time so a restarted
+        daemon may resume immediately.  If ownership was already lost, only
+        this campaign's still-running history row is terminalized.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            schedule = connection.execute(
+                """SELECT active_campaign_id, lease_owner, lease_until
+                   FROM daily_audit_schedule WHERE singleton = 1"""
+            ).fetchone()
+            owns_live_lease = bool(
+                schedule
+                and schedule["active_campaign_id"] == campaign_id
+                and schedule["lease_owner"] == owner
+                and schedule["lease_until"]
+                and parse_time(schedule["lease_until"]) > now
+            )
+            connection.execute(
+                """UPDATE daily_audit_campaign
+                   SET status = 'interrupted', finished_at = COALESCE(finished_at, ?),
+                       summary = ?
+                   WHERE id = ? AND status = 'running'""",
+                (iso(now), message, campaign_id),
+            )
+            if owns_live_lease:
+                connection.execute(
+                    """UPDATE daily_audit_schedule
+                       SET lease_owner = NULL, lease_until = NULL,
+                           active_campaign_id = NULL, updated_at = ?
+                       WHERE singleton = 1 AND active_campaign_id = ?
+                         AND lease_owner = ?""",
+                    (iso(now), campaign_id, owner),
+                )
+            connection.commit()
+            return owns_live_lease
 
     def status(self) -> dict | None:
         with self._connect() as connection:
@@ -316,9 +567,25 @@ class DailyAuditService:
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         resolved_db = db_path or runtime_db.resolve_db_path()
         self.store = DailyAuditStore(resolved_db)
+        self._stop_requested = threading.Event()
+        # RLock avoids self-deadlock if Python dispatches SIGTERM/SIGINT while
+        # the daemon's main thread is inside one of these tiny critical sections.
+        self._active_abort_lock = threading.RLock()
+        self._active_abort_event: threading.Event | None = None
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested.is_set()
+
+    def request_stop(self) -> None:
+        """Request bounded cancellation of the currently active campaign."""
+        self._stop_requested.set()
+        with self._active_abort_lock:
+            if self._active_abort_event is not None:
+                self._active_abort_event.set()
 
     def tick(self) -> CampaignResult | None:
-        if not self.config.enabled:
+        if not self.config.enabled or self._stop_requested.is_set():
             return None
         now = self.clock()
         campaign_id = self.store.acquire_due(
@@ -326,33 +593,116 @@ class DailyAuditService:
         )
         if campaign_id is None:
             return None
+        heartbeat_stop = threading.Event()
+        campaign_abort = threading.Event()
+        with self._active_abort_lock:
+            self._active_abort_event = campaign_abort
+            if self._stop_requested.is_set():
+                campaign_abort.set()
+
+        def lease_check() -> bool:
+            if campaign_abort.is_set():
+                return False
+            try:
+                owned = self.store.owns_lease(
+                    campaign_id,
+                    owner=self.owner,
+                    now=self.clock(),
+                )
+            except Exception:  # noqa: BLE001 - a fencing read must fail closed
+                campaign_abort.set()
+                return False
+            if not owned:
+                campaign_abort.set()
+            return owned
+
         request = CampaignRequest(
             campaign_id=campaign_id,
             repository_path=self.config.repository_path,
             max_remediation_rounds=self.config.max_remediation_rounds,
             merge_mode=self.config.merge_mode,
             validation_commands=self.config.validation_commands,
+            run_timeout_seconds=self.config.run_timeout_seconds,
+            git_timeout_seconds=self.config.git_timeout_seconds,
+            validation_timeout_seconds=self.config.validation_timeout_seconds,
+            completion_timeout_seconds=self.config.completion_timeout_seconds,
+            lease_owner=self.owner,
+            abort_event=campaign_abort,
+            lease_check=lease_check,
         )
+        heartbeat_seconds = self.config.lease_heartbeat_seconds
+        if heartbeat_seconds is None:
+            heartbeat_seconds = min(60.0, self.config.lease_duration.total_seconds() / 3)
+        heartbeat_seconds = max(0.01, heartbeat_seconds)
+
+        def heartbeat() -> None:
+            while not heartbeat_stop.wait(heartbeat_seconds):
+                if campaign_abort.is_set():
+                    return
+                try:
+                    renewed = self.store.renew_lease(
+                        campaign_id,
+                        owner=self.owner,
+                        now=self.clock(),
+                        lease_duration=self.config.lease_duration,
+                    )
+                except Exception:  # noqa: BLE001 - lost lease must fail closed
+                    campaign_abort.set()
+                    return
+                if not renewed:
+                    campaign_abort.set()
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name=f"daily-audit-lease-{campaign_id[:8]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
             result = self.backend.run(request)
+            if campaign_abort.is_set():
+                raise CampaignBackendError("Campaign scheduler lease was lost during execution.")
+            if result.status == "completed" and not result.target_verified:
+                result = CampaignResult(
+                    status="failed",
+                    summary="Backend claimed completion without target-branch verification.",
+                    pull_request_url=result.pull_request_url,
+                )
+            finished = self.store.finish(
+                campaign_id,
+                result,
+                owner=self.owner,
+                now=self.clock(),
+                interval=self.config.interval,
+            )
+            if not finished:
+                raise CampaignBackendError("Campaign finished after losing its scheduler lease.")
+            return result
         except Exception as exc:  # noqa: BLE001 - persist failure before retrying
+            if self._stop_requested.is_set():
+                summary = f"Campaign interrupted by service shutdown: {type(exc).__name__}: {exc}"
+                self.store.interrupt(
+                    campaign_id,
+                    summary,
+                    owner=self.owner,
+                    now=self.clock(),
+                )
+                return CampaignResult(status="interrupted", summary=summary)
             self.store.fail(
                 campaign_id,
                 f"{type(exc).__name__}: {exc}",
+                owner=self.owner,
                 now=self.clock(),
-                retry_after=timedelta(hours=1),
+                retry_at=getattr(exc, "retry_at", None),
             )
             raise
-        if result.status == "completed" and not result.target_verified:
-            result = CampaignResult(
-                status="failed",
-                summary="Backend claimed completion without target-branch verification.",
-                pull_request_url=result.pull_request_url,
-            )
-        self.store.finish(
-            campaign_id, result, now=self.clock(), interval=self.config.interval
-        )
-        return result
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=min(heartbeat_seconds, 1.0))
+            with self._active_abort_lock:
+                if self._active_abort_event is campaign_abort:
+                    self._active_abort_event = None
 
     def status_json(self) -> str:
         return json.dumps(self.store.status(), ensure_ascii=False, indent=2)
