@@ -7,6 +7,41 @@ import sys
 from pathlib import Path
 
 _APP_DIR = "AI Command Center"
+_WORKSPACE_NAME = "ai-command-center"
+_RUNTIME_PATHS = {
+    "AICC_DATA_DIR": "data",
+    "AICC_GENERATED_ROOT": "generated",
+    "AICC_REPORTS_ROOT": "reports",
+}
+
+
+def _discover_workspace_root() -> Path | None:
+    configured = os.environ.get("AICC_WORKSPACE_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+
+    for candidate in (
+        Path.home() / "Projects" / _WORKSPACE_NAME,
+        Path.home() / _WORKSPACE_NAME,
+    ):
+        if (candidate / "data").is_dir():
+            return candidate
+    return None
+
+
+def configure_runtime_environment(workspace_root: Path | None = None) -> Path | None:
+    """Point a packaged desktop app at a conventional live workspace."""
+    root = (
+        Path(workspace_root).expanduser()
+        if workspace_root is not None
+        else _discover_workspace_root()
+    )
+    if root is None:
+        return None
+
+    for variable, child in _RUNTIME_PATHS.items():
+        os.environ.setdefault(variable, str(root / child))
+    return root
 
 
 def platform_name() -> str:

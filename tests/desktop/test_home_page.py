@@ -15,7 +15,7 @@ import threading
 import weakref
 
 from PySide6.QtCore import QThreadPool, Qt
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QLabel, QSizePolicy
 
 from command_center.desktop import i18n, tokens
 from command_center.desktop.components.empty_state import EmptyState
@@ -86,6 +86,23 @@ def test_render_snapshot_metric_strip_reflects_counts(qtbot):
     assert metrics[i18n.METRIC_PROJECTS] == "2"
     assert metrics[i18n.METRIC_ACTIVE_RUNS] == "1"
     assert metrics[i18n.METRIC_REPORTS] == "1"
+
+
+def test_metric_strip_shares_available_width_between_all_captions(qtbot):
+    page = HomePage()
+    qtbot.addWidget(page)
+    page.resize(900, 700)
+    page.render_snapshot(_snapshot())
+    page.show()
+    qtbot.wait(20)
+
+    cards = page.metric_cards()
+    assert len(cards) == 5
+    assert all(
+        card.sizePolicy().horizontalPolicy() is QSizePolicy.Policy.Expanding
+        for card in cards
+    )
+    assert min(card.width() for card in cards) >= 130
 
 
 def test_home_shows_separate_russian_aios_core_card_with_source_and_evidence(qtbot):

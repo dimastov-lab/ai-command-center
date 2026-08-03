@@ -255,8 +255,7 @@ class HomePage(BasePage):
         ):
             card = MetricCard(value, label)
             self._metric_cards.append(card)
-            layout.addWidget(card)
-        layout.addStretch(1)
+            layout.addWidget(card, 1)
         return strip
 
     def _build_projects_section(self, snapshot: dict) -> QWidget:
