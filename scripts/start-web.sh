@@ -18,20 +18,39 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [[ -f "$ROOT_DIR/.venv/bin/activate" ]]; then
-  # shellcheck disable=SC1091
-  source "$ROOT_DIR/.venv/bin/activate"
+PYTHON_BIN=""
+
+if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+else
+  # AICC commonly uses Git worktrees. Reuse the primary checkout's virtual
+  # environment when this worktree does not have its own .venv.
+  GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [[ -n "$GIT_COMMON_DIR" ]]; then
+    PRIMARY_ROOT="$(dirname "$GIT_COMMON_DIR")"
+    if [[ -x "$PRIMARY_ROOT/.venv/bin/python" ]]; then
+      PYTHON_BIN="$PRIMARY_ROOT/.venv/bin/python"
+    fi
+  fi
 fi
 
-if ! command -v python >/dev/null 2>&1; then
-  echo "Error: python is not available on PATH." >&2
-  echo "Create a virtual environment and install requirements-web.txt." >&2
+if [[ -z "$PYTHON_BIN" ]] && command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+fi
+
+if [[ -z "$PYTHON_BIN" ]] && command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+fi
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "Error: Python is not available." >&2
+  echo "Create .venv in this checkout or in the primary Git worktree." >&2
   exit 1
 fi
 
-if ! python -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+if ! "$PYTHON_BIN" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
   echo "Error: FastAPI and Uvicorn are required." >&2
-  echo "Run: python -m pip install -r requirements-web.txt" >&2
+  echo "Run: $PYTHON_BIN -m pip install -r requirements-web.txt" >&2
   exit 1
 fi
 
@@ -43,5 +62,5 @@ fi
 (cd web && npm ci)
 (cd web && npm run build)
 
-exec python -m uvicorn "command_center.webapi.app:create_app" --factory \
+exec "$PYTHON_BIN" -m uvicorn "command_center.webapi.app:create_app" --factory \
   --host localhost --port "${PORT:-8791}"
