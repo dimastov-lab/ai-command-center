@@ -52,7 +52,7 @@ class ReconcileFinding:
     title: str
     kind: str
     reason: str
-    suggested_action: str            # "delete" | "mark_done"
+    suggested_action: str            # "delete" | "send_review"
     match_task_id: str | None = None
     match_title: str | None = None
     confidence: float = 1.0
@@ -117,7 +117,7 @@ def find_reconcilable(
                     kind=KIND_SELF_COMPLETED,
                     reason="Прогон этой задачи уже завершился успешно (launch=Completed), "
                     "но карточка осталась в открытой колонке.",
-                    suggested_action="mark_done",
+                    suggested_action="send_review",
                     confidence=1.0,
                 )
             )

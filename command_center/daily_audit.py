@@ -14,6 +14,7 @@ verified.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -114,13 +115,24 @@ class DailyAuditStore:
         self.db_path = db_path
         self._migrate()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self):
         connection = sqlite3.connect(self.db_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA foreign_keys=ON")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            # sqlite3.Connection.__exit__ commits/rolls back but deliberately
+            # does not close the descriptor.  The daemon polls forever, so an
+            # explicit close is required to keep DB/WAL descriptors bounded.
+            connection.close()
 
     def _migrate(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

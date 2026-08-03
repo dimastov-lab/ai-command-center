@@ -355,15 +355,9 @@ def manual_merge_available(completion: dict | None) -> bool:
 # finishes, then the completion pipeline's own state, which is a genuine,
 # observed milestone chain (validate -> review -> PR -> merge -> verify).
 #
-# Within the working phase there is no observable *fraction* done — an agent
-# emits work, not a percent-complete. The one honest, monotonic signal is how
-# much of the run's own time budget has been spent, so `Running` tracks
-# elapsed/timeout *directly* (clamped to [5 %, 92 %]). That keeps the operator's
-# expectation intact — "more time elapsed than remaining ⟹ past the halfway
-# mark" (at 50 % of the budget the bar reads 50 %, at 79 % it reads 79 %) — which
-# a compressed 25–50 % band violated (11 min in, 3 min left, yet only 44 %). The
-# 92 % cap leaves the top band for the post-process merge pipeline, so the bar
-# never claims "done" while the agent is still running.
+# Within the working phase there is no observable fraction complete. Elapsed
+# time is shown separately and must never be converted into delivery progress.
+# A running process therefore reports only its latest evidenced milestone.
 _RUN_WORKING_FLOOR = 5
 _RUN_WORKING_CEILING = 92
 
@@ -452,25 +446,9 @@ def derive_live_progress(
             return mapped
 
     if display_status in (STATUS_RUNNING, STATUS_STALE):
-        # Track the fraction of the time budget spent *directly* (not a
-        # compressed band): at 50 % of the budget the bar reads ~50 %, at 79 % it
-        # reads ~79 % — so "more elapsed than remaining ⟹ past halfway" holds,
-        # which the old 25–50 % band broke. Clamped to [floor, 92 %] so it never
-        # claims "done" while the process is still running.
-        frac = 0.0
-        if elapsed_seconds and timeout_seconds and timeout_seconds > 0:
-            frac = min(1.0, max(0.0, elapsed_seconds / timeout_seconds))
-        time_percent = min(_RUN_WORKING_CEILING, max(_RUN_WORKING_FLOOR, round(frac * 100)))
-        # The task's milestone-based progress is a floor: once the agent has
-        # produced output and the task advanced to "Implementation" (40 %),
-        # the bar must not drop below it. Use whichever is higher — the
-        # time-based fraction or the milestone — and prefer the milestone
-        # label when the milestone wins, so the bar says "Implementation"
-        # rather than the generic "Выполняется".
-        milestone = int(stage_progress) if stage_progress is not None else 0
-        if milestone > time_percent:
-            return min(_RUN_WORKING_CEILING, milestone), stage_label or "Выполняется"
-        return time_percent, "Выполняется"
+        del elapsed_seconds, timeout_seconds
+        milestone = int(stage_progress) if stage_progress is not None else 25
+        return min(_RUN_WORKING_CEILING, max(_RUN_WORKING_FLOOR, milestone)), stage_label or "Выполняется"
 
     phase = _RUN_PHASE_PROGRESS.get(display_status)
     if phase:

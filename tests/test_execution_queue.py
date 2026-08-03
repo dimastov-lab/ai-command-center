@@ -298,3 +298,46 @@ def test_module_never_constructs_a_git_subprocess_call():
         node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert "git" not in string_literals
+
+
+def test_explicit_remediation_retries_recovered_sole_provider(monkeypatch):
+    task = {"executor": "claude_code", "failed_executors": ["claude_code"]}
+    cfg = {"allowed_agents": ["claude_code"]}
+    availability = type("Availability", (), {"available": True})()
+    provider = type("Provider", (), {"availability": lambda self: availability})()
+    monkeypatch.setattr(
+        "command_center.runtime.providers.get_provider", lambda _provider_id: provider
+    )
+
+    assert execution_queue.select_available_executor(task, cfg) is None
+    assert execution_queue.select_remediation_executor(task, cfg) == "claude_code"
+
+
+def test_explicit_remediation_stays_blocked_when_sole_provider_is_unavailable(monkeypatch):
+    task = {"executor": "claude_code", "failed_executors": ["claude_code"]}
+    cfg = {"allowed_agents": ["claude_code"]}
+    availability = type("Availability", (), {"available": False})()
+    provider = type("Provider", (), {"availability": lambda self: availability})()
+    monkeypatch.setattr(
+        "command_center.runtime.providers.get_provider", lambda _provider_id: provider
+    )
+
+    assert execution_queue.select_remediation_executor(task, cfg) is None
+
+
+def test_missing_launched_run_becomes_idempotent_traceable_tombstone(tmp_path):
+    from command_center.runtime import db
+
+    db.migrate(db.resolve_db_path(tmp_path))
+    entries = [{
+        "id": "q1", "task_id": "t1", "project": "AICC",
+        "state": execution_queue.STATE_LAUNCHED, "run_id": "deleted-run",
+    }]
+
+    first = execution_queue.reconcile_missing_run_links(tmp_path, entries)
+    second = execution_queue.reconcile_missing_run_links(tmp_path, first)
+
+    assert first == second
+    assert first[0]["state"] == execution_queue.STATE_ATTENTION
+    assert first[0]["run_id"] == "deleted-run"
+    assert first[0]["missing_run_tombstone"]["run_id"] == "deleted-run"

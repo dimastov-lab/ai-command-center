@@ -4,7 +4,7 @@
 The deterministic matcher finds open tasks that are almost certainly already
 done (their own run finished, or they duplicate a Done / another open task).
 This panel renders each finding with its reason and a one-click resolution —
-move it to Done, or delete it — so the operator never launches the same work
+send it to Review, or delete it — so the operator never launches the same work
 twice. Nothing changes until a row's button is pressed: the matcher only ever
 *proposes*, exactly as asked ("если задача уже реализована, просто предложить
 её удалить"), and the operator confirms per row.
@@ -70,7 +70,7 @@ def render_backlog_reconcile_panel(
             # The suggested action is the primary button; the other stays
             # available so the operator keeps full control per row.
             done_clicked = done_col.button(
-                "В Done",
+                "На проверку",
                 key=f"{key_prefix}_done_{finding.task_id}",
                 use_container_width=True,
                 type="primary" if not finding.is_delete else "secondary",
@@ -83,9 +83,9 @@ def render_backlog_reconcile_panel(
             )
             if done_clicked:
                 tasks_repository.update_task_status(
-                    root, finding.task_id, backlog_reconcile.DONE_STATUS
+                    root, finding.task_id, "Review"
                 )
-                st.toast(f"В Done: {finding.title}")
+                st.toast(f"На проверку: {finding.title}")
                 st.rerun()
             if delete_clicked:
                 tasks_repository.delete_task(root, finding.task_id)

@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -115,3 +116,25 @@ def test_request_run_now_makes_idle_schedule_due(tmp_path):
     service.store.ensure_schedule(NOW + timedelta(days=1))
     assert service.store.request_run_now(now=NOW)
     assert service.store.status()["next_run_at"] == "2026-07-28T08:00:00+00:00"
+
+
+def test_store_closes_every_poll_connection(tmp_path, monkeypatch):
+    opened = []
+    real_connect = sqlite3.connect
+
+    def tracked_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr("command_center.daily_audit.sqlite3.connect", tracked_connect)
+    service = DailyAuditService(
+        config(tmp_path), Backend(), db_path=tmp_path / "db.sqlite", clock=lambda: NOW
+    )
+    for _ in range(100):
+        service.store.status()
+
+    assert opened
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connection.execute("SELECT 1")
