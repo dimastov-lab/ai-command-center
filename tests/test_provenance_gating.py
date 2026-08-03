@@ -95,6 +95,9 @@ def test_claude_provider_build_launch_untrusted_drops_bypass_and_bash(tmp_path):
         task_type="implementation", is_resume=False, model=None, untrusted=True,
     )
     argv = list(spec.argv)
+    assert "p" not in argv
+    assert spec.stdin_text == "p"
+    assert spec.audit_metadata["prompt_transport"] == "stdin"
     assert "bypassPermissions" not in argv
     assert "--tools" in argv
     assert "--disallowedTools" not in argv
@@ -108,6 +111,8 @@ def test_claude_provider_build_launch_trusted_keeps_full_development(tmp_path):
         task_type="implementation", is_resume=False, model=None,
     )
     assert "bypassPermissions" in list(spec.argv)
+    assert "p" not in spec.argv
+    assert spec.stdin_text == "p"
 
 
 def test_is_untrusted_source():

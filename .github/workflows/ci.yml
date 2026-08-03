@@ -103,13 +103,9 @@ jobs:
         continue-on-error: true
         run: mypy command_center || true
 
-      # Real-browser E2E of the status projection (audit D2/D5). Non-blocking so
-      # a browser hiccup can never wedge the merge gate; the required `pytest`
-      # step above skips this module (no browser installed there). Here Chromium
-      # is installed first, so the board's Blocked-lane / no-task-vanishes
-      # invariant is exercised in an actual browser on every run.
-      - name: Real-browser E2E (informational)
-        continue-on-error: true
+      # Real-browser lifecycle projection is a release invariant, not an
+      # informational signal: a failing user journey must fail this check.
+      - name: Real-browser E2E
         run: |
           python -m playwright install chromium
           pytest -q tests/test_e2e_status_projection.py
@@ -172,15 +168,13 @@ jobs:
       - name: Desktop pytest-qt suite
         run: pytest tests/desktop -q
 
-      # Real-browser E2E of the status projection. Informational/non-blocking,
-      # matching the ubuntu job. The full repository `pytest -q` is deliberately
+      # Real-browser E2E of the status projection. The full repository `pytest -q` is deliberately
       # NOT run here: ~200 of its non-desktop tests are POSIX-only by design
       # (process-group supervision via waitid(WNOWAIT)) and others hit the
       # Windows console `charmap` codec, so a Windows full-suite run is pure
       # noise plus ~23 min of runtime that risks cancelling the job. The
       # desktop gate signal is the `tests/desktop` suite above.
-      - name: Real-browser E2E (informational)
-        continue-on-error: true
+      - name: Real-browser E2E
         run: |
           python -m playwright install chromium
           pytest -q tests/test_e2e_status_projection.py

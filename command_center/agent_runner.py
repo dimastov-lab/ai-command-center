@@ -111,6 +111,7 @@ PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
 READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
 # empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
@@ -137,15 +138,12 @@ PERMISSION_MODE_BY_PROFILE: dict[str, str] = {
 
 
 def profile_for_task_type(task_type: str) -> str:
-    """The execution profile a `task_type` resolves to: `PROFILE_READ_ONLY`
-    for exactly `READ_ONLY_TASK_TYPES`, `PROFILE_TRUSTED_DEVELOPMENT` for
-    everything else — the same membership check `build_command`/
-    `runtime.supervisor.build_claude_command` already branched on before
-    this was named, preserved exactly (an unrecognized/future task_type
-    still resolves to `PROFILE_TRUSTED_DEVELOPMENT`, matching that existing
-    "else" branch; `READ_ONLY_TASK_TYPES` is the explicit allow-list here,
-    not the other way around)."""
-    return PROFILE_READ_ONLY if task_type in READ_ONLY_TASK_TYPES else PROFILE_TRUSTED_DEVELOPMENT
+    """Resolve capabilities with mutation denied unless explicitly allowed.
+
+    Only reviewed implementation/remediation types receive development
+    capabilities. Unknown and future task types fail closed as read-only.
+    """
+    return PROFILE_TRUSTED_DEVELOPMENT if task_type in MUTATING_TASK_TYPES else PROFILE_READ_ONLY
 
 
 def is_untrusted_source(source: str | None) -> bool:
@@ -177,7 +175,7 @@ def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevat
     explicitly elevated it — so a malicious imported task cannot silently obtain
     arbitrary local shell. A trusted (operator-authored) task is unchanged, so
     with `untrusted=False` this is identical to `profile_for_task_type`."""
-    if task_type in READ_ONLY_TASK_TYPES:
+    if task_type not in MUTATING_TASK_TYPES:
         return PROFILE_READ_ONLY
     if untrusted and not operator_elevated:
         return PROFILE_READ_ONLY
@@ -692,11 +690,9 @@ def resolve_report_path(run: dict) -> Path | None:
     Runs/Reports pages. Returns None (never raises) if `report_path` is missing or
     resolves outside REPORTS_ROOT.
     """
-    report_path = run.get("report_path")
-    if not report_path:
-        return None
-    candidate = (ROOT / report_path).resolve()
-    reports_root = REPORTS_ROOT.resolve()
-    if candidate != reports_root and reports_root not in candidate.parents:
-        return None
-    return candidate
+    # One resolver serves both runtime generations.  In particular, it must
+    # not join the stored reference to the code root when AICC_REPORTS_ROOT is
+    # configured independently.
+    from command_center.runtime import reports as runtime_reports
+
+    return runtime_reports.resolve_report_path(run.get("report_path"))

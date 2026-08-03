@@ -181,6 +181,7 @@ AGENT_ROLES: dict[str, dict[str, object]] = {
 # duplicate lists (command_center.task_import validates against the same
 # vocabulary and must never import app.py).
 KANBAN_COLUMNS: list[str] = models.KANBAN_STATUSES
+MANUAL_KANBAN_STATUSES: list[str] = [status for status in KANBAN_COLUMNS if status != "Done"]
 
 PRIORITIES: list[str] = models.TASK_PRIORITIES
 
@@ -1366,8 +1367,13 @@ def render_task_card(
 
             if report_open:
                 if task.get("report_path"):
-                    report_full_path = ROOT / task["report_path"]
-                    st.code(read_text(report_full_path), language="markdown")
+                    report_full_path = agent_runner.resolve_report_path(task)
+                    if report_full_path is None:
+                        st.warning("Путь к отчёту не проходит проверку безопасности — файл не открыт.")
+                    elif report_full_path.exists():
+                        st.code(read_text(report_full_path), language="markdown")
+                    else:
+                        st.caption("Файл отчёта не найден на диске.")
                 else:
                     st.caption("Отчёт ещё не создан.")
 
@@ -2077,26 +2083,14 @@ def _render_execution_center_card(
             bar_progress = session.get("progress")
             bar_stage = session.get("current_stage")
         if bar_progress is not None:
-            # For a still-running agent there is no true "percent done", so the
-            # bar is time-based — make that explicit by showing elapsed and the
-            # remaining time budget beside it (the % alone "does not reflect
-            # reality"). For a terminal run, elapsed is the final duration.
+            # Percent is an evidenced delivery milestone. Elapsed time is a
+            # separate fact and is never presented as percent complete or ETA.
             parts = [f"{bar_progress}%", bar_stage or "—"]
             elapsed = session.get("elapsed_seconds")
             if elapsed is not None:
                 parts.append(f"прошло {session_view.format_elapsed(elapsed)}")
             if session["status"] in session_view.LIVE_PROCESS_DISPLAY_STATUSES:
-                # "осталось" is against the *expected* duration (estimate or
-                # historical median), not the timeout budget — the timeout is a
-                # ~200 % cap a run rarely spends, so it read as unreal. Once a run
-                # runs past its estimate, say so honestly rather than show 0.
-                reference = session.get("reference_seconds")
-                if reference and elapsed is not None:
-                    remaining = int(reference) - int(elapsed)
-                    if remaining > 0:
-                        parts.append(f"осталось ~{session_view.format_elapsed(remaining)}")
-                    else:
-                        parts.append("дольше обычного")
+                parts.append("ETA недоступно: недостаточно исторических данных")
             st.progress(min(max(bar_progress, 0), 100) / 100, text=" · ".join(parts))
 
         # Goal and prompt belong on the face of the card, not behind a button.
@@ -2444,7 +2438,9 @@ def _render_inline_create_task() -> None:
             task_type = row2[0].selectbox("Тип", TASK_TYPES, key="console_create_type")
             priority = row2[1].selectbox("Приоритет", PRIORITIES, index=PRIORITIES.index("Medium"),
                                          key="console_create_priority")
-            status = row2[2].selectbox("Колонка", KANBAN_COLUMNS, key="console_create_status")
+            status = row2[2].selectbox(
+                "Колонка", MANUAL_KANBAN_STATUSES, key="console_create_status"
+            )
             goal = st.text_area("Цель", key="console_create_goal", height=80)
             if st.form_submit_button("Создать", type="primary", icon=":material/add_task:"):
                 if not title.strip():
@@ -2608,26 +2604,31 @@ def _fix_attention_sessions(
         # known to have failed to start.
         configured_executor = task.get("executor") or "claude_code"
         failed = set(task.get("failed_executors") or [])
-        if configured_executor not in failed:
-            selected_executor = configured_executor
-        else:
-            selected_executor = execution_queue.select_available_executor(task, cfg)
-            if selected_executor is None:
-                results.append(
-                    (title, False, "ни один из разрешённых исполнителей не доступен — проверьте установку/авторизацию агентов")
-                )
-                continue
-            original = configured_executor
-            task["executor"] = selected_executor
-            task.setdefault("timeline", []).append(
-                {
-                    "ts": models.iso_now(),
-                    "type": "executor_fallback",
-                    "from": original,
-                    "to": selected_executor,
-                    "reason": "configured executor failed to start (attention triage fix)",
-                }
+        selected_executor = execution_queue.select_remediation_executor(task, cfg)
+        if selected_executor is None:
+            results.append(
+                (title, False, "ни один из разрешённых исполнителей не доступен — проверьте установку/авторизацию агентов")
             )
+            continue
+        if configured_executor in failed and selected_executor == configured_executor:
+            models.append_timeline_event(
+                task,
+                "remediation_retry",
+                f"Оператор повторно разрешил проверку восстановленного исполнителя «{configured_executor}».",
+            )
+        else:
+            original = configured_executor
+            if selected_executor != original:
+                task["executor"] = selected_executor
+                task.setdefault("timeline", []).append(
+                    {
+                        "ts": models.iso_now(),
+                        "type": "executor_fallback",
+                        "from": original,
+                        "to": selected_executor,
+                        "reason": "configured executor failed to start (attention triage fix)",
+                    }
+                )
 
         source_repository_path = cfg.get("repository_path")
         expected_branch = task.get("branch")
@@ -3333,6 +3334,10 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
         ]
 
     queue_entries = execution_queue.load_queue(ROOT)
+    reconciled_queue = execution_queue.reconcile_missing_run_links(ROOT, queue_entries)
+    if reconciled_queue != queue_entries:
+        execution_queue.save_queue(ROOT, reconciled_queue)
+        queue_entries = reconciled_queue
     dismissed_attention = st.session_state.get(_ATTENTION_DISMISSED_KEY, set())
     visible_board = {
         bucket: list(rows)
@@ -4897,7 +4902,9 @@ elif page_key == "create":
             key="create_task_deps",
         )
 
-        initial_status = st.selectbox("Статус Kanban", KANBAN_COLUMNS, key="create_task_status")
+        initial_status = st.selectbox(
+            "Статус Kanban", MANUAL_KANBAN_STATUSES, key="create_task_status"
+        )
         submitted = st.form_submit_button(
             "Создать задачу",
             icon=":material/add_task:",
@@ -6285,14 +6292,10 @@ elif page_key == "focus":
                     update_task_status(task_id, new_status)
                     st.rerun()
 
-                if st.button(
-                    "Отметить как выполнено",
-                    icon=":material/check_circle:",
-                    type="primary",
-                    width="stretch",
-                ):
-                    update_task_status(task_id, "Done")
-                    st.rerun()
+                st.caption(
+                    "Done устанавливается автоматически после проверки результата "
+                    "и целевой ветки."
+                )
 
 
 # --------------------------------------------------------------------------

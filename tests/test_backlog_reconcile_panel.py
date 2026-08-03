@@ -3,7 +3,7 @@
 
 The pure matcher is covered in `test_backlog_reconcile.py`; here we prove the
 panel actually renders a finding and that its per-row buttons persist the
-resolution through `tasks_repository` — moving a self-completed card to Done and
+resolution through `tasks_repository` — moving a self-completed card to Review and
 deleting a duplicate — so the Kanban page reflects the change on the next rerun.
 """
 from __future__ import annotations
@@ -45,7 +45,7 @@ def _run() -> AppTest:
     return AppTest.from_function(_panel_script, default_timeout=30).run()
 
 
-def test_self_completed_finding_is_shown_and_moves_to_done(isolated_data_dir):
+def test_self_completed_finding_is_shown_and_moves_to_review(isolated_data_dir):
     root = isolated_data_dir
     tasks_repository.save_tasks(root, [_task("t1", "Ship the thing", launch_status="Completed")])
 
@@ -55,7 +55,7 @@ def test_self_completed_finding_is_shown_and_moves_to_done(isolated_data_dir):
     at.button(key="t_done_t1").click().run()
 
     reloaded = {t["id"]: t for t in tasks_repository.load_tasks(root)}
-    assert reloaded["t1"]["status"] == "Done"
+    assert reloaded["t1"]["status"] == "Review"
 
 
 def test_duplicate_of_done_is_deleted(isolated_data_dir):
