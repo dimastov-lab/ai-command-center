@@ -296,6 +296,11 @@ class _ActiveRun:
         # A failed post-Popen setup cleanup retains ownership and is retried by
         # a recovery thread, ``reconcile()``, and ``wait_for_run()``.
         self.launch_cleanup_failed_event = threading.Event()
+        # Those three recovery paths may race. Serialize the complete cleanup
+        # and terminal-persistence attempt so a contender that was waiting for
+        # another path to release ownership re-checks ``done_event`` before it
+        # can touch the run database again.
+        self.launch_cleanup_retry_lock = threading.Lock()
         # Set by `_timeout_watchdog` (never by `cancel()`) only after a signal
         # was delivered, so `_supervise` can
         # tell a timeout-triggered termination apart from an explicit,
@@ -1382,28 +1387,29 @@ class Supervisor:
             active.finalization_failed_event.set()
 
     def _retry_failed_launch_cleanup(self, run_id: str, active: _ActiveRun) -> bool:
-        if active.done_event.is_set():
-            return True
-        exited = self._terminate_active_process(
-            run_id,
-            active,
-            grace_seconds=DEFAULT_CANCEL_GRACE_SECONDS,
-            lifecycle_prefix="launch_recovery",
-        )
-        if not exited:
+        with active.launch_cleanup_retry_lock:
+            if active.done_event.is_set():
+                return True
+            exited = self._terminate_active_process(
+                run_id,
+                active,
+                grace_seconds=DEFAULT_CANCEL_GRACE_SECONDS,
+                lifecycle_prefix="launch_recovery",
+            )
+            if not exited:
+                return False
+            active.launch_cleanup_failed_event.clear()
+            terminal_persisted = self._persist_run_failure(
+                run_id,
+                exit_code=active.process.returncode,
+                failure_reason="launch_setup_failed",
+                lifecycle="launch_setup_failed",
+            )
+            if terminal_persisted:
+                self._release_active(run_id, active)
+                return True
+            active.finalization_failed_event.set()
             return False
-        active.launch_cleanup_failed_event.clear()
-        terminal_persisted = self._persist_run_failure(
-            run_id,
-            exit_code=active.process.returncode,
-            failure_reason="launch_setup_failed",
-            lifecycle="launch_setup_failed",
-        )
-        if terminal_persisted:
-            self._release_active(run_id, active)
-            return True
-        active.finalization_failed_event.set()
-        return False
 
     def _recover_failed_launch(self, run_id: str, active: _ActiveRun) -> None:
         while not active.done_event.is_set():
