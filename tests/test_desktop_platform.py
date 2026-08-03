@@ -57,10 +57,22 @@ def test_runtime_environment_discovers_conventional_workspace(monkeypatch, tmp_p
     ):
         monkeypatch.delenv(name, raising=False)
 
-    assert paths.configure_runtime_environment() == workspace
-    assert paths.os.environ["AICC_DATA_DIR"] == str(workspace / "data")
-    assert paths.os.environ["AICC_GENERATED_ROOT"] == str(workspace / "generated")
-    assert paths.os.environ["AICC_REPORTS_ROOT"] == str(workspace / "reports")
+    try:
+        assert paths.configure_runtime_environment() == workspace
+        assert paths.os.environ["AICC_DATA_DIR"] == str(workspace / "data")
+        assert paths.os.environ["AICC_GENERATED_ROOT"] == str(workspace / "generated")
+        assert paths.os.environ["AICC_REPORTS_ROOT"] == str(workspace / "reports")
+    finally:
+        # configure_runtime_environment intentionally mutates os.environ outside
+        # monkeypatch's own setters. Remove those additions explicitly so this
+        # test cannot redirect later workspace snapshot tests to a deleted tmpdir.
+        for name in (
+            "AICC_WORKSPACE_ROOT",
+            "AICC_DATA_DIR",
+            "AICC_GENERATED_ROOT",
+            "AICC_REPORTS_ROOT",
+        ):
+            paths.os.environ.pop(name, None)
 
 
 def test_runtime_environment_preserves_explicit_overrides(monkeypatch, tmp_path):
