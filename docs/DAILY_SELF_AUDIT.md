@@ -32,6 +32,13 @@ AICC_COMPLETION_AUTOPILOT=1
 AICC_DATA_DIR=/absolute/path/to/the/app/data
 ```
 
+Optional bounds are `AICC_DAILY_AUDIT_MAX_REMEDIATION_ROUNDS` (1–10,
+default 5), `AICC_DAILY_AUDIT_RUN_TIMEOUT_SECONDS` (30–3600, default 3600)
+and `AICC_DAILY_AUDIT_COMPLETION_TIMEOUT_SECONDS` (60–43200, default 21600).
+Git operations and each validation command also have fixed deadlines (120 and
+900 seconds by default). A timed-out agent run is explicitly cancelled and a
+timed-out completion remains recoverable instead of being reported as done.
+
 Run one scheduler tick:
 
 ```text
@@ -51,3 +58,51 @@ Streamlit application; otherwise campaigns run correctly but cannot appear in
 the application UI. The
 process is kept alive, while the SQLite due time and lease ensure that only one
 campaign is dispatched per day and that another host cannot duplicate it.
+
+## Safety and recovery contract
+
+- The active scheduler renews its lease throughout the campaign. A replacement
+  may claim an expired lease, and the abandoned campaign is terminalized as
+  `interrupted`; a late owner cannot overwrite the replacement's result. The
+  backend rechecks ownership before publication/completion side effects and
+  cancels an active agent run as soon as lease loss is observed. Heartbeats
+  extend leases monotonically and cannot shorten a longer publication-action
+  fence.
+- `SIGTERM` and `SIGINT` request an orderly service stop. The scheduler wakes
+  immediately, stops heartbeating, cancels an active agent run, and terminates
+  a running validation process group with bounded TERM/KILL escalation. The
+  campaign is persisted as `interrupted` and remains due for restart recovery.
+- Terminal agent state handling includes `INTERRUPTED`, `UNKNOWN` and future
+  unknown states. Result events are paginated, so the final result is not lost
+  after the first 1000 events.
+- Transient failures retry with bounded exponential backoff from one hour to
+  one day. A provider rate-limit reset timestamp is retained and postpones the
+  next attempt when it is later than the calculated backoff.
+- Validation runs before the final gate. The gate receives the audit and
+  remediation evidence, full review diff, validation evidence and exact SHA-256
+  digests. It must return structured findings and evidence; missing evidence,
+  digest drift, contradictory verdicts, or any Blocker/High/Medium finding
+  fails closed.
+- A clean, independently approved no-change audit is a successful campaign.
+  A change campaign can stage only the exact reviewed manifest. Runtime output,
+  generated, binary, oversized, sensitive and unexpected files are rejected;
+  staged and committed blob hashes and modes are revalidated, and publication
+  never uses `git add --all`.
+- Completion advancement is targeted to the campaign's run and uses the same
+  concurrency, transient Git/GitHub retry and merge-slot envelope as the global
+  poller. The campaign/owner fence is persisted in completion policy, so the
+  global poller enforces it too. Immediately before commit, push, PR creation,
+  recovery or merge it atomically renews the same lease beyond the bounded
+  action timeout; if renewal fails, completion is cancelled into attention
+  without the publication side effect. A transient completion race cannot
+  restart the whole audit campaign.
+- Clean completed, failed and attention worktrees are removed. Dirty worktrees
+  and worktrees with an active completion timeout are retained for investigation
+  or recovery.
+
+The agent prompt, blocked commands and removal of environment-provided VCS
+tokens are defence in depth. They do not provide credential-level isolation
+from credentials already cached in a user keychain or credential helper. A
+headless deployment that requires a hard publication boundary must run agents
+under an identity without such credentials and grant publication credentials
+only to the completion service.
