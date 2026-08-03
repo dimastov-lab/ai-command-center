@@ -32,9 +32,10 @@ reports/
 # macOS
 .DS_Store
 
-# Local Claude Code configuration
+# Local Claude Code configuration (checked-in project skills are allowed)
 .agents/
-.claude/
+.claude/*
+!.claude/skills/
 
 # Local environment variables (OPENAI_API_KEY, etc.) — see .env.example
 .env
