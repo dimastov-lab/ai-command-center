@@ -21,6 +21,7 @@ from command_center import (
     launch_service,
     models,
     project_config,
+    read_model,
     recommend,
     report_parser,
     storage,
@@ -35,10 +36,11 @@ from command_center import (
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
 from command_center.runtime import db as runtime_db
-from command_center.runtime import log_tail, project_overview, runs_read, scheduler, session_view, task_sync
+from command_center.runtime import log_tail, project_overview, runs_read, scheduler, session_view
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
+    aml_panel,
     autopilot_panel,
     backlog_proposals,
     backlog_reconcile_panel,
@@ -189,6 +191,7 @@ NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
+    "aml": ("AML Monitoring", ":material/policy:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
     "kanban": ("Kanban", ":material/view_kanban:"),
@@ -413,6 +416,10 @@ def update_task_status(task_id: str, new_status: str) -> dict | None:
 
 def delete_task(task_id: str) -> None:
     tasks_repository.delete_task(ROOT, task_id)
+    # Also remove the task's runtime.db footprint (session/run/event/report/
+    # completion cascade) so a deleted Kanban card leaves no orphan rows in the
+    # unified Runs/Timeline/metrics views (audit AR-1).
+    get_execution_center_api().delete_task(task_id)
 
 
 def task_label(task: dict) -> str:
@@ -790,6 +797,24 @@ def render_agent_launcher(
                 action_ok, action_message = launch.copy_to_clipboard(full_prompt)
                 (st.success if action_ok else st.error)(action_message)
 
+        # Provenance-based capability gating (audit D7): an imported (untrusted)
+        # task runs read-only by default. Offer the operator an explicit, per-task
+        # elevation to full development capability (Bash) at the point of launch.
+        elevate_trust = False
+        untrusted_import = bool(
+            task_for_launch and agent_runner.is_untrusted_task(task_for_launch)
+        ) and task_type not in agent_runner.READ_ONLY_TASK_TYPES
+        if untrusted_import:
+            st.warning(
+                "Импортированная (недоверенная) задача — по умолчанию запускается "
+                "в безопасном read-only режиме (без Bash и изменения файлов)."
+            )
+            elevate_trust = st.checkbox(
+                "Доверять этой задаче: запустить с полными правами разработки (Bash). "
+                "Включайте только для задач из проверенного источника.",
+                value=bool(task_for_launch.get("trusted_execution_approved")),
+                key=f"{key_prefix}_elevate_trust",
+            )
         confirmed = st.checkbox(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
@@ -823,6 +848,22 @@ def render_agent_launcher(
 
         if not launch_clicked:
             return
+
+        # Persist the operator's D7 elevation decision for this untrusted task so
+        # the launch below — and every later launch — runs with the chosen
+        # capability. Set on the in-memory record too, since that is what the
+        # launch path reads this run. Absent/False keeps it read-only.
+        if untrusted_import:
+            task_for_launch["trusted_execution_approved"] = elevate_trust
+            elevate_task_id = task_for_launch.get("id")
+            if elevate_task_id:
+
+                def _persist_trust(tasks_list, _tid=elevate_task_id, _value=elevate_trust):
+                    for candidate in tasks_list:
+                        if candidate.get("id") == _tid:
+                            candidate["trusted_execution_approved"] = _value
+
+                tasks_repository.mutate_tasks(ROOT, _persist_trust)
 
         # Defense in depth: `disabled=` on the button above is the primary
         # gate, but a launch this consequential should not depend solely on
@@ -985,7 +1026,13 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
                 workflow_stage=next_stage,
             )
             run["next_task_id"] = new_task["id"]
-            agent_runner.append_run(run)
+            # Only the v1.2 journal is writable here. A v2 run lives in runtime.db;
+            # re-appending it would write a duplicate/stale v2 snapshot into the
+            # legacy runs.jsonl and let the two stores diverge (audit AR-3). The
+            # new task still carries `parent_task_id`/`prior_run_id`, so the
+            # forward linkage is preserved regardless of the run's store.
+            if run.get("source") == "v1.2":
+                agent_runner.append_run(run)
             activity_log.log_event(
                 "next_task_created", project=project, task_id=new_task["id"], run_id=run["id"],
                 message=f"Создана задача из запуска {run['id'][:8]}",
@@ -1262,10 +1309,11 @@ def render_task_card(
 
         if show_kanban_controls:
             current_status = task.get("status", KANBAN_COLUMNS[0])
+            status_options = task_view.kanban_status_options(current_status)
             new_status = st.selectbox(
                 "Статус",
-                KANBAN_COLUMNS,
-                index=KANBAN_COLUMNS.index(current_status) if current_status in KANBAN_COLUMNS else 0,
+                status_options,
+                index=status_options.index(current_status),
                 key=f"{key_prefix}_status_select",
                 label_visibility="collapsed",
             )
@@ -3075,12 +3123,14 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # board.
     tick_result = _maybe_run_autopilot_tick(api)
 
-    def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
-        return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
-
-    tasks, _mutated_tasks = tasks_repository.mutate_tasks(
-        ROOT, _sync_mutator, persist_if=lambda result: bool(result[1])
-    )
+    # Reconcile live runs + re-project execution state, then project every
+    # *verified* completion onto the Kanban `Done` lane. The completion
+    # projection previously ran only inside the (default-off) autopilot tick, so
+    # a merge verified present in the target branch never reached the board
+    # unless autopilot was enabled — stranding genuinely merged tasks in Backlog
+    # with their dependents blocked (audit DATA-D2). `sync_on_refresh` is
+    # idempotent and persists only on change, so it is safe on every refresh.
+    tasks, _projected_done_ids = task_pipeline.sync_on_refresh(ROOT, api)
 
     # Queue readiness has no poller of its own (see `execution_queue`'s
     # module docstring — no hidden scheduler); it piggybacks on this
@@ -3221,20 +3271,23 @@ def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: lis
 
     header_cols = st.columns([1.4, 1, 1, 2])
     with header_cols[0]:
+        # session_state (seeded by the v2 migration above) is the single source
+        # of truth for this keyed widget; passing `value=` alongside a
+        # session-state-set key is what Streamlit warns about, so it is omitted.
         auto_refresh = st.toggle(
             "Режим мониторинга",
-            value=st.session_state.get("exec_center_auto_refresh", False),
             key="exec_center_auto_refresh",
             help="Периодически обновляет всю доску. Выключите во время работы с карточками.",
         )
     with header_cols[1]:
-        current_interval = st.session_state.get("exec_center_refresh_interval", 30)
-        if current_interval not in _EXECUTION_CENTER_POLLERS:
-            current_interval = 30
+        # Sanitize any stale/invalid stored value, then let the keyed widget read
+        # it directly — no `index=` default, which Streamlit forbids alongside a
+        # session-state-set key.
+        if st.session_state.get("exec_center_refresh_interval") not in _EXECUTION_CENTER_POLLERS:
+            st.session_state["exec_center_refresh_interval"] = 30
         interval = st.selectbox(
             "Интервал (с)",
             list(_EXECUTION_CENTER_POLLERS),
-            index=list(_EXECUTION_CENTER_POLLERS).index(current_interval),
             key="exec_center_refresh_interval",
         )
     with header_cols[2]:
@@ -3472,6 +3525,7 @@ def build_commands() -> list[dict]:
 # live glyph, Inspector) has the task map + api available without a second pass.
 tasks = load_tasks()
 tasks_by_id = {task["id"]: task for task in tasks}
+task_counts = read_model.task_snapshot(tasks)
 project_configs = project_config.load_project_configs()
 
 page_key = shell.render_shell(
@@ -3640,7 +3694,11 @@ _ACTIVITY_LABELS: dict[str, str] = {
 }
 
 
-def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+def render_home_dashboard(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    counts: read_model.TaskSnapshot,
+) -> None:
     """The Home dashboard from the approved design — KPI tiles, execution queue,
     project health, recent activity, a Kanban overview and quick actions, with an
     AI-Supervisor side panel. Pure presentation over the live task/run state via
@@ -3658,12 +3716,12 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         s["display_status"] = _execution_center_display_status(s)
     board = live_board.split_board(sessions, display_status="display_status")
 
-    active = [t for t in tasks if t.get("status") != "Done"]
-    done = [t for t in tasks if t.get("status") == "Done"]
     running = board[live_board.BUCKET_LIVE]
-    needs_review = [t for t in tasks if t.get("launch_status") == "Needs Review"]
-    projects_with_tasks = {t.get("project") for t in active if t.get("project")}
-    attention = board[live_board.BUCKET_ATTENTION]
+    projects_with_tasks = {
+        project_config.canonical_project_id(t.get("project")) or t.get("project")
+        for t in tasks
+        if t.get("project")
+    }
 
     greeting = f"{_home_greeting()} {owner}" if owner else _home_greeting()
     st.markdown(f"### {greeting}")
@@ -3720,11 +3778,29 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
     # than a duplicated, misleading one.
     home_dashboard.kpi_tiles([
         home_dashboard.Kpi("Проекты", len(projects_with_tasks),
-                           "все активны" if not attention else f"{len(attention)} требуют внимания",
+                           (
+                               f"{counts.attention} задач требуют внимания"
+                               if counts.attention
+                               else "нет задач, требующих внимания"
+                           ),
                            "📁", "violet", ()),
         home_dashboard.Kpi("Агенты", len(running), runs_delta_txt, "🤖", "blue", ()),
-        home_dashboard.Kpi("Задачи", len(active), f"{len(done)} завершено", "✓", "green", ()),
-        home_dashboard.Kpi("Ревью", len(needs_review), f"{len(needs_review)} ожидают", "★", "amber", ()),
+        home_dashboard.Kpi(
+            "Задачи",
+            counts.total,
+            f"{counts.active} активных · {counts.done} завершено",
+            "✓",
+            "green",
+            (),
+        ),
+        home_dashboard.Kpi(
+            "Ревью",
+            counts.by_lane["Review"],
+            f"{counts.by_lane['Review']} в колонке Review",
+            "★",
+            "amber",
+            (),
+        ),
     ])
 
     # Clickable KPI deep-links (UX-2b): the inert HTML tiles above cannot host
@@ -3794,7 +3870,7 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
             # 200-capped run list. The old `len(running)*20` / `len(attention)*10`
             # multipliers were magic numbers dressing up counts as percentages.
             window_success = _window_success_rate(runs)
-            task_ratio = int(100 * len(done) / len(tasks)) if tasks else 0
+            task_ratio = int(100 * counts.done / counts.total) if counts.total else 0
             if window_success is None:
                 home_dashboard.health_gauge(0, "Нет данных за неделю", accent="slate")
             else:
@@ -3834,18 +3910,21 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
 
         with col_k:
             home_dashboard.card_open("Обзор Kanban", "Доска")
-            accents = ["slate", "blue", "green", "amber", "violet"]
-            cols = []
-            for i, lane in enumerate(models.KANBAN_STATUSES):
-                n = sum(1 for t in tasks if t.get("status") == lane)
-                cols.append((lane, n, accents[i % len(accents)]))
+            accents = ["slate", "blue", "green", "amber", "red", "violet"]
+            overview_lanes = list(read_model.CANONICAL_LANES)
+            cols = [
+                (lane, counts.by_lane[lane], accents[i % len(accents)])
+                for i, lane in enumerate(overview_lanes)
+            ]
+            if counts.other:
+                cols.append(("Другие", counts.other, "amber"))
             home_dashboard.kanban_overview(cols)
             home_dashboard.card_close()
             # Clickable Kanban columns (UX-2b): each lane count deep-links to the
             # Kanban board (the page-level filter defaults to "Все", so the
             # operator lands on the full board and can filter further).
-            kbtns = st.columns(len(models.KANBAN_STATUSES))
-            for i, lane in enumerate(models.KANBAN_STATUSES):
+            kbtns = st.columns(len(overview_lanes))
+            for i, lane in enumerate(overview_lanes):
                 with kbtns[i]:
                     if st.button(
                         f"→ {lane}",
@@ -3875,12 +3954,20 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         # The gauge shows the same windowed health as the project-health card; the
         # status pill and caption describe what the supervisor is actually doing.
         window_success = _window_success_rate(runs)
-        if attention:
+        # audit D5: count runs needing attention the same way the Execution Strip
+        # banner does — the non-superseded latest attempt of each task only — so
+        # this caption and the strip never show two different "attention" numbers
+        # on the same screen. `running` (the board live bucket above) stays as-is
+        # for the "Активные агенты" list; only the headline counts are
+        # canonicalised here.
+        _superseded_ids = live_board.superseded_run_ids(sessions)
+        run_counts = read_model.run_snapshot([r for r in runs if r.get("id") not in _superseded_ids])
+        if run_counts.attention:
             sup_status, sup_accent = "Требует внимания", "amber"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(attention)} прогонов требуют внимания"
-        elif running:
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.attention} прогонов требуют внимания"
+        elif run_counts.running:
             sup_status, sup_accent = "В работе", "green"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(running)} прогонов выполняется"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.running} прогонов выполняется"
         else:
             sup_status, sup_accent = "Ожидает", "slate"
             sup_label = "Автопилот включён — ожидает задач" if settings.enabled else "Автопилот выключен"
@@ -3891,10 +3978,16 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         home_dashboard.card_open("Проекты")
         proj_rows = []
         for p in sorted(projects_with_tasks):
-            p_active = [t for t in active if project_config.project_matches(t.get("project"), p)]
+            project_tasks = [
+                t for t in tasks if project_config.project_matches(t.get("project"), p)
+            ]
+            project_counts = read_model.task_snapshot(project_tasks)
+            p_active = [
+                t for t in project_tasks if t.get("status") in read_model.ACTIVE_LANES
+            ]
             p_att = [t for t in p_active if t.get("launch_status") in ("Failed", "Requires Attention", "Blocked")]
             proj_rows.append({
-                "icon": "▪", "name": p, "meta": f"{len(p_active)} активных",
+                "icon": "▪", "name": p, "meta": f"{project_counts.active} активных",
                 "right": "Внимание" if p_att else "OK", "right_accent": "amber" if p_att else "green",
             })
         home_dashboard.simple_rows(proj_rows or [{"icon": "▪", "name": "Нет активных проектов", "meta": ""}])
@@ -4153,24 +4246,27 @@ def render_dashboard_analytics(
     api: runtime_api.ExecutionCenterAPI,
     tasks: list[dict],
     tasks_by_id: dict[str, dict],
+    counts: read_model.TaskSnapshot,
 ) -> None:
     """Compact cross-project analytics for the consolidated main dashboard."""
-    active_tasks = [task for task in tasks if task.get("status") != "Done"]
-    completed_tasks = [task for task in tasks if task.get("status") == "Done"]
-    blocked_tasks = [task for task in active_tasks if is_blocked(task, tasks_by_id)]
+    active_tasks = [task for task in tasks if task.get("status") in read_model.ACTIVE_LANES]
+    blocked_tasks = [task for task in tasks if task.get("status") == "Blocked"]
     completion_rate = (
-        round(len(completed_tasks) / len(tasks) * 100) if tasks else 0
+        round(counts.done / counts.total * 100) if counts.total else 0
     )
 
     with st.container(horizontal=True):
-        st.metric("Всего задач", len(tasks), border=True)
-        st.metric("Активные", len(active_tasks), border=True)
-        st.metric("Заблокированные", len(blocked_tasks), border=True)
+        st.metric("Всего задач", counts.total, border=True)
+        st.metric("Активные", counts.active, border=True)
+        st.metric("В статусе Blocked", counts.blocked, border=True)
         st.metric(
             "Выполнено",
-            f"{len(completed_tasks)} ({completion_rate}%)",
+            f"{counts.done} ({completion_rate}%)",
             border=True,
         )
+        if counts.other:
+            st.metric("Другие статусы", counts.other, border=True)
+        st.metric("Требуют внимания", counts.attention, border=True)
 
     left, right = st.columns([3, 2])
     with left:
@@ -4181,20 +4277,13 @@ def render_dashboard_analytics(
                 for task in tasks
                 if project_config.project_matches(task.get("project"), project)
             ]
-            active = sum(1 for task in project_tasks if task.get("status") != "Done")
-            done = sum(1 for task in project_tasks if task.get("status") == "Done")
-            blocked = sum(
-                1
-                for task in project_tasks
-                if task.get("status") != "Done"
-                and is_blocked(task, tasks_by_id)
-            )
+            project_counts = read_model.task_snapshot(project_tasks)
             with st.container(border=True):
                 cols = st.columns([3, 1, 1, 1, 1])
                 cols[0].markdown(f"**{project}**")
-                cols[1].metric("Актив.", active)
-                cols[2].metric("Блок.", blocked)
-                cols[3].metric("Готово", done)
+                cols[1].metric("Актив.", project_counts.active)
+                cols[2].metric("Blocked", project_counts.blocked)
+                cols[3].metric("Готово", project_counts.done)
                 if cols[4].button(
                     "Открыть",
                     key=f"dashboard_analytics_project_{project}",
@@ -4267,11 +4356,11 @@ if page_key == "dashboard":
     # discovery and analytics no longer execute invisibly on every overview
     # refresh, which keeps the home page responsive on large workspaces.
     if dashboard_section == "Аналитика":
-        render_dashboard_analytics(dashboard_api, tasks, tasks_by_id)
+        render_dashboard_analytics(dashboard_api, tasks, tasks_by_id, task_counts)
     elif dashboard_section == "Репозитории и артефакты":
         render_workspace_home_page(dashboard_api)
     else:
-        render_home_dashboard(dashboard_api, tasks)
+        render_home_dashboard(dashboard_api, tasks, task_counts)
 
 
 # --------------------------------------------------------------------------
@@ -4288,6 +4377,14 @@ elif page_key == "workspace_home":
 
 
 # --------------------------------------------------------------------------
+# AML Monitoring
+# --------------------------------------------------------------------------
+
+elif page_key == "aml":
+    aml_panel.render()
+
+
+# --------------------------------------------------------------------------
 # Executive Dashboard
 # --------------------------------------------------------------------------
 
@@ -4299,18 +4396,25 @@ elif page_key == "executive":
         active_runs=get_execution_center_api().list_runs(states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES),
     )
 
-    active_tasks = [task for task in tasks if task.get("status") != "Done"]
-    completed_tasks = [task for task in tasks if task.get("status") == "Done"]
-    blocked_tasks = [task for task in active_tasks if is_blocked(task, tasks_by_id)]
-    blocked_ids = {task["id"] for task in blocked_tasks}
-    completion_rate = f"{(len(completed_tasks) / len(tasks) * 100):.0f}%" if tasks else "—"
+    active_tasks = [
+        task for task in tasks if task.get("status") in read_model.ACTIVE_LANES
+    ]
+    blocked_tasks = [task for task in tasks if task.get("status") == "Blocked"]
+    completion_rate = (
+        f"{(task_counts.done / task_counts.total * 100):.0f}%"
+        if task_counts.total
+        else "—"
+    )
     total_estimate = sum(task.get("estimate_hours", 0.0) for task in active_tasks)
 
     with st.container(horizontal=True):
-        st.metric("Всего задач", len(tasks), border=True)
-        st.metric("Активные", len(active_tasks), border=True)
-        st.metric("Заблокированные", len(blocked_tasks), border=True)
-        st.metric("Выполнено", f"{len(completed_tasks)} ({completion_rate})", border=True)
+        st.metric("Всего задач", task_counts.total, border=True)
+        st.metric("Активные", task_counts.active, border=True)
+        st.metric("В статусе Blocked", task_counts.blocked, border=True)
+        st.metric("Выполнено", f"{task_counts.done} ({completion_rate})", border=True)
+        if task_counts.other:
+            st.metric("Другие статусы", task_counts.other, border=True)
+        st.metric("Требуют внимания", task_counts.attention, border=True)
         st.metric("Оценка нагрузки", format_estimate(total_estimate), border=True)
 
     st.divider()
@@ -4324,18 +4428,16 @@ elif page_key == "executive":
             # Canonical-id match (shared helper) so display-name tasks count
             # under their project — consistent with the Kanban lane and pill.
             project_tasks = [task for task in tasks if project_config.project_matches(task.get("project"), project)]
-            p_active = sum(1 for task in project_tasks if task.get("status") != "Done")
-            p_blocked = sum(1 for task in project_tasks if task["id"] in blocked_ids)
-            p_done = sum(1 for task in project_tasks if task.get("status") == "Done")
+            project_counts = read_model.task_snapshot(project_tasks)
             status_file = project_status_file_path(project)
 
             with st.container(border=True):
                 header_cols = st.columns([2, 1, 1, 1])
                 header_cols[0].markdown(f"**{project}**")
                 header_cols[0].caption(statuses.get(project, "—"))
-                header_cols[1].metric("Активн.", p_active)
-                header_cols[2].metric("Блок.", p_blocked)
-                header_cols[3].metric("Готово", p_done)
+                header_cols[1].metric("Активн.", project_counts.active)
+                header_cols[2].metric("Blocked", project_counts.blocked)
+                header_cols[3].metric("Готово", project_counts.done)
                 st.caption(f"Статус-файл обновлён: {format_mtime(status_file)}")
 
     with right:
@@ -4541,35 +4643,39 @@ elif page_key == "create":
         elif task_type not in TASK_TYPES:
             st.error("Неизвестный тип задачи.")
         else:
+            final_executor = (
+                None if override_executor == "(унаследовано из проекта)" else override_executor
+            )
+            create_task(
+                project,
+                title_clean,
+                task_type,
+                initial_status,
+                goal=objective_clean,
+                notes=notes.strip(),
+                priority=priority,
+                owner=owner.strip(),
+                estimate_hours=float(estimate),
+                depends_on=dependencies,
+                workspace_path=override_workspace.strip() or inherited["workspace_path"],
+                branch=override_branch.strip() or inherited["branch"],
+                executor=final_executor or inherited["executor"],
+                prompt=override_prompt.strip() or inherited["prompt"],
+            )
+            st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
+
             with st.spinner("Выполняется scripts/start-task.sh..."):
                 ok, stdout, stderr = run_start_task_script(project, task_type, objective_clean)
 
             if ok:
-                final_executor = (
-                    None if override_executor == "(унаследовано из проекта)" else override_executor
-                )
-                create_task(
-                    project,
-                    title_clean,
-                    task_type,
-                    initial_status,
-                    goal=objective_clean,
-                    notes=notes.strip(),
-                    priority=priority,
-                    owner=owner.strip(),
-                    estimate_hours=float(estimate),
-                    depends_on=dependencies,
-                    workspace_path=override_workspace.strip() or inherited["workspace_path"],
-                    branch=override_branch.strip() or inherited["branch"],
-                    executor=final_executor or inherited["executor"],
-                    prompt=override_prompt.strip() or inherited["prompt"],
-                )
-                st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
                 if stdout:
                     with st.expander("Вывод скрипта"):
                         st.code(stdout, language=None)
             else:
-                st.error("Не удалось выполнить scripts/start-task.sh.")
+                st.warning(
+                    "Задача сохранена в Kanban, но scripts/start-task.sh не смог "
+                    "сгенерировать Markdown-файл."
+                )
                 details = stderr or stdout
                 if details:
                     with st.expander("Подробности ошибки", expanded=True):
@@ -4752,6 +4858,7 @@ elif page_key == "kanban":
     filtered_tasks = task_view.filter_kanban_tasks(
         tasks, project=project_filter, priorities=priority_filter
     )
+    filtered_counts = read_model.task_snapshot(filtered_tasks)
 
     kanban_git_status_cache: dict[str, dict] = {}
     kanban_api = get_execution_center_api()
@@ -4801,16 +4908,37 @@ elif page_key == "kanban":
     # Полноширинные вертикальные дорожки Kanban.
     # Горизонтальная разметка через st.columns сжимала карточки
     # и делала заголовки и элементы управления нечитаемыми.
-    for status in KANBAN_COLUMNS:
+    for status in read_model.CANONICAL_LANES:
         with st.container(border=True):
             status_tasks = [task for task in filtered_tasks if task.get("status") == status]
             st.markdown(f"**{status}**")
-            st.caption(f"{len(status_tasks)} задач")
+            st.caption(f"{filtered_counts.by_lane[status]} задач")
 
             if not status_tasks:
                 st.caption("Пусто")
 
             for task in status_tasks:
+                render_task_card(
+                    task,
+                    tasks=tasks,
+                    tasks_by_id=tasks_by_id,
+                    key_prefix=f"kanban_{task.get('id')}",
+                    git_status_cache=kanban_git_status_cache,
+                    completion=completions_by_task.get(task.get("id")),
+                    live_progress=_kanban_live_progress(task),
+                    show_kanban_controls=True,
+                )
+
+    if filtered_counts.other:
+        with st.container(border=True):
+            other_tasks = [
+                task
+                for task in filtered_tasks
+                if task.get("status") not in read_model.CANONICAL_LANES
+            ]
+            st.markdown("**Другие статусы**")
+            st.caption(f"{filtered_counts.other} задач")
+            for task in other_tasks:
                 render_task_card(
                     task,
                     tasks=tasks,
@@ -4835,8 +4963,7 @@ elif page_key == "agents":
     for task_type in TASK_TYPES:
         meta = AGENT_ROLES[task_type]
         type_tasks = [task for task in tasks if task.get("task_type") == task_type]
-        active_count = sum(1 for task in type_tasks if task.get("status") != "Done")
-        done_count = len(type_tasks) - active_count
+        type_counts = read_model.task_snapshot(type_tasks)
         generated_count = sum(1 for path in generated_files if artifacts.infer_task_type_from_filename(path) == task_type)
 
         with st.container(border=True):
@@ -4844,8 +4971,8 @@ elif page_key == "agents":
             st.caption(f"`{task_type}` · {meta['summary']}")
 
             metric_cols = st.columns(3)
-            metric_cols[0].metric("Активные задачи", active_count)
-            metric_cols[1].metric("Завершено", done_count)
+            metric_cols[0].metric("Активные задачи", type_counts.active)
+            metric_cols[1].metric("Завершено", type_counts.done)
             metric_cols[2].metric("Сгенерировано файлов", generated_count)
 
             with st.expander("Правила выполнения"):
@@ -5747,18 +5874,19 @@ elif page_key == "workspace":
     for project in models.PROJECT_IDS:
         project_file = project_status_file_path(project)
         context_name = CONTEXT_FILES.get(project)
-        project_active = sum(
-            1
+        project_tasks = [
+            task
             for task in tasks
-            if project_config.project_matches(task.get("project"), project) and task.get("status") != "Done"
-        )
+            if project_config.project_matches(task.get("project"), project)
+        ]
+        project_counts = read_model.task_snapshot(project_tasks)
         project_generated = artifacts.list_markdown_files(GENERATED_DIR / project)
         last_activity = format_mtime(project_generated[0]) if project_generated else "—"
 
         with st.container(border=True):
             header_cols = st.columns([3, 1, 1])
             header_cols[0].markdown(f"**{project}**")
-            header_cols[1].metric("Активные", project_active)
+            header_cols[1].metric("Активные", project_counts.active)
             header_cols[2].caption(f"Активность: {last_activity}")
 
             st.code(str(project_file), language=None)
@@ -5856,14 +5984,13 @@ elif page_key == "focus":
                 st.divider()
 
                 _focus_status = task.get("status", "Backlog")
+                _focus_status_options = task_view.kanban_status_options(_focus_status)
                 new_status = st.selectbox(
                     "Статус",
-                    KANBAN_COLUMNS,
-                    # Guard like the task card / Kanban do: a non-canonical status
-                    # (e.g. "Blocked", which the board treats as live but is not a
-                    # column) would make .index() raise ValueError and crash Focus
-                    # Mode (audit M1). Fall back to the first column instead.
-                    index=KANBAN_COLUMNS.index(_focus_status) if _focus_status in KANBAN_COLUMNS else 0,
+                    _focus_status_options,
+                    # Preserve a legacy/unknown value while viewing the page;
+                    # selecting another option is the explicit migration.
+                    index=_focus_status_options.index(_focus_status),
                     key=f"focus_status_{task_id}",
                 )
                 if new_status != task.get("status"):

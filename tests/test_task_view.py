@@ -1,6 +1,16 @@
 from command_center import models, task_view
 
 
+def test_kanban_status_options_keep_canonical_order():
+    assert task_view.kanban_status_options("Review") == models.KANBAN_STATUSES
+
+
+def test_kanban_status_options_preserve_legacy_status_without_silent_rewrite():
+    options = task_view.kanban_status_options("Blocked")
+    assert options[0] == "Blocked"
+    assert options[1:] == models.KANBAN_STATUSES
+
+
 def test_cached_git_status_returns_not_repo_for_missing_path():
     assert task_view.cached_git_status(None, {}) == {"is_repo": False}
 
