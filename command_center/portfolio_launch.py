@@ -431,6 +431,13 @@ def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> Clai
     metadata proves that the owning local process no longer exists (or that
     the PID was reused). Legacy/invalid files are reported but deliberately
     not reclaimed: age alone cannot prove that a long-running launch is dead.
+
+    NOTE: "a live owner is never displaced" holds for a single-host lock
+    directory. A claim from a *different* host is treated as unrecoverable
+    (its PID cannot be checked locally), but the cross-host discriminator is
+    the short hostname, which is not globally unique. A lock directory shared
+    between two hosts with the same hostname is out of scope -- the same
+    single-host assumption the `flock`/`os.link` primitives already require.
     """
     path = _claim_lock_path(root, task_id)
     try:

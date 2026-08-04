@@ -550,6 +550,35 @@ def test_live_owner_claim_is_never_recovered_even_when_old(tmp_path, monkeypatch
     assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == "live-token"
 
 
+def test_claim_with_reused_pid_but_different_identity_is_recovered(tmp_path, monkeypatch):
+    # The PID is alive, but the process running under it is a DIFFERENT one
+    # than the claim recorded (PID reuse after a crash). This is the entire
+    # reason process_identity exists; it must make the claim recoverable.
+    task_id = "AICC-PID-REUSE"
+    lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
+    lock_path.parent.mkdir(parents=True)
+    metadata = {
+        "version": portfolio_launch.CLAIM_LOCK_VERSION,
+        "pid": 31337,
+        "hostname": portfolio_launch.socket.gethostname(),
+        "process_identity": "original-crashed-process",
+        "created_at": 1.0,
+        "token": "orphan-token",
+    }
+    lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+    monkeypatch.setattr(portfolio_launch, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(
+        portfolio_launch, "_process_identity", lambda pid: "a-different-live-process"
+    )
+
+    status = portfolio_launch.inspect_claim(tmp_path, task_id)
+    assert status.recoverable is True
+    assert "переиспользован" in status.reason
+    # And a fresh claim succeeds, replacing the orphaned token.
+    assert portfolio_launch._claim(tmp_path, task_id) is True
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] != "orphan-token"
+
+
 def test_old_owner_release_cannot_delete_recovered_replacement_claim(tmp_path):
     task_id = "AICC-TOKEN-RACE"
     lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
