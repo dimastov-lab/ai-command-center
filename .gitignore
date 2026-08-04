@@ -57,3 +57,4 @@ roadmap/*.zip
 runtime.db
 runtime.db-shm
 runtime.db-wal
+.worktrees/
