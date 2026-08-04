@@ -826,6 +826,41 @@ def test_launch_rejects_protected_branch_before_worktree_add(
     assert not Path(result.plan.worktree).exists()
 
 
+@pytest.mark.parametrize("protected_branch", ["Main", "MASTER", "MaStEr"])
+def test_launch_rejects_protected_branch_case_insensitively(
+    git_repo, tmp_path, portfolio_worktrees_root, monkeypatch, protected_branch
+):
+    # On a case-insensitive filesystem (macOS APFS, Windows) refs/heads/Main
+    # collides with refs/heads/main, so a mixed-case protected name must be
+    # rejected by the guard, not left for `git worktree add` to discover.
+    task = _write_card(
+        tmp_path,
+        base_branch=_current_branch(git_repo),
+        repository=str(git_repo),
+        branch=protected_branch,
+    )
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+
+    def unexpected_create_worktree(*args, **kwargs):
+        pytest.fail("create_worktree must not be called for a protected branch")
+
+    monkeypatch.setattr(portfolio_launch, "create_worktree", unexpected_create_worktree)
+
+    result = portfolio_launch.launch_portfolio_task(
+        tmp_path,
+        task,
+        tasks_by_id={},
+        repository_paths={"AICC": str(git_repo)},
+        execution_center_api=api,
+        confirmed=True,
+    )
+
+    assert result.launched is False
+    assert not result.plan.launchable
+    assert "защищённую ветку" in result.message
+    assert not Path(result.plan.worktree).exists()
+
+
 def test_relative_worktree_override_is_blocked_as_ambiguous(git_repo, tmp_path, portfolio_worktrees_root):
     base_branch = _current_branch(git_repo)
     task = _write_card(tmp_path, base_branch=base_branch, repository=str(git_repo), worktree="relative/path")

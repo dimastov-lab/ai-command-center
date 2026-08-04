@@ -197,8 +197,14 @@ def _validate_branch_name(name: str) -> str | None:
     """Returns an error message if `name` is not a safe git branch name,
     else `None`. Rejects protected main-line branches explicitly, then
     delegates syntax validation to `git check-ref-format --branch`, which
-    needs no repository context and does not touch the filesystem."""
-    if name in PROTECTED_BRANCH_NAMES:
+    needs no repository context and does not touch the filesystem.
+
+    Protected-name matching folds case: on a case-insensitive filesystem
+    (macOS APFS, Windows) `refs/heads/Main` collides with `refs/heads/main`,
+    so `Main`/`MASTER` must be rejected here rather than left to `git worktree
+    add` to notice -- which is exactly the collision this guard exists to
+    prevent."""
+    if name.casefold() in PROTECTED_BRANCH_NAMES:
         protected = ", ".join(sorted(PROTECTED_BRANCH_NAMES))
         return (
             f"защищённую ветку «{name}» нельзя использовать для Portfolio-задачи "
