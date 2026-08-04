@@ -168,9 +168,11 @@ def test_metric_list_and_supervisor_status_render():
 # --------------------------------------------------------------------------
 
 
-def _at_on_dashboard() -> AppTest:
+def _at_on_dashboard(section: str | None = None) -> AppTest:
     at = AppTest.from_file(APP_PATH, default_timeout=30)
     at.session_state["nav_page"] = "dashboard"
+    if section is not None:
+        at.session_state["dashboard_section"] = section
     at.run()
     return at
 
@@ -223,14 +225,79 @@ def test_dashboard_kpis_and_kanban_reflect_real_tasks(isolated_data_dir):
     assert not at.exception
     body = "".join(m.value for m in at.markdown)
 
-    # KPI "Задачи": count of non-Done tasks (3), "Ревью": tasks needing review (1).
-    assert "<div class='hx-kpi-value'>3</div>" in body
-    assert "<div class='hx-kpi-value'>1</div>" in body
+    # KPI "Задачи" is the canonical total (4), while "Ревью" is the Review
+    # planning lane (1); neither silently changes meaning between widgets.
+    assert (
+        "<div class='hx-kpi-label'>Задачи</div>"
+        "<div class='hx-kpi-value'>4</div>"
+    ) in body
+    assert (
+        "<div class='hx-kpi-label'>Ревью</div>"
+        "<div class='hx-kpi-value'>1</div>"
+    ) in body
 
     # Kanban overview shows real per-status counts, not zeros/placeholders.
     for status in models.KANBAN_STATUSES:
         assert status in body
     assert "<div class='hx-col-num'>1</div>" in body  # Backlog/In Progress/Review/Done each have exactly 1
+
+
+def test_dashboard_snapshot_surfaces_blocked_and_unknown_status_counts(
+    isolated_data_dir,
+):
+    tasks_repository.save_tasks(
+        isolated_data_dir,
+        [
+            _task("active", "Active", status="Backlog"),
+            _task("blocked", "Blocked legacy row", status="Blocked"),
+            _task("done", "Done", status="Done"),
+            _task("unknown", "Unknown", status="Custom State"),
+        ],
+    )
+
+    at = _at_on_dashboard()
+    assert not at.exception
+    body = "".join(m.value for m in at.markdown)
+    assert (
+        "<div class='hx-kpi-label'>Задачи</div>"
+        "<div class='hx-kpi-value'>4</div>"
+    ) in body
+    assert "<div class='hx-col-name'>Blocked</div><div class='hx-col-num'>1</div>" in body
+    assert "<div class='hx-col-name'>Другие</div><div class='hx-col-num'>1</div>" in body
+
+
+def test_dashboard_analytics_and_executive_use_the_same_task_snapshot(
+    isolated_data_dir,
+):
+    tasks_repository.save_tasks(
+        isolated_data_dir,
+        [
+            _task("active", "Active", status="Backlog"),
+            _task("blocked", "Blocked", status="Blocked"),
+            _task("done", "Done", status="Done"),
+            _task("unknown", "Unknown", status="Custom State"),
+        ],
+    )
+
+    analytics = _at_on_dashboard("Аналитика")
+    assert not analytics.exception
+    analytics_metrics = {metric.label: metric.value for metric in analytics.metric}
+    assert analytics_metrics["Всего задач"] == "4"
+    assert analytics_metrics["Активные"] == "1"
+    assert analytics_metrics["В статусе Blocked"] == "1"
+    assert analytics_metrics["Выполнено"] == "1 (25%)"
+    assert analytics_metrics["Другие статусы"] == "1"
+
+    executive = AppTest.from_file(APP_PATH, default_timeout=30)
+    executive.session_state["nav_page"] = "executive"
+    executive.run()
+    assert not executive.exception
+    executive_metrics = {metric.label: metric.value for metric in executive.metric}
+    assert executive_metrics["Всего задач"] == "4"
+    assert executive_metrics["Активные"] == "1"
+    assert executive_metrics["В статусе Blocked"] == "1"
+    assert executive_metrics["Выполнено"] == "1 (25%)"
+    assert executive_metrics["Другие статусы"] == "1"
 
 
 def test_dashboard_quick_action_navigates_to_create_page():

@@ -22,6 +22,7 @@ import streamlit as st
 
 from command_center import execution_queue, tasks_repository
 from command_center.runtime.api import ExecutionCenterAPI
+from command_center import read_model
 from command_center.runtime.db import RUN_STATES
 from command_center.ui import execution_metrics, tokens
 
@@ -42,9 +43,12 @@ from command_center.ui import execution_metrics, tokens
 #   FAILED            → Failed/Blocked    → board "Требуют внимания" (attention)
 #   INTERRUPTED, UNKNOWN → Requires Attention                          (attention)
 #   COMPLETED, CANCELLED → done / operator-stopped — not surfaced in the strip.
-_LIVE_STATES = frozenset({"RUNNING"})
-_WAITING_STATES = frozenset({"PREPARED", "QUEUED"})
-_ATTENTION_STATES = frozenset({"FAILED", "INTERRUPTED", "UNKNOWN"})
+# Single source of truth for the run buckets: shared with the AI-Supervisor
+# caption and the top-bar glyph via `read_model` (audit D5) so the three surfaces
+# can never again show three different "attention" numbers on one screen.
+_LIVE_STATES = read_model.RUN_LIVE_STATES
+_WAITING_STATES = read_model.RUN_WAITING_STATES
+_ATTENTION_STATES = read_model.RUN_ATTENTION_STATES
 
 
 def strip_counts(runs: list[dict]) -> tuple[int, int, int]:
@@ -71,25 +75,10 @@ def strip_counts(runs: list[dict]) -> tuple[int, int, int]:
 
 
 def _superseded_run_ids(runs: list[dict]) -> frozenset[str]:
-    """Run ids that are *not* the latest run of their task — a mirror of
-    ``live_board.superseded_run_ids`` that works on raw run rows instead of
-    session views. Ad-hoc runs (no ``task_id``) are never superseded; each
-    stands alone. Ties on ``started_at`` break by ``id`` for determinism."""
-    latest_by_task: dict[str, dict] = {}
-    for run in runs:
-        task_id = run.get("task_id")
-        if not task_id:
-            continue
-        cur = latest_by_task.get(task_id)
-        key = (run.get("started_at") or "", run.get("id") or "")
-        if cur is None or key > (cur.get("started_at") or "", cur.get("id") or ""):
-            latest_by_task[task_id] = run
-    latest_ids = {r.get("id") for r in latest_by_task.values()}
-    return frozenset(
-        r.get("id")
-        for r in runs
-        if r.get("task_id") and r.get("id") not in latest_ids
-    )
+    """Run ids that are *not* the latest run of their task. Delegates to
+    `read_model.superseded_run_ids` so the strip, the AI-Supervisor caption and
+    the top-bar glyph share one definition (audit D5)."""
+    return read_model.superseded_run_ids(runs)
 
 
 def _nonsuperseded_runs(runs: list[dict]) -> list[dict]:

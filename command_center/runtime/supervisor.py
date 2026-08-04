@@ -185,6 +185,8 @@ def build_claude_command(
     task_type: str,
     is_resume: bool,
     model: str | None = None,
+    untrusted: bool = False,
+    operator_elevated: bool = False,
 ) -> list[str]:
     """Construct the exact `claude` argv for one run.
 
@@ -205,7 +207,9 @@ def build_claude_command(
     against exactly this). `agent_runner.build_command` (the v1 synchronous
     executor) already set this; this was the divergence between the two.
     """
-    profile = agent_runner.profile_for_task_type(task_type)
+    profile = agent_runner.profile_for_task(
+        task_type, untrusted=untrusted, operator_elevated=operator_elevated
+    )
     command = [CLAUDE_BINARY]
     if is_resume:
         command += ["--resume", session_id]
@@ -223,7 +227,11 @@ def build_claude_command(
         "--permission-mode",
         agent_runner.PERMISSION_MODE_BY_PROFILE[profile],
     ]
-    if task_type in agent_runner.READ_ONLY_TASK_TYPES:
+    # Key the tool set on the *resolved* profile, not the task type alone: an
+    # untrusted task downgraded to read-only (audit D7) must get `--tools` (which
+    # replaces the built-in set, so Bash does not exist for the run), never the
+    # `--disallowedTools` pattern layer that still leaves Bash present.
+    if profile == agent_runner.PROFILE_READ_ONLY:
         command += ["--tools", ",".join(agent_runner.READ_ONLY_ALLOWED_TOOLS)]
     else:
         command += ["--disallowedTools", ",".join(agent_runner.GIT_WRITE_DISALLOWED_TOOLS)]
@@ -288,6 +296,11 @@ class _ActiveRun:
         # A failed post-Popen setup cleanup retains ownership and is retried by
         # a recovery thread, ``reconcile()``, and ``wait_for_run()``.
         self.launch_cleanup_failed_event = threading.Event()
+        # Those three recovery paths may race. Serialize the complete cleanup
+        # and terminal-persistence attempt so a contender that was waiting for
+        # another path to release ownership re-checks ``done_event`` before it
+        # can touch the run database again.
+        self.launch_cleanup_retry_lock = threading.Lock()
         # Set by `_timeout_watchdog` (never by `cancel()`) only after a signal
         # was delivered, so `_supervise` can
         # tell a timeout-triggered termination apart from an explicit,
@@ -469,6 +482,8 @@ class Supervisor:
         executor_id: str = providers.CLAUDE_ID,
         canonical_repository_path: str | None = None,
         max_global_concurrency: int | None = None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> dict:
         """Prepare and launch a run from an already-final `prompt` string.
 
@@ -648,6 +663,8 @@ class Supervisor:
                 task_type=task_type,
                 is_resume=is_resume,
                 model=model,
+                untrusted=untrusted,
+                operator_elevated=operator_elevated,
             )
         except (RuntimeError, ValueError) as exc:
             raise ProviderUnavailableError(str(exc)) from exc
@@ -1370,28 +1387,29 @@ class Supervisor:
             active.finalization_failed_event.set()
 
     def _retry_failed_launch_cleanup(self, run_id: str, active: _ActiveRun) -> bool:
-        if active.done_event.is_set():
-            return True
-        exited = self._terminate_active_process(
-            run_id,
-            active,
-            grace_seconds=DEFAULT_CANCEL_GRACE_SECONDS,
-            lifecycle_prefix="launch_recovery",
-        )
-        if not exited:
+        with active.launch_cleanup_retry_lock:
+            if active.done_event.is_set():
+                return True
+            exited = self._terminate_active_process(
+                run_id,
+                active,
+                grace_seconds=DEFAULT_CANCEL_GRACE_SECONDS,
+                lifecycle_prefix="launch_recovery",
+            )
+            if not exited:
+                return False
+            active.launch_cleanup_failed_event.clear()
+            terminal_persisted = self._persist_run_failure(
+                run_id,
+                exit_code=active.process.returncode,
+                failure_reason="launch_setup_failed",
+                lifecycle="launch_setup_failed",
+            )
+            if terminal_persisted:
+                self._release_active(run_id, active)
+                return True
+            active.finalization_failed_event.set()
             return False
-        active.launch_cleanup_failed_event.clear()
-        terminal_persisted = self._persist_run_failure(
-            run_id,
-            exit_code=active.process.returncode,
-            failure_reason="launch_setup_failed",
-            lifecycle="launch_setup_failed",
-        )
-        if terminal_persisted:
-            self._release_active(run_id, active)
-            return True
-        active.finalization_failed_event.set()
-        return False
 
     def _recover_failed_launch(self, run_id: str, active: _ActiveRun) -> None:
         while not active.done_event.is_set():

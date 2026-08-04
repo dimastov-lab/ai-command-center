@@ -733,6 +733,27 @@ def test_unconfirmed_launch_cleanup_is_retried_until_ownership_is_released(
     assert sup.active_run_ids() == []
 
 
+def test_launch_cleanup_retry_rechecks_completion_after_waiting_for_retry_lock(monkeypatch):
+    active = supervisor._ActiveRun(process=_NeverExitedProcess(), run_id="run-1")
+    sup = supervisor.Supervisor()
+
+    class CompletingRetryLock:
+        def __enter__(self):
+            active.done_event.set()
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    active.launch_cleanup_retry_lock = CompletingRetryLock()
+
+    def unexpected_termination(*args, **kwargs):
+        raise AssertionError("a completed competing cleanup must not be retried")
+
+    monkeypatch.setattr(sup, "_terminate_active_process", unexpected_termination)
+
+    assert sup._retry_failed_launch_cleanup("run-1", active) is True
+
+
 @pytest.mark.parametrize("failing_thread", ["run-timeout-", "run-stdout-", "run-stderr-"])
 def test_background_thread_start_failure_is_supervised_and_reaps_child(
     git_repo, configure_project_repo, fake_claude, monkeypatch, failing_thread

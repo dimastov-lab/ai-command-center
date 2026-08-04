@@ -59,6 +59,39 @@ def test_snapshot_all_projects_unconfigured_renders_without_exception(tmp_path):
     assert snapshot["recent_activity"] == []
 
 
+def test_snapshot_discovers_live_artifacts_next_to_overridden_data_dir(
+    tmp_path, monkeypatch
+):
+    """A frozen desktop bundle lives outside the operational workspace.
+
+    ``AICC_DATA_DIR`` points it at the live runtime store, so Workspace Home must
+    discover the sibling ``generated/`` and ``reports/`` trees instead of the
+    empty copies (or absent paths) inside the application bundle.
+    """
+    live_root = tmp_path / "live-workspace"
+    data_dir = live_root / "data"
+    generated_dir = live_root / "generated" / "AIOS"
+    reports_dir = live_root / "reports" / "AIOS"
+    data_dir.mkdir(parents=True)
+    generated_dir.mkdir(parents=True)
+    reports_dir.mkdir(parents=True)
+    (generated_dir / "task_implementation.md").write_text("# Task\n")
+    (reports_dir / "run.md").write_text("# Report\n")
+
+    monkeypatch.setenv("AICC_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("AICC_GENERATED_ROOT", raising=False)
+    monkeypatch.delenv("AICC_REPORTS_ROOT", raising=False)
+    monkeypatch.setattr(workspace_home, "GENERATED_DIR", tmp_path / "bundled" / "generated")
+    monkeypatch.setattr(workspace_home, "REPORTS_DIR", tmp_path / "bundled" / "reports")
+
+    snapshot = workspace_home.build_workspace_home_snapshot(
+        execution_center_api=_api(tmp_path)
+    )
+
+    assert [entry["project"] for entry in snapshot["artifacts"]] == ["AIOS"]
+    assert [entry["project"] for entry in snapshot["reports"]] == ["AIOS"]
+
+
 def workspace_home_state_for(snapshot: dict, project_id: str) -> str:
     return snapshot["worktrees_by_project"][project_id]["state"]
 
