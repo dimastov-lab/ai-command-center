@@ -16,7 +16,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Branch      = "integration/desktop-increment-1",
+    [string]$Branch      = "main",
     [string]$RepoUrl     = "https://github.com/dimastov-lab/ai-command-center",
     [string]$CloneDir    = "ai-command-center",
     [string]$PythonExe   = "",
@@ -154,7 +154,7 @@ Step "Step 2 - automated tests (pytest tests/desktop + ruff)"
 # Do NOT set QT_QPA_PLATFORM - conftest sets offscreen via setdefault.
 Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
 
-Write-Log "Running: pytest tests/desktop -q  (expected 124 passed)"
+Write-Log "Running: pytest tests/desktop -q  (expected 126 passed)"
 $pyOut = & $VenvPy -m pytest (Join-Path $Target "tests/desktop") -q 2>&1
 $pyOut | Add-Content -Path $LogFile -Encoding UTF8
 $lastLine = ($pyOut | Where-Object { $_ -match "passed|failed|skipped|error" } | Select-Object -Last 1)
