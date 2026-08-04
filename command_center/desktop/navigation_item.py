@@ -12,8 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QPushButton
 
 from . import tokens
-
-DISABLED_TOOLTIP = "Available in a future release"
+from .i18n import DISABLED_TOOLTIP
 
 
 class NavigationItem(QPushButton):

@@ -19,6 +19,21 @@ from command_center import git_info, models, project_config
 DEFAULT_TASK_PRIORITY = "Medium"
 
 
+def kanban_status_options(current_status: str | None) -> list[str]:
+    """Stored Kanban statuses plus the task's current legacy/unknown value.
+
+    A Streamlit selectbox immediately exposes its default value. If an unknown
+    current status is omitted from the options, the widget defaults to
+    ``Backlog`` and the renderer's ordinary ``new != current`` handler writes
+    that value back merely because the page was opened. Keeping the current
+    value as the first option makes rendering read-only while still letting the
+    operator explicitly migrate the task to a canonical lane."""
+    canonical = list(models.KANBAN_STATUSES)
+    if current_status and current_status not in canonical:
+        return [current_status, *canonical]
+    return canonical
+
+
 def kanban_priority_options(tasks: list[dict]) -> list[str]:
     """The priority values the Kanban priority filter must offer as options.
 

@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from command_center.platform import DensityMode
+
 from .pages.home import HomePage
 from .pages.projects import ProjectsPage
 from .pages.settings_page import SettingsPage
@@ -54,9 +56,11 @@ class AppShell(QWidget):
         super().__init__(parent)
         self._settings = settings
         self._theme = theme
-        # Cooperative-cancellation flag shared with future background workers
+        # Cooperative-cancellation flag shared with background workers
         # (`ARCHITECTURE.md` §11). Set on shutdown; workers poll it at checkpoints.
         self._cancel_event = threading.Event()
+        # Workspace Home data adapter, wired by :meth:`load_workspace_home`.
+        self._adapter: object | None = None
 
         self.setObjectName("AppShell")
         self.setWindowTitle(WINDOW_TITLE)
@@ -64,6 +68,7 @@ class AppShell(QWidget):
         self.setMinimumSize(MIN_WIDTH, MIN_HEIGHT)
 
         self._build_ui()
+        self._apply_density(self._theme.density)
         self._restore_geometry()
         # Select the default section without emitting through the sidebar signal.
         self._activate_section(DEFAULT_SECTION_KEY)
@@ -93,12 +98,29 @@ class AppShell(QWidget):
 
         home = HomePage()
         home.navigate_requested.connect(self.navigate_to)
+        self._home = home
+        # Keep the Home page's dynamic badges in step with the theme, and colour
+        # them for the palette already applied before this shell was constructed.
+        self._theme.palette_changed.connect(home.apply_palette)
+        if self._theme.palette is not None:
+            home.apply_palette(self._theme.palette)
         self._add_page(home)
 
         self._add_page(ProjectsPage())
 
-        settings_page = SettingsPage(self._theme.mode)
+        settings_page = SettingsPage(
+            self._theme.mode,
+            self._settings.density_mode(),
+            self._settings.selected_project(),
+        )
         settings_page.theme_mode_changed.connect(self._on_theme_mode_changed)
+        settings_page.density_mode_changed.connect(self._on_density_mode_changed)
+        settings_page.window_geometry_reset_requested.connect(
+            self._on_window_geometry_reset_requested
+        )
+        settings_page.workspace_save_requested.connect(
+            self._on_workspace_save_requested
+        )
         self._settings_page = settings_page
         self._add_page(settings_page)
 
@@ -140,11 +162,34 @@ class AppShell(QWidget):
         self._theme.set_mode(mode)
         self._settings.set_theme_mode(mode)
 
-    # --- refresh -----------------------------------------------------------
+    def _on_density_mode_changed(self, mode: DensityMode) -> None:
+        self._theme.set_density(mode)
+        self._apply_density(mode)
+        self._settings.set_density_mode(mode)
+
+    def _apply_density(self, mode: DensityMode) -> None:
+        self.sidebar.apply_density(mode)
+        self._settings_page.apply_density(mode)
+
+    def _on_window_geometry_reset_requested(self) -> None:
+        self._settings.reset_window_geometry()
+        self.resize(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+
+    def _on_workspace_save_requested(self, project_id: str | None) -> None:
+        self._settings.set_selected_project(project_id)
+        self._settings.sync()
+
+    # --- data / refresh ----------------------------------------------------
+    def load_workspace_home(self, adapter: object) -> None:
+        """Wire the Workspace Home data adapter and start the first async load."""
+        self._adapter = adapter
+        self._home.load(adapter, cancel_event=self._cancel_event)
+
     def _on_refresh(self) -> None:
-        # D1 has no page-level data adapter to re-run; this is the seam D2 wires
-        # the active page's Workspace Home refresh onto. Re-emit so callers/tests
-        # can observe the user's intent.
+        # Re-run the active page's data load when an adapter is wired; always
+        # re-emit so callers/tests can observe the user's refresh intent.
+        if self._adapter is not None:
+            self._home.load(self._adapter, cancel_event=self._cancel_event)
         self.refresh_requested.emit()
 
     # --- geometry / lifecycle ---------------------------------------------
@@ -158,6 +203,7 @@ class AppShell(QWidget):
     def _persist_state(self) -> None:
         self._settings.set_geometry(self.saveGeometry())
         self._settings.set_theme_mode(self._theme.mode)
+        self._settings.set_density_mode(self._theme.density)
         self._settings.sync()
 
     @property
@@ -169,6 +215,7 @@ class AppShell(QWidget):
         cancellation, waits up to ``timeout_ms`` for the global thread pool to
         drain, then persists state. Returns whether the pool drained in time."""
         self._cancel_event.set()
+        self._home.shutdown_workers()
         drained = QThreadPool.globalInstance().waitForDone(timeout_ms)
         self._persist_state()
         return drained

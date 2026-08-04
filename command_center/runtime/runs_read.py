@@ -163,7 +163,9 @@ def _normalize_v1(run: dict) -> dict:
     }
 
 
-def list_unified_runs(db_path: Path, *, root: Path, include_v1: bool = True) -> list[dict]:
+def list_unified_runs(
+    db_path: Path, *, root: Path, include_v1: bool = True, limit: int | None = None
+) -> list[dict]:
     """Merge v2 (``runtime.db``) and v1.2 (``runs.jsonl``) runs into one
     normalized list, newest-created first. ``root`` is the project root used
     to resolve v2 report paths for parsing.
@@ -172,7 +174,7 @@ def list_unified_runs(db_path: Path, *, root: Path, include_v1: bool = True) -> 
     shape (see module docstring). ``id`` is preserved per-source but the only
     stable cross-source identity is ``(source, id)`` — bare ``id`` collides.
     """
-    v2_runs = db.list_runs(db_path)  # no limit — the pages are paged by filters
+    v2_runs = db.list_runs(db_path, limit=limit)  # bounded inside SQLite when a limit is set (AR-4)
     reports = db.get_reports_for_runs(db_path, [r["id"] for r in v2_runs])
     unified = [_normalize_v2(r, report=reports.get(r["id"]), root=root) for r in v2_runs]
 
@@ -186,4 +188,8 @@ def list_unified_runs(db_path: Path, *, root: Path, include_v1: bool = True) -> 
             unified.append(_normalize_v1(run))
 
     unified.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    if limit is not None:
+        # v1.2 runs are merged after the already-bounded v2 query, so cap the
+        # combined, newest-first list to keep the overall bound (audit AR-4).
+        unified = unified[:limit]
     return unified

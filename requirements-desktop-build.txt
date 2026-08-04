@@ -1,0 +1,4 @@
+# Reproducible development packaging for Desktop D4.
+# Runtime dependencies stay in requirements-desktop.txt.
+-r requirements-desktop.txt
+PyInstaller>=6.10,<7.0
