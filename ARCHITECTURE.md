@@ -499,7 +499,7 @@ Roadmap statements in that directory beyond D1 must not be read as current capab
 - [`docs/adr/0005-autonomy-proposal-foundation.md`](docs/adr/0005-autonomy-proposal-foundation.md)
 - [`docs/adr/0006-codex-cli-execution-provider.md`](docs/adr/0006-codex-cli-execution-provider.md)
 - [`docs/adr/0007-unify-task-and-queue-storage.md`](docs/adr/0007-unify-task-and-queue-storage.md)
-- [`docs/adr/0008-canonical-project-registry-and-validating-task-import.md`](docs/adr/0008-canonical-project-registry-and-validating-task-import.md)
+- [`docs/adr/0009-canonical-project-registry-and-validating-task-import.md`](docs/adr/0009-canonical-project-registry-and-validating-task-import.md)
   — the 9-id `PROJECT_IDS` registry, the sensitive subset, the alias folding rule, and the rule that
   registry changes require an ADR
 - [`docs/completion-pipeline.md`](docs/completion-pipeline.md)

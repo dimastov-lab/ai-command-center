@@ -1,4 +1,4 @@
-# ADR 0008 — The canonical project registry and the validating task-import pipeline
+# ADR 0009 — The canonical project registry and the validating task-import pipeline
 
 Status: **Accepted, implemented.** Both halves of this record describe code that is already on
 `main`: the nine-entry `models.PROJECT_IDS` registry (expanded in PR #9, commit `98d7714`) and the
