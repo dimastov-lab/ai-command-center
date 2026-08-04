@@ -3954,20 +3954,23 @@ def render_home_dashboard(
         # The gauge shows the same windowed health as the project-health card; the
         # status pill and caption describe what the supervisor is actually doing.
         window_success = _window_success_rate(runs)
-        # audit D5: count runs needing attention the same way the Execution Strip
-        # banner does — the non-superseded latest attempt of each task only — so
-        # this caption and the strip never show two different "attention" numbers
-        # on the same screen. `running` (the board live bucket above) stays as-is
-        # for the "Активные агенты" list; only the headline counts are
-        # canonicalised here.
-        _superseded_ids = live_board.superseded_run_ids(sessions)
-        run_counts = read_model.run_snapshot([r for r in runs if r.get("id") not in _superseded_ids])
+        # audit D5: count "needs attention" with the exact same actionable,
+        # dismiss-aware computation the Execution Strip banner and the Live Center
+        # headline use (`execution_strip.current_counts` — drops superseded,
+        # completed-task and operator-dismissed rows), so this caption, the strip
+        # and the top-bar glyph never show two different "attention" numbers on
+        # one screen. queue_entries=[] because attention/running don't depend on
+        # the durable queue.
+        run_counts = execution_strip.current_counts(
+            runs, tasks, [],
+            dismissed_attention_run_ids=st.session_state.get("exec_attention_dismissed", set()),
+        )
         if run_counts.attention:
             sup_status, sup_accent = "Требует внимания", "amber"
             sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.attention} прогонов требуют внимания"
-        elif run_counts.running:
+        elif run_counts.live:
             sup_status, sup_accent = "В работе", "green"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.running} прогонов выполняется"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.live} прогонов выполняется"
         else:
             sup_status, sup_accent = "Ожидает", "slate"
             sup_label = "Автопилот включён — ожидает задач" if settings.enabled else "Автопилот выключен"
