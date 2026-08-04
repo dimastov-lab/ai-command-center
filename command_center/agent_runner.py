@@ -147,6 +147,42 @@ def profile_for_task_type(task_type: str) -> str:
     not the other way around)."""
     return PROFILE_READ_ONLY if task_type in READ_ONLY_TASK_TYPES else PROFILE_TRUSTED_DEVELOPMENT
 
+
+def is_untrusted_source(source: str | None) -> bool:
+    """Secondary heuristic: a non-empty `source` string is treated as untrusted
+    provenance. Kept for legacy data that carries a provenance label, but NOT the
+    primary signal — `source` on a task package is attacker-supplied, so a
+    malicious package could simply omit it. `is_untrusted_task` is the real gate;
+    it also honours the app-set `untrusted_import` flag `task_import` stamps on
+    every import (audit D7 / SEC-1)."""
+    return bool(source and source.strip())
+
+
+def is_untrusted_task(task: dict) -> bool:
+    """Whether a task must run with reduced capabilities by default (audit D7).
+
+    True when the task carries the **app-set** `untrusted_import` flag (stamped by
+    `task_import` on every imported task, independent of package content — an
+    attacker cannot clear it), or, for legacy data, when it has a non-empty
+    `source`. Operator-authored in-app tasks have neither and are trusted."""
+    return bool(task.get("untrusted_import")) or is_untrusted_source(task.get("source"))
+
+
+def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevated: bool = False) -> str:
+    """Provenance-aware execution profile (audit D7).
+
+    Read-only task types are always `PROFILE_READ_ONLY` (they have no dangerous
+    capability). A non-read-only task from an *untrusted* source is downgraded to
+    `PROFILE_READ_ONLY` (no Bash, no `bypassPermissions`) unless an operator has
+    explicitly elevated it — so a malicious imported task cannot silently obtain
+    arbitrary local shell. A trusted (operator-authored) task is unchanged, so
+    with `untrusted=False` this is identical to `profile_for_task_type`."""
+    if task_type in READ_ONLY_TASK_TYPES:
+        return PROFILE_READ_ONLY
+    if untrusted and not operator_elevated:
+        return PROFILE_READ_ONLY
+    return PROFILE_TRUSTED_DEVELOPMENT
+
 # The *complete* available tool set for read-only task types, passed via `--tools`
 # (not `--allowedTools`/`--disallowedTools`). Per `claude --help`, `--tools` replaces
 # the built-in tool set outright rather than layering a permission rule on top of it,
@@ -527,16 +563,30 @@ def get_run(run_id: str) -> dict | None:
 REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
 
 
+# Path components are restricted to this conservative charset so a hand-authored
+# or imported `task_id`/`project`/`agent` cannot introduce a path separator or a
+# `..` segment and walk the report *write* out of REPORTS_ROOT (audit SEC-2).
+# `.` is deliberately excluded so no component can become `.` or `..`.
+_SAFE_PATH_COMPONENT = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+
+def _safe_path_component(value: str, fallback: str) -> str:
+    cleaned = "".join(c if c in _SAFE_PATH_COMPONENT else "_" for c in value)
+    return cleaned or fallback
+
+
 def report_path_for(run: dict) -> Path:
-    project = run.get("project") or "UNKNOWN"
+    project = _safe_path_component(run.get("project") or "UNKNOWN", "UNKNOWN")
     started = run.get("started_at") or run.get("created_at") or models.iso_now()
     try:
         started_dt = datetime.fromisoformat(started)
     except ValueError:
         started_dt = datetime.now()
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
-    task_part = (run.get("task_id") or "adhoc")[:12]
-    agent = run.get("agent") or "agent"
+    task_part = _safe_path_component(run.get("task_id") or "adhoc", "adhoc")[:12]
+    agent = _safe_path_component(run.get("agent") or "agent", "agent")
     filename = f"{timestamp}_{task_part}_{agent}.md"
     return REPORTS_ROOT / project / filename
 

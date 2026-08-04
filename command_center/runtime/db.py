@@ -992,6 +992,23 @@ def create_task(
     return record
 
 
+def delete_task(db_path: Path, task_id: str) -> bool:
+    """Delete a task and everything that hangs off it, returning True iff a row
+    was removed.
+
+    The FK graph already declares `ON DELETE CASCADE` from session/run/run_event/
+    report/completion(+validation/event) to their parents, and proposal task refs
+    are `ON DELETE SET NULL`, so deleting the `task` row (with `foreign_keys=ON`,
+    set per connection) removes every dependent runtime.db row atomically. This
+    closes the AR-1 orphan gap: `tasks_repository.delete_task` only rewrites the
+    tasks.json card and previously left these rows behind forever.
+    """
+    with connect(db_path) as conn:
+        with transaction(conn):
+            cur = conn.execute("DELETE FROM task WHERE id = ?", (task_id,))
+            return cur.rowcount > 0
+
+
 def get_task(db_path: Path, task_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM task WHERE id = ?", (task_id,)).fetchone()

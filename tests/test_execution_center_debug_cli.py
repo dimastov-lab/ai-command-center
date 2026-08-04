@@ -176,8 +176,15 @@ def test_no_orphan_at_any_level_when_cancelled_via_ctrl_c(configured_repo):
 
     assert proc.returncode != 0
 
-    time.sleep(0.3)
+    # The process tree exits asynchronously after SIGINT — the grandchild in
+    # particular may still be unwinding when `communicate()` returns. Poll
+    # (bounded) for each pid to disappear rather than asserting on a single fixed
+    # sleep, which raced under CI load and flaked. A genuinely orphaned process
+    # still fails: it simply never disappears before the deadline.
+    deadline = time.monotonic() + 10
     for role, pid in pids.items():
+        while identity.process_exists(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
         assert identity.process_exists(pid) is False, f"{role} (pid {pid}) must not survive Ctrl+C cancellation"
 
 

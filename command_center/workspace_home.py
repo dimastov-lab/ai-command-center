@@ -20,6 +20,7 @@ Kanban board itself is unaffected and remains reachable via its own existing pag
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +33,45 @@ from command_center.runtime.api import ExecutionCenterAPI
 ROOT = Path(__file__).resolve().parent.parent
 GENERATED_DIR = ROOT / "generated"
 REPORTS_DIR = ROOT / "reports"
+
+
+def _runtime_sibling_dir(*, explicit_env: str, name: str, fallback: Path) -> Path:
+    """Resolve an operational workspace directory for source and frozen apps.
+
+    A packaged desktop bundle has its own immutable resource root, while the
+    live runtime database, generated tasks, and reports remain together in the
+    user's operational workspace. ``AICC_DATA_DIR`` already identifies that
+    workspace's ``data/`` directory; its siblings are therefore the safest
+    default unless a dedicated override is supplied.
+    """
+    explicit = os.environ.get(explicit_env)
+    if explicit:
+        return Path(explicit).expanduser()
+    data_dir = os.environ.get("AICC_DATA_DIR")
+    if data_dir:
+        data_path = Path(data_dir).expanduser()
+        # Production uses the conventional ``<workspace>/data`` shape, while
+        # isolated callers may point AICC_DATA_DIR at a standalone directory
+        # that directly owns all test/runtime material.
+        workspace_root = data_path.parent if data_path.name == "data" else data_path
+        return workspace_root / name
+    return fallback
+
+
+def resolve_generated_dir() -> Path:
+    return _runtime_sibling_dir(
+        explicit_env="AICC_GENERATED_ROOT",
+        name="generated",
+        fallback=GENERATED_DIR,
+    )
+
+
+def resolve_reports_dir() -> Path:
+    return _runtime_sibling_dir(
+        explicit_env="AICC_REPORTS_ROOT",
+        name="reports",
+        fallback=REPORTS_DIR,
+    )
 
 # --------------------------------------------------------------------------
 # §5.1 — field allowlists for sensitive (BANK/LEGAL) projects. Every field not
@@ -81,9 +121,9 @@ def _mtime(path: Path) -> float | None:
         return None
 
 
-def _artifact_entry(path: Path, project_id: str) -> dict:
+def _artifact_entry(path: Path, project_id: str, generated_dir: Path) -> dict:
     return {
-        "project": artifacts_module.project_from_path(path, GENERATED_DIR) or project_id,
+        "project": artifacts_module.project_from_path(path, generated_dir) or project_id,
         "task_type": artifacts_module.infer_task_type_from_filename(path),
         "created_at": _mtime(path),
         "nav_target": {"project": project_id, "section": "generated"},
@@ -98,6 +138,7 @@ def sanitize_workspace_project_entry(
     reports: list[dict],
     artifacts: list[Path],
     activity: list[dict],
+    generated_dir: Path | None = None,
 ) -> dict:
     """Returns `{"runs": [...], "reports": [...], "artifacts": [...], "activity": [...]}`
     with every entry passed through the field allowlist for this project. For a
@@ -105,7 +146,10 @@ def sanitize_workspace_project_entry(
     this is the *single* place Workspace Home's redaction policy lives, applied
     uniformly rather than as an if-sensitive branch scattered per section.
     """
-    artifact_entries = [_artifact_entry(path, project_id) for path in artifacts]
+    artifact_root = generated_dir or resolve_generated_dir()
+    artifact_entries = [
+        _artifact_entry(path, project_id, artifact_root) for path in artifacts
+    ]
 
     if not project_config.is_sensitive(project_id):
         return {
@@ -232,7 +276,9 @@ def _build_reports_for_project(
     v1_report_index: dict[str, dict],
     v2_terminal_runs_for_project: list[dict],
     execution_center_api: ExecutionCenterAPI,
+    reports_dir: Path | None = None,
 ) -> list[dict]:
+    report_root = reports_dir or resolve_reports_dir()
     v2_report_index: dict[str, dict] = {}
     for run in v2_terminal_runs_for_project:
         report_row = execution_center_api.get_report(run["id"])
@@ -241,7 +287,7 @@ def _build_reports_for_project(
 
     entries: list[dict] = []
     for path in report_files:
-        rel_str = f"reports/{path.relative_to(REPORTS_DIR)}"
+        rel_str = f"reports/{path.relative_to(report_root)}"
         v1_run = v1_report_index.get(rel_str)
         if v1_run is not None:
             entries.append(_v1_report_entry(v1_run, path))
@@ -302,6 +348,8 @@ def build_workspace_home_snapshot(
     reports_limit: int = 20,
 ) -> dict:
     configs = project_config.load_project_configs()
+    generated_dir = resolve_generated_dir()
+    reports_dir = resolve_reports_dir()
 
     v2_active_raw = execution_center_api.list_runs(
         states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES, limit=active_runs_limit
@@ -309,8 +357,8 @@ def build_workspace_home_snapshot(
     v2_recent_raw = execution_center_api.list_runs(states=runtime_db.TERMINAL_STATES, limit=recent_runs_limit)
     v1_runs_raw = agent_runner.load_runs()
     activity_raw = activity_log.load_activity(limit=max(activity_limit * len(models.PROJECT_IDS), activity_limit))
-    all_generated_files = artifacts_module.list_markdown_files(GENERATED_DIR)
-    all_report_files = artifacts_module.list_markdown_files(REPORTS_DIR)
+    all_generated_files = artifacts_module.list_markdown_files(generated_dir)
+    all_report_files = artifacts_module.list_markdown_files(reports_dir)
     v1_report_index = {run["report_path"]: run for run in v1_runs_raw if run.get("report_path")}
 
     projects_out: list[dict] = []
@@ -333,7 +381,9 @@ def build_workspace_home_snapshot(
         proj_v1_recent = [_tag_v1_run(r) for r in v1_runs_raw if r.get("project") == project_id]
 
         proj_report_files = [
-            path for path in all_report_files if artifacts_module.project_from_path(path, REPORTS_DIR) == project_id
+            path
+            for path in all_report_files
+            if artifacts_module.project_from_path(path, reports_dir) == project_id
         ]
         proj_reports = _build_reports_for_project(
             project_id=project_id,
@@ -341,10 +391,13 @@ def build_workspace_home_snapshot(
             v1_report_index=v1_report_index,
             v2_terminal_runs_for_project=[r for r in v2_recent_raw if r.get("project") == project_id],
             execution_center_api=execution_center_api,
+            reports_dir=reports_dir,
         )
 
         proj_artifact_paths = [
-            path for path in all_generated_files if artifacts_module.project_from_path(path, GENERATED_DIR) == project_id
+            path
+            for path in all_generated_files
+            if artifacts_module.project_from_path(path, generated_dir) == project_id
         ]
 
         proj_activity = [_normalize_activity_entry(e) for e in activity_raw if e.get("project") == project_id]
@@ -355,6 +408,7 @@ def build_workspace_home_snapshot(
             reports=proj_reports,
             artifacts=proj_artifact_paths,
             activity=proj_activity,
+            generated_dir=generated_dir,
         )
 
         sanitized_active = [r for r in sanitized["runs"] if r.get("state") in runtime_db.EXECUTION_CENTER_ACTIVE_STATES]
