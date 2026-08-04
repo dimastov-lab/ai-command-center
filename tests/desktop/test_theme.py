@@ -57,3 +57,14 @@ def test_theme_switch_visibly_changes_palette_token(shell, qapp):
     assert light_sheet != dark_sheet
     assert tokens.LIGHT.sidebar_bg in light_sheet
     assert tokens.DARK.sidebar_bg in dark_sheet
+
+
+def test_dark_theme_radio_indicator_has_explicit_high_contrast_states():
+    from command_center.desktop.theme import build_stylesheet
+
+    sheet = build_stylesheet(tokens.DARK)
+    assert "QRadioButton::indicator" in sheet
+    assert f"border: 2px solid {tokens.DARK.text_secondary}" in sheet
+    assert "QRadioButton::indicator:checked" in sheet
+    assert f"border: 2px solid {tokens.DARK.accent_emphasis}" in sheet
+    assert f"background-color: {tokens.DARK.accent}" in sheet

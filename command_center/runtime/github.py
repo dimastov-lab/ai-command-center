@@ -42,7 +42,7 @@ MERGE_METHODS = ("squash", "merge", "rebase")
 
 _PR_JSON_FIELDS = (
     "number,url,state,mergedAt,mergeCommit,mergeable,"
-    "statusCheckRollup,reviewDecision,headRefName,baseRefName,title"
+    "statusCheckRollup,reviewDecision,headRefName,headRefOid,baseRefName,title"
 )
 
 
@@ -71,6 +71,7 @@ class PullRequestState:
     checks_state: str = CHECKS_NONE  # PASSING / FAILING / PENDING / NONE
     review_decision: str | None = None  # APPROVED / REVIEW_REQUIRED / CHANGES_REQUESTED / None
     head_ref: str | None = None
+    head_oid: str | None = None  # exact head commit the checks/review belong to (audit D6)
     base_ref: str | None = None
     title: str | None = None
     raw: dict = field(default_factory=dict)
@@ -155,6 +156,7 @@ def pull_request_from_json(data: dict) -> PullRequestState:
         checks_state=_classify_checks(data.get("statusCheckRollup")),
         review_decision=data.get("reviewDecision") or None,
         head_ref=data.get("headRefName") or None,
+        head_oid=data.get("headRefOid") or None,
         base_ref=data.get("baseRefName") or None,
         title=data.get("title") or None,
         raw=data,
@@ -274,14 +276,22 @@ class GitHubClient:
         return PullRequestState(url=url, state=STATE_OPEN, head_ref=head, base_ref=base)
 
     def merge_pull_request(
-        self, repo: Path, *, number: int, method: str = "squash"
+        self, repo: Path, *, number: int, method: str = "squash", match_head_oid: str | None = None
     ) -> PullRequestState:
         """Merge PR `number` using `method` (squash/merge/rebase). Never passes
         `--delete-branch` (branches are only removed after target-branch
-        verification, which this pipeline never does automatically)."""
+        verification, which this pipeline never does automatically).
+
+        When `match_head_oid` is given, `--match-head-commit <oid>` makes GitHub
+        refuse the merge unless the PR head is still exactly that commit — the
+        one whose required checks/review were evaluated (audit D6). This closes
+        the stale-rollup race: if a new commit was pushed after the checks were
+        read, the merge fails instead of landing an unverified head."""
         if method not in MERGE_METHODS:
             raise ValueError(f"Unknown merge method: {method!r}")
         args = ["pr", "merge", str(number), f"--{method}"]
+        if match_head_oid:
+            args += ["--match-head-commit", match_head_oid]
         proc = self._run(args, cwd=repo)
         if proc.returncode != 0:
             raise GitHubError(args, proc.returncode, proc.stderr or "")
@@ -350,13 +360,21 @@ class FakeGitHubClient:
         return pr
 
     def merge_pull_request(
-        self, repo: Path, *, number: int, method: str = "squash"
+        self, repo: Path, *, number: int, method: str = "squash", match_head_oid: str | None = None
     ) -> PullRequestState:
         if method not in MERGE_METHODS:
             raise ValueError(f"Unknown merge method: {method!r}")
         pr = next((p for p in self._by_branch.values() if p.number == number), None)
         if pr is None:
             raise GitHubError(["pr", "merge", str(number)], 1, "no such PR")
+        # Mirror GitHub's `--match-head-commit`: refuse if the head moved since
+        # the checks/review were evaluated on `match_head_oid` (audit D6).
+        if match_head_oid is not None and pr.head_oid is not None and match_head_oid != pr.head_oid:
+            raise GitHubError(
+                ["pr", "merge", str(number), "--match-head-commit", match_head_oid],
+                1,
+                "head commit moved since checks were evaluated",
+            )
         merge_commit = None
         if self._on_merge is not None:
             merge_commit = self._on_merge(pr)

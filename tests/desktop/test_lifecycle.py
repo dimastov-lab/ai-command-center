@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 
+from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication
 
 _STARTUP_IMPORT_PROBE = """
@@ -66,3 +68,31 @@ def test_close_event_triggers_clean_shutdown(shell, settings_store):
     # Cooperative-cancel flag set for any future workers; state persisted.
     assert shell.cancel_event.is_set()
     assert settings_store.geometry() is not None
+
+
+def test_bounded_shutdown_with_undrained_worker_drops_late_ui_delivery(
+    shell, qtbot
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowAdapter:
+        def snapshot(self):
+            started.set()
+            release.wait(2.0)
+            return {
+                "projects": [{
+                    "id": "LATE",
+                    "display_name": "Поздний проект",
+                    "repository_state": "ok",
+                }]
+            }
+
+    shell.load_workspace_home(_SlowAdapter())
+    assert started.wait(2.0)
+    assert shell.shutdown(timeout_ms=0) is False
+    assert shell.cancel_event.is_set()
+    release.set()
+    assert QThreadPool.globalInstance().waitForDone(2000)
+    qtbot.wait(50)
+    assert shell._home.project_cards() == []

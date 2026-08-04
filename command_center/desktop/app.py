@@ -27,7 +27,11 @@ def build_shell(
     offscreen ``QApplication`` and inject an isolated :class:`SettingsStore`.
     """
     store = settings or SettingsStore()
-    theme = ThemeController(app, mode=store.theme_mode())
+    theme = ThemeController(
+        app,
+        mode=store.theme_mode(),
+        density=store.density_mode(),
+    )
     theme.apply()
     shell = AppShell(store, theme)
     return shell, theme
@@ -48,5 +52,11 @@ def run(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     app = _get_or_create_app(argv)
     shell, _theme = build_shell(app)
+    # Wire the Workspace Home data adapter and kick off the first async load
+    # (D2). Import here so importing this module constructs no ExecutionCenterAPI
+    # or runtime database at import time (keeps the D1A smoke-test contract).
+    from command_center.application.workspace_home_adapter import WorkspaceHomeAdapter
+
+    shell.load_workspace_home(WorkspaceHomeAdapter())
     shell.show()
     return app.exec()
