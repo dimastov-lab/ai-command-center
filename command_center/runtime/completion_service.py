@@ -875,7 +875,13 @@ class CompletionOrchestrator:
                     message=f"Merging pull request #{pr.number} via {policy.merge_method}.",
                 )
                 merged = self.github.merge_pull_request(
-                    repo, number=pr.number, method=policy.merge_method
+                    repo,
+                    number=pr.number,
+                    method=policy.merge_method,
+                    # Bind the merge to the exact head whose checks/review were
+                    # evaluated — GitHub refuses if a new commit was pushed since
+                    # (audit D6: no auto-merge of an unverified head).
+                    match_head_oid=pr.head_oid,
                 )
                 runtime_db.append_completion_event(
                     self.db_path, fresh["run_id"], EV_PR_MERGED,

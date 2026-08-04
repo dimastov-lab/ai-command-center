@@ -273,6 +273,7 @@ def test_stage_progress_table_matches_mission_spec():
         "Validation": 75,
         "Tests Passed": 90,
         "PR Ready": 95,
+        "Completed Locally": 100,
         "Merged": 100,
     }
     assert models.EXECUTION_STAGES == list(models.STAGE_PROGRESS.keys())
