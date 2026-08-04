@@ -47,3 +47,15 @@ def test_windows_spec_builds_a_windowed_app_without_a_console() -> None:
 
     assert "console=False" in text
     assert "target_arch" not in text, "target_arch is macOS-only; Windows must not pin it"
+
+
+def test_packaged_entrypoints_configure_runtime_paths_before_desktop_import() -> None:
+    root = Path(__file__).parents[2]
+    for entrypoint in (
+        root / "packaging/macos/entrypoint.py",
+        root / "packaging/windows/entrypoint.py",
+    ):
+        text = entrypoint.read_text(encoding="utf-8")
+        assert text.index("configure_runtime_environment()") < text.index(
+            "from command_center.desktop.app import run"
+        )
