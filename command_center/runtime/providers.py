@@ -139,6 +139,8 @@ class ExecutionProvider(Protocol):
         task_type: str,
         is_resume: bool,
         model: str | None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> LaunchSpec: ...
 
     def create_runtime(self, *, prompt: str, environment: dict[str, str]) -> ProviderRuntime: ...
@@ -676,6 +678,8 @@ class ClaudeProvider:
         task_type: str,
         is_resume: bool,
         model: str | None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> LaunchSpec:
         from command_center.runtime import supervisor
 
@@ -685,6 +689,8 @@ class ClaudeProvider:
             task_type=task_type,
             is_resume=is_resume,
             model=model,
+            untrusted=untrusted,
+            operator_elevated=operator_elevated,
         )
         return LaunchSpec(
             argv=tuple(argv),
@@ -779,6 +785,8 @@ class CodexProvider:
         task_type: str,
         is_resume: bool,
         model: str | None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> LaunchSpec:
         if is_resume:
             raise ValueError("Codex CLI resume is not supported by this provider increment.")
@@ -788,7 +796,16 @@ class CodexProvider:
         availability = self.availability()
         if not availability.available or not availability.executable:
             raise RuntimeError(availability.message)
-        sandbox = "read-only" if task_type in agent_runner.READ_ONLY_TASK_TYPES else "workspace-write"
+        # Provenance-aware sandbox (audit SEC-D-01): resolve the same execution
+        # profile the Claude path uses, so an untrusted (imported) non-read-only
+        # task is downgraded to the read-only sandbox — no command execution, no
+        # worktree writes — unless an operator has explicitly elevated it. Keying
+        # the sandbox on `task_type` alone let a prompt-injected imported task
+        # obtain `workspace-write` just by being run through the Codex executor.
+        profile = agent_runner.profile_for_task(
+            task_type, untrusted=untrusted, operator_elevated=operator_elevated
+        )
+        sandbox = "read-only" if profile == agent_runner.PROFILE_READ_ONLY else "workspace-write"
         argv = [
             availability.executable,
             "exec",
@@ -982,6 +999,8 @@ class OllamaProvider:
         task_type: str,
         is_resume: bool,
         model: str | None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> LaunchSpec:
         if is_resume:
             raise ValueError("Ollama resume is not supported: each run is a fresh, stateless completion.")
@@ -1227,10 +1246,26 @@ class CopilotProvider:
         task_type: str,
         is_resume: bool,
         model: str | None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> LaunchSpec:
         if is_resume:
             raise ValueError("Copilot CLI resume is not supported by this provider increment.")
         self.validate_prompt(prompt)
+        # Provenance gate (audit SEC-1/D-01): Copilot launches with a hardcoded
+        # `--allow-all-tools --no-ask-user` and has no read-only tool mode wired
+        # here, so it cannot honour the untrusted->read-only downgrade the other
+        # providers apply. Fail closed rather than grant full, unattended tool
+        # access to attacker-influenced (imported) input, unless the operator has
+        # explicitly elevated this task.
+        if untrusted and not operator_elevated:
+            raise RuntimeError(
+                "Copilot cannot run an untrusted (imported) task: it has no "
+                "read-only tool mode, so it fails closed instead of granting "
+                "--allow-all-tools to untrusted input (audit SEC-1/D-01). Elevate "
+                "the task explicitly or run it with a provider that supports a "
+                "read-only profile."
+            )
         environment = dict(os.environ)
         _sensitive_environment_values(environment)
         availability = self.availability()

@@ -96,6 +96,27 @@ def filter_new_candidates(
     return fresh
 
 
+def apply_candidate(root: Path, project: str, candidate: CandidateTask) -> dict:
+    """Create a Backlog task from a report-derived candidate.
+
+    The candidate's title/goal come from an agent's markdown report, whose
+    content is untrusted and can carry prompt-injected instructions. Accepting a
+    proposal must therefore NOT launder that content into a trusted
+    (Bash + bypassPermissions) run: the task is stamped `untrusted_import`, so the
+    provenance gate (`agent_runner.is_untrusted_task`) keeps it read-only until an
+    operator explicitly elevates it (audit SEC-D-02). Provenance is stamped here,
+    at task synthesis, not only at the file-import boundary."""
+    return tasks_repository.create_task(
+        root,
+        project,
+        candidate.title,
+        candidate.task_type,
+        "Backlog",
+        goal=candidate.goal,
+        untrusted_import=True,
+    )
+
+
 def render_candidate_tasks(
     candidates: list[CandidateTask],
     root: Path,
@@ -126,9 +147,7 @@ def render_candidate_tasks(
         )
         skipped = skip_col.button("Отклонить", key=f"{key_prefix}_skip_{index}", use_container_width=True)
         if applied:
-            tasks_repository.create_task(
-                root, project, candidate.title, candidate.task_type, "Backlog", goal=candidate.goal
-            )
+            apply_candidate(root, project, candidate)
             dismissed.add(candidate.title)
             st.session_state[dismissed_key] = dismissed
             st.toast(f"Создана задача: {candidate.title}")

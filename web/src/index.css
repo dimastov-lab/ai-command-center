@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  /* Visible background now comes from BackgroundLayer, a fixed
+     full-viewport element (z-index: -1) rendered once at the app root —
+     see components/BackgroundLayer.tsx. Keep body transparent so it shows
+     through undistorted. */
+  min-height: 100vh;
+}

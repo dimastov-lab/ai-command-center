@@ -568,6 +568,11 @@ def _build_task_record(item: dict, parsed: ParsedPackage, now: str) -> dict:
     extras["schema_version"] = parsed.schema_version
     extras["imported_at"] = now
     record["metadata"] = extras
+    # App-controlled provenance marker: this task entered from an external task
+    # package (untrusted input), so it must launch with reduced capabilities by
+    # default unless an operator explicitly elevates it (audit D7 / SEC-1). Set
+    # by the app, never read from package content — an attacker cannot clear it.
+    record["untrusted_import"] = True
     return record
 
 

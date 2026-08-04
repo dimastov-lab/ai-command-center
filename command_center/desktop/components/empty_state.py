@@ -45,6 +45,7 @@ class EmptyState(QWidget):
 
         body_label = QLabel(body)
         body_label.setObjectName("EmptyStateBody")
+        body_label.setAccessibleName(body)
         body_label.setWordWrap(True)
         body_label.setAlignment(Qt.AlignHCenter)
         body_label.setMaximumWidth(520)

@@ -164,6 +164,69 @@ def test_codex_audit_metadata_carries_only_prompt_hash(fake_codex, git_repo):
     assert len(spec.audit_metadata["prompt_sha256"]) == 64
 
 
+# ---------------------------------------------------------------------------
+# SEC-D-01 — the provenance gate must not be bypassable via the Codex executor
+# ---------------------------------------------------------------------------
+
+
+def _codex_sandbox(monkeypatch, git_repo, *, task_type, untrusted=False, operator_elevated=False):
+    """The `--sandbox` a Codex launch would use. Availability is stubbed so the
+    assertion targets the sandbox-derivation logic itself, independent of any
+    real/fake codex binary probe."""
+    codex = providers.get_provider("codex")
+    stub = providers.ProviderAvailability(
+        codex.id, True, "usable", "stub", executable=str(git_repo / "codex"), version="0.0"
+    )
+    monkeypatch.setattr(codex, "availability", lambda: stub)
+    spec = codex.build_launch(
+        repository_path=git_repo,
+        session_id="unused",
+        prompt="do something",
+        task_type=task_type,
+        is_resume=False,
+        model=None,
+        untrusted=untrusted,
+        operator_elevated=operator_elevated,
+    )
+    argv = list(spec.argv)
+    argv_sandbox = argv[argv.index("--sandbox") + 1]
+    assert spec.audit_metadata["sandbox"] == argv_sandbox
+    return argv_sandbox
+
+
+def test_codex_untrusted_implementation_downgrades_to_read_only_sandbox(monkeypatch, git_repo):
+    """An untrusted (imported) non-read-only task launched via Codex must run in
+    the read-only sandbox — exactly as the Claude path downgrades it. Otherwise a
+    prompt-injected imported task obtains `--sandbox workspace-write` (command
+    execution + worktree writes) simply by being run through the Codex executor,
+    re-opening the SEC-1 / D7 local-RCE class the provenance gate closes."""
+    assert (
+        _codex_sandbox(monkeypatch, git_repo, task_type="implementation", untrusted=True)
+        == "read-only"
+    )
+
+
+def test_codex_operator_elevated_untrusted_task_keeps_workspace_write(monkeypatch, git_repo):
+    """An explicit operator elevation is the only thing that restores write
+    capability for an untrusted task — matching `agent_runner.profile_for_task`."""
+    assert (
+        _codex_sandbox(
+            monkeypatch,
+            git_repo,
+            task_type="implementation",
+            untrusted=True,
+            operator_elevated=True,
+        )
+        == "workspace-write"
+    )
+
+
+def test_codex_trusted_implementation_keeps_workspace_write(monkeypatch, git_repo):
+    """A trusted (operator-authored, non-imported) implementation task is
+    unchanged: it still gets the write sandbox it needs to do real work."""
+    assert _codex_sandbox(monkeypatch, git_repo, task_type="implementation") == "workspace-write"
+
+
 def test_codex_prompt_never_enters_task_prompt_history(fake_codex):
     """`launch_service` must not copy a Codex outbound prompt into task
     persistence / prompt history (unlike Claude). `fake_codex` authorizes AIOS

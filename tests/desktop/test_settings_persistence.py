@@ -10,6 +10,7 @@ from PySide6.QtCore import QSettings
 
 from command_center.desktop.app import build_shell
 from command_center.desktop.settings import SettingsStore
+from command_center.platform import DensityMode
 from command_center.desktop.theme import ThemeMode
 
 
@@ -84,3 +85,78 @@ def test_selected_project_preference_roundtrips(settings_store, settings_file):
     settings_store.set_selected_project(None)
     settings_store.sync()
     assert _reopen_store(settings_file).selected_project() is None
+
+
+def test_density_preference_roundtrips(settings_store, settings_file):
+    assert settings_store.density_mode() is DensityMode.COMFORTABLE
+    settings_store.set_density_mode(DensityMode.COMPACT)
+    settings_store.sync()
+    assert _reopen_store(settings_file).density_mode() is DensityMode.COMPACT
+
+
+def test_reset_window_geometry_removes_geometry_and_state(
+    settings_store, settings_file
+):
+    from PySide6.QtCore import QByteArray
+
+    settings_store.set_geometry(QByteArray(b"geometry"))
+    settings_store.set_window_state(QByteArray(b"state"))
+    settings_store.reset_window_geometry()
+    settings_store.sync()
+
+    reopened = _reopen_store(settings_file)
+    assert reopened.geometry() is None
+    assert reopened.window_state() is None
+
+
+def test_settings_form_persists_density_and_workspace_across_restart(
+    qtbot, qapp, settings_store, settings_file
+):
+    first, theme = build_shell(qapp, settings_store)
+    qtbot.addWidget(first)
+    first.navigate_to("settings")
+    page = first._settings_page
+
+    page.density_buttons()[DensityMode.COMPACT].click()
+    assert first.sidebar.items()["home"].height() == 32
+    page.form.selected_project_edit.setText("  AICC  ")
+    page.form.save_workspace_button.click()
+    first.shutdown()
+
+    reopened = _reopen_store(settings_file)
+    assert reopened.density_mode() is DensityMode.COMPACT
+    assert reopened.selected_project() == "AICC"
+    assert theme.density is DensityMode.COMPACT
+
+    second, second_theme = build_shell(qapp, reopened)
+    qtbot.addWidget(second)
+    assert second_theme.density is DensityMode.COMPACT
+    assert second._settings_page.form.selected_project_edit.text() == "AICC"
+    assert second._settings_page.density_buttons()[DensityMode.COMPACT].isChecked()
+
+
+def test_settings_form_reset_restores_default_window_size(
+    qtbot, qapp, settings_store
+):
+    shell, _ = build_shell(qapp, settings_store)
+    qtbot.addWidget(shell)
+    shell.resize(1000, 700)
+    settings_store.set_geometry(shell.saveGeometry())
+    shell.navigate_to("settings")
+
+    shell._settings_page.form.reset_geometry_button.click()
+
+    from command_center.desktop.main_window import DEFAULT_HEIGHT, DEFAULT_WIDTH
+
+    assert shell.width() == DEFAULT_WIDTH
+    assert shell.height() == DEFAULT_HEIGHT
+    assert settings_store.geometry() is None
+
+
+def test_settings_fields_have_accessible_labels(shell):
+    shell.navigate_to("settings")
+    form = shell._settings_page.form
+    assert form.selected_project_edit.accessibleName()
+    assert form.selected_project_edit.accessibleDescription()
+    assert form.reset_geometry_button.accessibleName()
+    assert form.reset_geometry_button.accessibleDescription()
