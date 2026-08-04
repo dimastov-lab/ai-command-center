@@ -11,7 +11,7 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-from command_center import tasks_repository
+from command_center import agent_runner, tasks_repository
 from command_center.ui import backlog_proposals as bp
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -99,3 +99,32 @@ def test_audit_button_creates_and_enqueues_a_readonly_audit_task(isolated_data_d
     audit = [t for t in tasks if t.get("task_type") == "architecture_review" and t.get("project") == "AICC"]
     assert audit, "audit task was not created"
     assert audit[0].get("status") == "Next"
+
+
+# --------------------------------------------------------------------------
+# SEC-D-02 — report-derived proposals must not launder untrusted content into
+# a trusted (Bash + bypassPermissions) run
+# --------------------------------------------------------------------------
+
+
+def test_new_task_record_can_mark_untrusted_provenance():
+    trusted = tasks_repository.new_task_record("AICC", "t", "implementation", "Backlog")
+    assert not trusted.get("untrusted_import")
+    untrusted = tasks_repository.new_task_record(
+        "AICC", "t", "implementation", "Backlog", untrusted_import=True
+    )
+    assert untrusted.get("untrusted_import") is True
+
+
+def test_backlog_proposal_task_runs_untrusted_by_default(isolated_data_dir):
+    """A candidate parsed from an agent report (untrusted, possibly prompt-
+    injected content) must not be laundered into a trusted Bash+bypass run when
+    accepted: the created task must be untrusted so the provenance gate keeps it
+    read-only unless an operator explicitly elevates it (audit SEC-D-02)."""
+    candidate = bp.CandidateTask(title="Injected implementation task", goal="do x")
+    created = bp.apply_candidate(isolated_data_dir, "AICC", candidate)
+    assert agent_runner.is_untrusted_task(created) is True
+    persisted = tasks_repository.load_tasks(isolated_data_dir)
+    assert persisted, "task was not persisted"
+    assert agent_runner.is_untrusted_task(persisted[0]) is True
+    assert persisted[0]["status"] == "Backlog"

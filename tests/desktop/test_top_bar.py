@@ -5,12 +5,14 @@ Covers `DESIGN_SYSTEM.md` §7.4 and `DESIGN_DIRECTIONS.md` §5.
 
 from __future__ import annotations
 
+from command_center.desktop import i18n
+
 
 def test_project_switcher_is_placeholder_and_disabled(shell):
     switcher = shell.top_bar.project_switcher
     assert not switcher.isEnabled()  # not project-scoped in D1 (§7.5)
-    assert switcher.currentText() == "Select a project"
-    assert switcher.accessibleName() == "Project switcher"
+    assert switcher.currentText() == i18n.PROJECT_SWITCHER_PLACEHOLDER
+    assert switcher.accessibleName() == i18n.PROJECT_SWITCHER_ACCESSIBLE
 
 
 def test_status_area_starts_empty_and_never_polls(shell):
@@ -19,8 +21,8 @@ def test_status_area_starts_empty_and_never_polls(shell):
 
 
 def test_status_area_accepts_static_text(shell):
-    shell.top_bar.set_status_text("2 runs active")
-    assert shell.top_bar.status_area.text() == "2 runs active"
+    shell.top_bar.set_status_text("2 запуска активны")
+    assert shell.top_bar.status_area.text() == "2 запуска активны"
 
 
 def test_refresh_button_has_shortcut_and_emits(shell, qtbot):
@@ -31,4 +33,4 @@ def test_refresh_button_has_shortcut_and_emits(shell, qtbot):
 
 
 def test_refresh_button_accessible_name(shell):
-    assert shell.top_bar.refresh_button.accessibleName() == "Refresh"
+    assert shell.top_bar.refresh_button.accessibleName() == i18n.REFRESH_TEXT

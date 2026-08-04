@@ -17,6 +17,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage, task_view, workspace_home
@@ -446,6 +447,44 @@ def test_focus_mode_does_not_crash_on_a_non_canonical_task_status():
     assert not at.exception
     rendered = "\n".join(n.value for n in at.markdown)
     assert "BlockedFocusTask" in rendered
+    persisted = storage.read_json(
+        Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", []
+    )
+    assert persisted[0]["status"] == "Blocked"
+
+
+def test_kanban_renders_blocked_and_unknown_statuses_without_rewriting_them():
+    _seed_tasks(
+        [
+            {
+                "id": "blocked",
+                "project": "AICC",
+                "title": "VisibleBlockedTask",
+                "status": "Blocked",
+            },
+            {
+                "id": "custom",
+                "project": "AICC",
+                "title": "VisibleCustomTask",
+                "status": "Custom State",
+            },
+        ]
+    )
+    at = _at_on_page("kanban", kanban_project_selector_pills="AICC")
+    assert not at.exception
+    rendered = "\n".join(node.value for node in at.markdown)
+    assert "VisibleBlockedTask" in rendered
+    assert "VisibleCustomTask" in rendered
+    assert "**Blocked**" in rendered
+    assert "**Другие статусы**" in rendered
+
+    persisted = storage.read_json(
+        Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", []
+    )
+    assert {task["id"]: task["status"] for task in persisted} == {
+        "blocked": "Blocked",
+        "custom": "Custom State",
+    }
 
 
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
@@ -1006,6 +1045,39 @@ def test_created_task_override_wins_over_project_inheritance(tmp_path):
     assert len(tasks_on_disk) == 1
     assert tasks_on_disk[0]["workspace_path"] == override_path
     assert tasks_on_disk[0]["branch"] == "develop"  # not overridden — still inherited
+
+
+@pytest.mark.parametrize("project", models.PROJECT_IDS)
+def test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails(
+    project, monkeypatch
+):
+    real_run = subprocess.run
+
+    def fail_start_task(command, *args, **kwargs):
+        argv = list(command) if isinstance(command, (list, tuple)) else [command]
+        if argv and str(argv[0]).endswith("start-task.sh"):
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr=f"Unknown project: {project}",
+            )
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fail_start_task)
+
+    at = _at_on_page("create", create_task_project=project)
+    assert not at.exception
+    at = at.text_input(key="create_task_title").set_value(f"{project} task").run()
+    at = at.text_area(key="create_task_objective").set_value(f"Create for {project}").run()
+    at = at.button(key="create_task_form_submit").click().run()
+    assert not at.exception
+
+    tasks_on_disk = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    assert len(tasks_on_disk) == 1
+    assert tasks_on_disk[0]["project"] == project
+    assert tasks_on_disk[0]["title"] == f"{project} task"
+    assert any("Задача сохранена в Kanban" in warning.value for warning in at.warning)
 
 
 def _snapshot_dir(directory: Path) -> dict[str, tuple[int, float]]:

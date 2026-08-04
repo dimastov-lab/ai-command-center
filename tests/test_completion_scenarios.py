@@ -556,8 +556,10 @@ def test_step_verify_recovers_late_merge_commit_oid(env):
         """merge() reports success but with no merge-commit oid; the stored PR
         keeps the real oid, so a later discover() reveals it."""
 
-        def merge_pull_request(self, repo, *, number, method="squash"):
-            pr = super().merge_pull_request(repo, number=number, method=method)
+        def merge_pull_request(self, repo, *, number, method="squash", match_head_oid=None):
+            pr = super().merge_pull_request(
+                repo, number=number, method=method, match_head_oid=match_head_oid
+            )
             return dataclasses.replace(pr, merge_commit=None)
 
     gh = LateOidGitHub(on_merge=lambda pr: merge_into_main(remote, tmp, pr.head_ref, squash=True))

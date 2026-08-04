@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
-from .. import tokens
+from .. import i18n, tokens
 from ..components.page_header import PageHeader
 
 
@@ -19,7 +19,7 @@ class BasePage(QWidget):
     ) -> None:
         super().__init__(parent)
         self.section_key = section_key
-        self.setAccessibleName(f"{title} page")
+        self.setAccessibleName(i18n.page_accessible_name(title))
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(

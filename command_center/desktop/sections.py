@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .i18n import SECTION_LABELS
+
 
 @dataclass(frozen=True)
 class Section:
@@ -23,15 +25,15 @@ class Section:
 # rendered visibly disabled rather than hidden, so the sidebar never reflows
 # between increments (§2.1).
 SECTIONS: tuple[Section, ...] = (
-    Section("home", "Home", enabled=True),
-    Section("projects", "Projects", enabled=True),
-    Section("sessions", "Sessions", enabled=False),
-    Section("execution", "Execution", enabled=False),
-    Section("git", "Git", enabled=False),
-    Section("artifacts", "Artifacts", enabled=False),
-    Section("reports", "Reports", enabled=False),
-    Section("agents", "Agents", enabled=False),
-    Section("settings", "Settings", enabled=True),
+    Section("home", SECTION_LABELS["home"], enabled=True),
+    Section("projects", SECTION_LABELS["projects"], enabled=True),
+    Section("sessions", SECTION_LABELS["sessions"], enabled=False),
+    Section("execution", SECTION_LABELS["execution"], enabled=False),
+    Section("git", SECTION_LABELS["git"], enabled=False),
+    Section("artifacts", SECTION_LABELS["artifacts"], enabled=False),
+    Section("reports", SECTION_LABELS["reports"], enabled=False),
+    Section("agents", SECTION_LABELS["agents"], enabled=False),
+    Section("settings", SECTION_LABELS["settings"], enabled=True),
 )
 
 ACTIVE_SECTION_KEYS: tuple[str, ...] = tuple(s.key for s in SECTIONS if s.enabled)

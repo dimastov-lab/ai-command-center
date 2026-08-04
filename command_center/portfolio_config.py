@@ -41,6 +41,8 @@ from command_center.project_config import validate_repository_path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = storage.resolve_data_dir(ROOT)
 CONFIG_FILE = DATA_DIR / "portfolio_config.json"
+# Dedicated lock file guarding the config read-modify-write (audit AR-5).
+CONFIG_LOCK_FILE = DATA_DIR / "portfolio_config.lock"
 
 DEFAULT_REPOSITORY_PATHS: dict[str, str] = {
     "AICC": str(Path.home() / "Projects" / "ai-command-center"),
@@ -76,9 +78,13 @@ def save_repository_path(project_id: str, repository_path: str | None) -> None:
     """`repository_path=None` (or empty) explicitly clears any override —
     including a built-in default, so an operator can deliberately unset
     `AICC`/`PRODUCT` too if this machine's checkout moves."""
-    overrides = _read_overrides()
-    overrides[project_id] = repository_path if repository_path else None
-    storage.atomic_write_json(CONFIG_FILE, overrides)
+    # Hold the lock across the whole read-modify-write so a concurrent config
+    # writer can't read the same pre-write state and lost-update this change
+    # (audit AR-5).
+    with storage.file_lock(CONFIG_LOCK_FILE):
+        overrides = _read_overrides()
+        overrides[project_id] = repository_path if repository_path else None
+        storage.atomic_write_json(CONFIG_FILE, overrides)
 
 
 __all__ = [
