@@ -267,7 +267,6 @@ def forbid_real_codex_subprocess(monkeypatch):
 _CONTAMINATION_MARKERS: tuple[str, ...] = (
     "pytest-of-",
     "aicc_test_data_",
-    "/pytest-",  # e.g. .../T/pytest-184/...
     "-fake-repo",
 )
 
@@ -295,6 +294,8 @@ def guard_real_project_files():
     root = Path(__file__).resolve().parent.parent
     yield
 
+    reports_root = root / "reports"
+
     def _scan(directory: Path) -> list[str]:
         if not directory.is_dir():
             return []
@@ -303,7 +304,11 @@ def guard_real_project_files():
             if not path.is_file():
                 continue
             haystacks = [str(path)]
-            if path.suffix in (".json", ".jsonl", ".md"):
+            # Agent-generated report .md files are expected to contain arbitrary
+            # text (tool call logs, file paths, pytest references, etc.) — scan
+            # their path for contamination markers but not their content.
+            is_agent_report = reports_root in path.parents and path.suffix == ".md"
+            if not is_agent_report and path.suffix in (".json", ".jsonl", ".md"):
                 try:
                     haystacks.append(path.read_text(encoding="utf-8", errors="ignore"))
                 except OSError:
