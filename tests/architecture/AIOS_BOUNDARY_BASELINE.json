@@ -1,0 +1,141 @@
+{
+  "policy": "Frozen inventory of AICC-native subsystems overlapping AIOS Core domains (queue/orchestration/authz/audit/memory). These predate ADR-0008 (this repo) / ADR-0015 (aios repo) and are frozen until their convergence into AIOS Core (post-AIOS-CORE-ACCEPTED): they keep running, but growth is prohibited — no new files in these categories, no new engine categories in existing files. Any edit to this file is a reviewed architectural decision; see docs/AIOS_BOUNDARY.md for the procedure.",
+  "references": [
+    "docs/AIOS_BOUNDARY.md",
+    "docs/adr/0008-aios-first-control-plane-boundary.md",
+    "aios repo: ADR-0015 (single-core doctrine), docs/AIOS_CORE_ACCEPTANCE.md AC-01"
+  ],
+  "entries": {
+    "command_center/activity_log.py": [
+      "audit"
+    ],
+    "command_center/agent_runner.py": [
+      "orchestration"
+    ],
+    "command_center/aml_store.py": [
+      "memory"
+    ],
+    "command_center/companion/auth.py": [
+      "authz"
+    ],
+    "command_center/daily_audit.py": [
+      "audit",
+      "memory"
+    ],
+    "command_center/daily_audit_backend.py": [
+      "audit"
+    ],
+    "command_center/execution_queue.py": [
+      "queue"
+    ],
+    "command_center/executors.py": [
+      "orchestration"
+    ],
+    "command_center/pipeline_settings.py": [
+      "orchestration"
+    ],
+    "command_center/runtime/__init__.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/api.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/autonomy.py": [
+      "orchestration",
+      "runtime_package"
+    ],
+    "command_center/runtime/autonomy_service.py": [
+      "orchestration",
+      "runtime_package"
+    ],
+    "command_center/runtime/completion.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/completion_service.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/context_service.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/db.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/git_ops.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/github.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/identity.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/legacy_import.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/log_tail.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/outcome.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/project_overview.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/providers.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/repo_state.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/reports.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/runs_read.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/scheduler.py": [
+      "orchestration",
+      "runtime_package"
+    ],
+    "command_center/runtime/session_view.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/stream_parser.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/supervisor.py": [
+      "memory",
+      "orchestration",
+      "runtime_package"
+    ],
+    "command_center/runtime/task_sync.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/validation.py": [
+      "runtime_package"
+    ],
+    "command_center/storage.py": [
+      "memory"
+    ],
+    "command_center/task_pipeline.py": [
+      "orchestration"
+    ],
+    "command_center/tasks_repository.py": [
+      "memory"
+    ],
+    "command_center/worktree_launcher.py": [
+      "orchestration"
+    ],
+    "scripts/daily_audit_daemon.py": [
+      "audit",
+      "orchestration"
+    ],
+    "scripts/demo_autonomy_proposals.py": [
+      "orchestration"
+    ],
+    "scripts/demo_completion_pipeline.py": [
+      "orchestration"
+    ]
+  }
+}
