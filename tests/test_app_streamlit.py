@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage, task_view, workspace_home
+from command_center import agent_runner, execution_queue, git_info, models, project_config, report_parser, storage, task_view, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
 from command_center.ui import project_selector
@@ -125,6 +125,42 @@ def test_runs_page_renders_empty_state():
     at = _at_on_page("runs")
     assert not at.exception
     assert at.subheader[0].value == "Журнал запусков"
+
+
+def test_git_center_fetches_only_after_explicit_refresh(monkeypatch):
+    fetch_calls = []
+
+    def fake_fetch(path, timeout=30):
+        fetch_calls.append(path)
+        return True, ""
+
+    monkeypatch.setattr(git_info, "fetch_remotes", fake_fetch)
+    monkeypatch.setattr(
+        git_info,
+        "get_ahead_behind",
+        lambda path: {
+            "available": True,
+            "upstream": "origin/main",
+            "ahead": 2,
+            "behind": 3,
+            "error": "",
+        },
+    )
+
+    at = _at_on_page("git_center")
+    assert not at.exception
+    assert fetch_calls == []
+    assert any("ещё не обновлялись" in caption.value for caption in at.caption)
+
+    refresh = next(button for button in at.button if button.label == "Обновить")
+    at = refresh.click().run()
+
+    assert not at.exception
+    assert len(fetch_calls) == 1
+    metrics = {metric.label: metric.value for metric in at.metric}
+    assert metrics["Ahead"] == "2"
+    assert metrics["Behind"] == "3"
+    assert any("обновлено 0 мин. назад" in caption.value for caption in at.caption)
 
 
 def test_executive_dashboard_shows_run_metrics_section():
@@ -488,12 +524,21 @@ def test_kanban_renders_blocked_and_unknown_statuses_without_rewriting_them():
 
 
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
-    """`disabled=` on the launch button is the primary gate, but
-    `streamlit.testing.v1.AppTest.click()` does not itself respect
-    `disabled` (it drives the widget's simulated state directly) — so this
-    test forces the click a real disabled button in a browser could never
-    receive, to prove the server-side `validation.can_launch` re-check
-    (not just the widget attribute) is what actually stops the launch."""
+    """A forged click on the disabled launch button must never launch anything.
+
+    Layered gate, outermost first: streamlit >= 1.61 enforces `disabled`
+    server-side — an incoming widget value for a disabled widget is discarded
+    at registration against the *current* run's `disabled=` predicate
+    (`streamlit/runtime/state/widgets.py`, guarding against forged BackMsg
+    values), so the forced `.click()` below is inert before app code even sees
+    it. The app's own `prep.launchable` re-check ("Запуск заблокирован ошибками
+    валидации выше") stays in `app.py` as defense in depth for the day the
+    `disabled=` predicate and the launch conditions diverge, but while they
+    match it is unreachable by any client message — on streamlit < 1.61 (where
+    AppTest forged clicks did land) it was the layer this test exercised
+    directly. Either way the observable invariant asserted here is the same:
+    the forced click launches nothing and the blocking validation error stays
+    on screen."""
 
     real_run = subprocess.run
 
@@ -529,7 +574,12 @@ def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatc
     at = launch_button.click().run()
     assert not at.exception
     assert agent_runner.load_runs() == []  # the forced click must not have launched anything
-    assert any("заблокирован" in e.value for e in at.error)
+    # The dialog re-renders with the same fatal validation error and the gate
+    # still engaged — the forged click changed nothing. (No assertion on the
+    # app-level "Запуск заблокирован" message: on streamlit >= 1.61 the forged
+    # click is discarded by the framework before that re-check can run.)
+    assert any("не найден" in e.value for e in at.error)
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
 
 
 # --------------------------------------------------------------------------

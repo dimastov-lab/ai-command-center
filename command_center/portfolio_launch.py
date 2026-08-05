@@ -58,12 +58,14 @@ Safety model:
   every task once successfully launched, purely for fast duplicate rejection
   and UI history — never the sole authority (git's own state is). Two
   independent locks guard it, for two different races:
-  - The exclusive-create lock file in `data/portfolio_locks/<task_id>.lock`
-    (`os.open(..., O_CREAT | O_EXCL)`) serializes two concurrent launch
+  - The exclusive-publish lock file in `data/portfolio_locks/<task_id>.lock`
+    (a fully-written temporary inode atomically published with `os.link`)
+    serializes two concurrent launch
     *attempts for the same task_id* — the same technique this module needs
     for worktree/branch creation because, unlike the SQLite-backed
     workspace lock in `runtime.db`, that has no existing atomic primitive
-    in this codebase to reuse.
+    in this codebase to reuse. Its owner metadata allows a later launch to
+    recover it after a process crash, while a live owner is never displaced.
   - `_registry_lock` (`data/portfolio_locks/registry.lock`, an OS advisory
     file lock — `fcntl.flock` on POSIX, `msvcrt.locking` on Windows) guards
     the registry file's read-modify-write cycle itself, across *every*
@@ -85,7 +87,11 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import socket
 import subprocess
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -98,6 +104,10 @@ DEFAULT_WORKTREES_ROOT = Path.home() / "Projects" / "worktrees"
 
 REGISTRY_FILE_NAME = "portfolio_launches.json"
 LOCKS_DIR_NAME = "portfolio_locks"
+CLAIM_LOCK_VERSION = 1
+CLAIM_RECOVERY_LOCK_SUFFIX = ".recovery"
+CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS = 5.0
+_CLAIM_RECOVERY_LOCK_POLL_SECONDS = 0.02
 
 DEFAULT_MAX_CONCURRENT_LAUNCHES = 3
 
@@ -341,29 +351,254 @@ def _claim_lock_path(root: Path, task_id: str) -> Path:
     return candidate
 
 
+@dataclass(frozen=True)
+class ClaimLockStatus:
+    task_id: str
+    path: Path
+    exists: bool
+    stale: bool
+    recoverable: bool
+    reason: str
+    owner_pid: int | None = None
+    age_seconds: float | None = None
+
+
+_owned_claim_tokens: dict[Path, str] = {}
+_owned_claim_tokens_lock = threading.Lock()
+
+
+def _claim_recovery_lock_path(root: Path, task_id: str) -> Path:
+    claim_path = _claim_lock_path(root, task_id)
+    return claim_path.with_name(claim_path.name + CLAIM_RECOVERY_LOCK_SUFFIX)
+
+
+def _process_identity(pid: int) -> str | None:
+    """Return a value that changes when a PID is reused.
+
+    Linux exposes the process start tick directly. On macOS and other POSIX
+    hosts `ps lstart` is the portable fallback. Failure to obtain an identity
+    is handled conservatively by the caller: a live PID is never reclaimed.
+    """
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        raw = proc_stat.read_text(encoding="utf-8")
+        # The command name is parenthesized and may contain spaces. Everything
+        # after its final ')' starts at field 3; starttime is field 22.
+        tail = raw.rsplit(")", 1)[1].strip().split()
+        return f"linux-start-ticks:{tail[19]}"
+    except (OSError, IndexError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return f"ps-lstart:{value}" if result.returncode == 0 and value else None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_claim_metadata(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> ClaimLockStatus:
+    """Inspect a claim without mutating it.
+
+    A lock is automatically recoverable only when its structured owner
+    metadata proves that the owning local process no longer exists (or that
+    the PID was reused). Legacy/invalid files are reported but deliberately
+    not reclaimed: age alone cannot prove that a long-running launch is dead.
+
+    NOTE: "a live owner is never displaced" holds for a single-host lock
+    directory. A claim from a *different* host is treated as unrecoverable
+    (its PID cannot be checked locally), but the cross-host discriminator is
+    the short hostname, which is not globally unique. A lock directory shared
+    between two hosts with the same hostname is out of scope -- the same
+    single-host assumption the `flock`/`os.link` primitives already require.
+    """
+    path = _claim_lock_path(root, task_id)
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return ClaimLockStatus(task_id, path, False, False, False, "lock отсутствует")
+    except OSError as exc:
+        return ClaimLockStatus(task_id, path, True, False, False, f"lock недоступен: {exc}")
+
+    current_time = time.time() if now is None else now
+    age = max(0.0, current_time - stat.st_mtime)
+    metadata = _read_claim_metadata(path)
+    if not metadata:
+        return ClaimLockStatus(
+            task_id, path, True, False, False,
+            "lock создан старой версией или повреждён; владелец не может быть безопасно подтверждён",
+            age_seconds=age,
+        )
+
+    pid = metadata.get("pid")
+    token = metadata.get("token")
+    hostname = metadata.get("hostname")
+    identity = metadata.get("process_identity")
+    if (
+        metadata.get("version") != CLAIM_LOCK_VERSION
+        or not isinstance(pid, int)
+        or not isinstance(token, str)
+        or not token
+        or not isinstance(hostname, str)
+    ):
+        return ClaimLockStatus(
+            task_id, path, True, False, False, "метаданные lock неполны; автоматическое снятие небезопасно",
+            age_seconds=age,
+        )
+    if hostname != socket.gethostname():
+        return ClaimLockStatus(
+            task_id, path, True, False, False,
+            f"lock принадлежит другому хосту ({hostname}); локальная проверка процесса невозможна",
+            owner_pid=pid, age_seconds=age,
+        )
+    if not _pid_is_alive(pid):
+        return ClaimLockStatus(
+            task_id, path, True, True, True, f"процесс-владелец PID {pid} не существует",
+            owner_pid=pid, age_seconds=age,
+        )
+    current_identity = _process_identity(pid)
+    if identity and current_identity and identity != current_identity:
+        return ClaimLockStatus(
+            task_id, path, True, True, True, f"PID {pid} был переиспользован другим процессом",
+            owner_pid=pid, age_seconds=age,
+        )
+    return ClaimLockStatus(
+        task_id, path, True, False, False, f"процесс-владелец PID {pid} активен",
+        owner_pid=pid, age_seconds=age,
+    )
+
+
+def recover_stale_claim(root: Path, task_id: str) -> bool:
+    """Remove a provably orphaned claim, serialized against claim/release.
+
+    The status is re-read while holding the recovery lock and the file token
+    is checked again immediately before unlink. This makes recovery safe
+    against another process concurrently recovering and acquiring the task.
+    """
+    path = _claim_lock_path(root, task_id)
+    guard = _claim_recovery_lock_path(root, task_id)
+    try:
+        with storage.file_lock(
+            guard,
+            timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
+            poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
+        ):
+            status = inspect_claim(root, task_id)
+            if not status.recoverable:
+                return False
+            metadata = _read_claim_metadata(path)
+            if not metadata or not inspect_claim(root, task_id).recoverable:
+                return False
+            expected_token = metadata.get("token")
+            latest = _read_claim_metadata(path)
+            if not latest or latest.get("token") != expected_token:
+                return False
+            path.unlink(missing_ok=True)
+            return True
+    except storage.LockTimeoutError:
+        return False
+
+
 def _claim(root: Path, task_id: str) -> bool:
-    """Atomically claim `task_id` for launch. Returns False if another
-    in-flight (or crashed-and-never-released) claim already exists. This
-    function itself never clears an existing claim — a claim orphaned by a
-    launch that crashed between `_claim` succeeding and the `finally:
-    _release(...)` in `launch_portfolio_task` running is cleared by deleting
-    its lock file directly (`data/portfolio_locks/<task_id>.lock`). There is
-    deliberately no in-app helper for that: it's a rare, operator-triggered
-    recovery action on one well-known file, not a code path this module
-    needs to expose."""
+    """Atomically claim `task_id`, recovering a provably orphaned claim.
+
+    Creation and recovery share a short-lived OS advisory guard. The claim
+    itself contains owner identity and a random token; a live owner's claim
+    is never removed, while a process crash is recovered on the next attempt.
+    """
     lock_path = _claim_lock_path(root, task_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
+        guard_context = storage.file_lock(
+            _claim_recovery_lock_path(root, task_id),
+            timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
+            poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
+        )
+        with guard_context:
+            if lock_path.exists():
+                status = inspect_claim(root, task_id)
+                if not status.recoverable:
+                    return False
+                metadata = _read_claim_metadata(lock_path)
+                if not metadata or not inspect_claim(root, task_id).recoverable:
+                    return False
+                lock_path.unlink(missing_ok=True)
+
+            token = uuid.uuid4().hex
+            metadata = {
+                "version": CLAIM_LOCK_VERSION,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "process_identity": _process_identity(os.getpid()),
+                "created_at": time.time(),
+                "token": token,
+            }
+            # Publish a fully written inode with an atomic, exclusive hard
+            # link. A crash can leave only the uniquely named temp file, never
+            # a visible empty/partial claim that cannot identify its owner.
+            temp_path = lock_path.with_name(f".{lock_path.name}.{token}.tmp")
+            fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, (json.dumps(metadata, sort_keys=True) + "\n").encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.link(temp_path, lock_path)
+            finally:
+                temp_path.unlink(missing_ok=True)
+            with _owned_claim_tokens_lock:
+                _owned_claim_tokens[lock_path] = token
+            return True
+    except (FileExistsError, storage.LockTimeoutError):
         return False
-    os.close(fd)
-    return True
 
 
 def _release(root: Path, task_id: str) -> None:
     lock_path = _claim_lock_path(root, task_id)
-    lock_path.unlink(missing_ok=True)
+    try:
+        with storage.file_lock(
+            _claim_recovery_lock_path(root, task_id),
+            timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
+            poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
+        ):
+            with _owned_claim_tokens_lock:
+                token = _owned_claim_tokens.pop(lock_path, None)
+            metadata = _read_claim_metadata(lock_path)
+            if token and metadata and metadata.get("token") == token:
+                lock_path.unlink(missing_ok=True)
+    except storage.LockTimeoutError:
+        # A timed-out cleanup must not remove a lock whose ownership could
+        # have changed. It will be recovered automatically after this process
+        # exits if it genuinely becomes orphaned.
+        return
 
 
 REGISTRY_LOCK_FILE_NAME = "registry.lock"
