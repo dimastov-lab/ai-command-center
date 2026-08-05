@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import threading
@@ -487,6 +489,133 @@ def test_claim_prevents_concurrent_double_launch(tmp_path):
     portfolio_launch._release(tmp_path, "AICC-X")
     assert portfolio_launch._claim(tmp_path, "AICC-X") is True
     portfolio_launch._release(tmp_path, "AICC-X")
+
+
+def test_orphaned_claim_is_detected_and_recovered_automatically(tmp_path, monkeypatch):
+    task_id = "AICC-CRASHED"
+    lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "version": portfolio_launch.CLAIM_LOCK_VERSION,
+                "pid": 424242,
+                "hostname": portfolio_launch.socket.gethostname(),
+                "process_identity": "dead-process",
+                "created_at": 1.0,
+                "token": "orphan-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(portfolio_launch, "_pid_is_alive", lambda pid: False)
+
+    status = portfolio_launch.inspect_claim(tmp_path, task_id, now=100.0)
+    assert status.stale is True
+    assert status.recoverable is True
+    assert status.owner_pid == 424242
+
+    # The ordinary claim path performs recovery; no file deletion or other
+    # operator action is required after the simulated process crash.
+    assert portfolio_launch._claim(tmp_path, task_id) is True
+    replacement = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert replacement["pid"] == os.getpid()
+    assert replacement["token"] != "orphan-token"
+    portfolio_launch._release(tmp_path, task_id)
+
+
+def test_live_owner_claim_is_never_recovered_even_when_old(tmp_path, monkeypatch):
+    task_id = "AICC-LIVE"
+    lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
+    lock_path.parent.mkdir(parents=True)
+    metadata = {
+        "version": portfolio_launch.CLAIM_LOCK_VERSION,
+        "pid": 31337,
+        "hostname": portfolio_launch.socket.gethostname(),
+        "process_identity": "same-live-process",
+        "created_at": 1.0,
+        "token": "live-token",
+    }
+    lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+    os.utime(lock_path, (1, 1))
+    monkeypatch.setattr(portfolio_launch, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(portfolio_launch, "_process_identity", lambda pid: "same-live-process")
+
+    status = portfolio_launch.inspect_claim(tmp_path, task_id, now=10_000_000.0)
+    assert status.age_seconds and status.age_seconds > 1_000_000
+    assert status.stale is False
+    assert status.recoverable is False
+    assert portfolio_launch.recover_stale_claim(tmp_path, task_id) is False
+    assert portfolio_launch._claim(tmp_path, task_id) is False
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == "live-token"
+
+
+def test_claim_with_reused_pid_but_different_identity_is_recovered(tmp_path, monkeypatch):
+    # The PID is alive, but the process running under it is a DIFFERENT one
+    # than the claim recorded (PID reuse after a crash). This is the entire
+    # reason process_identity exists; it must make the claim recoverable.
+    task_id = "AICC-PID-REUSE"
+    lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
+    lock_path.parent.mkdir(parents=True)
+    metadata = {
+        "version": portfolio_launch.CLAIM_LOCK_VERSION,
+        "pid": 31337,
+        "hostname": portfolio_launch.socket.gethostname(),
+        "process_identity": "original-crashed-process",
+        "created_at": 1.0,
+        "token": "orphan-token",
+    }
+    lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+    monkeypatch.setattr(portfolio_launch, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(
+        portfolio_launch, "_process_identity", lambda pid: "a-different-live-process"
+    )
+
+    status = portfolio_launch.inspect_claim(tmp_path, task_id)
+    assert status.recoverable is True
+    assert "переиспользован" in status.reason
+    # And a fresh claim succeeds, replacing the orphaned token.
+    assert portfolio_launch._claim(tmp_path, task_id) is True
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] != "orphan-token"
+
+
+def test_old_owner_release_cannot_delete_recovered_replacement_claim(tmp_path):
+    task_id = "AICC-TOKEN-RACE"
+    lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
+    assert portfolio_launch._claim(tmp_path, task_id) is True
+    old_token = json.loads(lock_path.read_text(encoding="utf-8"))["token"]
+
+    # Simulate recovery by another claimant after the original process died,
+    # then a delayed finally-block from the original owner. Token matching is
+    # the backstop that protects the replacement claim.
+    replacement = {
+        "version": portfolio_launch.CLAIM_LOCK_VERSION,
+        "pid": os.getpid(),
+        "hostname": portfolio_launch.socket.gethostname(),
+        "process_identity": portfolio_launch._process_identity(os.getpid()),
+        "created_at": 2.0,
+        "token": "replacement-token",
+    }
+    lock_path.write_text(json.dumps(replacement), encoding="utf-8")
+    assert old_token != replacement["token"]
+
+    portfolio_launch._release(tmp_path, task_id)
+    assert lock_path.exists()
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == "replacement-token"
+
+
+def test_legacy_claim_is_reported_but_not_unsafely_removed_by_age(tmp_path):
+    task_id = "AICC-LEGACY"
+    lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("", encoding="utf-8")
+    os.utime(lock_path, (1, 1))
+
+    status = portfolio_launch.inspect_claim(tmp_path, task_id, now=10_000_000.0)
+    assert status.exists is True
+    assert status.recoverable is False
+    assert portfolio_launch._claim(tmp_path, task_id) is False
+    assert lock_path.exists()
 
 
 def test_create_worktree_raises_portfolio_launch_error_on_git_failure(git_repo, tmp_path):

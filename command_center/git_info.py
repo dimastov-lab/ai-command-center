@@ -1,4 +1,4 @@
-"""Read-only Git discovery, parameterized by repository path.
+"""Git discovery, parameterized by repository path.
 
 Extracted from `app.py`'s original git helpers (which hardcoded `cwd=ROOT`, the AI
 Command Center's own repository). Every function here takes an explicit `cwd: Path`
@@ -6,10 +6,9 @@ so callers — including Workspace Home (see `WORKSPACE_HOME_ARCHITECTURE.md` §
 query any of the managed projects' repositories, not just this one.
 
 Same subprocess-safety properties as the original: fixed argv, never `shell=True`,
-`capture_output=True`, `text=True`, an explicit timeout, and only the read-only git
-subcommands already documented in `ARCHITECTURE.md` §6 (`rev-parse`,
-`branch --show-current`, `branch --list`, `status --porcelain`, `log`, `diff --stat`,
-`remote -v`, `worktree list --porcelain`). No git-write subcommand is ever invoked.
+`capture_output=True`, `text=True`, and an explicit timeout. Discovery functions are
+read-only. ``fetch_remotes`` is the sole network/ref-mutating operation and is kept
+separate so UI callers can invoke it only after an explicit user action.
 """
 
 from __future__ import annotations
@@ -118,6 +117,84 @@ def get_remotes(cwd: Path) -> list[tuple[str, str]]:
         if len(parts) >= 2:
             seen.setdefault(parts[0], parts[1])
     return list(seen.items())
+
+
+def fetch_remotes(cwd: Path, timeout: int = 30) -> tuple[bool, str]:
+    """Refresh all configured remote-tracking refs after an explicit request."""
+    result = run_git_command(cwd, ["fetch", "--all", "--prune"], timeout=timeout)
+    if result is None:
+        return False, "Не удалось запустить git fetch."
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"git fetch завершился с кодом {result.returncode}"
+        return False, detail
+    return True, ""
+
+
+def get_ahead_behind(cwd: Path) -> dict[str, object]:
+    """Compare HEAD with its configured upstream using local refs only.
+
+    This function never fetches. Callers decide whether the remote-tracking
+    refs are fresh enough for their purpose.
+    """
+    upstream_result = run_git_command(
+        cwd,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    )
+    if upstream_result is None or upstream_result.returncode != 0:
+        return {
+            "available": False,
+            "upstream": None,
+            "ahead": None,
+            "behind": None,
+            "error": "Для текущей ветки не настроена tracking-ветка.",
+        }
+
+    upstream = upstream_result.stdout.strip()
+    counts = run_git_command(
+        cwd,
+        ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"],
+        timeout=10,
+    )
+    if counts is None or counts.returncode != 0:
+        detail = ""
+        if counts is not None:
+            detail = counts.stderr.strip() or counts.stdout.strip()
+        return {
+            "available": False,
+            "upstream": upstream,
+            "ahead": None,
+            "behind": None,
+            "error": detail or "Не удалось вычислить расхождение с tracking-веткой.",
+        }
+
+    parts = counts.stdout.split()
+    if len(parts) != 2:
+        return {
+            "available": False,
+            "upstream": upstream,
+            "ahead": None,
+            "behind": None,
+            "error": "Git вернул неожиданный результат сравнения веток.",
+        }
+
+    try:
+        ahead, behind = (int(value) for value in parts)
+    except ValueError:
+        return {
+            "available": False,
+            "upstream": upstream,
+            "ahead": None,
+            "behind": None,
+            "error": "Git вернул неожиданный результат сравнения веток.",
+        }
+
+    return {
+        "available": True,
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+        "error": "",
+    }
 
 
 def get_worktrees(cwd: Path) -> list[dict[str, str]]:

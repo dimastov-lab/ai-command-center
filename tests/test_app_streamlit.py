@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from command_center import agent_runner, execution_queue, models, project_config, report_parser, storage, task_view, workspace_home
+from command_center import agent_runner, execution_queue, git_info, models, project_config, report_parser, storage, task_view, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
 from command_center.ui import project_selector
@@ -125,6 +125,42 @@ def test_runs_page_renders_empty_state():
     at = _at_on_page("runs")
     assert not at.exception
     assert at.subheader[0].value == "Журнал запусков"
+
+
+def test_git_center_fetches_only_after_explicit_refresh(monkeypatch):
+    fetch_calls = []
+
+    def fake_fetch(path, timeout=30):
+        fetch_calls.append(path)
+        return True, ""
+
+    monkeypatch.setattr(git_info, "fetch_remotes", fake_fetch)
+    monkeypatch.setattr(
+        git_info,
+        "get_ahead_behind",
+        lambda path: {
+            "available": True,
+            "upstream": "origin/main",
+            "ahead": 2,
+            "behind": 3,
+            "error": "",
+        },
+    )
+
+    at = _at_on_page("git_center")
+    assert not at.exception
+    assert fetch_calls == []
+    assert any("ещё не обновлялись" in caption.value for caption in at.caption)
+
+    refresh = next(button for button in at.button if button.label == "Обновить")
+    at = refresh.click().run()
+
+    assert not at.exception
+    assert len(fetch_calls) == 1
+    metrics = {metric.label: metric.value for metric in at.metric}
+    assert metrics["Ahead"] == "2"
+    assert metrics["Behind"] == "3"
+    assert any("обновлено 0 мин. назад" in caption.value for caption in at.caption)
 
 
 def test_executive_dashboard_shows_run_metrics_section():
