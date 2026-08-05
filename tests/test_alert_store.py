@@ -19,10 +19,12 @@ from command_center.alert_store import (
     create_alert,
     dispose_alert,
     escalate_alert,
+    find_duplicates,
     get_alert,
     get_audit_log,
     init_db,
     list_alerts,
+    mark_duplicate,
     mark_overdue,
     start_triage,
     submit_for_review,
@@ -303,3 +305,55 @@ def test_list_alerts_filter_by_state(db: Path) -> None:
     results = list_alerts(db, state="generated")
     assert len(results) == 1
     assert results[0]["id"] == a2["id"]
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+
+def test_find_duplicates_returns_match(db: Path) -> None:
+    a1 = _make_alert(db, subject_id="cust-dup", trigger_desc="Suspicious transfer pattern")
+    matches = find_duplicates(db, subject_id="cust-dup", trigger_desc="Suspicious transfer pattern")
+    assert len(matches) == 1
+    assert matches[0]["id"] == a1["id"]
+
+
+def test_find_duplicates_case_insensitive(db: Path) -> None:
+    _make_alert(db, subject_id="cust-dup", trigger_desc="SUSPICIOUS TRANSFER PATTERN")
+    matches = find_duplicates(db, subject_id="cust-dup", trigger_desc="suspicious transfer pattern")
+    assert len(matches) == 1
+
+
+def test_find_duplicates_ignores_closed(db: Path) -> None:
+    alert = _make_alert(db, subject_id="cust-dup", trigger_desc="Suspicious transfer pattern")
+    aid = alert["id"]
+    assign_alert(db, aid, owner="Analyst", actor="Analyst")
+    start_triage(db, aid, actor="Analyst")
+    submit_for_review(db, aid, actor="Analyst", rationale="ok")
+    dispose_alert(db, aid, actor="Analyst", outcome="false_positive", rationale="x")
+
+    matches = find_duplicates(db, subject_id="cust-dup", trigger_desc="Suspicious transfer pattern")
+    assert matches == []
+
+
+def test_find_duplicates_empty_outside_window(db: Path) -> None:
+    _make_alert(db, subject_id="cust-old", trigger_desc="Old pattern")
+    matches = find_duplicates(
+        db, subject_id="cust-old", trigger_desc="Old pattern", window_days=0
+    )
+    assert matches == []
+
+
+def test_mark_duplicate_sets_field_and_audit(db: Path) -> None:
+    a1 = _make_alert(db, subject_id="cust-x", trigger_desc="Pattern A")
+    a2 = _make_alert(db, subject_id="cust-x", trigger_desc="Pattern A")
+
+    mark_duplicate(db, a2["id"], duplicate_of=a1["id"], actor="Analyst")
+
+    updated = get_alert(db, a2["id"])
+    assert updated["duplicate_of"] == a1["id"]
+
+    log = get_audit_log(db, a2["id"])
+    actions = [e["action"] for e in log]
+    assert "mark_duplicate" in actions
