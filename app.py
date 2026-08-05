@@ -40,6 +40,7 @@ from command_center.runtime import log_tail, project_overview, runs_read, schedu
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
+    alert_panel,
     aml_panel,
     autopilot_panel,
     backlog_proposals,
@@ -191,6 +192,7 @@ NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
+    "alerts": ("Алерты", ":material/notifications_active:"),
     "aml": ("AML Monitoring", ":material/policy:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
@@ -4427,6 +4429,13 @@ elif page_key == "workspace_home":
     )
     render_workspace_home_page(get_execution_center_api())
 
+
+# --------------------------------------------------------------------------
+# AML Alerts (DATA-1)
+# --------------------------------------------------------------------------
+
+elif page_key == "alerts":
+    alert_panel.render()
 
 # --------------------------------------------------------------------------
 # AML Monitoring
