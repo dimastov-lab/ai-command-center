@@ -524,12 +524,21 @@ def test_kanban_renders_blocked_and_unknown_statuses_without_rewriting_them():
 
 
 def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatch, tmp_path):
-    """`disabled=` on the launch button is the primary gate, but
-    `streamlit.testing.v1.AppTest.click()` does not itself respect
-    `disabled` (it drives the widget's simulated state directly) — so this
-    test forces the click a real disabled button in a browser could never
-    receive, to prove the server-side `validation.can_launch` re-check
-    (not just the widget attribute) is what actually stops the launch."""
+    """A forged click on the disabled launch button must never launch anything.
+
+    Layered gate, outermost first: streamlit >= 1.61 enforces `disabled`
+    server-side — an incoming widget value for a disabled widget is discarded
+    at registration against the *current* run's `disabled=` predicate
+    (`streamlit/runtime/state/widgets.py`, guarding against forged BackMsg
+    values), so the forced `.click()` below is inert before app code even sees
+    it. The app's own `prep.launchable` re-check ("Запуск заблокирован ошибками
+    валидации выше") stays in `app.py` as defense in depth for the day the
+    `disabled=` predicate and the launch conditions diverge, but while they
+    match it is unreachable by any client message — on streamlit < 1.61 (where
+    AppTest forged clicks did land) it was the layer this test exercised
+    directly. Either way the observable invariant asserted here is the same:
+    the forced click launches nothing and the blocking validation error stays
+    on screen."""
 
     real_run = subprocess.run
 
@@ -565,7 +574,12 @@ def test_kanban_launcher_blocking_validation_error_cannot_be_bypassed(monkeypatc
     at = launch_button.click().run()
     assert not at.exception
     assert agent_runner.load_runs() == []  # the forced click must not have launched anything
-    assert any("заблокирован" in e.value for e in at.error)
+    # The dialog re-renders with the same fatal validation error and the gate
+    # still engaged — the forged click changed nothing. (No assertion on the
+    # app-level "Запуск заблокирован" message: on streamlit >= 1.61 the forged
+    # click is discarded by the framework before that re-check can run.)
+    assert any("не найден" in e.value for e in at.error)
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
 
 
 # --------------------------------------------------------------------------
