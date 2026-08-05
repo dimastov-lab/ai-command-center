@@ -42,6 +42,7 @@ from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
     alert_panel,
     aml_panel,
+    case_panel,
     customer_panel,
     rules_panel,
     autopilot_panel,
@@ -197,6 +198,7 @@ NAV: dict[str, tuple[str, str]] = {
     "alerts": ("Алерты", ":material/notifications_active:"),
     "customers": ("Клиенты", ":material/people:"),
     "rules": ("Правила AML", ":material/gavel:"),
+    "cases": ("Дела AML", ":material/folder_special:"),
     "aml": ("AML Monitoring", ":material/policy:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
@@ -4454,6 +4456,13 @@ elif page_key == "customers":
 
 elif page_key == "rules":
     rules_panel.render()
+
+# --------------------------------------------------------------------------
+# AML Cases
+# --------------------------------------------------------------------------
+
+elif page_key == "cases":
+    case_panel.render()
 
 # --------------------------------------------------------------------------
 # AML Monitoring
