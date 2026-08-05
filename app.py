@@ -45,6 +45,7 @@ from command_center.ui import (
     case_panel,
     customer_panel,
     rules_panel,
+    sar_panel,
     autopilot_panel,
     backlog_proposals,
     backlog_reconcile_panel,
@@ -199,6 +200,7 @@ NAV: dict[str, tuple[str, str]] = {
     "customers": ("Клиенты", ":material/people:"),
     "rules": ("Правила AML", ":material/gavel:"),
     "cases": ("Дела AML", ":material/folder_special:"),
+    "sar": ("SAR", ":material/report:"),
     "aml": ("AML Monitoring", ":material/policy:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
@@ -4463,6 +4465,13 @@ elif page_key == "rules":
 
 elif page_key == "cases":
     case_panel.render()
+
+# --------------------------------------------------------------------------
+# SAR Filing
+# --------------------------------------------------------------------------
+
+elif page_key == "sar":
+    sar_panel.render()
 
 # --------------------------------------------------------------------------
 # AML Monitoring
