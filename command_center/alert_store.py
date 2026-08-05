@@ -12,7 +12,7 @@ from typing import Iterator
 from command_center import storage
 
 ROOT = Path(__file__).resolve().parent.parent
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 ROLES: tuple[str, ...] = ("Analyst", "SeniorAnalyst", "ComplianceOfficer", "MLRO")
 OUTCOME_VALUES: tuple[str, ...] = (
@@ -160,10 +160,29 @@ def init_db(db_path: Path) -> None:
     finally:
         connection.close()
 
+    # Run migrations on a separate connection (executescript commits its own txn)
+    conn2 = sqlite3.connect(db_path, timeout=5)
+    conn2.row_factory = sqlite3.Row
+    try:
+        _migrate(conn2)
+        conn2.commit()
+    finally:
+        conn2.close()
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Run forward migrations from current schema_version to SCHEMA_VERSION."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < 2:
+        conn.execute(
+            "ALTER TABLE alerts ADD COLUMN duplicate_of TEXT"
+        )
+        conn.execute("PRAGMA user_version = 2")
 
 
 def _utcnow() -> str:
@@ -471,3 +490,61 @@ def get_audit_log(db_path: Path, alert_id: str) -> list[dict]:
             (alert_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def find_duplicates(
+    db_path: Path,
+    *,
+    subject_id: str,
+    trigger_desc: str,
+    window_days: int = 30,
+) -> list[dict]:
+    """Return open alerts with matching subject and trigger within the window.
+
+    Matching: same subject_id AND trigger_desc first-50-chars case-insensitive.
+    Excludes closed/archived alerts.
+    """
+    cutoff = (
+        __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        - __import__("datetime").timedelta(days=window_days)
+    ).isoformat()
+    prefix = trigger_desc[:50].lower()
+    with _db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM alerts
+             WHERE subject_id = ?
+               AND LOWER(SUBSTR(trigger_desc, 1, 50)) = ?
+               AND state NOT IN ('closed', 'archived')
+               AND created_at >= ?
+             ORDER BY created_at DESC
+            """,
+            (subject_id, prefix, cutoff),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_duplicate(
+    db_path: Path,
+    alert_id: str,
+    *,
+    duplicate_of: str,
+    actor: str,
+) -> None:
+    """Mark alert_id as a duplicate of duplicate_of. Writes audit log entry."""
+    with _db(db_path) as conn:
+        row = conn.execute(
+            "SELECT id FROM alerts WHERE id=?", (alert_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(alert_id)
+        conn.execute(
+            "UPDATE alerts SET duplicate_of=?, updated_at=? WHERE id=?",
+            (duplicate_of, _utcnow(), alert_id),
+        )
+        conn.execute(
+            "INSERT INTO alert_audit_log"
+            "(alert_id,action,actor,old_state,new_state,rationale,ts)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (alert_id, "mark_duplicate", actor, None, None, f"duplicate_of={duplicate_of}", _utcnow()),
+        )
