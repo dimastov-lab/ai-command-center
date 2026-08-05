@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Данные (монтируются как том)
+data/
+
+# Тесты и разработка
+tests/
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Документация (не нужна в образе)
+docs/
+*.md
+!README.md
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Среда разработки
+.env
+.env.*
+*.local
+
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Packaging (сборка desktop-клиентов)
+packaging/
+deploy/
+
+# Прочие проектные директории
+archive/
+context/
+daily/
+generated/
+projects/
+prompts/
+reports/
+roadmap/
+scripts/
+templates/
+web/
+
+# Логи
+*.log
+
+# Lock-файлы (кроме requirements.txt)
+uv.lock
