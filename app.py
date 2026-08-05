@@ -43,6 +43,7 @@ from command_center.ui import (
     alert_panel,
     aml_panel,
     case_panel,
+    compliance_dashboard,
     customer_panel,
     rules_panel,
     sar_panel,
@@ -196,6 +197,7 @@ NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
+    "compliance": ("Compliance Dashboard", ":material/security:"),
     "alerts": ("Алерты", ":material/notifications_active:"),
     "customers": ("Клиенты", ":material/people:"),
     "rules": ("Правила AML", ":material/gavel:"),
@@ -4389,6 +4391,9 @@ elif page_key == "workspace_home":
 # --------------------------------------------------------------------------
 # AML Alerts (DATA-1)
 # --------------------------------------------------------------------------
+
+elif page_key == "compliance":
+    compliance_dashboard.render()
 
 elif page_key == "alerts":
     alert_panel.render()
