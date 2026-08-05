@@ -43,6 +43,7 @@ from command_center.ui import (
     alert_panel,
     aml_panel,
     customer_panel,
+    rules_panel,
     autopilot_panel,
     backlog_proposals,
     backlog_reconcile_panel,
@@ -195,6 +196,7 @@ NAV: dict[str, tuple[str, str]] = {
     "executive": ("Исполнительная панель", ":material/insights:"),
     "alerts": ("Алерты", ":material/notifications_active:"),
     "customers": ("Клиенты", ":material/people:"),
+    "rules": ("Правила AML", ":material/gavel:"),
     "aml": ("AML Monitoring", ":material/policy:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
@@ -4445,6 +4447,13 @@ elif page_key == "alerts":
 
 elif page_key == "customers":
     customer_panel.render()
+
+# --------------------------------------------------------------------------
+# AML Rules
+# --------------------------------------------------------------------------
+
+elif page_key == "rules":
+    rules_panel.render()
 
 # --------------------------------------------------------------------------
 # AML Monitoring
