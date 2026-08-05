@@ -179,9 +179,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """Run forward migrations from current schema_version to SCHEMA_VERSION."""
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version < 2:
-        conn.execute(
-            "ALTER TABLE alerts ADD COLUMN duplicate_of TEXT"
-        )
+        # Check if column already exists before adding (idempotent)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+        if "duplicate_of" not in cols:
+            conn.execute("ALTER TABLE alerts ADD COLUMN duplicate_of TEXT")
         conn.execute("PRAGMA user_version = 2")
 
 
