@@ -40,7 +40,13 @@ from command_center.runtime import log_tail, project_overview, runs_read, schedu
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
+    alert_panel,
     aml_panel,
+    case_panel,
+    compliance_dashboard,
+    customer_panel,
+    rules_panel,
+    sar_panel,
     autopilot_panel,
     backlog_proposals,
     backlog_reconcile_panel,
@@ -191,6 +197,12 @@ NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
+    "compliance": ("Compliance Dashboard", ":material/security:"),
+    "alerts": ("Алерты", ":material/notifications_active:"),
+    "customers": ("Клиенты", ":material/people:"),
+    "rules": ("Правила AML", ":material/gavel:"),
+    "cases": ("Дела AML", ":material/folder_special:"),
+    "sar": ("SAR", ":material/report:"),
     "aml": ("AML Monitoring", ":material/policy:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
@@ -4375,6 +4387,44 @@ elif page_key == "workspace_home":
     )
     render_workspace_home_page(get_execution_center_api())
 
+
+# --------------------------------------------------------------------------
+# AML Alerts (DATA-1)
+# --------------------------------------------------------------------------
+
+elif page_key == "compliance":
+    compliance_dashboard.render()
+
+elif page_key == "alerts":
+    alert_panel.render()
+
+# --------------------------------------------------------------------------
+# AML Customers & Risk
+# --------------------------------------------------------------------------
+
+elif page_key == "customers":
+    customer_panel.render()
+
+# --------------------------------------------------------------------------
+# AML Rules
+# --------------------------------------------------------------------------
+
+elif page_key == "rules":
+    rules_panel.render()
+
+# --------------------------------------------------------------------------
+# AML Cases
+# --------------------------------------------------------------------------
+
+elif page_key == "cases":
+    case_panel.render()
+
+# --------------------------------------------------------------------------
+# SAR Filing
+# --------------------------------------------------------------------------
+
+elif page_key == "sar":
+    sar_panel.render()
 
 # --------------------------------------------------------------------------
 # AML Monitoring

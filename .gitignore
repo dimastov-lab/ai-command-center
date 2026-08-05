@@ -23,6 +23,7 @@ data/runtime.db-shm
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/*.db-journal
 
 # Transient AI task artifacts and agent reports generated at runtime
 # (scripts/start-task.sh and the v1.2 Claude Code runner)

@@ -15,6 +15,7 @@ STATUS_LABELS = {
     "escalated": "Эскалирован",
     "waiting": "Ожидает данных",
     "closed": "Закрыт",
+    "reported": "Сообщение утверждено",
 }
 RISK_COLORS = {"critical": "red", "high": "orange", "medium": "blue"}
 
@@ -108,6 +109,12 @@ def _money(case: dict[str, Any]) -> str:
     return f"{case['amount']:,.0f} {case['currency']}".replace(",", " ")
 
 
+def _open_investigation(case_id: str) -> None:
+    """Select a case before the AML view widget is recreated on rerun."""
+    st.session_state.aml_investigation_case = case_id
+    st.session_state.aml_view = "investigation"
+
+
 def _init_state() -> None:
     aml_store.seed_cases(DEMO_CASES)
     st.session_state.setdefault("aml_actor", "AML Analyst")
@@ -190,7 +197,7 @@ def _approve_sar_dialog(sar: dict[str, Any]) -> None:
 
 
 def _render_metrics(cases: list[dict[str, Any]]) -> None:
-    open_cases = [case for case in cases if case["status"] not in {"closed", "escalated"}]
+    open_cases = [case for case in cases if case["status"] not in {"closed", "reported"}]
     with st.container(horizontal=True):
         st.metric("Открытые алерты", len(open_cases), "+2 сегодня", border=True, chart_data=[3, 4, 3, 5, 4, 6, len(open_cases)])
         st.metric("Критические", sum(case["risk"] == "critical" for case in cases), "требуют внимания", border=True)
@@ -222,7 +229,7 @@ def _render_overview(cases: list[dict[str, Any]]) -> None:
         with st.container(border=True):
             st.markdown("#### Приоритетная очередь")
             priority = sorted(
-                (case for case in cases if case["status"] != "closed"),
+                (case for case in cases if case["status"] not in {"closed", "reported"}),
                 key=lambda case: case["score"],
                 reverse=True,
             )
@@ -232,7 +239,7 @@ def _render_overview(cases: list[dict[str, Any]]) -> None:
             st.markdown("#### Этапы процесса")
             stage_counts = [
                 {"Этап": STATUS_LABELS[status], "Кейсы": sum(case["status"] == status for case in cases)}
-                for status in ("new", "review", "waiting", "escalated", "closed")
+                for status in ("new", "review", "waiting", "escalated", "reported", "closed")
             ]
             st.bar_chart(stage_counts, x="Этап", y="Кейсы", horizontal=True)
     with st.container(border=True):
@@ -267,10 +274,14 @@ def _render_queue(cases: list[dict[str, Any]]) -> None:
         key="aml_selected_case", persist_state="session",
     )
     with st.container(horizontal=True):
-        if st.button("Перейти к расследованию", type="primary", icon=":material/manage_search:", key="aml_open_investigation"):
-            st.session_state.aml_investigation_case = selected_id
-            st.session_state.aml_view = "investigation"
-            st.rerun()
+        st.button(
+            "Перейти к расследованию",
+            type="primary",
+            icon=":material/manage_search:",
+            key="aml_open_investigation",
+            on_click=_open_investigation,
+            args=(selected_id,),
+        )
         st.caption("Выбранный кейс сохранится при переходе между окнами.")
 
 
@@ -324,6 +335,7 @@ def _render_investigation(cases: list[dict[str, Any]]) -> None:
         persist_state="session",
     )
     case = next(case for case in cases if case["id"] == selected_id)
+    case_sar = next((sar for sar in aml_store.list_sar() if sar["case_id"] == case["id"]), None)
     st.divider()
     header, score = st.columns([4, 1])
     with header:
@@ -354,14 +366,17 @@ def _render_investigation(cases: list[dict[str, Any]]) -> None:
                          disabled=case["status"] != "new" or st.session_state.aml_role != "Analyst"):
                 _apply_action(case, "assign", note)
             if st.button("Запросить документы", width="stretch", key=f"aml_request_{case['id']}",
-                         disabled=case["status"] in {"closed", "escalated"} or st.session_state.aml_role != "Analyst"):
+                         disabled=case["status"] != "review" or st.session_state.aml_role != "Analyst"):
                 _apply_action(case, "documents", note)
             if st.button("Эскалировать MLRO", width="stretch", key=f"aml_escalate_{case['id']}",
-                         disabled=case["status"] in {"closed", "escalated"} or st.session_state.aml_role != "Analyst"):
+                         disabled=case["status"] not in {"review", "waiting"} or st.session_state.aml_role != "Analyst"):
                 _critical_action_dialog(case, "escalate", "Подтвердить эскалацию MLRO", note)
             if st.button("Закрыть без сообщения", width="stretch", key=f"aml_close_{case['id']}",
-                         disabled=case["status"] == "closed" or st.session_state.aml_role != "MLRO"):
+                         disabled=case["status"] != "escalated" or case_sar is not None
+                         or st.session_state.aml_role != "MLRO"):
                 _critical_action_dialog(case, "close", "Подтвердить закрытие кейса", note)
+            if case_sar is not None:
+                st.caption(f"Связанное сообщение: {case_sar['id']} · {case_sar['status']}")
     st.markdown("##### Хронология кейса")
     events = aml_store.list_audit_events(case["id"])
     st.dataframe(events, hide_index=True, key=f"aml_case_timeline_{case['id']}",
@@ -373,11 +388,14 @@ def _render_reporting(cases: list[dict[str, Any]]) -> None:
     st.markdown("#### Отчётность и контроль")
     report, controls = st.tabs(["Регуляторная отчётность", "Правила мониторинга"])
     with report:
+        sar_drafts = aml_store.list_sar()
+        cases_with_sar = {sar["case_id"] for sar in sar_drafts}
         escalated = [case for case in cases if case["status"] == "escalated"]
+        eligible = [case for case in escalated if case["id"] not in cases_with_sar]
         st.metric("На решении MLRO", len(escalated), border=True)
-        if escalated:
+        if eligible:
             st.dataframe(_case_rows(escalated), hide_index=True, key="aml_reporting_cases")
-            selected = st.selectbox("Кейс для черновика", [case["id"] for case in escalated], key="aml_sar_case")
+            selected = st.selectbox("Кейс для черновика", [case["id"] for case in eligible], key="aml_sar_case")
             with st.form("aml_sar_form"):
                 rationale = st.text_area("Основание для сообщения", placeholder="Опишите подозрительную активность и связь операций…")
                 filing_type = st.selectbox("Тип", ["SAR / STR", "Внутреннее уведомление MLRO"])
@@ -396,9 +414,10 @@ def _render_reporting(cases: list[dict[str, Any]]) -> None:
                 else:
                     st.success("Черновик сохранён в постоянном AML-хранилище.")
                     st.rerun()
-        else:
+        elif not escalated:
             st.info("Нет кейсов, эскалированных для решения MLRO.")
-        sar_drafts = aml_store.list_sar()
+        else:
+            st.info("Для всех эскалированных кейсов уже созданы сообщения.")
         if sar_drafts:
             st.markdown("##### Черновики")
             st.dataframe(sar_drafts, hide_index=True, key="aml_sar_drafts")
@@ -433,18 +452,20 @@ def render() -> None:
     st.subheader("AML Monitoring")
     st.caption("Мониторинг транзакций, расследования и регуляторная отчётность · SQLite AML store")
     st.info(
-        "Рабочий прототип с постоянным локальным хранилищем. Внешние банковские системы пока не подключены.",
+        "Рабочий прототип с синтетическими данными и локальным хранилищем. "
+        "Роль и пользователь ниже — только симуляция, не authentication/RBAC. "
+        "Внешние банковские системы не подключены.",
         icon=":material/shield:",
     )
     identity = st.columns([2, 2, 3])
     identity[0].selectbox(
-        "Роль",
+        "Роль (симуляция)",
         aml_store.ROLES,
         key="aml_role",
         persist_state="session",
         help="Права действий проверяются повторно в AML repository.",
     )
-    identity[1].text_input("Пользователь", key="aml_actor", persist_state="session")
+    identity[1].text_input("Пользователь (демо)", key="aml_actor", persist_state="session")
     identity[2].caption(
         "Analyst расследует и эскалирует · MLRO принимает финальные решения. "
         "Критические действия требуют отдельного подтверждения."
