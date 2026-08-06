@@ -64,6 +64,12 @@ functional application milestones of `app.py`.
 - **Runtime documentation**: README, current-state, architecture, changelog, and ADR 0005 are
   reconciled with schema 11, queue locking, workspace provisioning, scheduler and autonomy
   boundaries, and CI.
+- **Per-warning launch confirmation** (Founder audit MAJOR-4): the launch confirmation dialog no
+  longer clears a dirty working tree and a branch mismatch with one shared "подтверждаю несмотря на
+  предупреждения" checkbox. Each warning now renders its own acknowledgement, keyed by its stable
+  issue code, and the launch stays blocked — button `disabled=` plus the server-side re-check —
+  until every one is ticked. Acknowledgements are also cleared each time the dialog is opened, so a
+  previous launch's confirmations are never inherited.
 
 ### Portfolio Execution and Intelligence
 

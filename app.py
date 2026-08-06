@@ -668,6 +668,17 @@ def render_agent_launcher(
     st.session_state.setdefault(confirm_key, False)
 
     if st.button("Запустить агента", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
+        # Every launch is confirmed from scratch: a previous dialog's ticked
+        # acknowledgements must never carry over into a new one, or an
+        # operator would silently inherit a "yes, launch on the wrong branch"
+        # from a state of the repository that no longer holds.
+        for stale_key in [
+            key
+            for key in st.session_state
+            if isinstance(key, str) and key.startswith(f"{key_prefix}_ack_")
+        ]:
+            del st.session_state[stale_key]
+        st.session_state.pop(f"{key_prefix}_confirmed", None)
         st.session_state[confirm_key] = True
 
     if not st.session_state[confirm_key]:
@@ -826,12 +837,27 @@ def render_agent_launcher(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
         )
-        warnings_ack = True
-        if validation.warnings:
-            warnings_ack = st.checkbox(
-                "Я подтверждаю запуск несмотря на предупреждения выше.",
-                key=f"{key_prefix}_warnings_ack",
-            )
+
+        # One acknowledgement per warning, keyed by its stable `code` — never a
+        # single collective "подтверждаю несмотря на предупреждения" checkbox.
+        # A branch mismatch and a dirty working tree are independent hazards
+        # (agent runs on the wrong branch vs. agent edits on top of
+        # uncommitted work); the shared checkbox let an operator who had only
+        # noticed one of them dismiss both in a single click, which is exactly
+        # the accidental launch this gate exists to prevent.
+        acknowledged: set[str] = set()
+        warning_issues = validation.warning_issues
+        if warning_issues:
+            st.markdown("**Подтвердите каждое предупреждение отдельно:**")
+        for issue in warning_issues:
+            if st.checkbox(
+                launch.warning_ack_label(issue),
+                key=f"{key_prefix}_ack_{issue.code}",
+            ):
+                acknowledged.add(issue.code)
+            st.caption(issue.message)
+        unacknowledged = validation.unacknowledged_warning_codes(acknowledged)
+
         action_cols = st.columns(2)
         with action_cols[0]:
             launch_clicked = st.button(
@@ -843,7 +869,7 @@ def render_agent_launcher(
                     # `prep.launchable` supersedes the raw `validation.can_launch`:
                     # a missing-but-provisionable workspace is launchable.
                     or not prep.launchable
-                    or not warnings_ack
+                    or bool(unacknowledged)
                     or not bool(provider_availability and provider_availability.available)
                 ),
                 icon=":material/play_arrow:",
@@ -882,8 +908,16 @@ def render_agent_launcher(
         if not prep.launchable:
             st.error("Запуск заблокирован ошибками валидации выше — сначала устраните их.")
             return
-        if validation.warnings and not warnings_ack:
-            st.error("Подтвердите предупреждения выше перед запуском.")
+        if not confirmed:
+            st.error("Подтвердите запуск внешнего агента перед запуском.")
+            return
+        if unacknowledged:
+            missing = "; ".join(
+                launch.warning_ack_label(issue)
+                for issue in warning_issues
+                if issue.code in unacknowledged
+            )
+            st.error(f"Не подтверждены все предупреждения — запуск заблокирован: {missing}")
             return
 
         # `selection.path` was already validated above (existence, is_dir,
@@ -894,9 +928,9 @@ def render_agent_launcher(
         resolved_workspace = Path(selection.path).expanduser().resolve()
 
         # Real, PID-tracked, cancellable v2 run — not a blocking call. The
-        # button click above already re-validated `confirmed`/`warnings_ack`
-        # server-side, so `confirmed=True` here reflects a genuine, already-
-        # checked confirmation, not a bypass of it.
+        # button click above already re-validated `confirmed` and every
+        # per-warning acknowledgement server-side, so `confirmed=True` here
+        # reflects a genuine, already-checked confirmation, not a bypass of it.
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=project,
@@ -3423,8 +3457,75 @@ def _quick_action_view_run(source: str, run_id: str) -> None:
         st.session_state.pending_nav = "runs"
 
 
-def render_workspace_home_page(api: runtime_api.ExecutionCenterAPI) -> None:
+def render_project_planning_intelligence(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    *,
+    selector_key: str,
+    recommendation_key_prefix: str,
+    backlog_reconcile_key_prefix: str | None = None,
+) -> str | None:
+    """Render the shared founder health/recommendation surface.
+
+    Workspace Home and Kanban deliberately delegate to the same component
+    functions here so their metrics, scoring, queue state, and launch behavior
+    cannot drift into separate implementations: the numbers come from
+    `project_intelligence.compute_project_intelligence` and the cards from
+    `recommendation_service.build_recommendation_views` on *both* pages, so
+    there is exactly one implementation of each to keep correct.
+
+    Only the Streamlit widget-key namespace differs per host page — each caller
+    passes its own prefixes so the two pages' pills/buttons never collide on
+    widget identity. `backlog_reconcile_key_prefix` is opt-in: backlog
+    reconciliation is a Kanban-only planning tool, not part of the founder
+    health/recommendation surface Workspace Home is meant to mirror.
+    """
+    project_filter = project_selector.render_project_selector(tasks, key=selector_key)
+    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
+    st.divider()
+
+    project_configs = project_config.load_project_configs()
+    with st.expander(
+        "Планирование и рекомендации",
+        icon=":material/auto_awesome:",
+        expanded=False,
+    ):
+        recommendations_panel.render_recommendations_panel(
+            tasks,
+            tasks_by_id,
+            ROOT,
+            api,
+            project_configs,
+            upsert_tasks,
+            project=project_filter,
+            key_prefix=recommendation_key_prefix,
+        )
+        if backlog_reconcile_key_prefix is not None:
+            backlog_reconcile_panel.render_backlog_reconcile_panel(
+                tasks,
+                ROOT,
+                project=project_filter,
+                key_prefix=backlog_reconcile_key_prefix,
+            )
+    return project_filter
+
+
+def render_workspace_home_page(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+) -> None:
     snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
+
+    render_project_planning_intelligence(
+        api,
+        tasks,
+        tasks_by_id,
+        selector_key="workspace_home_project_selector",
+        recommendation_key_prefix="workspace_home_reco",
+    )
+    st.divider()
 
     with st.container(horizontal=True):
         st.metric("Проекты", len(snapshot["projects"]), border=True)
@@ -4426,7 +4527,7 @@ if page_key == "dashboard":
     if dashboard_section == "Аналитика":
         render_dashboard_analytics(dashboard_api, tasks, tasks_by_id, task_counts)
     elif dashboard_section == "Репозитории и артефакты":
-        render_workspace_home_page(dashboard_api)
+        render_workspace_home_page(dashboard_api, tasks, tasks_by_id)
     else:
         render_home_dashboard(dashboard_api, tasks, task_counts)
 
@@ -4439,9 +4540,9 @@ elif page_key == "workspace_home":
     content_area.page_header(
         "Workspace Home",
         "Кросс-проектная сводка: репозитории, прогоны, артефакты и отчёты — "
-        "в одном месте, только для чтения.",
+        "в одном месте, с health-метриками и рекомендациями следующих действий.",
     )
-    render_workspace_home_page(get_execution_center_api())
+    render_workspace_home_page(get_execution_center_api(), tasks, tasks_by_id)
 
 
 # --------------------------------------------------------------------------
@@ -4898,29 +4999,14 @@ elif page_key == "waves":
 elif page_key == "kanban":
     st.subheader("Kanban", anchor="kanban")
 
-    project_filter = project_selector.render_project_selector(tasks, key="kanban_project_selector")
-    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
-    st.divider()
-
-    project_configs = project_config.load_project_configs()
-    with st.expander(
-        "Планирование и рекомендации",
-        icon=":material/auto_awesome:",
-        expanded=False,
-    ):
-        recommendations_panel.render_recommendations_panel(
-            tasks,
-            tasks_by_id,
-            ROOT,
-            get_execution_center_api(),
-            project_configs,
-            upsert_tasks,
-            project=project_filter,
-            key_prefix="kanban_reco",
-        )
-        backlog_reconcile_panel.render_backlog_reconcile_panel(
-            tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
-        )
+    project_filter = render_project_planning_intelligence(
+        get_execution_center_api(),
+        tasks,
+        tasks_by_id,
+        selector_key="kanban_project_selector",
+        recommendation_key_prefix="kanban_reco",
+        backlog_reconcile_key_prefix="kanban_reconcile",
+    )
     st.divider()
 
     # Options come from the tasks themselves (canonical priorities + any
