@@ -154,6 +154,74 @@ merged into the target branch". See `docs/adr/0004-autonomous-task-completion-pi
 - **`scripts/demo_completion_pipeline.py`**: deterministic Scenario A/B/C demonstration against
   real git + a fake GitHub client.
 
+### Project registry governance (ADR 0009/0010)
+
+#### Added
+
+- **Canonical project registry** (`models.PROJECT_IDS`): eleven ids — `AICC`, `AIOS`, `AICOS`,
+  `PRODUCT`, `ECOSYSTEM`, `ESF`, `AML`, `BANK`, `LEGAL`, `BUSINESS`, `PERSONAL`. `ESF` and `AML`
+  were added by commit `a20add0`; ADR 0009 established the nine-id baseline and the validating
+  import pipeline; ADR 0010 ratifies the expansion, adds task-id authoring rules (R1–R5), and
+  draws the roadmap-authority boundary at the architecture tier. `SENSITIVE_PROJECT_IDS = {BANK,
+  LEGAL}` is a registry property, not a separate list; `AML` is deliberately excluded (compliance
+  domain ≠ sensitive founder material).
+- **Validating task-import pipeline** (`command_center/task_import.py`,
+  `scripts/import_tasks.py`): four-stage parse → validate → preview → apply. Every `project`
+  value is normalized through `normalize_project_id` (fail-to-`None`, never guesses); a single
+  unresolvable value rejects the whole package; `apply` holds `tasks.lock` across its full
+  load-transform-save span so it races no other task-writing path. `normalize_project_id` folds
+  case and whitespace only — underscores are not folded, `AI_COMMAND_CENTER`/`AIOS_PRODUCT` do
+  not resolve.
+- **Architecture fitness gate** (`tests/architecture/test_project_id_authoring.py`,
+  `tests/architecture/project_ids.py`, `arch-fitness.yml`): CI fails when the ADR 0010 registry
+  table and `models.py`/`project_config.DISPLAY_NAMES`/`SENSITIVE_PROJECT_IDS` disagree, when
+  the task-id grammar regex changes, when program and master roadmap packages mint a colliding ID,
+  or when the alias table is widened to admit `AI_COMMAND_CENTER`, `AIOS_PRODUCT`, `PORTFOLIO`,
+  or `PLATFORM`. Runs alongside the ADR 0008 AIOS-boundary gate in `arch-fitness.yml`.
+- **AIOS boundary fitness gate** (`tests/architecture/test_aios_boundary_fitness.py`,
+  `arch-fitness.yml`): enforces the `command_center/aios_sdk/` import boundary declared in
+  ADR 0008; updated baseline in `tests/architecture/AIOS_BOUNDARY_BASELINE.json`.
+
+### AML Service integration (Phases 1–7)
+
+Full AML Governance Platform merged into `main` from branch `feat/aml` (commit `0654c56`):
+
+#### Added
+- **Phase 1** — Data layer and alert-disposition API (customers, risk profiles, alerts, dispositions).
+- **Phase 2** — Customer panel, KYC, risk scoring, Risk→Alert promotion.
+- **Phase 3** — Rule engine, evidence store, 115-ФЗ country pack.
+- **Phase 4** — Case management.
+- **Phase 5** — SAR filing workflow.
+- **Phase 6** — Compliance dashboard.
+- **Phase 7** — Docker Compose stack and банковский acceptance package.
+
+`AML` is now a live project-registry entry with tasks, a `project_config.json` entry, and a
+`projects/AML.md` status file. The AML service is a separate product tracked by AICC, not an
+AICOS sub-track; it has its own repository at `~/Projects/aml` (or configured in
+`data/project_config.json`).
+
+### Desktop Increment 2 design (D2)
+
+#### Added
+- **D2 native Workspace Home design spec** (`docs/desktop/D2_NATIVE_WORKSPACE_HOME_DESIGN.md`,
+  commit `d2bed25`): the target architecture for the native data-adapter layer, Workspace Home
+  Qt widget, async worker framework, and edge-state/accessibility handling. Companion to the
+  existing D1 implementation and the `MASTER_PRODUCT_ROADMAP.md` D2A–D2-GATE row sequence.
+- **D2 implementation plan** (`docs/desktop/D2_NATIVE_WORKSPACE_HOME_IMPL_PLAN.md`, commit
+  `c784ee2`): five TDD tasks (`AICC-D2A`–`AICC-D2-GATE`) with PR boundaries, test-first
+  acceptance criteria, and sequencing constraints. Documentation only — no D2 code, dependencies,
+  or data-adapter implementation yet. Next: `AICC-D2A` (Application service adapter).
+
+### Canonical attention count (D5)
+
+#### Fixed
+- **Single-source execution counts** (`command_center/read_model.py`,
+  `command_center/ui/execution_metrics.py`, commit `a3f3899`): `read_model.superseded_run_ids`,
+  `completed_task_run_ids`, and `execution_metrics.actionable_board` are now the shared authority
+  for attention/waiting/live counts. The execution strip, the AI-Supervisor caption, and the
+  top-bar glyph previously computed three independent (and often disagreeing) numbers; they now
+  derive from one function, so "Requires Attention: 97 / 0 / 4" on one screen is impossible.
+
 ### Desktop Architecture D0
 
 #### Added

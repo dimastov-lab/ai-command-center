@@ -15,12 +15,12 @@ single-host control plane whose durable state is local to the machine running St
 
 | Classification | Capabilities |
 |---|---|
-| Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; current JSON/JSONL project-chat and activity stores; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; fail-closed task-workspace provisioning and verification; a persisted execution queue whose application-owned mutations are locked; Portfolio parsing, intelligence, and guarded worktree launch; completion-state seeding and read-only completion status |
+| Implemented and enabled by default | Streamlit UI; planning and Kanban; project context, reports, and generated-task views; current JSON/JSONL project-chat and activity stores; asynchronous local Claude CLI execution; persisted run events; cancellation and timeouts; fail-closed task-workspace provisioning and verification; a persisted execution queue whose application-owned mutations are locked; Portfolio parsing, intelligence, and guarded worktree launch; completion-state seeding and read-only completion status; canonical eleven-project registry (`models.PROJECT_IDS`, ADR 0009/0010) with a validating four-stage task-import pipeline |
 | Implemented service/API foundations, not autonomously driven | Deterministic read-only scheduling decisions through `ExecutionCenterAPI.plan_schedule`; persisted, evidence-backed autonomy proposals through the runtime API/domain layer, surfaced in an operator approve/reject inbox (`ui/proposals_panel.py`). Neither capability has a background task driver, durable scheduling claim/lease, or automatic dispatcher |
 | Implemented but opt-in | Completion autopilot through `AICC_COMPLETION_AUTOPILOT`; OpenAI project-chat provider when its package and environment variables are supplied; project-specific completion policies that permit automatic merge or recovery |
 | Legacy but still present | Synchronous Claude execution; `runs.jsonl` run journal; generated-task shell workflow |
-| Partially implemented | Native PySide6 desktop client: Desktop Increment 1 (the `command_center.desktop` shell — navigation, theming, settings/geometry persistence, pytest-qt tested) has shipped; its data-adapter, platform-abstraction, and native-packaging increments have not |
-| Designed or planned, not implemented | Native desktop data wiring and packaging; distributed execution; durable remote workers; seamless attachment to a subprocess after the hosting Python process restarts |
+| Partially implemented | Native PySide6 desktop client: Desktop Increment 1 D1 sub-increments (`AICC-D1A`/`D1B`/`D1C` — dependency skeleton, main window, navigation/themes) are Done; the D1 cross-platform gate (`AICC-D1-GATE`) is in Review pending a Windows 11 pass. D2 (data-adapter and Workspace Home), D3 (Projects/Settings), and D4 (macOS/Windows packaging) are designed but not yet implemented. The live shell (`command_center.desktop`) is pytest-qt tested with 28 passing tests on macOS Apple Silicon |
+| Designed or planned, not implemented | D2–D4 native desktop data wiring, native Workspace Home, platform integration, and packaging; distributed execution; durable remote workers; seamless subprocess reattachment |
 
 Normal task launches require an explicit user action and confirmation. The scheduling API can
 return advisory `ASSIGN`, `DEFER`, or `BLOCKED` decisions from a point-in-time snapshot, but it
@@ -93,6 +93,40 @@ Like the Streamlit UI, the web dashboard binds to `localhost` only and has no
 authentication layer, so it must not be exposed beyond the local machine. It
 honors an existing `AICC_DATA_DIR` override the same way the rest of the
 application does; the launch script does not set or change it.
+
+## Project registry
+
+`command_center/models.py` is the single canonical source for the eleven project IDs that scope
+every Kanban task, metric, completion policy, and sensitivity-redaction decision in this
+application:
+
+| ID | Display name | Sensitive |
+|---|---|---|
+| `AICC` | AI Command Center | |
+| `AIOS` | AIOS | |
+| `AICOS` | AICOS | |
+| `PRODUCT` | AIOS Product | |
+| `ECOSYSTEM` | Ecosystem | |
+| `ESF` | ESF Enterprise Platform | |
+| `AML` | AML Governance Platform | |
+| `BANK` | Bank Strategy | **yes** |
+| `LEGAL` | Legal | **yes** |
+| `BUSINESS` | Business | |
+| `PERSONAL` | Personal | |
+
+Any document that disagrees with `models.PROJECT_IDS` is stale and must be corrected against
+the code — never the reverse. Registry changes require a new ADR (see
+[`docs/adr/0009-canonical-project-registry-and-validating-task-import.md`](docs/adr/0009-canonical-project-registry-and-validating-task-import.md)
+and
+[`docs/adr/0010-project-id-authoring-and-roadmap-authority.md`](docs/adr/0010-project-id-authoring-and-roadmap-authority.md)).
+`SENSITIVE_PROJECT_IDS = {BANK, LEGAL}` governs redaction on every surface that renders
+sensitive content; `AML` is a compliance-domain product, not a sensitive project.
+
+External tasks enter the store only through the four-stage validating import pipeline
+(`command_center/task_import.py`): parse → validate → preview → apply, where `validate`
+normalizes every `project` through `normalize_project_id` and rejects the whole package if any
+value is unresolvable. A fitness gate (`tests/architecture/test_project_id_authoring.py`,
+`arch-fitness.yml`) fails CI when the registry or task-id grammar in code and ADR 0010 disagree.
 
 ## Application structure
 

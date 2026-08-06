@@ -81,6 +81,7 @@ EXCLUDED_DIR_NAMES = frozenset(
         "build",
         "dist",
         ".claude",
+        ".worktrees",
     }
 )
 
