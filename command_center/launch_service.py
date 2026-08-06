@@ -256,6 +256,34 @@ def find_active_run_conflict(
     return None
 
 
+def execute_agent_launch(
+    *,
+    project: str,
+    task_type: str,
+    prompt: str,
+    timeout_seconds: int,
+    repository_path: Path,
+    capability_override: str | None = None,
+) -> agent_runner.RunResult:
+    """Synchronous capability-gated launch: check preflight, then run.
+
+    Raises `CapabilityMismatchError` before spawning any subprocess when the
+    task/prompt requires capabilities the configured profile would not grant.
+    This is the v1 analogue of `runtime.supervisor.Supervisor.start_raw`.
+    """
+    from command_center import capabilities
+
+    decision = capabilities.decide(task_type, prompt, capability_override)
+    if not decision.ok:
+        raise CapabilityMismatchError(decision)
+    return agent_runner.run_claude_code(
+        repository_path=repository_path,
+        prompt=prompt,
+        task_type=task_type,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def execute_agent_launch_v2(
     *,
     project: str,

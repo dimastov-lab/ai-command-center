@@ -141,6 +141,7 @@ class ExecutionProvider(Protocol):
         model: str | None,
         untrusted: bool = False,
         operator_elevated: bool = False,
+        capability_override: str | None = None,
     ) -> LaunchSpec: ...
 
     def create_runtime(self, *, prompt: str, environment: dict[str, str]) -> ProviderRuntime: ...
@@ -680,6 +681,7 @@ class ClaudeProvider:
         model: str | None,
         untrusted: bool = False,
         operator_elevated: bool = False,
+        capability_override: str | None = None,
     ) -> LaunchSpec:
         from command_center.runtime import supervisor
 
@@ -691,6 +693,7 @@ class ClaudeProvider:
             model=model,
             untrusted=untrusted,
             operator_elevated=operator_elevated,
+            capability_override=capability_override,
             prompt_in_argv=False,
         )
         return LaunchSpec(
@@ -788,6 +791,7 @@ class CodexProvider:
         model: str | None,
         untrusted: bool = False,
         operator_elevated: bool = False,
+        capability_override: str | None = None,
     ) -> LaunchSpec:
         if is_resume:
             raise ValueError("Codex CLI resume is not supported by this provider increment.")
@@ -1002,6 +1006,7 @@ class OllamaProvider:
         model: str | None,
         untrusted: bool = False,
         operator_elevated: bool = False,
+        capability_override: str | None = None,
     ) -> LaunchSpec:
         if is_resume:
             raise ValueError("Ollama resume is not supported: each run is a fresh, stateless completion.")
@@ -1249,6 +1254,7 @@ class CopilotProvider:
         model: str | None,
         untrusted: bool = False,
         operator_elevated: bool = False,
+        capability_override: str | None = None,
     ) -> LaunchSpec:
         if is_resume:
             raise ValueError("Copilot CLI resume is not supported by this provider increment.")

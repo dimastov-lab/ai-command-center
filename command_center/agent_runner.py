@@ -360,8 +360,12 @@ def build_command(
     *,
     task_type: str,
     model: str | None = None,
+    capability_override: str | None = None,
 ) -> list[str]:
-    profile = profile_for_task_type(task_type)
+    if capability_override is not None:
+        profile = PROFILE_READ_ONLY if capability_override.lower() in ("read_only", "readonly") else PROFILE_TRUSTED_DEVELOPMENT
+    else:
+        profile = profile_for_task_type(task_type)
     command = [
         CLAUDE_BINARY,
         "-p",
@@ -372,7 +376,7 @@ def build_command(
         PERMISSION_MODE_BY_PROFILE[profile],
     ]
 
-    if task_type in READ_ONLY_TASK_TYPES:
+    if profile == PROFILE_READ_ONLY:
         # Tool-set replacement, not a permission-layer denial: Bash (and every
         # shell-reachable mutation) is not in this list, so it cannot be invoked by
         # this run at all. See the module docstring and READ_ONLY_ALLOWED_TOOLS.
@@ -427,6 +431,10 @@ class RunResult:
         self.duration_seconds = duration_seconds
         self.started_at = started_at
         self.completed_at = completed_at
+
+    @property
+    def result_status(self) -> str:
+        return self.status
 
 
 def run_claude_code(

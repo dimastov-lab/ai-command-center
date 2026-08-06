@@ -235,9 +235,16 @@ def build_claude_command(
     against exactly this). `agent_runner.build_command` (the v1 synchronous
     executor) already set this; this was the divergence between the two.
     """
-    profile = agent_runner.profile_for_task(
-        task_type, untrusted=untrusted, operator_elevated=operator_elevated
-    )
+    if capability_override is not None:
+        profile = (
+            agent_runner.PROFILE_READ_ONLY
+            if capability_override.upper() == capabilities.PROFILE_READ_ONLY
+            else agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+        )
+    else:
+        profile = agent_runner.profile_for_task(
+            task_type, untrusted=untrusted, operator_elevated=operator_elevated
+        )
     command = [CLAUDE_BINARY]
     if is_resume:
         command += ["--resume", session_id]
@@ -703,6 +710,7 @@ class Supervisor:
                 model=model,
                 untrusted=untrusted,
                 operator_elevated=operator_elevated,
+                capability_override=decision.override,
             )
         except (RuntimeError, ValueError) as exc:
             raise ProviderUnavailableError(str(exc)) from exc
