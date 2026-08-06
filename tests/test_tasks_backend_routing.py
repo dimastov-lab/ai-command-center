@@ -42,6 +42,17 @@ def test_aios_backend_raises_without_url(tmp_path):
             tr_module.get_repository(tmp_path)
 
 
+def test_aios_backend_raises_without_token(tmp_path):
+    """AICC_TASKS_BACKEND=aios с URL, но без AICC_AIOS_TOKEN → RuntimeError."""
+    with patch.dict(os.environ, {"AICC_TASKS_BACKEND": "aios", "AICC_AIOS_URL": "http://localhost:5000"}):
+        os.environ.pop("AICC_AIOS_TOKEN", None)
+        from importlib import reload
+        import command_center.tasks_repository as tr_module
+        reload(tr_module)
+        with pytest.raises(RuntimeError, match="AICC_AIOS_TOKEN"):
+            tr_module.get_repository(tmp_path)
+
+
 def test_json_backend_load_tasks_is_empty_on_fresh_dir(tmp_path):
     """JSONTasksRepository.load_all() returns [] for a fresh directory."""
     with patch.dict(os.environ, {}, clear=False):
