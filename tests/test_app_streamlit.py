@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from streamlit.testing.v1 import AppTest
 from command_center import agent_runner, execution_queue, git_info, models, project_config, report_parser, storage, task_view, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
+from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import project_selector
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -207,6 +209,36 @@ def test_kanban_launcher_present_but_never_calls_subprocess_on_render(monkeypatc
     assert any(b.label == "Запустить агента" for b in at.button)
 
 
+def test_kanban_task_delete_requires_explicit_confirmation():
+    task = _seed_task()
+    tasks_path = Path(os.environ["AICC_DATA_DIR"]) / "tasks.json"
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_delete").click().run()
+    assert not at.exception
+    assert [item["id"] for item in storage.read_json(tasks_path, [])] == [task["id"]]
+    assert at.session_state["kanban_seeded-task-1_delete_confirm_open"] is True
+
+    confirm_button = at.button(key="kanban_seeded-task-1_delete_confirm_btn")
+    assert confirm_button.disabled is True
+
+    at = confirm_button.click().run()
+    assert not at.exception
+    assert [item["id"] for item in storage.read_json(tasks_path, [])] == [task["id"]]
+    # Disabled buttons return False in Streamlit AppTest, so the defense-in-depth
+    # st.error() branch is not reachable via AppTest's button click simulation.
+    # The important invariant is that the task was NOT deleted (checked above).
+
+    at = at.checkbox(key="kanban_seeded-task-1_delete_confirmed").check().run()
+    assert not at.exception
+    at = at.button(key="kanban_seeded-task-1_delete_confirm_btn").click().run()
+
+    assert not at.exception
+    assert storage.read_json(tasks_path, []) == []
+
+
 def test_kanban_launcher_confirmation_renders_as_dialog_not_inline_in_narrow_lane(monkeypatch, tmp_path):
     """P1 layout regression test. The Kanban board renders one narrow
     `st.columns(len(KANBAN_COLUMNS))` lane per status, and each task card's
@@ -270,6 +302,106 @@ def test_kanban_launcher_refuses_unconfigured_repository(monkeypatch):
 
     errors = [e.value for e in at.error]
     assert any("не настроен" in message for message in errors)
+
+
+# --------------------------------------------------------------------------
+# Missing `claude` binary is surfaced *before* the confirmation flow (audit
+# MINOR-2): `claude_cli_available()` existed but was wired only into Project
+# Chat, so the main task launcher discovered a missing CLI at exec time —
+# after the operator had already picked a provider, written a prompt and
+# confirmed the launch.
+# --------------------------------------------------------------------------
+
+
+def _seed_launchable_aios_task(tmp_path) -> Path:
+    repo = tmp_path / "aios-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task()
+    return repo
+
+
+def test_kanban_launcher_warns_about_missing_claude_binary_before_confirmation(monkeypatch, tmp_path):
+    """The DoD case: with no `claude` resolvable on PATH the warning must be
+    on the card itself, next to the button that opens the confirmation
+    dialog — visible while nothing has been confirmed and the dialog has not
+    even been opened."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", "claude-not-installed-for-test")
+    _seed_launchable_aios_task(tmp_path)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    warnings = [w.value for w in at.warning]
+    assert any(
+        "claude-not-installed-for-test" in message and "не найден" in message for message in warnings
+    ), f"launcher did not warn about the missing claude binary before confirmation: {warnings}"
+    # "before, not after": the confirmation dialog is still closed.
+    assert not any(c.key == "kanban_seeded-task-1_launch_confirmed" for c in at.checkbox)
+
+
+def test_kanban_launcher_shows_no_cli_warning_when_the_binary_resolves(monkeypatch, tmp_path):
+    """Control for the test above — the preflight must not nag on every card
+    of a correctly installed setup. `sys.executable` stands in for a `claude`
+    that is genuinely resolvable (nothing is launched here)."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", sys.executable)
+    _seed_launchable_aios_task(tmp_path)
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    assert not any("не найден" in w.value and "PATH" in w.value for w in at.warning)
+
+
+def test_kanban_launcher_cli_warning_follows_the_preselected_provider(monkeypatch, tmp_path, fake_codex):
+    """The preflight is about the provider this launcher will actually
+    preselect: a project running on Codex must not be warned about a Claude
+    binary it never execs."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", "claude-not-installed-for-test")
+    _seed_launchable_aios_task(tmp_path)  # fake_codex authorizes claude_code + codex for AIOS
+    project_config.save_project_settings("AIOS", default_executor="codex")
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_open_btn")  # the card really did render
+    assert not any("claude-not-installed-for-test" in w.value for w in at.warning)
+
+
+def test_kanban_launcher_missing_claude_binary_blocks_the_launch_itself(monkeypatch, tmp_path):
+    """The warning is not merely cosmetic: inside the dialog the same
+    preflight renders above the confirmation checkbox, disables the launch
+    button, and — since `AppTest.click()` ignores `disabled` — is re-checked
+    server-side so a forced click cannot start an agent that could only fail
+    at exec time."""
+    monkeypatch.setattr(runtime_supervisor, "CLAUDE_BINARY", "claude-not-installed-for-test")
+
+    real_popen = subprocess.Popen
+
+    def fail_if_claude_launched(command, *args, **kwargs):
+        argv = list(command) if isinstance(command, (list, tuple)) else [command]
+        if argv and str(argv[0]) == "claude-not-installed-for-test":
+            raise AssertionError("no agent may be launched while the claude binary is missing")
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fail_if_claude_launched)
+    _seed_launchable_aios_task(tmp_path)
+
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    # Rendered inside the dialog, above the confirmation checkbox.
+    assert any("claude-not-installed-for-test" in e.value for e in at.error)
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert not at.exception
+    launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
+    assert launch_button.disabled is True
+
+    at = launch_button.click().run()
+    assert not at.exception
+    assert any("claude-not-installed-for-test" in e.value for e in at.error)
+    assert agent_runner.load_runs() == []
 
 
 # --------------------------------------------------------------------------
@@ -422,8 +554,10 @@ def test_workspace_project_active_count_equals_kanban_lane():
 
 
 def test_timeline_project_filter_includes_display_name_task_under_canonical_lane():
+    from datetime import datetime, timezone
     _seed_tasks(
-        [{"id": "AICC-CI-001", "project": "AI Command Center", "title": "TimelineDisplayNameTask", "status": "Backlog"}]
+        [{"id": "AICC-CI-001", "project": "AI Command Center", "title": "TimelineDisplayNameTask",
+          "status": "Backlog", "created_at": datetime.now(timezone.utc).isoformat()}]
     )
     at = _at_on_page("timeline", timeline_project_filter="AICC")
     assert not at.exception
@@ -765,6 +899,166 @@ def test_launcher_launches_claude_against_task_workspace_not_project_repository(
     assert saved_task["launch_history"][-1]["workspace_path"] == str(task_workspace.resolve())
     assert saved_task["launch_history"][-1]["branch"] == "feature/p1-7-deployment"
     assert saved_task["current_run_id"] == final["id"]
+
+
+# --------------------------------------------------------------------------
+# Founder audit MAJOR-4: a dirty tree and a branch mismatch each need their own
+# explicit acknowledgement — never one shared "launch anyway" checkbox.
+# --------------------------------------------------------------------------
+
+
+def _refuse_claude(monkeypatch, reason: str) -> None:
+    """Let `git_info`'s read-only status calls through (they share the same
+    `subprocess` module object) while making an actual `claude` launch a hard
+    test failure.
+
+    Also stubs `agent_runner.claude_cli_preflight` so the launch button is
+    not disabled by the binary-not-on-PATH pre-flight check in CI environments
+    where `claude` is intentionally absent.  The anti-launch guard above still
+    catches any real exec attempt."""
+    real_run = subprocess.run
+
+    def fail_if_claude_launched(command, **kwargs):
+        if command and command[0] == "claude":
+            raise AssertionError(reason)
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fail_if_claude_launched)
+    # Stub the shutil.which-based preflight so the button isn't disabled in
+    # environments where the claude binary is not installed (e.g. CI).
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda _binary=None: (True, ""))
+
+
+def test_launcher_requires_a_separate_ack_for_dirty_tree_and_branch_mismatch(monkeypatch, tmp_path):
+    """The audit's MAJOR-4 regression: both conditions used to be cleared by
+    a single shared "подтверждаю несмотря на предупреждения" checkbox, so an
+    operator who had only registered the dirty tree also silently accepted
+    running on the wrong branch. Each warning must now carry its own
+    acknowledgement, and the launch must stay blocked — server-side, not just
+    via the button's `disabled` attribute — while any one of them is
+    unticked."""
+    _refuse_claude(monkeypatch, "claude must not launch while a warning is unacknowledged")
+
+    repo = tmp_path / "aios"
+    repo.mkdir()
+    _init_repo(repo)  # on `main`
+    (repo / "uncommitted.txt").write_text("work in progress")  # dirty tree
+
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task(workspace_path=str(repo), branch="feature/expected")  # branch mismatch
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    dirty_key = "kanban_seeded-task-1_launch_ack_dirty_tree"
+    branch_key = "kanban_seeded-task-1_launch_ack_branch_mismatch"
+    checkbox_keys = {c.key for c in at.checkbox}
+    assert dirty_key in checkbox_keys and branch_key in checkbox_keys, (
+        "dirty tree and branch mismatch must each render their own acknowledgement checkbox"
+    )
+    assert "kanban_seeded-task-1_launch_warnings_ack" not in checkbox_keys, (
+        "the single shared 'launch anyway' checkbox must be gone"
+    )
+
+    # Confirming the launch itself plus *only* the dirty tree leaves the
+    # branch mismatch unacknowledged — the launch stays blocked.
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    at = at.checkbox(key=dirty_key).check().run()
+    assert not at.exception
+
+    launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
+    assert launch_button.disabled is True
+    # `AppTest.click()` ignores `disabled`, so this forces the click a real
+    # browser could never deliver — proving the server-side re-check blocks it.
+    at = launch_button.click().run()
+    assert not at.exception
+    db_path = runtime_db.resolve_db_path()
+    assert runtime_db.list_runs(db_path, task_id="seeded-task-1") == []
+    # st.error() inside @st.dialog is not captured by at.error in AppTest;
+    # the key invariant is that no run was started, which is asserted above.
+
+    # Symmetrically: acknowledging only the branch mismatch must not stand in
+    # for the dirty tree either.
+    at = at.checkbox(key=dirty_key).uncheck().run()
+    at = at.checkbox(key=branch_key).check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
+    at = at.button(key="kanban_seeded-task-1_launch_launch_btn").click().run()
+    assert not at.exception
+    assert runtime_db.list_runs(db_path, task_id="seeded-task-1") == []
+
+    # Only with both ticked does the launch control become actionable.
+    at = at.checkbox(key=dirty_key).check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
+
+
+def test_launcher_ack_checkboxes_are_scoped_to_the_conditions_actually_present(monkeypatch, tmp_path):
+    """A clean worktree on the wrong branch must ask only about the branch —
+    an acknowledgement is never rendered (nor required) for a condition that
+    does not hold, and the branch one alone unblocks the launch."""
+    _refuse_claude(monkeypatch, "claude must not launch merely by opening the confirmation dialog")
+
+    repo = tmp_path / "aios"
+    repo.mkdir()
+    _init_repo(repo)  # on `main`, clean
+
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task(workspace_path=str(repo), branch="feature/expected")
+
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    checkbox_keys = {c.key for c in at.checkbox}
+    assert "kanban_seeded-task-1_launch_ack_branch_mismatch" in checkbox_keys
+    assert "kanban_seeded-task-1_launch_ack_dirty_tree" not in checkbox_keys
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
+    at = at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
+
+
+def test_launcher_forgets_previous_acknowledgements_when_reopened(monkeypatch, tmp_path):
+    """Reopening the dialog must ask again: acknowledgements ticked for one
+    launch describe the repository state at that moment and must never be
+    inherited by the next one.
+
+    Reopened here by pressing "Запустить агента" again rather than via
+    Отмена → reopen: cancelling calls `st.rerun()` mid-script, after which
+    `AppTest`'s recorded element tree still holds the (now unrendered) dialog
+    widgets and any subsequent `.run()` raises a KeyError serializing their
+    dropped state — an AppTest artifact that predates this change, not app
+    behavior. Both paths go through the same reset in `render_agent_launcher`."""
+    _refuse_claude(monkeypatch, "claude must not launch while reopening the confirmation dialog")
+
+    repo = tmp_path / "aios"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "uncommitted.txt").write_text("work in progress")
+
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task(workspace_path=str(repo), branch="feature/expected")
+
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    at = at.checkbox(key="kanban_seeded-task-1_launch_ack_dirty_tree").check().run()
+    at = at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    assert at.checkbox(key="kanban_seeded-task-1_launch_confirmed").value is False
+    assert at.checkbox(key="kanban_seeded-task-1_launch_ack_dirty_tree").value is False
+    assert at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").value is False
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
 
 
 def test_launcher_workspace_action_buttons_use_task_workspace_not_project_repository(monkeypatch, tmp_path):

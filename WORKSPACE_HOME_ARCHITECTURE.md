@@ -744,6 +744,21 @@ redaction stage (§5.1) has no bearing on this section: there is nothing here fo
 
 - Home is entirely read-only except Quick Actions, which delegate to already-reviewed, already-
   gated mutation entry points (§11) — this increment introduces **no new mutation surface**.
+- **Amendment (audit W2-004, Project Intelligence / Recommendations on Home).** Home now also
+  hosts the founder health strip and the "Recommended Next Tasks" surface, previously wired only
+  to Kanban. This keeps the property above rather than weakening it: both are rendered by the
+  *same* `app.render_project_planning_intelligence` helper Kanban calls, over the *same*
+  `project_intelligence.compute_project_intelligence` /
+  `recommendation_service.build_recommendation_views` computations, and their two mutating
+  actions ("В очередь", "Запустить") are the already-reviewed, already-gated
+  `execution_queue.enqueue_and_persist` / `execution_queue.launch_ready` entry points — no new
+  mutation *class*, only a second, already-audited caller of the existing ones. The gate on a
+  dirty working tree, the sensitive-project boundary, and the locked-queue persistence
+  invariants all continue to apply unchanged, because there is exactly one implementation of
+  each behind both pages. Only the Streamlit widget-key namespace differs per page
+  (`workspace_home_reco_*` vs `kanban_reco_*`) so the two surfaces cannot collide on widget
+  identity. Backlog reconciliation stays Kanban-only — it is a planning tool, not part of the
+  health/recommendation surface Home mirrors.
 - **BANK/LEGAL sensitivity — the one genuinely new consideration this increment introduces, not a
   reuse of an existing guarantee.** Every existing sensitive-project boundary
   (ARCHITECTURE.md §11.3, `context_service.assemble_context`) was designed around *explicit,

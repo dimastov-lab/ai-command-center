@@ -28,7 +28,9 @@ def kanban_status_options(current_status: str | None) -> list[str]:
     that value back merely because the page was opened. Keeping the current
     value as the first option makes rendering read-only while still letting the
     operator explicitly migrate the task to a canonical lane."""
-    canonical = list(models.KANBAN_STATUSES)
+    canonical = [status for status in models.KANBAN_STATUSES if status != "Done"]
+    if current_status == "Done":
+        return ["Done", *canonical]
     if current_status and current_status not in canonical:
         return [current_status, *canonical]
     return canonical

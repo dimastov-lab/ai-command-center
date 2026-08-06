@@ -8,17 +8,21 @@ attention; structural completion-state transition guard). Uses REAL git (via
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from command_center.daily_audit import DailyAuditStore
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
+from command_center.runtime import git_ops
 from command_center.runtime import task_sync
 from command_center.runtime.completion import (
     COMPLETION_TRANSITIONS,
     TERMINAL_STATES,
+    CompletionPolicy,
     CompletionState,
+    ReasonCode,
     is_valid_completion_transition,
 )
 from command_center.runtime.completion_service import CompletionOrchestrator
@@ -72,6 +76,39 @@ def _task_for(run, **overrides):
     }
     task.update(overrides)
     return task
+
+
+def test_publication_fence_is_accepted_only_from_trusted_policy_overrides():
+    untrusted = CompletionPolicy.resolve(
+        task={
+            "publication_fence_campaign_id": "task-campaign",
+            "publication_fence_owner": "task-owner",
+        },
+        project_cfg={
+            "publication_fence_campaign_id": "project-campaign",
+            "publication_fence_owner": "project-owner",
+        },
+    )
+    assert untrusted.publication_fence_campaign_id is None
+    assert untrusted.publication_fence_owner is None
+
+    trusted = CompletionPolicy.resolve(
+        task={
+            "publication_fence_campaign_id": "task-campaign",
+            "publication_fence_owner": "task-owner",
+        },
+        project_cfg={
+            "publication_fence_campaign_id": "project-campaign",
+            "publication_fence_owner": "project-owner",
+        },
+        overrides={
+            "publication_fence_campaign_id": "trusted-campaign",
+            "publication_fence_owner": "trusted-owner",
+        },
+    )
+    round_tripped = CompletionPolicy.from_json(trusted.to_json())
+    assert round_tripped.publication_fence_campaign_id == "trusted-campaign"
+    assert round_tripped.publication_fence_owner == "trusted-owner"
 
 
 # ============================================================================
@@ -183,6 +220,7 @@ def test_advance_pending_benign_cas_loss_is_skipped(repo_env, monkeypatch):
         raise runtime_db.LostUpdateError("simulated concurrent advance")
 
     monkeypatch.setattr(orch, "advance", _lose)
+    assert orch.advance_safely(run["id"], now=NOW) is None
     results = orch.advance_pending(now=NOW)
 
     after = runtime_db.get_completion(db_path, run["id"])
@@ -192,6 +230,91 @@ def test_advance_pending_benign_cas_loss_is_skipped(repo_env, monkeypatch):
     assert after["requires_human"] == 0
     assert after["retry_count"] == before["retry_count"]  # no benign-loss counter bump
     assert after["version"] == before["version"]  # the loser wrote nothing at all
+
+
+def test_daily_completion_renews_fence_before_publish_and_cancels_after_replacement(
+    repo_env, monkeypatch
+):
+    remote, work, tmp = repo_env
+    db_path = runtime_db.resolve_db_path()
+    runtime_db.migrate(db_path)
+    fence_now = NOW.replace(tzinfo=timezone.utc)
+    owner = "daily-owner"
+    store = DailyAuditStore(db_path)
+    campaign_id = store.acquire_due(
+        now=fence_now,
+        owner=owner,
+        lease_duration=timedelta(minutes=1),
+    )
+    branch = "task/daily-fence"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+    gh = FakeGitHubClient()
+    fence_clock = [fence_now]
+    orch = CompletionOrchestrator(
+        db_path,
+        github=gh,
+        publication_fence_clock=lambda: fence_clock[0],
+    )
+    orch.begin_completion(
+        run,
+        project_cfg={
+            "default_branch": "main",
+            "merge_mode": "manual",
+            "validation_required": False,
+        },
+        policy_overrides={
+            "publication_fence_campaign_id": campaign_id,
+            "publication_fence_owner": owner,
+        },
+    )
+
+    original_push = git_ops.push_branch
+    replacement_attempts = []
+
+    def push_after_original_expiry(repo, *, remote, branch, set_upstream=True):
+        assert store.renew_lease(
+            campaign_id,
+            owner=owner,
+            now=fence_now + timedelta(seconds=20),
+            lease_duration=timedelta(minutes=1),
+        )
+        replacement_attempts.append(
+            store.acquire_due(
+                now=fence_now + timedelta(minutes=2),
+                owner="replacement-too-early",
+                lease_duration=timedelta(hours=1),
+            )
+        )
+        return original_push(
+            repo,
+            remote=remote,
+            branch=branch,
+            set_upstream=set_upstream,
+        )
+
+    monkeypatch.setattr(git_ops, "push_branch", push_after_original_expiry)
+    orch.advance_safely(run["id"], now=fence_now)
+
+    assert replacement_attempts == [None]
+    assert gh.created
+    assert datetime.fromisoformat(store.status()["lease_until"]) >= fence_now + timedelta(
+        minutes=5
+    )
+
+    fence_clock[0] = fence_now + timedelta(minutes=6)
+    replacement = store.acquire_due(
+        now=fence_clock[0],
+        owner="replacement",
+        lease_duration=timedelta(hours=1),
+    )
+    assert replacement and replacement != campaign_id
+    orch.advance_safely(run["id"], now=fence_clock[0])
+
+    completion = runtime_db.get_completion(db_path, run["id"])
+    assert completion["completion_state"] == CompletionState.REQUIRES_ATTENTION
+    assert completion["last_reason_code"] == ReasonCode.PUBLICATION_FENCE_LOST
+    assert gh.merged == []
 
 
 def test_advance_pending_missing_row_is_skipped(repo_env, monkeypatch):

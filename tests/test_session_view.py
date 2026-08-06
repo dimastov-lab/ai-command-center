@@ -270,24 +270,20 @@ def test_derive_live_progress_read_only_completed_is_100():
         assert stage
 
 
-def test_derive_live_progress_running_tracks_elapsed_fraction_directly():
-    """The working phase tracks the fraction of the time budget spent directly:
-    at half the budget it reads ~50 %, at 79 % it reads ~79 % — "more elapsed
-    than remaining ⟹ past halfway" — and it never claims done while running."""
+def test_derive_live_progress_running_uses_evidenced_stage_not_elapsed_time():
     half, _ = session_view.derive_live_progress(
         session_view.STATUS_RUNNING, None, elapsed_seconds=500, timeout_seconds=1000
     )
     mostly, _ = session_view.derive_live_progress(
         session_view.STATUS_RUNNING, None, elapsed_seconds=790, timeout_seconds=1000
     )
-    assert half == 50
-    assert mostly == 79           # elapsed (790) > remaining (210) → well past 50 %
-    assert mostly < 100           # never "done" while the process is running
-    # The old skew this fixes: 11 min in, 3 left (≈78.6 %) must read > 50 %.
-    skewed, _ = session_view.derive_live_progress(
-        session_view.STATUS_RUNNING, None, elapsed_seconds=11 * 60, timeout_seconds=14 * 60
+    assert half == mostly == 25
+    evidenced, label = session_view.derive_live_progress(
+        session_view.STATUS_RUNNING, None, elapsed_seconds=790, timeout_seconds=1000,
+        stage_progress=40, stage_label="Implementation",
     )
-    assert skewed > 50
+    assert evidenced == 40
+    assert label == "Implementation"
 
 
 def test_build_session_view_exposes_live_progress_fields():
@@ -301,8 +297,9 @@ def test_build_session_view_exposes_live_progress_fields():
     )
     # Raw task fields preserved…
     assert session["progress"] == 5
-    # …but the live bar reflects the elapsed time budget, not the stale 5.
-    assert session["live_progress"] == 50
+    # …and the live bar reports the evidenced milestone, never elapsed time as
+    # a fabricated delivery percentage.
+    assert session["live_progress"] == 5
     assert session["live_stage"]
 
 

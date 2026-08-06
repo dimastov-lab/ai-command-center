@@ -17,13 +17,13 @@ def _task(task_id, title, *, status="Backlog", goal=None, launch_status=None, cr
     }
 
 
-def test_self_completed_task_is_flagged_to_mark_done():
+def test_self_completed_task_is_flagged_to_send_review():
     tasks = [_task("t1", "Ship the thing", launch_status="Completed")]
     findings = br.find_reconcilable(tasks)
     assert len(findings) == 1
     f = findings[0]
     assert f.kind == br.KIND_SELF_COMPLETED
-    assert f.suggested_action == "mark_done"
+    assert f.suggested_action == "send_review"
     assert not f.is_delete
 
 

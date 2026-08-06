@@ -187,6 +187,7 @@ def build_claude_command(
     model: str | None = None,
     untrusted: bool = False,
     operator_elevated: bool = False,
+    prompt_in_argv: bool = True,
 ) -> list[str]:
     """Construct the exact `claude` argv for one run.
 
@@ -215,9 +216,10 @@ def build_claude_command(
         command += ["--resume", session_id]
     else:
         command += ["--session-id", session_id]
+    command += ["-p"]
+    if prompt_in_argv:
+        command.append(prompt)
     command += [
-        "-p",
-        prompt,
         "--output-format",
         "stream-json",
         "--include-partial-messages",
@@ -689,9 +691,9 @@ class Supervisor:
                     task_type=task_type,
                     repository_path=str(repo_path),
                     prompt=(
-                        prompt
-                        if executor_id == providers.CLAUDE_ID
-                        else "[redacted: prompt transported via stdin]"
+                        "[redacted: prompt transported via stdin]"
+                        if spec.stdin_text is not None
+                        else prompt
                     ),
                     is_resume=is_resume,
                     timeout_seconds=timeout_seconds,
@@ -1924,7 +1926,7 @@ class Supervisor:
                     db.create_report(
                         self.db_path,
                         run_id,
-                        str(path.relative_to(reports.REPORTS_ROOT.parent)),
+                        reports.stored_report_path(path),
                     )
                 except Exception as exc:
                     logger.exception("Could not persist report for run %s", run_id)

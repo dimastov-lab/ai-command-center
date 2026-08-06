@@ -88,7 +88,7 @@ function CenteredPanel({ children }: { children: ReactNode }) {
   )
 }
 
-export default function Home() {
+export default function Home({ onNavigate = () => undefined }: { onNavigate?: (screen: 'home' | 'execution') => void }) {
   const { t } = useTranslation()
   const [data, setData] = useState<HomeDTO | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -170,7 +170,7 @@ export default function Home() {
         >
           {NAV_KEYS.map((key, i) => {
             const Icon = NAV_ICONS[i]
-            return <NavItem key={key} label={t(key)} icon={<Icon />} active={i === 0} />
+            return <NavItem key={key} label={t(key)} icon={<Icon />} active={i === 0} onClick={key === 'home' || key === 'execution' ? () => onNavigate(key) : undefined} />
           })}
         </aside>
 

@@ -65,6 +65,47 @@ def report_path_for(run: dict) -> Path:
     return REPORTS_ROOT / project / f"{timestamp}_{run_part}.md"
 
 
+def stored_report_path(path: Path) -> str:
+    """Return the stable persisted reference for a report under REPORTS_ROOT.
+
+    The historical schema stores ``reports/<project>/<file>``.  Keep that
+    representation for compatibility, but derive it from the configured
+    reports root instead of the application source root.
+    """
+    resolved = path.resolve()
+    root = REPORTS_ROOT.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("report path is outside the configured reports root")
+    return str(Path("reports") / resolved.relative_to(root))
+
+
+def resolve_report_path(report_path: str | None) -> Path | None:
+    """Resolve a persisted report reference without allowing root escape.
+
+    Canonical ``reports/...`` references are resolved from the configured
+    REPORTS_ROOT, so code, data and report roots may live independently.
+    Older root-relative references and absolute paths are accepted only when
+    they resolve inside REPORTS_ROOT.  ``resolve()`` also closes symlink and
+    traversal escapes.  Missing/invalid references return ``None``.
+    """
+    if not report_path or not isinstance(report_path, str):
+        return None
+
+    raw = Path(report_path)
+    if raw.is_absolute():
+        candidate = raw.resolve()
+    elif raw.parts and raw.parts[0] == "reports":
+        candidate = (REPORTS_ROOT / Path(*raw.parts[1:])).resolve()
+    else:
+        # Legacy rows occasionally stored a path relative to REPORTS_ROOT.
+        candidate = (REPORTS_ROOT / raw).resolve()
+
+    root = REPORTS_ROOT.resolve()
+    if candidate != root and root not in candidate.parents:
+        return None
+    return candidate
+
+
 def _assistant_text_blocks(events: list[dict]) -> list[str]:
     blocks: list[str] = []
     for event in events:

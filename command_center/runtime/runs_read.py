@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from command_center import agent_runner, report_parser
-from command_center.runtime import db
+from command_center.runtime import db, reports
 
 # v2 persisted ``state`` (``runtime/db.RUN_STATES``) → the v1.2 lowercase
 # ``status`` vocabulary that the Runs/Timeline/Executive pages and
@@ -93,8 +93,9 @@ def _parse_report_file(report_path: str | None, root: Path) -> dict:
     renders "не определён"), never raises."""
     if not report_path:
         return report_parser.empty_parsed_result()
-    full = root / report_path
-    if not full.exists():
+    del root  # retained in the public read API for backward compatibility
+    full = reports.resolve_report_path(report_path)
+    if full is None or not full.exists():
         return report_parser.empty_parsed_result()
     try:
         text = full.read_text(encoding="utf-8")

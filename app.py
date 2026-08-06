@@ -181,6 +181,7 @@ AGENT_ROLES: dict[str, dict[str, object]] = {
 # duplicate lists (command_center.task_import validates against the same
 # vocabulary and must never import app.py).
 KANBAN_COLUMNS: list[str] = models.KANBAN_STATUSES
+MANUAL_KANBAN_STATUSES: list[str] = [status for status in KANBAN_COLUMNS if status != "Done"]
 
 PRIORITIES: list[str] = models.TASK_PRIORITIES
 
@@ -352,6 +353,7 @@ def new_task_record(
     branch: str | None = None,
     executor: str | None = None,
     prompt: str | None = None,
+    untrusted_import: bool = False,
 ) -> dict:
     return tasks_repository.new_task_record(
         project,
@@ -371,6 +373,7 @@ def new_task_record(
         branch=branch,
         executor=executor,
         prompt=prompt,
+        untrusted_import=untrusted_import,
     )
 
 
@@ -393,12 +396,18 @@ def create_task(
     branch: str | None = None,
     executor: str | None = None,
     prompt: str | None = None,
+    untrusted_import: bool = False,
 ) -> dict:
     """Locked create — every page that adds a task to the Kanban board must
     call this (never `tasks.append(new_task_record(...)); save_tasks(tasks)`
     against its own possibly-stale in-memory `tasks` list, which is exactly
     the pattern that silently drops a concurrent writer's task). See
-    `tasks_repository.create_task`/module docstring."""
+    `tasks_repository.create_task`/module docstring.
+
+    `untrusted_import` stamps the provenance flag `agent_runner.is_untrusted_task`
+    gates on, so a task synthesized from untrusted report content (the "create
+    next task" widget, chat "convert message to task") is not laundered into a
+    trusted run — audit SEC-D-02, mirroring `backlog_proposals.apply_candidate`."""
     _repo = tasks_repository.get_repository(ROOT)
     return _repo.create(new_task_record(
         project,
@@ -418,6 +427,7 @@ def create_task(
         branch=branch,
         executor=executor,
         prompt=prompt,
+        untrusted_import=untrusted_import,
     ))
 
 
@@ -648,6 +658,31 @@ def _save_message_as_report(conversation: dict, message: dict) -> Path:
     return path
 
 
+def _preselected_executor_id(*, cfg: dict, task: dict | None, options: list[str] | None = None) -> str:
+    """Which executor the launcher will preselect: the task's own, else the
+    project default, else `claude_code` — clamped to `options` (the project's
+    authorized providers) exactly as the confirmation dialog's selectbox
+    clamps it, so the pre-dialog preflight below can never warn about a
+    provider the dialog is not going to offer."""
+    configured = (task or {}).get("executor") or cfg.get("default_executor") or "claude_code"
+    if options and configured not in options:
+        return options[0]
+    return configured
+
+
+def _claude_cli_preflight(executor_id: str) -> str | None:
+    """The message to show when `executor_id` is Claude Code but its CLI is
+    not on PATH; `None` when nothing is wrong (or another provider is
+    selected — each provider carries its own availability probe).
+
+    Probes `runtime_supervisor.CLAUDE_BINARY`, the executable the v2 Session
+    Supervisor will actually exec, not a separately-guessed name."""
+    if executor_id != "claude_code":
+        return None
+    available, message = agent_runner.claude_cli_preflight(runtime_supervisor.CLAUDE_BINARY)
+    return None if available else message
+
+
 def render_agent_launcher(
     *,
     key_prefix: str,
@@ -670,8 +705,38 @@ def render_agent_launcher(
     repo_path = cfg.get("repository_path")
     confirm_key = f"{key_prefix}_confirm_open"
     st.session_state.setdefault(confirm_key, False)
+    task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
+
+    # Preflight (audit MINOR-2): a missing `claude` binary makes the run fail
+    # at exec time, which used to be discovered only *after* the operator had
+    # walked the entire confirmation flow. Say it here, next to the button
+    # that opens that flow. The dialog re-checks the *selected* provider
+    # below — this one reports on the provider it will preselect.
+    try:
+        preselectable_executors = list(project_config.allowed_execution_providers(project))
+    except project_config.ProviderAuthorizationError:
+        # A broken authorization policy blocks the launch outright and the
+        # dialog reports it in full; a CLI warning on top would only be noise.
+        preselectable_executors = []
+    if preselectable_executors:
+        cli_preflight_message = _claude_cli_preflight(
+            _preselected_executor_id(cfg=cfg, task=task_for_launch, options=preselectable_executors)
+        )
+        if cli_preflight_message:
+            st.warning(cli_preflight_message)
 
     if st.button("Запустить агента", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
+        # Every launch is confirmed from scratch: a previous dialog's ticked
+        # acknowledgements must never carry over into a new one, or an
+        # operator would silently inherit a "yes, launch on the wrong branch"
+        # from a state of the repository that no longer holds.
+        for stale_key in [
+            key
+            for key in st.session_state
+            if isinstance(key, str) and key.startswith(f"{key_prefix}_ack_")
+        ]:
+            del st.session_state[stale_key]
+        st.session_state.pop(f"{key_prefix}_confirmed", None)
         st.session_state[confirm_key] = True
 
     if not st.session_state[confirm_key]:
@@ -684,7 +749,6 @@ def render_agent_launcher(
     # this entire form into a sliver a few hundred pixels wide.
     @st.dialog("Подтверждение запуска агента", width="large")
     def _render_launch_confirmation() -> None:
-        task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
         selection = launch.resolve_workspace_path(task=task_for_launch, project_config=cfg)
 
         if not selection.path:
@@ -718,11 +782,9 @@ def render_agent_launcher(
         except project_config.ProviderAuthorizationError as exc:
             st.error(str(exc))
             return
-        configured_executor = (
-            (task_for_launch or {}).get("executor") or cfg.get("default_executor") or "claude_code"
+        configured_executor = _preselected_executor_id(
+            cfg=cfg, task=task_for_launch, options=executor_options
         )
-        if configured_executor not in executor_options:
-            configured_executor = executor_options[0]
         executor_id = st.selectbox(
             "Execution provider",
             executor_options,
@@ -739,6 +801,13 @@ def render_agent_launcher(
                 else f"Недоступен ({provider_availability.code}): {provider_availability.message}"
             )
             (st.caption if provider_availability.available else st.error)(availability_text)
+        # `ClaudeProvider.availability()` reports "configured", not "installed"
+        # (it never probes PATH), so the missing-binary case is caught here —
+        # still above the prompt, the confirmation checkbox and the launch
+        # button, never after them.
+        selected_cli_preflight_message = _claude_cli_preflight(executor_id)
+        if selected_cli_preflight_message:
+            st.error(selected_cli_preflight_message)
         prompt = st.text_area(
             "Промпт для агента", value=default_prompt, height=220, key=f"{key_prefix}_prompt"
         )
@@ -830,12 +899,27 @@ def render_agent_launcher(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
         )
-        warnings_ack = True
-        if validation.warnings:
-            warnings_ack = st.checkbox(
-                "Я подтверждаю запуск несмотря на предупреждения выше.",
-                key=f"{key_prefix}_warnings_ack",
-            )
+
+        # One acknowledgement per warning, keyed by its stable `code` — never a
+        # single collective "подтверждаю несмотря на предупреждения" checkbox.
+        # A branch mismatch and a dirty working tree are independent hazards
+        # (agent runs on the wrong branch vs. agent edits on top of
+        # uncommitted work); the shared checkbox let an operator who had only
+        # noticed one of them dismiss both in a single click, which is exactly
+        # the accidental launch this gate exists to prevent.
+        acknowledged: set[str] = set()
+        warning_issues = validation.warning_issues
+        if warning_issues:
+            st.markdown("**Подтвердите каждое предупреждение отдельно:**")
+        for issue in warning_issues:
+            if st.checkbox(
+                launch.warning_ack_label(issue),
+                key=f"{key_prefix}_ack_{issue.code}",
+            ):
+                acknowledged.add(issue.code)
+            st.caption(issue.message)
+        unacknowledged = validation.unacknowledged_warning_codes(acknowledged)
+
         action_cols = st.columns(2)
         with action_cols[0]:
             launch_clicked = st.button(
@@ -847,8 +931,9 @@ def render_agent_launcher(
                     # `prep.launchable` supersedes the raw `validation.can_launch`:
                     # a missing-but-provisionable workspace is launchable.
                     or not prep.launchable
-                    or not warnings_ack
+                    or bool(unacknowledged)
                     or not bool(provider_availability and provider_availability.available)
+                    or bool(selected_cli_preflight_message)
                 ),
                 icon=":material/play_arrow:",
             )
@@ -886,8 +971,23 @@ def render_agent_launcher(
         if not prep.launchable:
             st.error("Запуск заблокирован ошибками валидации выше — сначала устраните их.")
             return
-        if validation.warnings and not warnings_ack:
-            st.error("Подтвердите предупреждения выше перед запуском.")
+        if not confirmed:
+            st.error("Подтвердите запуск внешнего агента перед запуском.")
+            return
+        if unacknowledged:
+            missing = "; ".join(
+                launch.warning_ack_label(issue)
+                for issue in warning_issues
+                if issue.code in unacknowledged
+            )
+            st.error(f"Не подтверждены все предупреждения — запуск заблокирован: {missing}")
+            return
+        # Same defense in depth for the CLI preflight, and re-probed at click
+        # time: the operator may have installed the binary while this dialog
+        # was open, so this is a fresh check, not the render-time verdict.
+        click_time_preflight_message = _claude_cli_preflight(executor_id)
+        if click_time_preflight_message:
+            st.error(click_time_preflight_message)
             return
 
         # `selection.path` was already validated above (existence, is_dir,
@@ -898,9 +998,9 @@ def render_agent_launcher(
         resolved_workspace = Path(selection.path).expanduser().resolve()
 
         # Real, PID-tracked, cancellable v2 run — not a blocking call. The
-        # button click above already re-validated `confirmed`/`warnings_ack`
-        # server-side, so `confirmed=True` here reflects a genuine, already-
-        # checked confirmation, not a bypass of it.
+        # button click above already re-validated `confirmed` and every
+        # per-warning acknowledgement server-side, so `confirmed=True` here
+        # reflects a genuine, already-checked confirmation, not a bypass of it.
         _repo = tasks_repository.get_repository(ROOT)
         try:
             run = launch_service.execute_agent_launch_v2(
@@ -1036,6 +1136,10 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
                 parent_task_id=run.get("task_id"),
                 prior_run_id=run["id"],
                 workflow_stage=next_stage,
+                # The objective is drafted from the parent run's report output
+                # (untrusted agent text), so mark the follow-up untrusted — it
+                # launches read-only until an operator elevates it (SEC-D-02).
+                untrusted_import=True,
             )
             run["next_task_id"] = new_task["id"]
             # Only the v1.2 journal is writable here. A v2 run lives in runtime.db;
@@ -1265,8 +1369,13 @@ def render_task_card(
 
             if report_open:
                 if task.get("report_path"):
-                    report_full_path = ROOT / task["report_path"]
-                    st.code(read_text(report_full_path), language="markdown")
+                    report_full_path = agent_runner.resolve_report_path(task)
+                    if report_full_path is None:
+                        st.warning("Путь к отчёту не проходит проверку безопасности — файл не открыт.")
+                    elif report_full_path.exists():
+                        st.code(read_text(report_full_path), language="markdown")
+                    else:
+                        st.caption("Файл отчёта не найден на диске.")
                 else:
                     st.caption("Отчёт ещё не создан.")
 
@@ -1333,9 +1442,51 @@ def render_task_card(
                 update_task_status(task_id, new_status)
                 st.rerun()
 
+            delete_confirm_key = f"{key_prefix}_delete_confirm_open"
+            st.session_state.setdefault(delete_confirm_key, False)
             if st.button("Удалить", key=f"{key_prefix}_delete", icon=":material/delete:", width="stretch"):
-                delete_task(task_id)
-                st.rerun()
+                st.session_state[delete_confirm_key] = True
+
+            if st.session_state[delete_confirm_key]:
+                @st.dialog("Подтверждение удаления")
+                def _render_delete_confirmation() -> None:
+                    st.warning(
+                        f"Задача «{title}» (`{task_id}`) будет удалена. "
+                        "Это действие нельзя отменить."
+                    )
+                    confirmed = st.checkbox(
+                        "Я подтверждаю удаление этой задачи.",
+                        key=f"{key_prefix}_delete_confirmed",
+                    )
+                    confirm_cols = st.columns(2)
+                    with confirm_cols[0]:
+                        delete_clicked = st.button(
+                            "Подтвердить удаление",
+                            type="primary",
+                            key=f"{key_prefix}_delete_confirm_btn",
+                            disabled=not confirmed,
+                            icon=":material/delete_forever:",
+                        )
+                    with confirm_cols[1]:
+                        if st.button("Отмена", key=f"{key_prefix}_delete_cancel_btn"):
+                            st.session_state[delete_confirm_key] = False
+                            st.rerun()
+
+                    if not delete_clicked:
+                        return
+
+                    # Defense in depth: AppTest and future callers can trigger a
+                    # disabled widget programmatically, so never rely solely on
+                    # the button's disabled state for a destructive action.
+                    if not confirmed:
+                        st.error("Подтвердите удаление задачи.")
+                        return
+
+                    delete_task(task_id)
+                    st.session_state[delete_confirm_key] = False
+                    st.rerun()
+
+                _render_delete_confirmation()
 
 
 def render_next_task_callout(tasks: list[dict], project: str | None = None, *, active_runs: list[dict] | None = None) -> None:
@@ -1934,26 +2085,14 @@ def _render_execution_center_card(
             bar_progress = session.get("progress")
             bar_stage = session.get("current_stage")
         if bar_progress is not None:
-            # For a still-running agent there is no true "percent done", so the
-            # bar is time-based — make that explicit by showing elapsed and the
-            # remaining time budget beside it (the % alone "does not reflect
-            # reality"). For a terminal run, elapsed is the final duration.
+            # Percent is an evidenced delivery milestone. Elapsed time is a
+            # separate fact and is never presented as percent complete or ETA.
             parts = [f"{bar_progress}%", bar_stage or "—"]
             elapsed = session.get("elapsed_seconds")
             if elapsed is not None:
                 parts.append(f"прошло {session_view.format_elapsed(elapsed)}")
             if session["status"] in session_view.LIVE_PROCESS_DISPLAY_STATUSES:
-                # "осталось" is against the *expected* duration (estimate or
-                # historical median), not the timeout budget — the timeout is a
-                # ~200 % cap a run rarely spends, so it read as unreal. Once a run
-                # runs past its estimate, say so honestly rather than show 0.
-                reference = session.get("reference_seconds")
-                if reference and elapsed is not None:
-                    remaining = int(reference) - int(elapsed)
-                    if remaining > 0:
-                        parts.append(f"осталось ~{session_view.format_elapsed(remaining)}")
-                    else:
-                        parts.append("дольше обычного")
+                parts.append("ETA недоступно: недостаточно исторических данных")
             st.progress(min(max(bar_progress, 0), 100) / 100, text=" · ".join(parts))
 
         # Goal and prompt belong on the face of the card, not behind a button.
@@ -2301,7 +2440,9 @@ def _render_inline_create_task() -> None:
             task_type = row2[0].selectbox("Тип", TASK_TYPES, key="console_create_type")
             priority = row2[1].selectbox("Приоритет", PRIORITIES, index=PRIORITIES.index("Medium"),
                                          key="console_create_priority")
-            status = row2[2].selectbox("Колонка", KANBAN_COLUMNS, key="console_create_status")
+            status = row2[2].selectbox(
+                "Колонка", MANUAL_KANBAN_STATUSES, key="console_create_status"
+            )
             goal = st.text_area("Цель", key="console_create_goal", height=80)
             if st.form_submit_button("Создать", type="primary", icon=":material/add_task:"):
                 if not title.strip():
@@ -2465,26 +2606,31 @@ def _fix_attention_sessions(
         # known to have failed to start.
         configured_executor = task.get("executor") or "claude_code"
         failed = set(task.get("failed_executors") or [])
-        if configured_executor not in failed:
-            selected_executor = configured_executor
-        else:
-            selected_executor = execution_queue.select_available_executor(task, cfg)
-            if selected_executor is None:
-                results.append(
-                    (title, False, "ни один из разрешённых исполнителей не доступен — проверьте установку/авторизацию агентов")
-                )
-                continue
-            original = configured_executor
-            task["executor"] = selected_executor
-            task.setdefault("timeline", []).append(
-                {
-                    "ts": models.iso_now(),
-                    "type": "executor_fallback",
-                    "from": original,
-                    "to": selected_executor,
-                    "reason": "configured executor failed to start (attention triage fix)",
-                }
+        selected_executor = execution_queue.select_remediation_executor(task, cfg)
+        if selected_executor is None:
+            results.append(
+                (title, False, "ни один из разрешённых исполнителей не доступен — проверьте установку/авторизацию агентов")
             )
+            continue
+        if configured_executor in failed and selected_executor == configured_executor:
+            models.append_timeline_event(
+                task,
+                "remediation_retry",
+                f"Оператор повторно разрешил проверку восстановленного исполнителя «{configured_executor}».",
+            )
+        else:
+            original = configured_executor
+            if selected_executor != original:
+                task["executor"] = selected_executor
+                task.setdefault("timeline", []).append(
+                    {
+                        "ts": models.iso_now(),
+                        "type": "executor_fallback",
+                        "from": original,
+                        "to": selected_executor,
+                        "reason": "configured executor failed to start (attention triage fix)",
+                    }
+                )
 
         source_repository_path = cfg.get("repository_path")
         expected_branch = task.get("branch")
@@ -3190,6 +3336,10 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
         ]
 
     queue_entries = execution_queue.load_queue(ROOT)
+    reconciled_queue = execution_queue.reconcile_missing_run_links(ROOT, queue_entries)
+    if reconciled_queue != queue_entries:
+        execution_queue.save_queue(ROOT, reconciled_queue)
+        queue_entries = reconciled_queue
     dismissed_attention = st.session_state.get(_ATTENTION_DISMISSED_KEY, set())
     visible_board = {
         bucket: list(rows)
@@ -3382,8 +3532,75 @@ def _quick_action_view_run(source: str, run_id: str) -> None:
         st.session_state.pending_nav = "runs"
 
 
-def render_workspace_home_page(api: runtime_api.ExecutionCenterAPI) -> None:
+def render_project_planning_intelligence(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    *,
+    selector_key: str,
+    recommendation_key_prefix: str,
+    backlog_reconcile_key_prefix: str | None = None,
+) -> str | None:
+    """Render the shared founder health/recommendation surface.
+
+    Workspace Home and Kanban deliberately delegate to the same component
+    functions here so their metrics, scoring, queue state, and launch behavior
+    cannot drift into separate implementations: the numbers come from
+    `project_intelligence.compute_project_intelligence` and the cards from
+    `recommendation_service.build_recommendation_views` on *both* pages, so
+    there is exactly one implementation of each to keep correct.
+
+    Only the Streamlit widget-key namespace differs per host page — each caller
+    passes its own prefixes so the two pages' pills/buttons never collide on
+    widget identity. `backlog_reconcile_key_prefix` is opt-in: backlog
+    reconciliation is a Kanban-only planning tool, not part of the founder
+    health/recommendation surface Workspace Home is meant to mirror.
+    """
+    project_filter = project_selector.render_project_selector(tasks, key=selector_key)
+    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
+    st.divider()
+
+    project_configs = project_config.load_project_configs()
+    with st.expander(
+        "Планирование и рекомендации",
+        icon=":material/auto_awesome:",
+        expanded=False,
+    ):
+        recommendations_panel.render_recommendations_panel(
+            tasks,
+            tasks_by_id,
+            ROOT,
+            api,
+            project_configs,
+            upsert_tasks,
+            project=project_filter,
+            key_prefix=recommendation_key_prefix,
+        )
+        if backlog_reconcile_key_prefix is not None:
+            backlog_reconcile_panel.render_backlog_reconcile_panel(
+                tasks,
+                ROOT,
+                project=project_filter,
+                key_prefix=backlog_reconcile_key_prefix,
+            )
+    return project_filter
+
+
+def render_workspace_home_page(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+) -> None:
     snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
+
+    render_project_planning_intelligence(
+        api,
+        tasks,
+        tasks_by_id,
+        selector_key="workspace_home_project_selector",
+        recommendation_key_prefix="workspace_home_reco",
+    )
+    st.divider()
 
     with st.container(horizontal=True):
         st.metric("Проекты", len(snapshot["projects"]), border=True)
@@ -4144,6 +4361,11 @@ def render_project_chat(project: str, tasks: list[dict], tasks_by_id: dict[str, 
                                     conv_task_type,
                                     "Backlog",
                                     goal=objective_clean,
+                                    # An assistant message is untrusted agent output;
+                                    # converting it to a task must not launder that into
+                                    # a trusted run (SEC-D-02). A user's own message stays
+                                    # trusted.
+                                    untrusted_import=(message["role"] == "assistant"),
                                 )
                                 activity_log.log_event(
                                     "task_created_from_message", project=active_conversation["project"],
@@ -4380,7 +4602,7 @@ if page_key == "dashboard":
     if dashboard_section == "Аналитика":
         render_dashboard_analytics(dashboard_api, tasks, tasks_by_id, task_counts)
     elif dashboard_section == "Репозитории и артефакты":
-        render_workspace_home_page(dashboard_api)
+        render_workspace_home_page(dashboard_api, tasks, tasks_by_id)
     else:
         render_home_dashboard(dashboard_api, tasks, task_counts)
 
@@ -4393,9 +4615,9 @@ elif page_key == "workspace_home":
     content_area.page_header(
         "Workspace Home",
         "Кросс-проектная сводка: репозитории, прогоны, артефакты и отчёты — "
-        "в одном месте, только для чтения.",
+        "в одном месте, с health-метриками и рекомендациями следующих действий.",
     )
-    render_workspace_home_page(get_execution_center_api())
+    render_workspace_home_page(get_execution_center_api(), tasks, tasks_by_id)
 
 
 # --------------------------------------------------------------------------
@@ -4682,7 +4904,9 @@ elif page_key == "create":
             key="create_task_deps",
         )
 
-        initial_status = st.selectbox("Статус Kanban", KANBAN_COLUMNS, key="create_task_status")
+        initial_status = st.selectbox(
+            "Статус Kanban", MANUAL_KANBAN_STATUSES, key="create_task_status"
+        )
         submitted = st.form_submit_button(
             "Создать задачу",
             icon=":material/add_task:",
@@ -4890,29 +5114,14 @@ elif page_key == "waves":
 elif page_key == "kanban":
     st.subheader("Kanban", anchor="kanban")
 
-    project_filter = project_selector.render_project_selector(tasks, key="kanban_project_selector")
-    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
-    st.divider()
-
-    project_configs = project_config.load_project_configs()
-    with st.expander(
-        "Планирование и рекомендации",
-        icon=":material/auto_awesome:",
-        expanded=False,
-    ):
-        recommendations_panel.render_recommendations_panel(
-            tasks,
-            tasks_by_id,
-            ROOT,
-            get_execution_center_api(),
-            project_configs,
-            upsert_tasks,
-            project=project_filter,
-            key_prefix="kanban_reco",
-        )
-        backlog_reconcile_panel.render_backlog_reconcile_panel(
-            tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
-        )
+    project_filter = render_project_planning_intelligence(
+        get_execution_center_api(),
+        tasks,
+        tasks_by_id,
+        selector_key="kanban_project_selector",
+        recommendation_key_prefix="kanban_reco",
+        backlog_reconcile_key_prefix="kanban_reconcile",
+    )
     st.divider()
 
     # Options come from the tasks themselves (canonical priorities + any
@@ -6085,14 +6294,10 @@ elif page_key == "focus":
                     update_task_status(task_id, new_status)
                     st.rerun()
 
-                if st.button(
-                    "Отметить как выполнено",
-                    icon=":material/check_circle:",
-                    type="primary",
-                    width="stretch",
-                ):
-                    update_task_status(task_id, "Done")
-                    st.rerun()
+                st.caption(
+                    "Done устанавливается автоматически после проверки результата "
+                    "и целевой ветки."
+                )
 
 
 # --------------------------------------------------------------------------

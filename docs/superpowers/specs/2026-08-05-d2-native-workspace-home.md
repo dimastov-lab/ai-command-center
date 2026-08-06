@@ -1,8 +1,8 @@
 # D2 — Native Workspace Home Design Spec
 
-**Date:** 2026-08-05  
-**Status:** Approved  
-**Scope:** Desktop Increment 1, stage D2 (D2A → D2B → D2C → D2D)  
+**Date:** 2026-08-05
+**Status:** Approved
+**Scope:** Desktop Increment 1, stage D2 (D2A → D2B → D2C → D2D)
 **References:** `docs/desktop/IMPLEMENTATION_ROADMAP.md`, `docs/desktop/WORKSPACE_HOME_SPEC.md`,
 `docs/desktop/ARCHITECTURE.md`, `docs/desktop/DESIGN_SYSTEM.md`
 

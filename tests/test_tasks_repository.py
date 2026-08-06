@@ -65,23 +65,21 @@ def test_new_task_record_seeds_task_created_timeline_event():
     assert task["timeline"][0]["type"] == "task_created"
 
 
-def test_update_task_status_to_done_does_not_falsely_stamp_merged(tmp_path):
-    """A manual/administrative move to Done is NOT evidence of a merge; only the
-    completion projection (gated on a target-verified merge) may claim "Merged".
-    `update_task_status` must record the move truthfully and never stamp a merge
-    onto a task that nothing actually merged (audit DATA-D3)."""
+def test_update_task_status_rejects_manual_done_without_rewriting(tmp_path):
     task = tr.create_task(tmp_path, "AIOS", "T", "implementation", "Backlog")
-    updated = tr.update_task_status(tmp_path, task["id"], "Done")
-    assert updated["status"] == "Done"
-    assert updated["current_stage"] != "Merged"
-    assert not any(ev.get("type") == "merged" for ev in updated.get("timeline", []))
+    before = tr.tasks_file_path(tmp_path).read_bytes()
+
+    with pytest.raises(tr.CompletionEvidenceRequired, match="completion-owned"):
+        tr.update_task_status(tmp_path, task["id"], "Done")
+
+    assert tr.tasks_file_path(tmp_path).read_bytes() == before
     reloaded = tr.load_tasks(tmp_path)
-    assert reloaded[0]["status"] == "Done"
+    assert reloaded[0]["status"] == "Backlog"
 
 
 def test_update_task_status_unknown_id_returns_none_and_is_a_no_op(tmp_path):
     tr.create_task(tmp_path, "AIOS", "T", "implementation", "Backlog")
-    result = tr.update_task_status(tmp_path, "nonexistent", "Done")
+    result = tr.update_task_status(tmp_path, "nonexistent", "Review")
     assert result is None
     reloaded = tr.load_tasks(tmp_path)
     assert reloaded[0]["status"] == "Backlog"

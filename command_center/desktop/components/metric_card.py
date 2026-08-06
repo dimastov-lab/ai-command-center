@@ -23,7 +23,8 @@ class MetricCard(QFrame):
         )
         layout.setSpacing(tokens.SPACE_XS)
 
-        self._value = QLabel(str(value))
+        display_value = "—" if value is None else str(value)
+        self._value = QLabel(display_value)
         self._value.setObjectName("MetricValue")
         self._label = QLabel(label)
         self._label.setObjectName("MetricCaption")
@@ -35,7 +36,7 @@ class MetricCard(QFrame):
 
         # One combined accessible name so a screen reader announces the metric as
         # a unit ("Активные запуски: 2") rather than two disjoint labels.
-        self.setAccessibleName(f"{label}: {value}")
+        self.setAccessibleName(f"{label}: {display_value}")
 
     def value_text(self) -> str:
         return self._value.text()

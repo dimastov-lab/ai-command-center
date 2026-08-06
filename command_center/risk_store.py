@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterator
 
 from command_center import storage
-from command_center.customer_store import NotFound, get_customer, init_db as _init_customers
+from command_center.customer_store import get_customer
 
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_VERSION = 1

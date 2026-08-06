@@ -12,18 +12,37 @@
     "command_center/agent_runner.py": [
       "orchestration"
     ],
+    "command_center/alert_store.py": [
+      "memory"
+    ],
     "command_center/aml_store.py": [
+      "memory"
+    ],
+    "command_center/case_store.py": [
       "memory"
     ],
     "command_center/companion/auth.py": [
       "authz"
+    ],
+    "command_center/compliance_store.py": [
+      "memory"
+    ],
+    "command_center/customer_store.py": [
+      "memory"
     ],
     "command_center/daily_audit.py": [
       "audit",
       "memory"
     ],
     "command_center/daily_audit_backend.py": [
-      "audit"
+      "audit",
+      "orchestration"
+    ],
+    "command_center/evidence_store.py": [
+      "memory"
+    ],
+    "command_center/evidence_store.py": [
+      "memory"
     ],
     "command_center/execution_queue.py": [
       "queue"
@@ -32,6 +51,13 @@
       "orchestration"
     ],
     "command_center/pipeline_settings.py": [
+      "orchestration"
+    ],
+    "command_center/risk_store.py": [
+      "memory"
+    ],
+    "command_center/rule_engine.py": [
+      "memory",
       "orchestration"
     ],
     "command_center/runtime/__init__.py": [
@@ -114,6 +140,12 @@
     ],
     "command_center/runtime/validation.py": [
       "runtime_package"
+    ],
+    "command_center/sar_store.py": [
+      "memory"
+    ],
+    "command_center/seed_rules_115fz.py": [
+      "memory"
     ],
     "command_center/storage.py": [
       "memory"
