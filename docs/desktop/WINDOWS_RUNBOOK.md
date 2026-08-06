@@ -1,13 +1,19 @@
 # Windows 11 x64 — раннбук прогона Desktop Increment 1
 
 Этот документ самодостаточен: его хватит, чтобы выполнить всю Windows-часть,
-не зная истории обсуждения. Ветка для работы — `integration/desktop-increment-1`.
+не зная истории обсуждения. Ветка для работы — **`main`**: с 2026-08-04 весь
+Increment 1 (PR #110) и Windows-фиксы скриптов (PR #122) влиты.
+
+Быстрый путь: `scripts/run-windows-d1.ps1` автоматизирует шаги 1, 2, 4 и 6 и
+ведёт человека по интерактивному шагу 3 (лог — `windows-d1-run.log`, отчёт —
+`WINDOWS_D1_RESULT.md` рядом со скриптом). Шаг 5 (clean-machine smoke) —
+отдельно, по этому документу.
 
 ## Зачем это нужно
 
 Windows-железа у проекта не было с 2026-07-28, и на этом застряли четыре вещи:
 
-1. **`AICC-D1-GATE`** — открытый PR #83. macOS-нога PASS, Windows-нога `NOT PERFORMED`.
+1. **`AICC-D1-GATE`** — PR #83 (влит). macOS-нога PASS, Windows-нога `NOT PERFORMED`.
    Чеклист — в `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md` §"Outstanding work".
    Раннер GitHub Actions гейт не закрывает: определение требует реального железа.
 2. **D3-гейт** — `DESKTOP_INCREMENT_1.md` §4 требует прохода **на обеих** платформах.
@@ -26,7 +32,7 @@ Windows-железа у проекта не было с 2026-07-28, и на эт
 ## Шаг 1 — окружение
 
 ```powershell
-git clone -b integration/desktop-increment-1 https://github.com/dimastov-lab/ai-command-center
+git clone https://github.com/dimastov-lab/ai-command-center
 cd ai-command-center
 py -3.12 -m venv .venv-desktop
 .venv-desktop\Scripts\python -m pip install -r requirements-desktop.txt -r requirements-dev.txt -r requirements-desktop-build.txt
@@ -38,7 +44,8 @@ py -3.12 -m venv .venv-desktop
 .venv-desktop\Scripts\python -m pytest tests/desktop -q
 ```
 
-Ожидается **124 passed**. Две ловушки, обе дают ложный успех:
+Ожидается **126 passed** (число растёт со временем; ориентир — трёхзначное и
+ноль failed). Две ловушки, обе дают ложный успех:
 
 - **Не задавай `QT_QPA_PLATFORM` вручную.** `tests/desktop/conftest.py` делает
   `os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")`. Уже заданную переменную
