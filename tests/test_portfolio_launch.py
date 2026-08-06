@@ -922,7 +922,17 @@ def test_malformed_branch_override_is_blocked(git_repo, tmp_path, portfolio_work
     assert any("недопустим" in b for b in plan.blockers)
 
 
-@pytest.mark.parametrize("protected_branch", sorted(portfolio_launch.PROTECTED_BRANCH_NAMES))
+@pytest.mark.parametrize(
+    "protected_branch",
+    [
+        *sorted(portfolio_launch.PROTECTED_BRANCH_NAMES),
+        # Case variants resolve to the same loose ref on a case-insensitive
+        # filesystem, so they must be caught by the explicit guard too — not
+        # left to `git worktree add`'s "a branch named 'Main' already exists".
+        *sorted(name.capitalize() for name in portfolio_launch.PROTECTED_BRANCH_NAMES),
+        *sorted(name.upper() for name in portfolio_launch.PROTECTED_BRANCH_NAMES),
+    ],
+)
 def test_launch_rejects_protected_branch_before_worktree_add(
     git_repo, tmp_path, portfolio_worktrees_root, monkeypatch, protected_branch
 ):

@@ -121,6 +121,9 @@ WORKTREE_MODE_NEW = "new"
 # launch. Portfolio launches are isolated implementation/audit runs: allowing
 # one to resolve to a repository's primary branch would make safety depend on
 # `git worktree add` noticing that the branch is already checked out elsewhere.
+# Matched case-insensitively: on a case-insensitive filesystem (the default on
+# macOS) a loose ref `Main` collides with `main`, so a case variant is not a
+# distinct branch — it is the protected one reached by a different spelling.
 PROTECTED_BRANCH_NAMES = frozenset({"main", "master"})
 
 # `build_launch_plan`'s blocker text for "this task_id is already in the
@@ -208,7 +211,7 @@ def _validate_branch_name(name: str) -> str | None:
     else `None`. Rejects protected main-line branches explicitly, then
     delegates syntax validation to `git check-ref-format --branch`, which
     needs no repository context and does not touch the filesystem."""
-    if name in PROTECTED_BRANCH_NAMES:
+    if name.casefold() in PROTECTED_BRANCH_NAMES:
         protected = ", ".join(sorted(PROTECTED_BRANCH_NAMES))
         return (
             f"защищённую ветку «{name}» нельзя использовать для Portfolio-задачи "
