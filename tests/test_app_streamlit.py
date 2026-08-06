@@ -554,8 +554,10 @@ def test_workspace_project_active_count_equals_kanban_lane():
 
 
 def test_timeline_project_filter_includes_display_name_task_under_canonical_lane():
+    from datetime import datetime, timezone
     _seed_tasks(
-        [{"id": "AICC-CI-001", "project": "AI Command Center", "title": "TimelineDisplayNameTask", "status": "Backlog"}]
+        [{"id": "AICC-CI-001", "project": "AI Command Center", "title": "TimelineDisplayNameTask",
+          "status": "Backlog", "created_at": datetime.now(timezone.utc).isoformat()}]
     )
     at = _at_on_page("timeline", timeline_project_filter="AICC")
     assert not at.exception
