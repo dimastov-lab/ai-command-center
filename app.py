@@ -3370,16 +3370,26 @@ def render_project_planning_intelligence(
     *,
     selector_key: str,
     recommendation_key_prefix: str,
-    include_backlog_reconcile: bool = False,
+    backlog_reconcile_key_prefix: str | None = None,
 ) -> str | None:
     """Render the shared founder health/recommendation surface.
 
     Workspace Home and Kanban deliberately delegate to the same component
     functions here so their metrics, scoring, queue state, and launch behavior
-    cannot drift into separate implementations.
+    cannot drift into separate implementations: the numbers come from
+    `project_intelligence.compute_project_intelligence` and the cards from
+    `recommendation_service.build_recommendation_views` on *both* pages, so
+    there is exactly one implementation of each to keep correct.
+
+    Only the Streamlit widget-key namespace differs per host page — each caller
+    passes its own prefixes so the two pages' pills/buttons never collide on
+    widget identity. `backlog_reconcile_key_prefix` is opt-in: backlog
+    reconciliation is a Kanban-only planning tool, not part of the founder
+    health/recommendation surface Workspace Home is meant to mirror.
     """
     project_filter = project_selector.render_project_selector(tasks, key=selector_key)
     project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
+    st.divider()
 
     project_configs = project_config.load_project_configs()
     with st.expander(
@@ -3397,12 +3407,12 @@ def render_project_planning_intelligence(
             project=project_filter,
             key_prefix=recommendation_key_prefix,
         )
-        if include_backlog_reconcile:
+        if backlog_reconcile_key_prefix is not None:
             backlog_reconcile_panel.render_backlog_reconcile_panel(
                 tasks,
                 ROOT,
                 project=project_filter,
-                key_prefix="kanban_reconcile",
+                key_prefix=backlog_reconcile_key_prefix,
             )
     return project_filter
 
@@ -4881,7 +4891,7 @@ elif page_key == "kanban":
         tasks_by_id,
         selector_key="kanban_project_selector",
         recommendation_key_prefix="kanban_reco",
-        include_backlog_reconcile=True,
+        backlog_reconcile_key_prefix="kanban_reconcile",
     )
     st.divider()
 

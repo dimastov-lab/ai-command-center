@@ -5,15 +5,25 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from command_center import activity_log, agent_runner, models, workspace_home
+from command_center import activity_log, agent_runner, models, project_intelligence, storage, workspace_home
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
+
+_INTELLIGENCE_METRIC_LABELS = {
+    "Здоровье",
+    "Прогресс спринта",
+    "Roadmap",
+    "Осталось",
+    "Заблокировано",
+    "Завершено",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -73,15 +83,102 @@ def test_workspace_home_shows_shared_health_metrics_and_recommendations():
     assert not at.exception
 
     metric_labels = {metric.label for metric in at.metric}
-    assert {
-        "Здоровье",
-        "Прогресс спринта",
-        "Roadmap",
-        "Осталось",
-        "Заблокировано",
-        "Завершено",
-    } <= metric_labels
+    assert _INTELLIGENCE_METRIC_LABELS <= metric_labels
     assert any("Рекомендованные задачи" in markdown.value for markdown in at.markdown)
+
+
+# --------------------------------------------------------------------------
+# Project Intelligence / Recommendations parity with Kanban (audit W2-004).
+# Founder-facing point of entry: Home must show the *same* numbers and the
+# *same* recommended tasks as Kanban, computed once — not a second, drifting
+# implementation. These tests fail if either page grows its own rollup.
+# --------------------------------------------------------------------------
+
+
+def _seed_intelligence_tasks() -> None:
+    """A blocked task behind an unfinished dependency plus a ready one, so the
+    health strip and the recommendation list both have non-degenerate values
+    to report (`Заблокировано` > 0, at least one recommendable task)."""
+    tasks = []
+    for task_id, status, depends_on in (
+        ("wh-dep", "In Progress", []),
+        ("wh-blocked", "Backlog", ["wh-dep"]),
+        ("wh-ready", "Backlog", []),
+        ("wh-done", "Done", []),
+    ):
+        task = {
+            "id": task_id,
+            "project": "AICC",
+            "title": f"Workspace Home parity {task_id}",
+            "task_type": "implementation",
+            "status": status,
+            "priority": "High",
+            "owner": "",
+            "estimate_hours": 0.0,
+            "depends_on": depends_on,
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        }
+        task.update(models.default_task_workflow_fields())
+        tasks.append(task)
+    storage.atomic_write_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", tasks)
+
+
+def _metric_values(at: AppTest, labels: set[str]) -> dict[str, str]:
+    return {metric.label: metric.value for metric in at.metric if metric.label in labels}
+
+
+def _at_on_page(page_key: str) -> AppTest:
+    at = AppTest.from_file(APP_PATH, default_timeout=30)
+    at.session_state["nav_page"] = page_key
+    at.run()
+    return at
+
+
+def test_workspace_home_health_metrics_match_kanban_and_the_shared_computation():
+    """Same rollup on both pages — and the same one
+    `project_intelligence.compute_project_intelligence` produces, so neither
+    page can be reading a privately recomputed number."""
+    _seed_intelligence_tasks()
+
+    home = _at_on_page("workspace_home")
+    kanban = _at_on_page("kanban")
+    assert not home.exception
+    assert not kanban.exception
+
+    home_metrics = _metric_values(home, _INTELLIGENCE_METRIC_LABELS)
+    assert set(home_metrics) == _INTELLIGENCE_METRIC_LABELS
+    assert home_metrics == _metric_values(kanban, _INTELLIGENCE_METRIC_LABELS)
+
+    tasks = storage.read_json(Path(os.environ["AICC_DATA_DIR"]) / "tasks.json", [])
+    intel = project_intelligence.compute_project_intelligence(None, tasks)
+    assert home_metrics["Осталось"] == str(intel["remaining"])
+    assert home_metrics["Заблокировано"] == str(intel["blocked"])
+    assert home_metrics["Завершено"] == f"{intel['completion_pct']}%"
+    assert intel["blocked"] >= 1, "fixture must exercise a non-zero blocked count"
+
+
+def test_workspace_home_recommends_the_same_tasks_as_kanban_with_its_own_widget_keys():
+    _seed_intelligence_tasks()
+
+    home = _at_on_page("workspace_home")
+    kanban = _at_on_page("kanban")
+    assert not home.exception
+    assert not kanban.exception
+
+    def recommended_ids(at: AppTest, prefix: str) -> set[str]:
+        return {
+            button.key[len(prefix) + 1 : -len("_launch")] for button in at.button if button.key.endswith("_launch") and button.key.startswith(f"{prefix}_")
+        }
+
+    home_ids = recommended_ids(home, "workspace_home_reco")
+    assert home_ids, "Workspace Home must render at least one recommendation card"
+    assert home_ids == recommended_ids(kanban, "kanban_reco")
+
+    # Distinct widget-key namespaces: Home must not reuse Kanban's keys (which
+    # would collide the moment both surfaces render, and would silently rewire
+    # the existing Kanban regression tests onto Home's buttons).
+    assert not any(button.key.startswith("kanban_reco_") for button in home.button)
 
 
 # --------------------------------------------------------------------------
