@@ -44,8 +44,26 @@ Current position:
   `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
+- Founder Functional Audit `9761459` is **closed** (2026-08-07). Of its 14 Still Open rows, 6 are
+  remediated and verified on `main` (report-path containment, per-warning launch acknowledgement,
+  task-delete confirmation, `claude` pre-flight, Workspace Home intelligence, git ahead/behind +
+  fetch), 1 is partial (Portfolio stale-claim recovery: service half only), 1 is folded into the
+  desktop D2 stage tasks, and 6 remain open as `AICC-AUDIT-W*` rows in
+  `docs/roadmap/MASTER_ROADMAP_TASKS.json`. See
+  `docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §Closure.
 
 Current boundaries:
+- Six audit remediations remain outstanding and are the known functional gaps: `scripts/start-task.sh`
+  accepts 3 of the 11 registered project ids; Portfolio has no protected-branch guard before
+  `git worktree add`; there is no canonical task schema and no dependency-cycle detection; run
+  results reach a task's Timeline only page-driven or under `AICC_BACKGROUND_SYNC`; and the
+  autopilot has no founder batch-confirmation surface before it launches.
+- `data/tasks.json` is out of sync with the roadmap for the audit-remediation track: it holds 7 of
+  13 `AICC-AUDIT-W*` rows and three of those contradict `main`. Reconciliation is tracked as
+  `AICC-GOV-F2`; a refreshed audit against current `main` is tracked as `AICC-GOV-F4B`.
+- **Known regression on `main`:** `app.py:3339` calls the removed
+  `execution_queue.reconcile_missing_run_links`, so rendering the Live Execution Center raises
+  `AttributeError`. Introduced by `81833da`; untracked as of this update.
 - Normal task launches require explicit user action. Scheduler `ASSIGN` results are point-in-time
   advice, not persisted claims; task-id/capacity decisions may race before the separate launch, and
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
