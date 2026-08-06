@@ -499,7 +499,7 @@ def build_import_preview(
     Nothing here is written to `tasks.json` — the caller (UI/CLI) must call
     `apply_task_package` separately, after explicit user confirmation.
     """
-    existing_ids = {t["id"] for t in tasks_repository.load_tasks(root) if t.get("id")}
+    existing_ids = {t["id"] for t in tasks_repository.get_repository(root).load_all() if t.get("id")}
     package_ids = {item["id"] for item in validation.items}
 
     new_items: list[dict] = []
@@ -631,8 +631,9 @@ def apply_task_package(
     skipped: list[str] = []
     warnings = list(validation.warnings)
 
-    def _mutator(tasks: list[dict]) -> list[dict]:
-        existing_ids = {t["id"] for t in tasks if t.get("id")}
+    try:
+        _repo = tasks_repository.get_repository(root)
+        existing_ids = {t["id"] for t in _repo.load_all() if t.get("id")}
         package_ids = {item["id"] for item in validation.items}
 
         new_items = [item for item in validation.items if item["id"] not in existing_ids]
@@ -647,13 +648,7 @@ def apply_task_package(
 
         now = models.iso_now()
         new_records = [_build_task_record(item, parsed, now) for item in new_items]
-        tasks.extend(new_records)
-        return new_records
-
-    try:
-        imported = tasks_repository.mutate_tasks(
-            root, _mutator, timeout=lock_timeout, persist_if=lambda records: bool(records)
-        )
+        imported = [_repo.create(task_dict) for task_dict in new_records]
     except storage.LockTimeoutError as exc:
         raise TaskImportError(
             f"не удалось получить блокировку импорта задач за {lock_timeout:.0f}с: {tasks_repository.tasks_lock_path(root)}"

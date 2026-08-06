@@ -312,7 +312,7 @@ def normalize_task(task: dict) -> dict:
 
 
 def load_tasks() -> list[dict]:
-    return tasks_repository.load_tasks(ROOT, example_file=TASKS_EXAMPLE_FILE)
+    return tasks_repository.get_repository(ROOT).load_all()
 
 
 # No `save_tasks(tasks)` wrapper here (deliberately removed): writing back
@@ -331,7 +331,9 @@ def upsert_tasks(tasks: list[dict]) -> None:
     need to commit exactly those changes. Locked bulk upsert, not a blind
     overwrite of this script run's entire (possibly-stale) `tasks` snapshot —
     see `tasks_repository.upsert_tasks`."""
-    tasks_repository.upsert_tasks(ROOT, tasks)
+    _repo = tasks_repository.get_repository(ROOT)
+    for t in tasks:
+        _repo.upsert(t)
 
 
 def new_task_record(
@@ -400,8 +402,8 @@ def create_task(
     against its own possibly-stale in-memory `tasks` list, which is exactly
     the pattern that silently drops a concurrent writer's task). See
     `tasks_repository.create_task`/module docstring."""
-    return tasks_repository.create_task(
-        ROOT,
+    _repo = tasks_repository.get_repository(ROOT)
+    return _repo.create(new_task_record(
         project,
         title,
         task_type,
@@ -419,15 +421,15 @@ def create_task(
         branch=branch,
         executor=executor,
         prompt=prompt,
-    )
+    ))
 
 
 def update_task_status(task_id: str, new_status: str) -> dict | None:
-    return tasks_repository.update_task_status(ROOT, task_id, new_status)
+    return tasks_repository.get_repository(ROOT).update_status(task_id, new_status)
 
 
 def delete_task(task_id: str) -> None:
-    tasks_repository.delete_task(ROOT, task_id)
+    tasks_repository.get_repository(ROOT).delete(task_id)
     # Also remove the task's runtime.db footprint (session/run/event/report/
     # completion cascade) so a deleted Kanban card leaves no orphan rows in the
     # unified Runs/Timeline/metrics views (audit AR-1).
@@ -902,6 +904,7 @@ def render_agent_launcher(
         # button click above already re-validated `confirmed`/`warnings_ack`
         # server-side, so `confirmed=True` here reflects a genuine, already-
         # checked confirmation, not a bypass of it.
+        _repo = tasks_repository.get_repository(ROOT)
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=project,
@@ -918,7 +921,7 @@ def render_agent_launcher(
                 base_branch=base_branch,
                 source_repository_path=repo_path,
                 on_task_state_changed=(
-                    (lambda: tasks_repository.upsert_task(ROOT, task_for_launch))
+                    (lambda: _repo.upsert(task_for_launch))
                     if task_for_launch is not None
                     else None
                 ),
@@ -962,7 +965,7 @@ def render_agent_launcher(
             # loaded once at the top — persisting it verbatim would silently
             # discard whatever a concurrent writer (another tab, an import,
             # ...) committed to `tasks.json` in the meantime.
-            tasks_repository.upsert_task(ROOT, task_for_launch)
+            _repo.upsert(task_for_launch)
 
         st.session_state[confirm_key] = False
         st.success(
