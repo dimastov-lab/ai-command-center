@@ -1,11 +1,10 @@
 from __future__ import annotations
-from unittest.mock import MagicMock
-import pytest
+
 from command_center.application.aios_tasks import (
     aicc_dict_to_create_request,
     aios_task_to_aicc_dict,
 )
-from aios_sdk import CreateTaskRequest, Task
+from aios_sdk import Task
 
 def _make_aicc_task(**overrides) -> dict:
     base = {

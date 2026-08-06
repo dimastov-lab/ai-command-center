@@ -34,6 +34,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os as _os
 import shutil
 import uuid
 from collections.abc import Callable
@@ -517,8 +518,6 @@ def task_label(task: dict) -> str:
 # Port interface and factory
 # ---------------------------------------------------------------------------
 
-import os as _os
-
 
 class JSONTasksRepository:
     """Thin wrapper around the module-level JSON functions, implementing the TasksPort contract."""
@@ -555,7 +554,7 @@ class JSONTasksRepository:
         return delete_task(self._root, task_id)
 
 
-def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  # type: ignore[name-defined]
+def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  # type: ignore[name-defined]  # noqa: F821
     """Return the active task store backend.
 
     ``AICC_TASKS_BACKEND=json`` (default) → ``JSONTasksRepository``

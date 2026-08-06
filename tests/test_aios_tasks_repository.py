@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 
 from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository
 from aios_sdk import AIOSClient
