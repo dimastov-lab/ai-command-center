@@ -225,6 +225,9 @@ REMEDIATION_BY_REASON: dict[str, str] = {
     ),
     REASON_ADAPTATION_FAILED: "Не удалось подготовить задачу к планированию — см. текст ошибки.",
     execution_queue.LAUNCH_OK: "Запуск начат.",
+    execution_queue.LAUNCH_SKIP_TASK_DONE: (
+        "Задача уже в статусе Done — запись очереди устарела, удалите её."
+    ),
     execution_queue.LAUNCH_SKIP_TASK_NOT_FOUND: "Задача очереди больше не существует — очистите запись очереди.",
     execution_queue.LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED: (
         "Укажите workspace_path задачи или repository_path проекта."
