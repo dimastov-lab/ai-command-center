@@ -870,3 +870,36 @@ def _commit_launch_results(
 
         save_queue(root, merged)
     return merged
+
+
+def reconcile_missing_run_links(root: Path, entries: list[dict]) -> list[dict]:
+    """Backfill `run_id` on LAUNCHED entries that lost their run link.
+
+    A queue entry transitions to STATE_LAUNCHED and receives a `run_id` in
+    `_commit_launch_results`. If that commit was interrupted (crash, SIGKILL,
+    lost write) the entry stays LAUNCHED but with `run_id=None`, making it
+    invisible to live-board and attention tracking.
+
+    For each such orphaned entry, look up the latest run for that `task_id` in
+    runtime.db and fill in its id. Returns the (possibly modified) list; the
+    caller decides whether to persist it.
+    """
+    db_path = runtime_db.resolve_db_path(root)
+    repaired: list[dict] = []
+    changed = False
+    for entry in entries:
+        if entry.get("state") == STATE_LAUNCHED and not entry.get("run_id"):
+            task_id = entry.get("task_id")
+            run = runtime_db.get_latest_run_for_task(db_path, task_id) if task_id else None
+            if run and run.get("id"):
+                entry = dict(entry)
+                entry["run_id"] = run["id"]
+                logger.info(
+                    "reconcile_missing_run_links: backfilled run_id=%s for queue entry %s (task %s)",
+                    run["id"],
+                    entry.get("id"),
+                    task_id,
+                )
+                changed = True
+        repaired.append(entry)
+    return repaired if changed else entries
