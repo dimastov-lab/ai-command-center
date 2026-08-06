@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from aios_sdk import CreateTaskRequest, Task
+from aios_sdk import AIOSClient, CreateTaskRequest, Task
 
 # ---------------------------------------------------------------------------
 # Priority mapping
@@ -139,3 +139,122 @@ def aios_task_to_aicc_dict(task: Task) -> dict[str, Any]:
     result.setdefault("workflow_stage", "Draft")
     result.setdefault("timeline", [])
     return result
+
+
+# ---------------------------------------------------------------------------
+# ID mapping (AICC uuid hex ↔ AIOS task id)
+# ---------------------------------------------------------------------------
+
+import json
+import threading
+from pathlib import Path
+
+
+class AIOSIdMap:
+    """Thread-safe persistent mapping between AICC task ids (uuid hex) and AIOS task ids.
+
+    Backed by a single JSON file (`data/aios_task_map.json`). All writes are
+    atomic (write-to-temp + os.replace) to prevent corruption on crash.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._data: dict[str, str] = self._load()
+
+    def _load(self) -> dict[str, str]:
+        if self._path.exists():
+            try:
+                return json.loads(self._path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return {}
+        return {}
+
+    def _save(self) -> None:
+        import tempfile
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        import os
+        os.replace(tmp, self._path)
+
+    def get(self, aicc_id: str) -> str | None:
+        with self._lock:
+            return self._data.get(aicc_id)
+
+    def put(self, aicc_id: str, aios_id: str) -> None:
+        with self._lock:
+            self._data[aicc_id] = aios_id
+            self._save()
+
+    def remove(self, aicc_id: str) -> None:
+        with self._lock:
+            if aicc_id in self._data:
+                del self._data[aicc_id]
+                self._save()
+
+
+# ---------------------------------------------------------------------------
+# AIOS-backed repository
+# ---------------------------------------------------------------------------
+
+class AIOSTasksRepository:
+    """Implements AICC task CRUD operations via the AIOS Tasks API SDK.
+
+    All methods accept/return plain AICC task dicts (same shape as the JSON backend).
+    State transitions drive AIOS lifecycle calls; the local ``AIOSIdMap`` bridges
+    AICC uuid-hex ids to AIOS system ids.
+    """
+
+    def __init__(self, client: AIOSClient, id_map: AIOSIdMap) -> None:
+        self._client = client
+        self._id_map = id_map
+
+    def load_all(self) -> list[dict[str, Any]]:
+        return [aios_task_to_aicc_dict(t) for t in self._client.tasks.iterate()]
+
+    def create(self, task_dict: dict[str, Any]) -> dict[str, Any]:
+        req, target_state = aicc_dict_to_create_request(task_dict)
+        result = self._client.tasks.create(req)
+        aios_id = result.data.id
+        aicc_id = task_dict.get("id", "")
+        if aicc_id:
+            self._id_map.put(aicc_id, aios_id)
+        if target_state == "in_progress":
+            result = self._client.tasks.start(aios_id)
+        elif target_state == "completed":
+            result = self._client.tasks.complete(aios_id)
+        return aios_task_to_aicc_dict(result.data)
+
+    def upsert(self, task_dict: dict[str, Any]) -> None:
+        aicc_id = task_dict.get("id", "")
+        aios_id = self._id_map.get(aicc_id) if aicc_id else None
+        if aios_id:
+            # Task exists in AIOS — sync status only (full update not in API v1)
+            new_status = task_dict.get("status", "Backlog")
+            self.update_status(aicc_id, new_status)
+        else:
+            self.create(task_dict)
+
+    def update_status(self, task_id: str, new_status: str) -> dict[str, Any] | None:
+        aios_id = self._id_map.get(task_id)
+        if not aios_id:
+            return None
+        target_state = _STATUS_TO_AIOS_STATE.get(new_status, "open")
+        if target_state == "in_progress":
+            result = self._client.tasks.start(aios_id)
+        elif target_state == "completed":
+            result = self._client.tasks.complete(aios_id)
+        elif target_state == "open":
+            # No direct "reopen" in API v1 — treat as noop (state already open or assigned)
+            result = self._client.tasks.get(aios_id)
+        else:
+            result = self._client.tasks.get(aios_id)
+        return aios_task_to_aicc_dict(result.data)
+
+    def delete(self, task_id: str) -> bool:
+        aios_id = self._id_map.get(task_id)
+        if not aios_id:
+            return False
+        self._client.tasks.cancel(aios_id)
+        self._id_map.remove(task_id)
+        return True
