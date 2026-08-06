@@ -427,7 +427,7 @@ def fake_codex(monkeypatch, tmp_path):
     from command_center import project_config
 
     executable = tmp_path / "codex"
-    shutil.copyfile(FAKE_CODEX_SCRIPT, executable)
+    executable.write_text(f"#!/bin/sh\nexec {sys.executable} {FAKE_CODEX_SCRIPT} \"$@\"\n")
     executable.chmod(0o700)
     monkeypatch.setenv("AICC_CODEX_BINARY", str(executable))
     monkeypatch.setenv("AICC_TEST_FAKE_CODEX_BINARY", str(executable))
@@ -445,7 +445,7 @@ def fake_copilot(monkeypatch, tmp_path):
     from command_center import project_config
 
     executable = tmp_path / "copilot"
-    shutil.copyfile(FAKE_COPILOT_SCRIPT, executable)
+    executable.write_text(f"#!/bin/sh\nexec {sys.executable} {FAKE_COPILOT_SCRIPT} \"$@\"\n")
     executable.chmod(0o700)
     monkeypatch.setenv("AICC_COPILOT_BINARY", str(executable))
     monkeypatch.setenv("FAKE_COPILOT_TOUCH_FILE", "fake_copilot_default_touch.txt")
