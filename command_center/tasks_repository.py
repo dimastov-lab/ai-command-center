@@ -504,3 +504,68 @@ def reconcile_project_aliases(root: Path) -> dict[str, int]:
 def task_label(task: dict) -> str:
     title = (task.get("title") or "—")[:50]
     return f"[{task.get('project')}] {title} · {task.get('status')}"
+
+
+# ---------------------------------------------------------------------------
+# Port interface and factory
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+
+class JSONTasksRepository:
+    """Thin wrapper around the module-level JSON functions, implementing the TasksPort contract."""
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def load_all(self) -> list[dict]:
+        return load_tasks(self._root)
+
+    def create(self, task_dict: dict) -> dict:
+        task_id = task_dict.get("id")
+        if not task_id:
+            raise ValueError("task_dict must have an 'id' field")
+
+        def _mutator(tasks: list[dict]) -> dict:
+            if any(t.get("id") == task_id for t in tasks):
+                raise ValueError(f"refusing to create task with colliding id: {task_id!r}")
+            tasks.append(task_dict)
+            return task_dict
+
+        return mutate_tasks(self._root, _mutator)
+
+    def upsert(self, task_dict: dict) -> None:
+        upsert_task(self._root, task_dict)
+
+    def update_status(self, task_id: str, new_status: str) -> dict | None:
+        return update_task_status(self._root, task_id, new_status)
+
+    def delete(self, task_id: str) -> bool:
+        return delete_task(self._root, task_id)
+
+
+def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  # type: ignore[name-defined]
+    """Return the active task store backend.
+
+    ``AICC_TASKS_BACKEND=json`` (default) → ``JSONTasksRepository``
+    ``AICC_TASKS_BACKEND=aios`` → ``AIOSTasksRepository`` (requires AICC_AIOS_URL + AICC_AIOS_TOKEN)
+    """
+    backend = _os.environ.get("AICC_TASKS_BACKEND", "json").lower()
+    if backend == "aios":
+        url = _os.environ.get("AICC_AIOS_URL")
+        token = _os.environ.get("AICC_AIOS_TOKEN")
+        if not url:
+            raise RuntimeError(
+                "AICC_TASKS_BACKEND=aios requires AICC_AIOS_URL to be set"
+            )
+        if not token:
+            raise RuntimeError(
+                "AICC_TASKS_BACKEND=aios requires AICC_AIOS_TOKEN to be set"
+            )
+        from aios_sdk import AIOSClient  # local import: only when AIOS backend requested
+        from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository
+        client = AIOSClient(url, token=token)
+        id_map = AIOSIdMap(storage.resolve_data_dir(root) / "aios_task_map.json")
+        return AIOSTasksRepository(client, id_map)
+    return JSONTasksRepository(root)
