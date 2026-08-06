@@ -391,6 +391,7 @@ def waiting_entries(entries: list[dict]) -> list[dict]:
 # trail, the desktop wave view's remediation hints, tests — reads `reason_code`
 # instead. Every `LaunchAttemptResult` carries exactly one.
 LAUNCH_OK = "launched"
+LAUNCH_SKIP_TASK_DONE = "task_already_done"
 LAUNCH_SKIP_TASK_NOT_FOUND = "task_not_found"
 LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED = "workspace_not_configured"
 LAUNCH_SKIP_BLOCKED = "launch_blocked"
@@ -602,6 +603,17 @@ def launch_ready(
                     False,
                     message="задача не найдена",
                     reason_code=LAUNCH_SKIP_TASK_NOT_FOUND,
+                )
+            )
+            continue
+        if task.get("status") == "Done":
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message="задача уже в статусе Done — запуск отклонён",
+                    reason_code=LAUNCH_SKIP_TASK_DONE,
                 )
             )
             continue
