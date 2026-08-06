@@ -382,12 +382,18 @@ def create_task(
     branch: str | None = None,
     executor: str | None = None,
     prompt: str | None = None,
+    untrusted_import: bool = False,
 ) -> dict:
     """Locked create — every page that adds a task to the Kanban board must
     call this (never `tasks.append(new_task_record(...)); save_tasks(tasks)`
     against its own possibly-stale in-memory `tasks` list, which is exactly
     the pattern that silently drops a concurrent writer's task). See
-    `tasks_repository.create_task`/module docstring."""
+    `tasks_repository.create_task`/module docstring.
+
+    `untrusted_import` stamps the provenance flag `agent_runner.is_untrusted_task`
+    gates on, so a task synthesized from untrusted report content (the "create
+    next task" widget, chat "convert message to task") is not laundered into a
+    trusted run — audit SEC-D-02, mirroring `backlog_proposals.apply_candidate`."""
     return tasks_repository.create_task(
         ROOT,
         project,
@@ -407,6 +413,7 @@ def create_task(
         branch=branch,
         executor=executor,
         prompt=prompt,
+        untrusted_import=untrusted_import,
     )
 
 
@@ -1114,6 +1121,10 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
                 parent_task_id=run.get("task_id"),
                 prior_run_id=run["id"],
                 workflow_stage=next_stage,
+                # The objective is drafted from the parent run's report output
+                # (untrusted agent text), so mark the follow-up untrusted — it
+                # launches read-only until an operator elevates it (SEC-D-02).
+                untrusted_import=True,
             )
             run["next_task_id"] = new_task["id"]
             # Only the v1.2 journal is writable here. A v2 run lives in runtime.db;
@@ -4331,6 +4342,11 @@ def render_project_chat(project: str, tasks: list[dict], tasks_by_id: dict[str, 
                                     conv_task_type,
                                     "Backlog",
                                     goal=objective_clean,
+                                    # An assistant message is untrusted agent output;
+                                    # converting it to a task must not launder that into
+                                    # a trusted run (SEC-D-02). A user's own message stays
+                                    # trusted.
+                                    untrusted_import=(message["role"] == "assistant"),
                                 )
                                 activity_log.log_event(
                                     "task_created_from_message", project=active_conversation["project"],
