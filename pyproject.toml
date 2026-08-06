@@ -37,3 +37,12 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "if TYPE_CHECKING:",
 ]
+
+[tool.uv.sources]
+aios = { path = "../aios" }
+
+[dependency-groups]
+dev = [
+    "aios",
+    "pytest>=9.1.1",
+]

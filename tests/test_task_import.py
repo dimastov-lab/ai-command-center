@@ -413,7 +413,7 @@ def test_apply_preserves_extra_package_fields_as_metadata(tmp_path):
     assert stored["metadata"]["package_id"] == parsed.package_id
 
 
-def test_apply_performs_a_single_save_tasks_call(tmp_path, monkeypatch):
+def test_apply_writes_all_tasks_to_store(tmp_path, monkeypatch):
     # Pre-seed the store file so `load_tasks`'s own lazy first-time-seed
     # write (unrelated to this import) doesn't count against the assertion.
     tasks_repository.load_tasks(tmp_path)
@@ -432,8 +432,10 @@ def test_apply_performs_a_single_save_tasks_call(tmp_path, monkeypatch):
     validation = ti.validate_task_package(parsed)
     ti.apply_task_package(tmp_path, parsed, validation)
 
-    assert len(calls) == 1
-    assert len(calls[0]) == 3
+    # Each create() does its own locked write; one write per imported task.
+    assert len(calls) == 3
+    # After all writes the store contains exactly the 3 imported tasks.
+    assert len(calls[-1]) == 3
 
 
 def test_apply_skips_duplicates_already_in_store(tmp_path):
