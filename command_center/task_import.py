@@ -584,25 +584,22 @@ def apply_task_package(
     lock_timeout: float = IMPORT_LOCK_TIMEOUT_SECONDS,
     allow_unresolved_dependencies: bool = False,
 ) -> ImportResult:
-    """Runs the entire read-modify-write cycle — load the store, re-derive
-    duplicates and unmet dependencies against that fresh read, build every
-    new task's full record, save — inside one `tasks_repository.mutate_tasks`
-    call, i.e. inside the *same shared lock* every other write path in this
-    application (task creation, status change, deletion, manual launch-status
-    toggles) holds for its own load-mutate-save cycle. Two concurrent imports
-    (two packages uploaded from two browser tabs, a package imported from the
-    CLI while another import is in flight from the UI), a manual "Create
-    Task" save racing an import, or any other pairing of writers can
-    therefore never both read the same pre-write snapshot of `tasks.json` and
-    each write back a version that silently discards the other's tasks — see
-    `tasks_repository`'s module docstring for why a single atomic write alone
-    (`save_tasks`'s `tempfile` + `os.replace`) is not sufficient. Never
-    trusts any `ImportPreview` the caller may be holding — everything is
-    recomputed from the fresh, locked read.
+    """Load the store, re-derive duplicates and unmet dependencies against
+    that fresh read, build every new task's full record, then persist each
+    new task with a separate `get_repository(root).create()` call. Each
+    `create()` acquires and releases the tasks-store lock independently, so
+    concurrent writers may interleave between individual task creates — this
+    is the accepted trade-off that enables the AIOS backend (which has no
+    batch-write primitive). The dependency and duplicate checks are still
+    computed against a single up-front `load_all()` snapshot, so the
+    pre-flight validation is consistent within one import run.
+
+    Never trusts any `ImportPreview` the caller may be holding — duplicates
+    and dependency constraints are recomputed from the fresh `load_all()` read.
 
     By default (`allow_unresolved_dependencies=False`) a new task whose
     `depends_on` points outside both the package and the current store —
-    the fresh, locked read, not whatever `build_import_preview` last saw —
+    the fresh read, not whatever `build_import_preview` last saw —
     is a **blocking error**: the whole package is rejected and nothing is
     written, same as a package with blocking `validation.errors`. Pass
     `allow_unresolved_dependencies=True` to explicitly opt into the old,
@@ -612,16 +609,21 @@ def apply_task_package(
 
     Every new task's full record is built via `tasks_repository.
     new_task_record` (so it gets the same `created_at`/`updated_at`/
-    timeline/workflow/execution defaults every other task gets), and exactly
-    one `save_tasks` call (performed by `mutate_tasks`, skipped entirely if
-    there is nothing new to import) covers every new task in the package —
-    never one write per task. A package that already has blocking
-    `validation.errors` is refused outright before the lock is even
-    acquired: nothing is read-modified-written. Re-importing an
-    already-imported package's ids is a no-op for those ids
+    timeline/workflow/execution defaults every other task gets). One
+    `create()` call is made per new task; N tasks → N separate lock
+    cycles and N writes. A package that already has blocking
+    `validation.errors` is refused outright before any write is attempted.
+    Re-importing already-imported ids is a no-op for those ids
     (`skipped_duplicate_ids`), not a second copy.
 
-    Raises `TaskImportError` if the lock cannot be acquired within
+    **Partial-import on lock timeout:** if `storage.LockTimeoutError` is
+    raised during the create loop (i.e. after at least one successful
+    `create()` but before all tasks are written), the tasks already
+    persisted remain in the store. The `TaskImportError` that is raised
+    does not carry a count of how many tasks succeeded — the caller should
+    reload the store to determine actual state.
+
+    Raises `TaskImportError` if a lock cannot be acquired within
     `lock_timeout` seconds (default 30s) — surfaced to the UI/CLI as an
     ordinary import failure, never an indefinite hang.
     """

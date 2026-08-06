@@ -330,7 +330,7 @@ def upsert_tasks(tasks: list[dict]) -> None:
     (via `execution_queue.launch_ready`, exactly like `launch_service`) and
     need to commit exactly those changes. Locked bulk upsert, not a blind
     overwrite of this script run's entire (possibly-stale) `tasks` snapshot —
-    see `tasks_repository.upsert_tasks`."""
+    each task is written via `get_repository(ROOT).upsert()`."""
     _repo = tasks_repository.get_repository(ROOT)
     for t in tasks:
         _repo.upsert(t)
