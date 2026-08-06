@@ -475,6 +475,38 @@ def select_available_executor(
     return candidates[0][0]
 
 
+def select_remediation_executor(task: dict, cfg: dict) -> str | None:
+    """Pick the executor to use for a «Исправить» (fix) re-launch.
+
+    Simpler than ``select_available_executor``:
+    - Does NOT probe ``provider.availability()`` — transient probe failures
+      must not block an operator-initiated retry (see comment in app.py).
+    - Does NOT apply load-awareness — this is a one-off human action.
+    - Skips only executors already in ``task["failed_executors"]`` (those
+      recorded as startup failures, not permission-denied blocks mid-run).
+
+    Returns the first viable candidate in configured order, or ``None`` when
+    every candidate is in ``failed_executors``.
+    """
+    configured = task.get("executor") or "claude_code"
+    failed = set(task.get("failed_executors") or [])
+    allowed = list(cfg.get("allowed_agents") or [])
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for eid in [configured, *allowed]:
+        if eid not in seen:
+            candidates.append(eid)
+            seen.add(eid)
+    if not candidates:
+        candidates = ["claude_code"]
+
+    for eid in candidates:
+        if eid not in failed:
+            return eid
+    return None
+
+
 @dataclass
 class LaunchAttemptResult:
     entry_id: str
