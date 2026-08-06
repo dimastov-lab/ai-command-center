@@ -97,6 +97,43 @@ def detect_blocker_language(text: str | None) -> str | None:
     return None
 
 
+_HISTORICAL_BLOCKER_MARKERS = re.compile(
+    r"\b(?:previous|prior|earlier|last)\s+(?:attempt|run|failure|error)\b"
+    r"|\bwhat\s+(?:failed|went\s+wrong)\s+(?:before|previously)\b"
+    r"|\bпредыдущ(?:ая|ей|ую)\s+(?:попытк[аиу]|запуск|ошибк[аиу])\b"
+    r"|\bв\s+прошл(?:ой|ом)\s+(?:попытке|запуске)\b",
+    re.I,
+)
+_ONGOING_BLOCKER_MARKERS = re.compile(
+    r"\b(?:still|again|remains?|continues?|unresolved|not\s+fixed)\b"
+    r"|\b(?:всё\s+ещ[её]|снова|оста[её]тся|не\s+исправлен[ао]?)\b",
+    re.I,
+)
+
+
+def detect_actionable_blocker_language(text: str | None) -> str | None:
+    """Return blocker evidence about the current attempt, not quoted history."""
+    if not text:
+        return None
+    for pattern in _BLOCKER_PATTERNS:
+        for match in pattern.finditer(text):
+            start = max(text.rfind(".", 0, match.start()), text.rfind("\n", 0, match.start())) + 1
+            stops = [
+                pos
+                for pos in (text.find(".", match.end()), text.find("\n", match.end()))
+                if pos >= 0
+            ]
+            end = min(stops) if stops else len(text)
+            sentence = text[start:end]
+            if (
+                _HISTORICAL_BLOCKER_MARKERS.search(sentence)
+                and not _ONGOING_BLOCKER_MARKERS.search(sentence)
+            ):
+                continue
+            return match.group(0).strip().lower()
+    return None
+
+
 # --------------------------------------------------------------------------
 # Completion evidence — the counterpart to `detect_blocker_language`.
 #
@@ -161,17 +198,18 @@ def detect_completion_evidence(text: str | None) -> str | None:
     return None
 
 
-# Git subcommands that a trusted implementation agent is *intentionally* denied
-# (the completion pipeline owns commit/push/merge, never the agent — see
-# `agent_runner.GIT_WRITE_DISALLOWED_TOOLS`). A denial of one of these is the
+# Git subcommands that a trusted implementation agent is *intentionally* denied.
+# The task agent may create its local commit; push/merge/history/branch mutations
+# remain outside its authority (see `agent_runner.GIT_WRITE_DISALLOWED_TOOLS`).
+# A denial of one of these is the
 # system working as designed, not a run that "could not do its work": the agent
 # poking at git it isn't allowed to touch, while its real work happened through
 # Read/Edit/Write/other Bash. Such denials must NOT fail an otherwise-productive
 # run. (`git stash` is included because the disallow pattern also catches the
 # read-only `git stash list` the agent sometimes runs to inspect state.)
 _EXPECTED_GIT_DENIAL_MARKERS: tuple[str, ...] = (
-    "git add", "git apply", "git checkout", "git restore", "git switch",
-    "git stash", "git commit", "git push", "git merge", "git reset",
+    "git apply", "git checkout", "git restore", "git switch",
+    "git stash", "git push", "git merge", "git reset",
     "git rebase", "git clean", "git branch -d", "git branch -D",
 )
 
@@ -242,7 +280,7 @@ def classify_process_result(
     if denied_tools:
         return BLOCKED, f"permission_denied:{','.join(denied_tools)}"
 
-    blocker_phrase = detect_blocker_language(result_text)
+    blocker_phrase = detect_actionable_blocker_language(result_text)
     if blocker_phrase:
         return BLOCKED, f"final_response:{blocker_phrase}"
 
