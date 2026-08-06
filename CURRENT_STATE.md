@@ -1,6 +1,6 @@
 # AI Command Center — Current State
 
-Updated: 2026-07-27
+Updated: 2026-08-07
 
 ## 0. AI Command Center platform
 
@@ -9,7 +9,10 @@ Status: Active, local Streamlit implementation
 Current position:
 - `app.py` hosts the implemented Streamlit control application: 20 page handlers, 16 shown in the
   sidebar (chat, generated files, reports, and context open inside the project view).
-- `data/tasks.json` remains the planning and Kanban store.
+- `data/tasks.json` is the default planning and Kanban store. `AICC_TASKS_BACKEND=aios` routes
+  all task reads/writes through the AIOS Tasks API instead (requires `AICC_AIOS_URL` + `AICC_AIOS_TOKEN`).
+  `tasks_repository.get_repository()` is the factory; `scripts/migrate_tasks_to_aios.py` provides
+  one-shot migration. See CHANGELOG [Unreleased] §"AIOS Tasks backend (Sprint 4)" for limitations.
 - `data/runtime.db` schema 11 is authoritative for asynchronous execution, completion, the
   persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
   verdict, and the `queue_entry` mirror (ADR 0007 dual-write).

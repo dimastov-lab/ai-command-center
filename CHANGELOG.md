@@ -8,6 +8,35 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### AIOS Tasks backend (Sprint 4) — 2026-08-06
+
+Feature flag `AICC_TASKS_BACKEND=json|aios` selects the tasks persistence layer at runtime.
+Default is `json` (no behaviour change). Set to `aios` and provide `AICC_AIOS_URL` + `AICC_AIOS_TOKEN`
+to route all task reads/writes through the AIOS Tasks API.
+
+#### Added
+- **`command_center/application/aios_tasks.py`**: `aicc_dict_to_create_request` / `aios_task_to_aicc_dict`
+  pure mapping functions; `AIOSIdMap` (local JSON file for AICC-id ↔ AIOS-uuid correlation);
+  `AIOSTasksRepository` (read/create/update/upsert/upsert_all via `aios_sdk.AIOSClient`).
+- **`tasks_repository.get_repository(root)`** factory: returns `JSONTasksRepository` (default) or
+  `AIOSTasksRepository` based on `AICC_TASKS_BACKEND`. AIOS variant is lazily imported so
+  the JSON path carries zero new overhead.
+- **`scripts/migrate_tasks_to_aios.py`**: one-shot migration of `data/tasks.json` into AIOS;
+  writes `data/.aios_id_map.json` for continuity; dry-run mode via `--dry-run`.
+- **`JSONTasksRepository.upsert_all(tasks)`**: atomic batch write that replaces the previous
+  individual-upsert loop in `app.py:upsert_tasks()`.
+- **Tests**: `tests/test_aios_tasks_adapter.py`, `tests/test_aios_tasks_repository.py`,
+  `tests/test_tasks_backend_routing.py` — skipped via `pytest.importorskip("aios_sdk")`
+  when the local SDK path dep is unavailable (CI).
+
+#### Known limitations (AIOS v1)
+- C1: Titles longer than 512 chars are silently truncated on create.
+- C2: AICC-specific fields (`duration_estimate`, `assignee`, etc.) round-trip as notes/tags only.
+- C3: `AIOSIdMap` is per-process; multi-worker Streamlit deployments need a shared store.
+- I3: AIOS auth token is not refreshed mid-session (assumed long-lived).
+- I4: `list_tasks()` fetches only the first page (AIOS v1 has no cursor pagination).
+- I5: `aios_sdk` is a local path dep; not in `requirements.txt` — CI skips AIOS tests.
+
 ### D1 final gate — cross-platform smoke pass (partial)
 
 - **Verification record added**: `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md` records the D1 final gate
