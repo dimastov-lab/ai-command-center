@@ -124,10 +124,12 @@ def test_metric_card_accessible_name_combines_label_and_value(qtbot):
     assert "7" in card.accessibleName()
 
 
-def test_metric_card_zero_value_renders_as_zero_string(qtbot):
-    card = MetricCard(0, "Артефакты")
+def test_metric_card_none_value_renders_em_dash(qtbot):
+    """MetricCard with value=None shows the em-dash sentinel, never the string 'None'."""
+    card = MetricCard(None, "Артефакты")
     qtbot.addWidget(card)
-    assert card.value_text() == "0"
+    assert card.value_text() == "—"
+    assert "—" in card.accessibleName()
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,18 @@ def test_worktree_row_missing_fields_degrade_to_empty(qtbot):
     assert row.head_text() == ""
 
 
+def test_worktree_row_detached_head_verbatim(qtbot):
+    """The detached-HEAD marker is passed through verbatim to the accessible name.
+
+    Note: WorktreeRow sets accessibleName (not accessibleDescription); only
+    accessibleName is verified here since setAccessibleDescription is never called.
+    """
+    row = WorktreeRow({"path": "/r", "branch": "(detached HEAD)", "head": "abc1234567"})
+    qtbot.addWidget(row)
+    assert row.branch_text() == "(detached HEAD)"
+    assert "(detached HEAD)" in row.accessibleName()
+
+
 # ---------------------------------------------------------------------------
 # ActivityItem component tests
 # (actual API: ActivityItem(event_dict) — not positional project/event_type/ts)
@@ -176,10 +190,11 @@ def test_activity_item_renders_known_event_type(qtbot):
     assert "AIOS" in item.detail_text()
 
 
-def test_activity_item_accessible_name_not_empty(qtbot):
+def test_activity_item_accessible_name_contains_project(qtbot):
+    """Accessible name must include the project name so screen-reader users can navigate."""
     item = ActivityItem({"event_type": "run_started", "project": "ESF", "ts": "2026-08-06T09:00:00"})
     qtbot.addWidget(item)
-    assert item.accessibleName() != ""
+    assert "ESF" in item.accessibleName()
 
 
 def test_activity_item_tolerates_empty_dict(qtbot):
@@ -194,7 +209,8 @@ def test_activity_item_tolerates_empty_dict(qtbot):
 # ---------------------------------------------------------------------------
 
 
-def test_artifact_row_summary_contains_task_type_label(qtbot):
+def test_artifact_row_summary_and_accessible_name_contain_project(qtbot):
+    """Summary text must be non-empty and accessible name must include the project."""
     artifact = {
         "project": "AIOS",
         "task_type": "implementation",
@@ -204,6 +220,7 @@ def test_artifact_row_summary_contains_task_type_label(qtbot):
     row = ArtifactRow(artifact)
     qtbot.addWidget(row)
     assert row.summary_text() != ""
+    assert "AIOS" in row.accessibleName()
 
 
 def test_artifact_row_has_path_when_path_present(qtbot):
@@ -250,11 +267,17 @@ def test_report_row_no_badge_for_unmatched_run(qtbot):
     assert row.verdict_badge_widget is None
 
 
-def test_report_row_accessible_name_not_empty_for_matched(qtbot):
+def test_report_row_accessible_name_contains_project_and_verdict(qtbot):
+    """Accessible name must include the project and the verdict label for matched runs."""
+    from command_center import models
     report = {"run_id": "r2", "project": "ESF", "verdict": "APPROVED_FOR_COMMIT", "created_at": "2026-08-02"}
     row = ReportRow(report)
     qtbot.addWidget(row)
-    assert row.accessibleName() != ""
+    name = row.accessibleName()
+    assert "ESF" in name
+    # verdict badge text comes from models.VERDICT_LABELS
+    expected_badge = models.VERDICT_LABELS.get("APPROVED_FOR_COMMIT", "APPROVED_FOR_COMMIT")
+    assert expected_badge in name
 
 
 # ---------------------------------------------------------------------------
@@ -285,10 +308,28 @@ def test_run_summary_no_state_badge_when_state_absent(qtbot):
 
 
 def test_run_summary_run_key_is_source_run_id_composite(qtbot):
-    run = {"source": "v2", "run_id": "abc", "project": "AIOS", "task_type": "implementation", "state": "QUEUED"}
+    run = {"source": "v1", "run_id": "r3", "project": "AIOS", "task_type": "implementation", "state": "QUEUED"}
     summary = RunSummary(run)
     qtbot.addWidget(summary)
-    assert summary.run_key == ("v2", "abc")
+    assert summary.run_key == ("v1", "r3")
+
+
+def test_run_summary_active_uses_active_token(qtbot):
+    """A RUNNING run must use the ACTIVE status token — not INFO or NEUTRAL."""
+    run = {"source": "v2", "run_id": "r1", "project": "AIOS", "task_type": "implementation", "state": "RUNNING"}
+    summary = RunSummary(run)
+    qtbot.addWidget(summary)
+    assert summary.state_badge is not None
+    assert summary.state_badge.variant is StatusVariant.ACTIVE
+
+
+def test_run_summary_queued_uses_info_token(qtbot):
+    """A QUEUED run must use the INFO status token — same visual level as PREPARED."""
+    run = {"source": "v2", "run_id": "r2", "project": "AIOS", "task_type": "review", "state": "QUEUED"}
+    summary = RunSummary(run)
+    qtbot.addWidget(summary)
+    assert summary.state_badge is not None
+    assert summary.state_badge.variant is StatusVariant.INFO
 
 
 # ---------------------------------------------------------------------------
