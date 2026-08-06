@@ -30,6 +30,15 @@ file** and is deliberately not rewritten as rows get fixed. Rows resolved since 
 dated "**Resolved since this reconciliation**" note in their own section below:
 
 - W2-004 (`AICC-AUDIT-W2-004`) — resolved 2026-07-29.
+- W0-006 (`AICC-AUDIT-W0-006`) — resolved 2026-08-06, verified on `main` 2026-08-07.
+- W1-004 (`AICC-AUDIT-W1-004`) — resolved 2026-08-06, verified on `main` 2026-08-07.
+- W1-007 (`AICC-AUDIT-W1-007`) — resolved 2026-08-06, verified on `main` 2026-08-07.
+- W1-009 (`AICC-AUDIT-W1-009`) — resolved 2026-08-06, verified on `main` 2026-08-07.
+- W2-006 (`AICC-AUDIT-W2-006`) — resolved 2026-08-06, verified on `main` 2026-08-07.
+- W1-006 (`AICC-AUDIT-W1-006`) — **partially** resolved 2026-08-06; the service half landed, the
+  UI recovery action did not. Stays Still Open.
+
+Closure state for the audit as a whole: `FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md`.
 
 ---
 
@@ -93,6 +102,18 @@ Practical mitigation, not the requested guard: `portfolio_launch.py:536-538` blo
 today. The DoD's test — a Portfolio card with `../` in `project` cannot write outside `reports/` —
 does not exist.
 
+**Resolved since this reconciliation (2026-08-06; verified on `main` 2026-08-07).** Both write
+sides are now contained by sanitization rather than by an allowlist: `command_center/runtime/reports.py:51`
+`_safe_path_component` maps every character outside the safe set to `_` and is applied to
+`project`, the run id and the task/agent parts before the path is joined (line 57), and
+`agent_runner.report_path_for` (agent_runner.py:573-589) mirrors it. A `project` of `../..`
+therefore becomes a literal directory name under `REPORTS_ROOT`, so no traversal escapes.
+Tests: `tests/test_runtime_report_path_containment.py`, `tests/test_report_path_containment.py`,
+plus the `report_path_for` cases in `tests/test_agent_runner.py` — all pass on `main`.
+Git: `7bfb025` ("contain runtime report write path against traversal (MAJOR-9)").
+Note: PR #84 (`fix/portfolio-report-path-containment`) was **closed unmerged**; the fix reached
+`main` by a different commit, so the task record's PR link is not the evidence — `7bfb025` is.
+
 ---
 
 ## Wave 1
@@ -116,6 +137,12 @@ Create Task form still gates task persistence on the script exiting 0
 documentation of the gap, not a fix. The gap has widened since the audit: `models.PROJECT_IDS`
 now holds 9 ids, not 6.
 
+**Re-verified 2026-08-07 — still open, and the gap has widened again.** The `case` in
+`scripts/start-task.sh:26-35` still accepts only `AIOS`, `BANK|BANK_STRATEGY` and `LEGAL`, while
+`models.PROJECT_IDS` (models.py:18) now holds **11** ids — `AICC`, `AIOS`, `AICOS`, `PRODUCT`,
+`ECOSYSTEM`, `ESF`, `AML`, `BANK`, `LEGAL`, `BUSINESS`, `PERSONAL`. Eight of eleven projects,
+including `AICC` itself, cannot be created through the script-gated form.
+
 ### AUDIT-W1-003 — Убрать legacy синхронный путь запуска — **Done**
 
 `launch_service.execute_agent_launch`, `_apply_run_outcome_to_task` and `LaunchOutcome` are
@@ -130,6 +157,15 @@ machine-readable codes (launch.py:114-115) and both are displayed, but `app.py:7
 clears the whole set with one shared checkbox ("Я подтверждаю запуск несмотря на предупреждения
 выше"). The DoD requires a separate explicit acknowledgement per condition.
 
+**Resolved since this reconciliation (2026-08-06; verified on `main` 2026-08-07).** The shared
+checkbox is gone. `app.py:903-921` renders one checkbox per warning keyed by the issue's stable
+`code` (`f"{key_prefix}_ack_{issue.code}"`) under the heading "Подтвердите каждое предупреждение
+отдельно", and the launch button stays disabled while
+`launch.unacknowledged_warning_codes(acknowledged)` is non-empty (app.py:934). A dirty tree and a
+branch mismatch are now two independent acknowledgements, which is the DoD.
+Tests: `tests/test_launch.py` (`warning_ack_label` / `unacknowledged_warning_codes` cases) — pass.
+Git: `acdfe7c`; PR #88 merged 2026-08-06.
+
 ### AUDIT-W1-005 — Защита от git worktree/branch операций над `main` — **Still Open**
 
 `portfolio_launch._validate_branch_name` (line 190) only delegates to `git check-ref-format`,
@@ -139,6 +175,14 @@ Adjacent, non-substituting protection exists in `workspace_provisioning.MAIN_BRA
 The DoD's test — a Portfolio task with `branch: main` rejected with a clear error before git is
 called — does not exist.
 
+**Re-verified 2026-08-07 — still open, unchanged.** `command_center/portfolio_launch.py` still
+contains no protected-branch list; `MAIN_BRANCH_NAMES` exists only in
+`workspace_provisioning.py:48` and is consulted only on the Kanban path (line 297), exactly as
+described above. PR #85 (`fix/portfolio-main-branch-guard`) was **closed unmerged** and the branch
+is not an ancestor of `main`, so the attempt at this row produced nothing on `main`. The live task
+record `AICC-AUDIT-W1-005` is nevertheless still marked `In Progress` and links that dead PR —
+the store is stale here, not the code.
+
 ### AUDIT-W1-006 — Восстановление после зависшего Portfolio claim-lock — **Still Open**
 
 `portfolio_launch._claim` (line 344) states in its own docstring that an orphaned claim is
@@ -146,10 +190,31 @@ cleared by the operator deleting `data/portfolio_locks/<task_id>.lock` by hand a
 deliberately no in-app helper for that". No staleness/age detection, no liveness check on the
 owning process, no UI recovery action.
 
+**Partially resolved since this reconciliation (2026-08-06; verified on `main` 2026-08-07) —
+row stays Still Open.** The detection and service half landed: the claim record now carries
+`stale` / `owner_pid` / `age_seconds` (portfolio_launch.py:359-363), `_pid_is_alive` (line 405)
+and `_process_identity` (line 375) give a real liveness check on the owning process, and
+`recover_stale_claim(root, task_id)` (line 498) releases an orphaned claim programmatically.
+Git: `8f4e3fc`. Test: `tests/test_portfolio_launch.py:548`.
+What is still missing is the row's operator-facing half: `recover_stale_claim` has **no caller
+outside the test suite** — no Portfolio surface exposes the recovery action — so the founder's
+documented procedure is still deleting `data/portfolio_locks/<task_id>.lock` by hand.
+
 ### AUDIT-W1-007 — Подтверждение перед удалением задачи — **Still Open**
 
 `app.py:1268-1270`: the "Удалить" button calls `delete_task(task_id)` on first click. No
 confirmation state, no dialog.
+
+**Resolved since this reconciliation (2026-08-06; verified on `main` 2026-08-07).** "Удалить" now
+only opens a confirmation: it sets `st.session_state[f"{key_prefix}_delete_confirm_open"]`
+(app.py:1445-1448), and the actual `delete_task` call sits behind an `@st.dialog`
+("Подтверждение удаления") whose "Подтвердить удаление" button is `disabled=not confirmed` on an
+explicit "Я подтверждаю удаление этой задачи" checkbox (app.py:1450-1472). Two deliberate actions,
+no silent delete — the DoD.
+Git: `1eb942a`; PR #87 merged 2026-08-06.
+**Coverage gap, recorded not hidden:** no test under `tests/` exercises this dialog — grepping the
+suite for `delete_confirm` / "Подтвердить удаление" returns nothing. The behaviour is correct by
+inspection but is an untested UI path, so a refactor could silently restore the one-click delete.
 
 ### AUDIT-W1-008 — Фоновая синхронизация run→task — **Done (opt-in by design)**
 
@@ -169,6 +234,16 @@ daemon enabled. See AUDIT-W4-003 for the part that stays open because of this.
 `chat_service.py:109`. `render_agent_launcher` never calls it, so a missing `claude` on PATH is
 still discovered after confirmation. (v2 providers resolve the binary at spawn time —
 `providers.py:662` — which is not a pre-flight either.)
+
+**Resolved since this reconciliation (2026-08-06; verified on `main` 2026-08-07).** The launcher
+now checks before the dialog, not after: `_claude_cli_preflight(executor_id)` (app.py:673) calls
+`agent_runner.claude_cli_preflight(runtime_supervisor.CLAUDE_BINARY)`, which returns availability
+plus an operator-facing explanation (agent_runner.py:280-288). It runs twice — once pre-dialog
+(app.py:722, shown as `st.warning`) and once for the selected executor (app.py:808, shown as
+`st.error`) — and its message feeds the launch button's `disabled=` expression (app.py:936), so a
+missing `claude` on PATH blocks the launch instead of surfacing after confirmation.
+Tests: `tests/test_agent_runner.py`, `tests/test_app_streamlit.py` (`claude_cli_preflight` cases).
+Git: `ca4261d`; branch `improve/claude-binary-preflight-check` merged into `main`.
 
 ### AUDIT-W1-010 — Реальный batch-импорт задач — **Done**
 
@@ -192,12 +267,22 @@ The task shape is still three layers merged on read: base fields plus
 There is no single dataclass/TypedDict, no task-level schema version, and no migration.
 `tasks_repository.validate_tasks` added integrity *surfacing* (BLOCKER-4) but is not a schema.
 
+**Re-verified 2026-08-07 — still open, unchanged.** There is no `command_center/schemas/`
+directory and no `schema_version` on the task record in `models.py`. (`schema_version` exists only
+on the *import package* envelope, which is a transport format, not the stored task shape.) No PR
+was ever opened for this row.
+
 ### AUDIT-W2-002 — Обнаружение циклов зависимостей задач — **Still Open**
 
 `models.unmet_dependencies` / `is_blocked` (lines 394-403) do a one-hop status check with no
 cycle detection; `derive_dependency_edges` computes reverse edges only. Kahn-style cycle-safe
 traversal exists only in `portfolio_intelligence` for Portfolio cards, over a different data
 model. The Create Task dependency picker (`app.py:4545`) performs no cycle check.
+
+**Re-verified 2026-08-07 — still open, unchanged.** `models.unmet_dependencies` (models.py:416)
+and `is_blocked` (line 424) are still the same one-hop status check, and `models.py` contains no
+cycle/topological traversal at all. The only `cycle` occurrences in `task_import.py` are
+read-modify-write *lock* cycles in comments, not dependency-graph analysis.
 
 ### AUDIT-W2-003 — `repository_path` для всех проектов реестра — **Done (via the DoD's second branch)**
 
@@ -241,6 +326,16 @@ docs (audit H7/H8)").
 `get_branches`, `get_remotes`, `get_worktrees`. No ahead/behind computation, no fetch of any
 kind, no "updated N minutes ago" indicator.
 
+**Resolved since this reconciliation (2026-08-06; verified on `main` 2026-08-07).** `git_info.py`
+now exposes both halves, with the read/network split made explicit in the module docstring
+(line 10: "``fetch_remotes`` is the sole network/ref-mutating operation"):
+`fetch_remotes(cwd, timeout=30)` (line 122) runs `git fetch --all --prune` and returns a
+`(ok, message)` pair, and `get_ahead_behind(cwd)` (line 133) computes the counts against the
+remote-tracking ref and **never fetches** — the caller decides whether the ref is fresh, and the
+result degrades to `{"ahead": None, "behind": None}` rather than lying when there is no upstream.
+Tests: `tests/test_git_info.py`, `tests/test_app_streamlit.py` — pass.
+Git: `b2b94f3`.
+
 ### AUDIT-W2-007 — `#`-комментарии в парсере Portfolio-карточек — **Done**
 
 `portfolio_models._parse_scalar` (lines 354-363) now fails closed on an inline `# …` comment in
@@ -275,6 +370,14 @@ This is stage **D2** of the frozen scope, explicitly "not yet implemented"
 (`DESKTOP_INCREMENT_1.md` header and §3). `desktop/pages/home.py` is still an `EmptyState`
 placeholder whose own docstring says D1 forbids real data wiring. The row remains valid and in
 scope — it is simply the next stage.
+
+**Folded, not closed (recorded 2026-08-07).** `docs/roadmap/MASTER_ROADMAP_TASKS.json` lists this
+row under `folded` as "Duplicate — folded into AICC-D2A/D2B/D2C/D2D": the D2 stage tasks carry the
+same work at finer granularity with explicit acceptance criteria, so it is not a separate row in
+the executable roadmap. It is therefore **not** counted as remediated here — it is tracked, with
+`AICC-D2C` (Workspace Home layout) and `AICC-D2D` (edge states and accessibility) as its carriers.
+`desktop/pages/home.py` has since gained snapshot loading (`HomePage.load`, line 48) but still
+falls back to `EmptyState` (line 135), consistent with D2 being in `Backlog`.
 
 ### AUDIT-W3-003 — Портировать Tasks/Kanban на desktop — **Superseded**
 
@@ -340,6 +443,11 @@ which runs page-driven from the Live Execution Center or via the opt-in `AICC_BA
 daemon (see AUDIT-W1-008). With the default configuration, a run that finishes while no page is
 open leaves the report on disk but the task's Timeline unwritten until someone opens the app.
 
+**Re-verified 2026-08-07 — still open, unchanged.** The Timeline half is still gated:
+`app.py:1569-1570` starts `task_pipeline.start_background_sync` only `if
+os.environ.get("AICC_BACKGROUND_SYNC")`, and `task_pipeline.py:2278` still documents that gate as
+the sole activation path. PR #92 (`feature/auto-result-collector`) was **closed unmerged**.
+
 ### AUDIT-W4-004 — UI подтверждения founder для оркестратор-инициированных запусков — **Still Open**
 
 No batch-approval surface exists. `ui/proposals_panel.py` is a per-proposal Принять/Отклонить
@@ -348,6 +456,11 @@ directly once enabled without an intermediate screen listing the tasks/branches/
 about to start. Its original dependency AUDIT-W4-002 is Superseded, so this row now stands on its
 own as the missing confirmation surface over the *shipped* autopilot rather than over a
 hypothetical one.
+
+**Re-verified 2026-08-07 — still open, unchanged.** No batch-approval symbol exists anywhere in
+`command_center/` (`pipeline_settings.py` and `task_pipeline.py` carry no `require_founder`,
+`pending_approval` or batch-approval gate). This is the largest remaining safety gap of the
+fourteen and no PR was ever opened for it.
 
 ---
 
