@@ -146,7 +146,7 @@ def test_not_git_repo_badge_label(qtbot):
 # ---------------------------------------------------------------------------
 
 
-def test_all_six_unconfigured_primary_scenario(qtbot):
+def test_all_projects_unconfigured_primary_scenario(qtbot):
     """render_snapshot with all PROJECT_IDS unconfigured produces one card each."""
     page = HomePage()
     qtbot.addWidget(page)
