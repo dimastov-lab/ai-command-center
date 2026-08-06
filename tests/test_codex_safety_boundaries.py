@@ -44,7 +44,7 @@ def _start_codex(sup, *, canonical, worktree, project="AIOS", branch="feature/co
         canonical_repository_path=str(canonical),
         expected_branch=branch,
         task_type=kwargs.pop("task_type", "review"),
-        prompt=kwargs.pop("prompt", "implement safely"),
+        prompt=kwargs.pop("prompt", "summarize the recent changes"),
         confirmed=True,
         repository_already_validated=True,
         executor_id="codex",

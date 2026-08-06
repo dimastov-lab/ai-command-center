@@ -186,6 +186,16 @@ def render_report_markdown(run: dict, events: list[dict]) -> str:
 - State: {run.get('state', '—')}
 - Malformed stream lines encountered: {malformed}
 
+## Executor capabilities
+
+- Capability profile: {run.get('capability_profile') or '—'}
+- Capability override: {run.get('capability_override') or '—'}
+- Required capabilities: {run.get('required_capabilities') or '—'}
+- Granted capabilities: {run.get('granted_capabilities') or '—'}
+- Preflight: {run.get('capability_preflight') or '—'}
+- Command policy: {run.get('command_policy') or '—'}
+- Failure reason: {run.get('failure_reason') or '—'}
+
 ## Prompt
 
 ```

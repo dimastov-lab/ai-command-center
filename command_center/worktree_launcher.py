@@ -48,7 +48,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import agent_runner, executors, git_info
+from command_center import agent_runner, capabilities, executors, git_info
 
 # Machine-readable status values for a single validation check — surfaced in
 # the launcher UI (`command_center.ui.portfolio_panel`) so each requirement can
@@ -344,6 +344,11 @@ class PermissionProfile:
     allowed_tools: tuple[str, ...] | None  # None => all tools except `disallowed_tools`
     disallowed_tools: tuple[str, ...]
     summary: str
+    # Canonical executor-capability profile name (`capabilities.PROFILE_*`:
+    # `READ_ONLY` / `WORKSPACE_WRITE`) this permission model corresponds to,
+    # so the launcher can show the capability profile before launch. Defaulted
+    # (empty) so any existing construction site stays valid.
+    capability_profile: str = ""
 
 
 @dataclass(frozen=True)
@@ -375,6 +380,7 @@ def describe_permission_profile(task_type: str) -> PermissionProfile:
             disallowed_tools=(),
             summary="Доступны только " + ", ".join(agent_runner.READ_ONLY_ALLOWED_TOOLS)
             + " — Bash и запись файлов недоступны.",
+            capability_profile=capabilities.PROFILE_READ_ONLY,
         )
     return PermissionProfile(
         key=PROFILE_IMPLEMENTATION,
@@ -383,6 +389,7 @@ def describe_permission_profile(task_type: str) -> PermissionProfile:
         disallowed_tools=tuple(agent_runner.GIT_WRITE_DISALLOWED_TOOLS),
         summary="Bash доступен для тестов/линтеров; git-write подкоманды "
         f"({len(agent_runner.GIT_WRITE_DISALLOWED_TOOLS)}) заблокированы.",
+        capability_profile=capabilities.PROFILE_WORKSPACE_WRITE,
     )
 
 

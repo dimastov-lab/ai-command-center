@@ -92,6 +92,40 @@ def test_classify_blocked_falls_back_to_final_response_text_when_no_structured_e
     assert reason is not None and reason.startswith("final_response:")
 
 
+def test_classify_ok_when_final_report_only_describes_resolved_previous_permission_failure():
+    classification, reason = outcome.classify_process_result(
+        task_type="remediation",
+        result_text=(
+            "The previous attempt failed with blocked:final_response:permission denied. "
+            "That classifier defect is now fixed. All 15 tests pass."
+        ),
+        permission_denials=[],
+        working_tree_changed=True,
+    )
+    assert (classification, reason) == (outcome.OK, None)
+
+
+def test_classify_blocked_when_previous_permission_failure_explicitly_persists():
+    classification, reason = outcome.classify_process_result(
+        task_type="remediation",
+        result_text="The previous attempt hit permission denied and the restriction still remains.",
+        permission_denials=[],
+        working_tree_changed=False,
+    )
+    assert classification == outcome.BLOCKED
+    assert reason is not None and reason.startswith("final_response:")
+
+
+def test_classify_ok_when_russian_final_report_describes_resolved_previous_failure():
+    classification, reason = outcome.classify_process_result(
+        task_type="remediation",
+        result_text="Предыдущая попытка завершилась с permission denied. Исправлено, 15 tests passed.",
+        permission_denials=[],
+        working_tree_changed=True,
+    )
+    assert (classification, reason) == (outcome.OK, None)
+
+
 def test_classify_incomplete_when_requires_changes_and_working_tree_unchanged():
     classification, reason = outcome.classify_process_result(
         task_type="implementation",
@@ -198,8 +232,8 @@ def test_classify_blocked_takes_priority_over_incomplete():
 
 def test_intentional_git_write_denial_is_not_a_blocker():
     """An implementation agent that did its work but incidentally tried a
-    blocked git command (`git stash list`, `git commit`, …) is NOT blocked —
-    git-write is denied by design (the pipeline owns it), not a permission gap."""
+    blocked git command (`git stash list`, `git push`, …) is NOT blocked —
+    remote/history mutation is denied by design, not a permission gap."""
     from command_center.runtime import outcome
     denials = [{"tool_name": "Bash", "tool_input": {"command": 'cd /x && echo "===stash==="; git stash list'}}]
     result, reason = outcome.classify_process_result(
@@ -207,6 +241,23 @@ def test_intentional_git_write_denial_is_not_a_blocker():
     )
     assert result == outcome.OK
     assert reason is None
+
+
+def test_local_commit_permission_denial_is_a_real_blocker():
+    denials = [
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": 'git add app.py && git commit -m "finish task"'},
+        }
+    ]
+    result, reason = outcome.classify_process_result(
+        task_type="implementation",
+        result_text="Could not create the required local commit.",
+        permission_denials=denials,
+        working_tree_changed=True,
+    )
+    assert result == outcome.BLOCKED
+    assert reason == "permission_denied:Bash"
 
 
 def test_non_git_permission_denial_still_blocks():

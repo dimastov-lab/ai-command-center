@@ -42,16 +42,10 @@ Security model:
   closes that gap by removing Bash from what the run can invoke at all, rather than
   trying to enumerate everything Bash must not be allowed to do.
 - **Implementation/remediation task types** keep `Bash` (they need it to run tests,
-  linters, etc., per the `AGENT_ROLES` prompt rules in `scripts/start-task.sh`) but
-  get `--disallowedTools` set to `GIT_WRITE_DISALLOWED_TOOLS`, which blocks the Bash
-  patterns for every git operation `scripts/start-task.sh`'s own prompts already
-  forbid these task types from performing (`add`, `apply`, `checkout`, `restore`,
-  `switch`, `stash`, `commit`, `push`, `merge`, `reset`, `rebase`, `clean`, branch
-  deletion). This is pattern-based denial, not tool removal — it does not, and does
-  not claim to, prevent all possible repository mutation via Bash, only the git-write
-  operations listed above. These task types are *expected* to edit files (that is
-  their job); the boundary being enforced here is specifically "no git writes," not
-  "no writes."
+  linters and create the task's local commit). `git add` and `git commit` are
+  available inside the already-verified dedicated worktree. History, branch and
+  remote mutations (`apply`, `checkout`, `restore`, `switch`, `stash`, `push`,
+  `merge`, `reset`, `rebase`, `clean`, branch deletion and `gh`) remain denied.
 - **This application's own code** is the only place the actual git-write prohibition
   (never commit/push/merge/reset/rebase/delete/clean *automatically*) is absolute: it
   is simply never called by any code path in this codebase, verified by the absence
@@ -197,17 +191,16 @@ READ_ONLY_ALLOWED_TOOLS: list[str] = ["Read", "Grep", "Glob"]
 # Bash patterns blocked via `--disallowedTools` for implementation/remediation runs,
 # which keep the `Bash` tool (they need it to run tests/linters/etc. per the
 # `AGENT_ROLES` prompt rules in `scripts/start-task.sh`). This is pattern-based
-# denial of specific git-write subcommands, not tool removal, and does not claim to
-# block every possible repository mutation reachable through Bash — only the git
-# operations these task types' own prompts already forbid them from performing.
+# denial of history, branch and remote mutations, not tool removal. `git add` and
+# `git commit` deliberately stay available because implementation/remediation task
+# prompts require a reviewable local commit and no separate pipeline commit step
+# exists.
 GIT_WRITE_DISALLOWED_TOOLS: list[str] = [
-    "Bash(git add:*)",
     "Bash(git apply:*)",
     "Bash(git checkout:*)",
     "Bash(git restore:*)",
     "Bash(git switch:*)",
     "Bash(git stash:*)",
-    "Bash(git commit:*)",
     "Bash(git push:*)",
     "Bash(git merge:*)",
     "Bash(git reset:*)",
@@ -360,8 +353,12 @@ def build_command(
     *,
     task_type: str,
     model: str | None = None,
+    capability_override: str | None = None,
 ) -> list[str]:
-    profile = profile_for_task_type(task_type)
+    if capability_override is not None:
+        profile = PROFILE_READ_ONLY if capability_override.lower() in ("read_only", "readonly") else PROFILE_TRUSTED_DEVELOPMENT
+    else:
+        profile = profile_for_task_type(task_type)
     command = [
         CLAUDE_BINARY,
         "-p",
@@ -372,7 +369,7 @@ def build_command(
         PERMISSION_MODE_BY_PROFILE[profile],
     ]
 
-    if task_type in READ_ONLY_TASK_TYPES:
+    if profile == PROFILE_READ_ONLY:
         # Tool-set replacement, not a permission-layer denial: Bash (and every
         # shell-reachable mutation) is not in this list, so it cannot be invoked by
         # this run at all. See the module docstring and READ_ONLY_ALLOWED_TOOLS.
@@ -427,6 +424,10 @@ class RunResult:
         self.duration_seconds = duration_seconds
         self.started_at = started_at
         self.completed_at = completed_at
+
+    @property
+    def result_status(self) -> str:
+        return self.status
 
 
 def run_claude_code(

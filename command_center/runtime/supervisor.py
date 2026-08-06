@@ -50,7 +50,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from command_center import agent_runner, project_config, workspace_provisioning
+from command_center import agent_runner, capabilities, project_config, workspace_provisioning
 from command_center.models import iso_now
 from command_center.runtime import context_service, db, identity, outcome, providers, reports, stream_parser
 
@@ -123,6 +123,32 @@ class SupervisorError(Exception):
     """Raised for a launch/cancel request that cannot be carried out."""
 
 
+class InvalidCapabilityOverrideError(SupervisorError):
+    """Raised by `start_raw` — before any subprocess, task, session, or run row
+    is created — when a task carries an executor-capability override that is
+    not a recognized profile. Fail closed: an invalid override is never
+    silently ignored (which would hand the run whatever the default happened to
+    be while the operator believed they had constrained it). Wraps
+    `capabilities.InvalidCapabilityOverrideError` as a `SupervisorError` so
+    existing `except SupervisorError` handlers surface it unchanged."""
+
+
+class CapabilityMismatchError(SupervisorError):
+    """Raised by `start_raw` when the executor-capability preflight fails: the
+    capabilities the task requires (from its type and/or prompt intent) are not
+    a subset of the capabilities the selected profile would grant. This is a
+    *pre-spawn* rejection — the run row is recorded and transitioned straight to
+    `FAILED` (with a `capability_mismatch:` `failure_reason` and a structured
+    `capability_preflight` event) and **no `subprocess.Popen` is ever called**.
+    Carries the persisted `run` row and the `capabilities.CapabilityDecision`
+    so the caller can display exactly what was required vs. granted."""
+
+    def __init__(self, run: dict, decision) -> None:
+        self.run = run
+        self.decision = decision
+        super().__init__(decision.reason or "Executor capability mismatch.")
+
+
 class WorkspaceVerificationFailed(SupervisorError):
     """Fail-closed launch rejection: the target workspace did not pass
     `workspace_provisioning.verify_workspace` (wrong branch, not an isolated
@@ -185,6 +211,7 @@ def build_claude_command(
     task_type: str,
     is_resume: bool,
     model: str | None = None,
+    capability_override: str | None = None,
     untrusted: bool = False,
     operator_elevated: bool = False,
     prompt_in_argv: bool = True,
@@ -208,9 +235,16 @@ def build_claude_command(
     against exactly this). `agent_runner.build_command` (the v1 synchronous
     executor) already set this; this was the divergence between the two.
     """
-    profile = agent_runner.profile_for_task(
-        task_type, untrusted=untrusted, operator_elevated=operator_elevated
-    )
+    if capability_override is not None:
+        profile = (
+            agent_runner.PROFILE_READ_ONLY
+            if capability_override.upper() == capabilities.PROFILE_READ_ONLY
+            else agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+        )
+    else:
+        profile = agent_runner.profile_for_task(
+            task_type, untrusted=untrusted, operator_elevated=operator_elevated
+        )
     command = [CLAUDE_BINARY]
     if is_resume:
         command += ["--resume", session_id]
@@ -479,6 +513,7 @@ class Supervisor:
         expected_branch: str | None = None,
         launch_source: str | None = None,
         prompt_version: int | None = None,
+        capability_override: str | None = None,
         repository_already_validated: bool = False,
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
         executor_id: str = providers.CLAUDE_ID,
@@ -594,6 +629,14 @@ class Supervisor:
         else:
             repo_path = agent_runner.validate_repository(project, repository_path)
 
+        # Resolve the executor-capability decision up front (before any task/
+        # session/run row is created). An invalid override fails closed here,
+        # with nothing persisted — it is a configuration error, not a run.
+        try:
+            decision = capabilities.decide(task_type, prompt, capability_override)
+        except capabilities.InvalidCapabilityOverrideError as exc:
+            raise InvalidCapabilityOverrideError(str(exc)) from exc
+
         # Fail-closed workspace gate — the single chokepoint no v2 task launch
         # can bypass. Runs before any run row exists or any process is spawned;
         # its passing evidence is the *only* authorization to emit "Workspace
@@ -667,6 +710,7 @@ class Supervisor:
                 model=model,
                 untrusted=untrusted,
                 operator_elevated=operator_elevated,
+                capability_override=decision.override,
             )
         except (RuntimeError, ValueError) as exc:
             raise ProviderUnavailableError(str(exc)) from exc
@@ -701,6 +745,12 @@ class Supervisor:
                     expected_branch=expected_branch,
                     launch_source=launch_source,
                     prompt_version=prompt_version,
+                    capability_profile=decision.selected_profile,
+                    capability_override=decision.override,
+                    required_capabilities=",".join(decision.required_capabilities),
+                    granted_capabilities=",".join(decision.granted_capabilities),
+                    capability_preflight="ok" if decision.ok else "mismatch",
+                    command_policy=decision.command_policy,
                     provider_id=executor_id,
                     provider_metadata_json=providers.audit_json(spec.audit_metadata),
                     enforce_workspace_lock=True,
@@ -711,6 +761,50 @@ class Supervisor:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
         except db.TaskAlreadyActiveError as exc:
             raise TaskAlreadyActiveError(exc.conflicting_run) from exc
+
+        # Executor capability preflight (Required fix 5). The decision itself is
+        # already persisted on the run row's `capability_*`/`command_policy`
+        # columns for every run (see `db.create_run` above). If the capabilities
+        # the task requires (from its type and/or its prompt's own intent) are
+        # not covered by the profile it will be granted, fail the run right here
+        # — while it is still PREPARED, before the QUEUED transition, and before
+        # any `subprocess.Popen` — with a `capability_mismatch:` failure_reason
+        # the UI renders as a blocking preflight error distinct from a process
+        # exit. A structured `capability_preflight` event plus a
+        # `capability_preflight_failed` lifecycle event record the full decision
+        # for the audit trail. The run stays guarded in `self._launching`
+        # through the FAILED transition so a concurrent `reconcile()` never
+        # races it to INTERRUPTED.
+        if not decision.ok:
+            try:
+                db.append_run_event(self.db_path, run["id"], "capability_preflight", decision.as_metadata())
+                run = db.update_run_state(
+                    self.db_path,
+                    run["id"],
+                    expected_version=run["version"],
+                    new_state="FAILED",
+                    fields={
+                        "completed_at": iso_now(),
+                        "failure_reason": capabilities.failure_reason_code(decision),
+                    },
+                )
+                db.append_run_event(
+                    self.db_path,
+                    run["id"],
+                    "lifecycle",
+                    stream_parser.lifecycle_event(
+                        "capability_preflight_failed",
+                        selected_profile=decision.selected_profile,
+                        required=decision.required_capabilities,
+                        granted=decision.granted_capabilities,
+                        missing=decision.missing_capabilities,
+                        reason=decision.reason,
+                    )["payload"],
+                )
+            finally:
+                with self._active_lock:
+                    self._launching.discard(run["id"])
+            raise CapabilityMismatchError(db.get_run(self.db_path, run["id"]), decision)
 
         try:
             if verification_evidence is not None:

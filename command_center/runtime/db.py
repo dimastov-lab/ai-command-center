@@ -273,7 +273,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -682,6 +682,39 @@ CREATE INDEX IF NOT EXISTS idx_queue_entry_state ON queue_entry(state);
 CREATE INDEX IF NOT EXISTS idx_queue_entry_task ON queue_entry(task_id);
 """
 
+def _migration_12_add_executor_capability_fields(conn: sqlite3.Connection) -> None:
+    """Adds the executor-capability columns (see the executor-capabilities
+    brief): `capability_profile` (the granted profile — `READ_ONLY` /
+    `WORKSPACE_WRITE`), `capability_override` (the normalized per-task override,
+    or NULL), `required_capabilities` / `granted_capabilities` (comma-joined
+    canonical tool lists), `capability_preflight` (`ok` / `mismatch`, the
+    pre-spawn decision), and `command_policy` (a secret-free identity of the
+    tool-permission policy the command encodes — profile + permission-mode +
+    tool flag, never the prompt).
+
+    All are write-once, resolved by the launcher at run-creation time. A run
+    row that predates this migration keeps NULL for every one of them; readers
+    (`session_view`, `reports`) treat NULL as "legacy / unknown" and fall back
+    to deriving the profile from `task_type` deterministically, so legacy rows
+    render a stable, safe default rather than crashing.
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2
+    and 3, wrapped in one `BEGIN IMMEDIATE` transaction — safe to re-run and
+    safe under genuine concurrent execution.
+    """
+    with transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        for column in (
+            "capability_profile",
+            "capability_override",
+            "required_capabilities",
+            "granted_capabilities",
+            "capability_preflight",
+            "command_policy",
+        ):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE run ADD COLUMN {column} TEXT")
+
 
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
@@ -703,6 +736,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (9, _migration_9_add_execution_provider_fields),
     (10, _SCHEMA_V10),
     (11, _migration_11_add_pre_run_head),
+    (12, _migration_12_add_executor_capability_fields),
 ]
 
 
@@ -1098,6 +1132,12 @@ def create_run(
     expected_branch: str | None = None,
     launch_source: str | None = None,
     prompt_version: int | None = None,
+    capability_profile: str | None = None,
+    capability_override: str | None = None,
+    required_capabilities: str | None = None,
+    granted_capabilities: str | None = None,
+    capability_preflight: str | None = None,
+    command_policy: str | None = None,
     provider_id: str = "claude_code",
     provider_metadata_json: str | None = None,
     enforce_workspace_lock: bool = False,
@@ -1200,6 +1240,12 @@ def create_run(
                 "provider_metadata_json": provider_metadata_json,
                 "commit_hash": None,
                 "pull_request_url": None,
+                "capability_profile": capability_profile,
+                "capability_override": capability_override,
+                "required_capabilities": required_capabilities,
+                "granted_capabilities": granted_capabilities,
+                "capability_preflight": capability_preflight,
+                "command_policy": command_policy,
                 "version": 0,
                 "created_at": now,
                 "updated_at": now,

@@ -9,10 +9,9 @@ data/portfolio_config.json
 data/portfolio_launches.json
 data/portfolio_locks/
 data/pipeline_settings.json
-data/tasks.lock
-data/execution_queue.lock
-data/pipeline_settings.lock
-data/task_pipeline.lock
+# Glob, not a by-name list: every lock added with a new feature was otherwise
+# missed, leaving AICC's own tree dirty and tripping its UNCOMMITTED_CHANGES gate.
+data/*.lock
 
 # SQLite runtime database and its WAL/SHM sidecars. Local execution state —
 # must never be committed. (Previously excluded only via .git/info/exclude,
@@ -24,6 +23,11 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.db-journal
+
+# Runtime logs written by the daily-audit campaign runner and friends. Local
+# stdout/stderr capture — never committed. Left unignored these dirty the
+# working tree and trip AICC's own UNCOMMITTED_CHANGES launch gate.
+data/*.log
 
 # Transient AI task artifacts and agent reports generated at runtime
 # (scripts/start-task.sh and the v1.2 Claude Code runner)
