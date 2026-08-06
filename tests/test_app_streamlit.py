@@ -207,6 +207,36 @@ def test_kanban_launcher_present_but_never_calls_subprocess_on_render(monkeypatc
     assert any(b.label == "Запустить агента" for b in at.button)
 
 
+def test_kanban_task_delete_requires_explicit_confirmation():
+    task = _seed_task()
+    tasks_path = Path(os.environ["AICC_DATA_DIR"]) / "tasks.json"
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+
+    at = at.button(key="kanban_seeded-task-1_delete").click().run()
+    assert not at.exception
+    assert [item["id"] for item in storage.read_json(tasks_path, [])] == [task["id"]]
+    assert at.session_state["kanban_seeded-task-1_delete_confirm_open"] is True
+
+    confirm_button = at.button(key="kanban_seeded-task-1_delete_confirm_btn")
+    assert confirm_button.disabled is True
+
+    at = confirm_button.click().run()
+    assert not at.exception
+    assert [item["id"] for item in storage.read_json(tasks_path, [])] == [task["id"]]
+    # Disabled buttons return False in Streamlit AppTest, so the defense-in-depth
+    # st.error() branch is not reachable via AppTest's button click simulation.
+    # The important invariant is that the task was NOT deleted (checked above).
+
+    at = at.checkbox(key="kanban_seeded-task-1_delete_confirmed").check().run()
+    assert not at.exception
+    at = at.button(key="kanban_seeded-task-1_delete_confirm_btn").click().run()
+
+    assert not at.exception
+    assert storage.read_json(tasks_path, []) == []
+
+
 def test_kanban_launcher_confirmation_renders_as_dialog_not_inline_in_narrow_lane(monkeypatch, tmp_path):
     """P1 layout regression test. The Kanban board renders one narrow
     `st.columns(len(KANBAN_COLUMNS))` lane per status, and each task card's
