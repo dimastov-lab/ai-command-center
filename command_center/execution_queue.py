@@ -86,7 +86,6 @@ STATE_WAITING = "waiting"
 STATE_READY = "ready"
 STATE_LAUNCHED = "launched"
 STATE_CANCELLED = "cancelled"
-STATE_ATTENTION = "attention"
 
 # Non-terminal — still tracked, still re-evaluated on every checkpoint.
 OPEN_STATES: frozenset[str] = frozenset({STATE_WAITING, STATE_READY})
@@ -327,30 +326,6 @@ def evaluate_readiness(entries: list[dict], tasks_by_id: dict[str, dict]) -> lis
     return updated
 
 
-def reconcile_missing_run_links(root: Path, entries: list[dict]) -> list[dict]:
-    """Turn a broken launched→run link into a durable, inspectable tombstone.
-
-    A crash, manual database replacement or retention mistake must not leave a
-    queue row claiming that work launched while its execution silently
-    disappears. The original run id is retained as evidence and reconciliation
-    is idempotent.
-    """
-    db_path = runtime_db.resolve_db_path(root)
-    updated: list[dict] = []
-    for original in entries:
-        entry = dict(original)
-        run_id = entry.get("run_id")
-        if entry.get("state") == STATE_LAUNCHED and run_id and runtime_db.get_run(db_path, run_id) is None:
-            entry["state"] = STATE_ATTENTION
-            entry["reason"] = "связанный запуск отсутствует; требуется проверка"
-            entry["missing_run_tombstone"] = {
-                "run_id": run_id,
-                "detected_at": entry.get("missing_run_tombstone", {}).get("detected_at") or models.iso_now(),
-            }
-        updated.append(entry)
-    return updated
-
-
 def reevaluate_and_persist(root: Path, tasks_by_id: dict[str, dict]) -> list[dict]:
     """The single call the UI layer makes at each of the four checkpoints
     (app load, manual refresh, after a task-state change, after a run
@@ -405,90 +380,99 @@ LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR = "no_available_executor"
 
 
 def select_available_executor(
-    task: dict, cfg: dict, *, preferred_executor: str | None = None
+    task: dict,
+    cfg: dict,
+    *,
+    preferred_executor: str | None = None,
+    load_snapshot=None,
 ) -> str | None:
-    """Pick the first *available* executor for this task, trying them in
-    preference order and skipping any that already failed to start
-    (``task["failed_executors"]``) or whose binary is unreachable
-    (``provider.availability()``).
+    """Pick the best *available* executor for this task.
 
-    Preference order: the task's own ``executor`` first (the configured
-    choice), then the remaining ``allowed_agents`` from the project config in
-    listed order. A provider whose ``availability()`` probe returns
-    ``available=False`` is skipped — so a machine without ``codex`` or with
-    an uninstalled ``ollama`` is never selected. A provider already in
-    ``task["failed_executors"]`` (set by ``task_sync`` when a run died on
-    startup with no output — e.g. an expired OAuth token that
-    ``availability()`` cannot detect) is also skipped, so the next launch
-    automatically falls through to the next agent in the chain without
-    manual intervention.
+    When ``load_snapshot`` is a ``scheduler.LoadSnapshot`` (built once per
+    ``launch_ready`` batch from ``runtime.db``), the selection is
+    **load-aware**: among all viable candidates the executor with the most
+    spare concurrency capacity is chosen, so idle agents are preferred over
+    ones already running tasks. The explicitly configured executor (the
+    task's own ``executor`` or the caller's ``preferred_executor``) is still
+    tried first — but only if it has capacity; if it is at its concurrency
+    limit and another executor has spare slots, the other one wins.
 
-    Returns ``None`` when every allowed executor is unavailable or has
-    already failed — the caller skips the launch with
-    ``LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`` so the task stays queued for an
-    operator to fix the agent (re-authenticate, install, …) rather than
-    silently doing nothing.
+    Capability check: ``ollama`` (and any future capability-restricted
+    executor) is only eligible for task types it can actually run —
+    read-only types (review, audit, …). An implementation task silently
+    skips ``ollama`` rather than dispatching to a provider that will refuse
+    it at launch time.
+
+    A provider whose ``availability()`` probe returns ``available=False``
+    (binary missing, daemon unreachable, …) is never selected. A provider
+    already in ``task["failed_executors"]`` (set by ``task_sync`` when a run
+    died at startup) is also skipped, triggering automatic fallover to the
+    next eligible agent.
+
+    Returns ``None`` when every allowed executor is ineligible — the caller
+    emits ``LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`` and the task stays queued.
     """
     from command_center.runtime import providers as runtime_providers
+    from command_center.runtime import scheduler as runtime_scheduler
 
     allowed = list(cfg.get("allowed_agents") or [])
-    configured = (
-        preferred_executor
-        or task.get("executor")
-        or (allowed[0] if allowed else "claude_code")
-    )
-
-    # Preference order: configured executor first, then the rest of allowed.
-    tried: set[str] = set()
-    preference: list[str] = []
-    if configured not in tried:
-        preference.append(configured)
-        tried.add(configured)
-    for aid in allowed:
-        if aid not in tried:
-            preference.append(aid)
-            tried.add(aid)
-
+    explicit_executor = preferred_executor or task.get("executor")
+    task_type = task.get("task_type") or "implementation"
+    required_caps = runtime_scheduler.capabilities_for_task_type(task_type)
     failed = set(task.get("failed_executors") or [])
 
-    for executor_id in preference:
+    running_by_executor: dict[str, int] = {}
+    if load_snapshot is not None:
+        running_by_executor = dict(load_snapshot.running_by_agent)
+
+    def _viable(executor_id: str) -> bool:
         if executor_id in failed:
-            continue
-        provider = runtime_providers.get_provider(executor_id)
-        if provider is None:
-            continue
+            return False
+        try:
+            provider = runtime_providers.get_provider(executor_id)
+        except ValueError:
+            return False
         if not provider.availability().available:
+            return False
+        # Capability gate: ollama only matches read-only task types.
+        executor_caps = runtime_scheduler.capabilities_for_executor(executor_id)
+        if runtime_scheduler.CAP_ANY not in executor_caps:
+            if not (required_caps <= executor_caps):
+                return False
+        return True
+
+    # Build a deduped candidate list: explicit executor first (if any),
+    # then the rest of allowed_agents in configured order. When neither
+    # an explicit executor nor allowed_agents is configured, fall back to
+    # "claude_code" (the system default) so unconfigured tasks still launch.
+    all_ids: list[str] = []
+    seen: set[str] = set()
+    if explicit_executor:
+        all_ids.append(explicit_executor)
+        seen.add(explicit_executor)
+    for eid in allowed:
+        if eid not in seen:
+            all_ids.append(eid)
+            seen.add(eid)
+    if not all_ids:
+        all_ids = ["claude_code"]
+
+    DEFAULT_MAX_CONCURRENCY = 2
+    candidates: list[tuple[str, int, bool]] = []  # (executor_id, spare, is_explicit)
+    for executor_id in all_ids:
+        if not _viable(executor_id):
             continue
-        return executor_id
+        spare = DEFAULT_MAX_CONCURRENCY - running_by_executor.get(executor_id, 0)
+        candidates.append((executor_id, spare, executor_id == explicit_executor))
 
-    return None
-
-
-def select_remediation_executor(task: dict, cfg: dict) -> str | None:
-    """Select an executor for an explicit operator-requested remediation.
-
-    Normal scheduling never retries an executor recorded in
-    ``failed_executors``.  That is correct for unattended failover, but it made
-    the Fix button a permanent dead end when a project had only one provider
-    and the operator had re-authenticated it.  An explicit remediation first
-    tries normal failover, then re-probes the configured provider and permits
-    one new attempt when it is currently available.  Active-run exclusivity in
-    ``execute_agent_launch_v2`` remains the idempotency boundary for double
-    clicks and concurrent sessions.
-    """
-    selected = select_available_executor(task, cfg)
-    if selected is not None:
-        return selected
-
-    from command_center.runtime import providers as runtime_providers
-
-    allowed = list(cfg.get("allowed_agents") or [])
-    configured = task.get("executor") or (allowed[0] if allowed else "claude_code")
-    if allowed and configured not in allowed:
+    if not candidates:
         return None
-    provider = runtime_providers.get_provider(configured)
-    availability = provider.availability()
-    return configured if availability.available else None
+
+    # Sort: most spare capacity first; explicit executor wins on equal capacity.
+    # Python's sort is stable, so configured list order is the tiebreak when
+    # spare capacity and explicit-flag are both equal.
+    candidates.sort(key=lambda c: (-c[1], not c[2]))
+    return candidates[0][0]
 
 
 @dataclass
@@ -583,6 +567,16 @@ def launch_ready(
     # lock — never holding the queue lock across an `execute_agent_launch_v2`
     # subprocess spawn.
     launched_patches: dict[str, dict] = {}
+
+    # Build a load snapshot once for the whole batch so executor selection is
+    # capacity-aware. A single read avoids repeated DB round-trips and ensures
+    # all entries in this batch see the same baseline load (intra-batch launches
+    # are reflected by the global concurrency counter, not this snapshot).
+    try:
+        from command_center.runtime import scheduler as _sched
+        _load_snapshot = _sched.build_load_snapshot(runtime_db.resolve_db_path(root))
+    except Exception:  # noqa: BLE001
+        _load_snapshot = None
 
     # Global concurrency cap (audit H3). launch_ready is a direct entry point
     # (the queue's "launch all READY" button, portfolio launches) that bypasses
@@ -687,6 +681,7 @@ def launch_ready(
             task,
             cfg,
             preferred_executor=planned_executor,
+            load_snapshot=_load_snapshot,
         )
         if selected_executor is None:
             results.append(
