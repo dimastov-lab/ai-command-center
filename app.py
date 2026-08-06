@@ -1165,7 +1165,7 @@ def render_task_card(
                 st.badge(format_estimate(task["estimate_hours"]), color="gray", icon=":material/schedule:")
 
         with st.container(horizontal=True):
-            launch_status = task.get("launch_status", "Ready")
+            launch_status = task.get("launch_status") or "Ready"
             running = launch_status == "Running"
             st.badge(
                 f"⏺ {launch_status}" if running else launch_status,
