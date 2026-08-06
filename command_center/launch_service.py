@@ -31,7 +31,6 @@ from pathlib import Path
 from command_center import (
     activity_log,
     agent_runner,
-    capabilities,
     git_info,
     launch,
     models,
