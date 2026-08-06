@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAccessibleEvent, QAccessible
+from PySide6.QtGui import QAccessible, QAccessibleEvent, QShowEvent
 from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 from .. import tokens
@@ -48,7 +48,7 @@ class ErrorState(QWidget):
 
         self.setAccessibleName(message)
 
-    def showEvent(self, event) -> None:
+    def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
         QAccessible.updateAccessibility(
             QAccessibleEvent(self, QAccessible.Event.Alert)
