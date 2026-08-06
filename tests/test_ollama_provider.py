@@ -94,12 +94,21 @@ def test_output_shaping_flags_protect_the_verdict(provider):
     assert "--hidethinking" in argv
 
 
-def test_model_precedence_is_explicit_then_env_then_default(provider, monkeypatch):
+def test_model_precedence_is_explicit_then_env_then_routing(provider, monkeypatch):
+    from command_center.model_router import TASK_MODEL_MAP
+
+    # 1. Explicit model arg wins over everything.
     assert _spec(provider, model="gemma4:12b").argv[2] == "gemma4:12b"
+
+    # 2. AICC_OLLAMA_MODEL env var wins over task routing.
     monkeypatch.setenv("AICC_OLLAMA_MODEL", "deepseek-r1:8b")
     assert _spec(provider, model=None).argv[2] == "deepseek-r1:8b"
     monkeypatch.delenv("AICC_OLLAMA_MODEL")
-    assert _spec(provider, model=None).argv[2] == providers.DEFAULT_OLLAMA_MODEL
+
+    # 3. Task routing selects the cheapest model for each task type.
+    assert _spec(provider, model=None, task_type="review").argv[2] == TASK_MODEL_MAP["review"]
+    assert _spec(provider, model=None, task_type="final_gate").argv[2] == TASK_MODEL_MAP["final_gate"]
+    assert _spec(provider, model=None, task_type="architecture_review").argv[2] == TASK_MODEL_MAP["architecture_review"]
 
 
 def test_an_oversized_prompt_is_refused_rather_than_silently_truncated(provider):

@@ -952,8 +952,14 @@ class OllamaProvider:
             return str(path) if path.is_file() and os.access(path, os.X_OK) else None
         return shutil.which("ollama")
 
-    def _model(self, model: str | None) -> str:
-        return model or os.environ.get("AICC_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL
+    def _model(self, model: str | None, task_type: str | None = None) -> str:
+        if model:
+            return model
+        env_override = os.environ.get("AICC_OLLAMA_MODEL")
+        if env_override:
+            return env_override
+        from command_center import model_router
+        return model_router.select_model(task_type or "", DEFAULT_OLLAMA_MODEL)
 
     def availability(self) -> ProviderAvailability:
         executable = self._executable()
@@ -1018,7 +1024,7 @@ class OllamaProvider:
         if not availability.available or not availability.executable:
             raise RuntimeError(availability.message)
 
-        resolved_model = self._model(model)
+        resolved_model = self._model(model, task_type=task_type)
         argv = [
             availability.executable,
             "run",
