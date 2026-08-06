@@ -20,11 +20,15 @@ import os
 import sys
 from pathlib import Path
 
+# Ensure project root is on sys.path when run as a script (flat layout, no install)
+_PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # Resolve project root (one level up from scripts/)
-_DEFAULT_ROOT = Path(__file__).parent.parent
+_DEFAULT_ROOT = _PROJECT_ROOT
 
 
 def main(root: Path, *, dry_run: bool) -> int:
