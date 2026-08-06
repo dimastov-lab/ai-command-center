@@ -288,6 +288,108 @@ def test_launch_ready_one_bad_entry_does_not_abort_the_batch(tmp_path, git_repo,
     api.request_cancel(by_task["healthy"].run_id, confirmed=True)
 
 
+# --------------------------------------------------------------------------
+# select_available_executor — load-aware, capability-gated selection
+# --------------------------------------------------------------------------
+
+
+def _make_availability(provider_id: str, available: bool):
+    from command_center.runtime.providers import ProviderAvailability
+    return ProviderAvailability(provider_id, available, "usable" if available else "missing", "")
+
+
+def _make_load(running_by_agent: dict):
+    from command_center.runtime.scheduler import LoadSnapshot
+    return LoadSnapshot(
+        running_by_agent=running_by_agent,
+        busy_workspaces=frozenset(),
+        active_task_ids=frozenset(),
+        global_running=sum(running_by_agent.values()),
+    )
+
+
+def test_select_available_executor_defaults_to_claude_when_no_config(monkeypatch):
+    from command_center.runtime import providers as p
+
+    monkeypatch.setattr(p, "get_provider", lambda eid: type("P", (), {"availability": lambda self: _make_availability(eid, True)})())
+    task = _task()
+    result = execution_queue.select_available_executor(task, {})
+    assert result == "claude_code"
+
+
+def test_select_available_executor_picks_most_spare_capacity(monkeypatch):
+    from command_center.runtime import providers as p
+
+    monkeypatch.setattr(p, "get_provider", lambda eid: type("P", (), {"availability": lambda self: _make_availability(eid, True)})())
+
+    cfg = {"allowed_agents": ["claude_code", "codex"]}
+    task = _task(task_type="implementation")
+    load = _make_load({"claude_code": 2, "codex": 0})  # claude_code at capacity, codex free
+    result = execution_queue.select_available_executor(task, cfg, load_snapshot=load)
+    assert result == "codex"
+
+
+def test_select_available_executor_prefers_explicit_on_equal_capacity(monkeypatch):
+    from command_center.runtime import providers as p
+
+    monkeypatch.setattr(p, "get_provider", lambda eid: type("P", (), {"availability": lambda self: _make_availability(eid, True)})())
+
+    task = _task(executor="codex", task_type="implementation")
+    cfg = {"allowed_agents": ["claude_code", "codex"]}
+    load = _make_load({"claude_code": 0, "codex": 0})  # both equally free
+    result = execution_queue.select_available_executor(task, cfg, load_snapshot=load)
+    assert result == "codex"
+
+
+def test_select_available_executor_skips_ollama_for_implementation(monkeypatch):
+    from command_center.runtime import providers as p
+
+    monkeypatch.setattr(p, "get_provider", lambda eid: type("P", (), {"availability": lambda self: _make_availability(eid, True)})())
+
+    cfg = {"allowed_agents": ["ollama"]}
+    task = _task(task_type="implementation")
+    result = execution_queue.select_available_executor(task, cfg)
+    assert result is None  # ollama rejected by capability gate
+
+
+def test_select_available_executor_allows_ollama_for_review(monkeypatch):
+    from command_center.runtime import providers as p
+
+    monkeypatch.setattr(p, "get_provider", lambda eid: type("P", (), {"availability": lambda self: _make_availability(eid, True)})())
+
+    cfg = {"allowed_agents": ["ollama"]}
+    task = _task(task_type="review")
+    result = execution_queue.select_available_executor(task, cfg)
+    assert result == "ollama"
+
+
+def test_select_available_executor_skips_failed_executors(monkeypatch):
+    from command_center.runtime import providers as p
+
+    monkeypatch.setattr(p, "get_provider", lambda eid: type("P", (), {"availability": lambda self: _make_availability(eid, True)})())
+
+    cfg = {"allowed_agents": ["claude_code", "codex"]}
+    task = _task(task_type="implementation")
+    task["failed_executors"] = ["claude_code"]
+    result = execution_queue.select_available_executor(task, cfg)
+    assert result == "codex"
+
+
+def test_select_available_executor_skips_unavailable_provider(monkeypatch):
+    from command_center.runtime import providers as p
+
+    def fake_get_provider(eid):
+        available = eid != "claude_code"
+        return type("P", (), {"availability": lambda self: _make_availability(eid, available)})()
+
+    monkeypatch.setattr(p, "get_provider", fake_get_provider)
+
+    cfg = {"allowed_agents": ["claude_code", "codex"]}
+    task = _task(task_type="implementation")
+    result = execution_queue.select_available_executor(task, cfg)
+    assert result == "codex"
+
+
 def test_module_never_constructs_a_git_subprocess_call():
     import ast
     import inspect
