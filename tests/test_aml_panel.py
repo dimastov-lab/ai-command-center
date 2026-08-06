@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -30,7 +31,12 @@ def test_aml_queue_renders_filters_and_case_selection():
     at = _at_on_aml_page(aml_view="queue")
     assert not at.exception
     assert any(select.key == "aml_selected_case" for select in at.selectbox)
-    assert any(button.label == "Перейти к расследованию" for button in at.button)
+    open_button = next(button for button in at.button if button.label == "Перейти к расследованию")
+
+    at = open_button.click().run()
+    assert not at.exception
+    assert at.session_state["aml_view"] == "investigation"
+    assert any("Рабочее место расследования" in markdown.value for markdown in at.markdown)
 
 
 def test_aml_investigation_actions_drive_case_lifecycle():
@@ -50,10 +56,39 @@ def test_aml_investigation_actions_drive_case_lifecycle():
 
 def test_aml_page_marks_persistent_local_prototype():
     at = _at_on_aml_page()
-    assert any("постоянным локальным хранилищем" in info.value for info in at.info)
+    assert any("синтетическими данными" in info.value for info in at.info)
+    assert any("не authentication/RBAC" in info.value for info in at.info)
+
+
+def test_aml_page_renders_while_another_writer_holds_the_store():
+    aml_store.seed_cases(aml_panel.DEMO_CASES)
+    path = aml_store.resolve_db_path()
+    writer = sqlite3.connect(path, timeout=1)
+    try:
+        writer.execute("PRAGMA journal_mode = WAL")
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE aml_case SET score = 95 WHERE id = 'AML-2026-0418'")
+
+        at = _at_on_aml_page()
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert not at.exception
+    assert any(metric.label == "Открытые алерты" for metric in at.metric)
 
 
 def test_mlro_role_enables_close_and_disables_analyst_actions():
+    aml_store.seed_cases(aml_panel.DEMO_CASES)
+    case = next(case for case in aml_store.list_cases() if case["id"] == "AML-2026-0418")
+    review = aml_store.transition_case(
+        case["id"], "assign", actor="AML Analyst", role="Analyst", reason="Проверка",
+        expected_version=case["version"],
+    )
+    aml_store.transition_case(
+        case["id"], "escalate", actor="AML Analyst", role="Analyst", reason="Требуется решение",
+        expected_version=review["version"], confirmed=True,
+    )
     at = _at_on_aml_page(aml_view="investigation", aml_role="MLRO", aml_actor="Maria MLRO")
 
     close = next(button for button in at.button if button.label == "Закрыть без сообщения")
@@ -86,6 +121,15 @@ def test_customer_and_reporting_windows_render():
 
 def test_mlro_reporting_exposes_sar_approval_flow():
     aml_store.seed_cases(aml_panel.DEMO_CASES)
+    case = next(case for case in aml_store.list_cases() if case["id"] == "AML-2026-0418")
+    review = aml_store.transition_case(
+        case["id"], "assign", actor="AML Analyst", role="Analyst", reason="Проверка",
+        expected_version=case["version"],
+    )
+    aml_store.transition_case(
+        case["id"], "escalate", actor="AML Analyst", role="Analyst", reason="Требуется решение",
+        expected_version=review["version"], confirmed=True,
+    )
     aml_store.create_sar_draft(
         "AML-2026-0418",
         filing_type="SAR / STR",
