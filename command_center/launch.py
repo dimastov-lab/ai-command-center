@@ -21,6 +21,7 @@ this module only calls into it, so it stays platform-agnostic itself (see
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -117,6 +118,28 @@ ISSUE_BRANCH_MISMATCH = "branch_mismatch"
 SEVERITY_ERROR = "error"
 SEVERITY_WARNING = "warning"
 
+# One acknowledgement prompt per *warning* code, deliberately naming the
+# specific hazard being accepted. Every warning is confirmed separately in the
+# Launch confirmation UI (`app.py`'s `render_agent_launcher`): a branch
+# mismatch and a dirty working tree are independent risks with different
+# consequences (running on the wrong branch vs. an agent editing on top of
+# uncommitted work), and a single shared "подтверждаю несмотря на
+# предупреждения" checkbox let an operator who had only registered one of them
+# clear both at once. Keyed by the stable `code`, never by message text.
+WARNING_ACK_LABELS: dict[str, str] = {
+    ISSUE_DIRTY_TREE: (
+        "Подтверждаю: агент будет работать поверх незакоммиченных изменений "
+        "(рабочее дерево не чистое)."
+    ),
+    ISSUE_BRANCH_MISMATCH: (
+        "Подтверждаю: агент будет работать на текущей ветке, а не на ожидаемой."
+    ),
+    ISSUE_DETACHED_HEAD: (
+        "Подтверждаю: агент будет работать в состоянии detached HEAD (коммиты "
+        "не попадут ни в одну ветку)."
+    ),
+}
+
 
 @dataclass
 class LaunchIssue:
@@ -155,6 +178,28 @@ class LaunchValidation:
     @property
     def error_codes(self) -> list[str]:
         return [i.code for i in self.issues if i.severity == SEVERITY_ERROR]
+
+    @property
+    def warning_issues(self) -> list[LaunchIssue]:
+        """Every warning as a structured issue, in detection order — what the
+        confirmation UI iterates over to render one acknowledgement control
+        per condition instead of a single collective one."""
+        return [i for i in self.issues if i.severity == SEVERITY_WARNING]
+
+    @property
+    def warning_codes(self) -> list[str]:
+        return [i.code for i in self.warning_issues]
+
+    def unacknowledged_warning_codes(self, acknowledged: Iterable[str] | None) -> list[str]:
+        """The warning codes still missing an explicit, per-condition
+        acknowledgement. Acknowledging a dirty tree says nothing about a
+        branch mismatch, so each code must appear in `acknowledged` on its own
+        for the launch to proceed."""
+        ack = set(acknowledged or ())
+        return [code for code in self.warning_codes if code not in ack]
+
+    def warnings_acknowledged(self, acknowledged: Iterable[str] | None) -> bool:
+        return not self.unacknowledged_warning_codes(acknowledged)
 
     def blocked_only_by(self, code: str) -> bool:
         """True when validation failed and *every* blocking error is `code` —
@@ -211,6 +256,14 @@ def validate_launch(*, workspace_path: str | None, expected_branch: str | None =
         )
 
     return result
+
+
+def warning_ack_label(issue: LaunchIssue) -> str:
+    """The acknowledgement text for one warning. Falls back to the issue's own
+    message for a code with no dedicated prompt yet, so a warning added later
+    still gets its own separate confirmation rather than silently sharing
+    another one's."""
+    return WARNING_ACK_LABELS.get(issue.code, f"Подтверждаю предупреждение: {issue.message}")
 
 
 def open_terminal_at(path: str | Path) -> tuple[bool, str]:

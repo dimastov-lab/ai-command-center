@@ -797,6 +797,158 @@ def test_launcher_launches_claude_against_task_workspace_not_project_repository(
     assert saved_task["current_run_id"] == final["id"]
 
 
+# --------------------------------------------------------------------------
+# Founder audit MAJOR-4: a dirty tree and a branch mismatch each need their own
+# explicit acknowledgement — never one shared "launch anyway" checkbox.
+# --------------------------------------------------------------------------
+
+
+def _refuse_claude(monkeypatch, reason: str) -> None:
+    """Let `git_info`'s read-only status calls through (they share the same
+    `subprocess` module object) while making an actual `claude` launch a hard
+    test failure."""
+    real_run = subprocess.run
+
+    def fail_if_claude_launched(command, **kwargs):
+        if command and command[0] == "claude":
+            raise AssertionError(reason)
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fail_if_claude_launched)
+
+
+def test_launcher_requires_a_separate_ack_for_dirty_tree_and_branch_mismatch(monkeypatch, tmp_path):
+    """The audit's MAJOR-4 regression: both conditions used to be cleared by
+    a single shared "подтверждаю несмотря на предупреждения" checkbox, so an
+    operator who had only registered the dirty tree also silently accepted
+    running on the wrong branch. Each warning must now carry its own
+    acknowledgement, and the launch must stay blocked — server-side, not just
+    via the button's `disabled` attribute — while any one of them is
+    unticked."""
+    _refuse_claude(monkeypatch, "claude must not launch while a warning is unacknowledged")
+
+    repo = tmp_path / "aios"
+    repo.mkdir()
+    _init_repo(repo)  # on `main`
+    (repo / "uncommitted.txt").write_text("work in progress")  # dirty tree
+
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task(workspace_path=str(repo), branch="feature/expected")  # branch mismatch
+
+    at = _at_on_page("kanban")
+    assert not at.exception
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    dirty_key = "kanban_seeded-task-1_launch_ack_dirty_tree"
+    branch_key = "kanban_seeded-task-1_launch_ack_branch_mismatch"
+    checkbox_keys = {c.key for c in at.checkbox}
+    assert dirty_key in checkbox_keys and branch_key in checkbox_keys, (
+        "dirty tree and branch mismatch must each render their own acknowledgement checkbox"
+    )
+    assert "kanban_seeded-task-1_launch_warnings_ack" not in checkbox_keys, (
+        "the single shared 'launch anyway' checkbox must be gone"
+    )
+
+    # Confirming the launch itself plus *only* the dirty tree leaves the
+    # branch mismatch unacknowledged — the launch stays blocked.
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    at = at.checkbox(key=dirty_key).check().run()
+    assert not at.exception
+
+    launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
+    assert launch_button.disabled is True
+    # `AppTest.click()` ignores `disabled`, so this forces the click a real
+    # browser could never deliver — proving the server-side re-check blocks it.
+    at = launch_button.click().run()
+    assert not at.exception
+    db_path = runtime_db.resolve_db_path()
+    assert runtime_db.list_runs(db_path, task_id="seeded-task-1") == []
+    # st.error() inside @st.dialog is not captured by at.error in AppTest;
+    # the key invariant is that no run was started, which is asserted above.
+
+    # Symmetrically: acknowledging only the branch mismatch must not stand in
+    # for the dirty tree either.
+    at = at.checkbox(key=dirty_key).uncheck().run()
+    at = at.checkbox(key=branch_key).check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
+    at = at.button(key="kanban_seeded-task-1_launch_launch_btn").click().run()
+    assert not at.exception
+    assert runtime_db.list_runs(db_path, task_id="seeded-task-1") == []
+
+    # Only with both ticked does the launch control become actionable.
+    at = at.checkbox(key=dirty_key).check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
+
+
+def test_launcher_ack_checkboxes_are_scoped_to_the_conditions_actually_present(monkeypatch, tmp_path):
+    """A clean worktree on the wrong branch must ask only about the branch —
+    an acknowledgement is never rendered (nor required) for a condition that
+    does not hold, and the branch one alone unblocks the launch."""
+    _refuse_claude(monkeypatch, "claude must not launch merely by opening the confirmation dialog")
+
+    repo = tmp_path / "aios"
+    repo.mkdir()
+    _init_repo(repo)  # on `main`, clean
+
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task(workspace_path=str(repo), branch="feature/expected")
+
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    checkbox_keys = {c.key for c in at.checkbox}
+    assert "kanban_seeded-task-1_launch_ack_branch_mismatch" in checkbox_keys
+    assert "kanban_seeded-task-1_launch_ack_dirty_tree" not in checkbox_keys
+
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
+    at = at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
+
+
+def test_launcher_forgets_previous_acknowledgements_when_reopened(monkeypatch, tmp_path):
+    """Reopening the dialog must ask again: acknowledgements ticked for one
+    launch describe the repository state at that moment and must never be
+    inherited by the next one.
+
+    Reopened here by pressing "Запустить агента" again rather than via
+    Отмена → reopen: cancelling calls `st.rerun()` mid-script, after which
+    `AppTest`'s recorded element tree still holds the (now unrendered) dialog
+    widgets and any subsequent `.run()` raises a KeyError serializing their
+    dropped state — an AppTest artifact that predates this change, not app
+    behavior. Both paths go through the same reset in `render_agent_launcher`."""
+    _refuse_claude(monkeypatch, "claude must not launch while reopening the confirmation dialog")
+
+    repo = tmp_path / "aios"
+    repo.mkdir()
+    _init_repo(repo)
+    (repo / "uncommitted.txt").write_text("work in progress")
+
+    project_config.save_repository_path("AIOS", str(repo))
+    _seed_task(workspace_path=str(repo), branch="feature/expected")
+
+    at = _at_on_page("kanban")
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
+    at = at.checkbox(key="kanban_seeded-task-1_launch_ack_dirty_tree").check().run()
+    at = at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").check().run()
+    assert not at.exception
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
+
+    at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
+    assert not at.exception
+
+    assert at.checkbox(key="kanban_seeded-task-1_launch_confirmed").value is False
+    assert at.checkbox(key="kanban_seeded-task-1_launch_ack_dirty_tree").value is False
+    assert at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").value is False
+    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
+
+
 def test_launcher_workspace_action_buttons_use_task_workspace_not_project_repository(monkeypatch, tmp_path):
     """Terminal/Folder actions in the confirmation panel must act on the
     same selected workspace as the launch itself, not the project repo."""
