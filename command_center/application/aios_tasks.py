@@ -6,7 +6,11 @@ Imports only from aios_sdk (public SDK), not from aios.* (boundary gate: ADR-000
 
 from __future__ import annotations
 
+import json
+import os
+import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from aios_sdk import AIOSClient, CreateTaskRequest, Task
@@ -145,10 +149,6 @@ def aios_task_to_aicc_dict(task: Task) -> dict[str, Any]:
 # ID mapping (AICC uuid hex ↔ AIOS task id)
 # ---------------------------------------------------------------------------
 
-import json
-import threading
-from pathlib import Path
-
 
 class AIOSIdMap:
     """Thread-safe persistent mapping between AICC task ids (uuid hex) and AIOS task ids.
@@ -171,10 +171,8 @@ class AIOSIdMap:
         return {}
 
     def _save(self) -> None:
-        import tempfile
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        import os
         os.replace(tmp, self._path)
 
     def get(self, aicc_id: str) -> str | None:
