@@ -705,6 +705,17 @@ def render_agent_launcher(
             st.warning(cli_preflight_message)
 
     if st.button("Запустить агента", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
+        # Every launch is confirmed from scratch: a previous dialog's ticked
+        # acknowledgements must never carry over into a new one, or an
+        # operator would silently inherit a "yes, launch on the wrong branch"
+        # from a state of the repository that no longer holds.
+        for stale_key in [
+            key
+            for key in st.session_state
+            if isinstance(key, str) and key.startswith(f"{key_prefix}_ack_")
+        ]:
+            del st.session_state[stale_key]
+        st.session_state.pop(f"{key_prefix}_confirmed", None)
         st.session_state[confirm_key] = True
 
     if not st.session_state[confirm_key]:
@@ -867,12 +878,27 @@ def render_agent_launcher(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
         )
-        warnings_ack = True
-        if validation.warnings:
-            warnings_ack = st.checkbox(
-                "Я подтверждаю запуск несмотря на предупреждения выше.",
-                key=f"{key_prefix}_warnings_ack",
-            )
+
+        # One acknowledgement per warning, keyed by its stable `code` — never a
+        # single collective "подтверждаю несмотря на предупреждения" checkbox.
+        # A branch mismatch and a dirty working tree are independent hazards
+        # (agent runs on the wrong branch vs. agent edits on top of
+        # uncommitted work); the shared checkbox let an operator who had only
+        # noticed one of them dismiss both in a single click, which is exactly
+        # the accidental launch this gate exists to prevent.
+        acknowledged: set[str] = set()
+        warning_issues = validation.warning_issues
+        if warning_issues:
+            st.markdown("**Подтвердите каждое предупреждение отдельно:**")
+        for issue in warning_issues:
+            if st.checkbox(
+                launch.warning_ack_label(issue),
+                key=f"{key_prefix}_ack_{issue.code}",
+            ):
+                acknowledged.add(issue.code)
+            st.caption(issue.message)
+        unacknowledged = validation.unacknowledged_warning_codes(acknowledged)
+
         action_cols = st.columns(2)
         with action_cols[0]:
             launch_clicked = st.button(
@@ -884,7 +910,7 @@ def render_agent_launcher(
                     # `prep.launchable` supersedes the raw `validation.can_launch`:
                     # a missing-but-provisionable workspace is launchable.
                     or not prep.launchable
-                    or not warnings_ack
+                    or bool(unacknowledged)
                     or not bool(provider_availability and provider_availability.available)
                     or bool(selected_cli_preflight_message)
                 ),
@@ -924,8 +950,16 @@ def render_agent_launcher(
         if not prep.launchable:
             st.error("Запуск заблокирован ошибками валидации выше — сначала устраните их.")
             return
-        if validation.warnings and not warnings_ack:
-            st.error("Подтвердите предупреждения выше перед запуском.")
+        if not confirmed:
+            st.error("Подтвердите запуск внешнего агента перед запуском.")
+            return
+        if unacknowledged:
+            missing = "; ".join(
+                launch.warning_ack_label(issue)
+                for issue in warning_issues
+                if issue.code in unacknowledged
+            )
+            st.error(f"Не подтверждены все предупреждения — запуск заблокирован: {missing}")
             return
         # Same defense in depth for the CLI preflight, and re-probed at click
         # time: the operator may have installed the binary while this dialog
@@ -943,9 +977,9 @@ def render_agent_launcher(
         resolved_workspace = Path(selection.path).expanduser().resolve()
 
         # Real, PID-tracked, cancellable v2 run — not a blocking call. The
-        # button click above already re-validated `confirmed`/`warnings_ack`
-        # server-side, so `confirmed=True` here reflects a genuine, already-
-        # checked confirmation, not a bypass of it.
+        # button click above already re-validated `confirmed` and every
+        # per-warning acknowledgement server-side, so `confirmed=True` here
+        # reflects a genuine, already-checked confirmation, not a bypass of it.
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=project,
@@ -1377,9 +1411,51 @@ def render_task_card(
                 update_task_status(task_id, new_status)
                 st.rerun()
 
+            delete_confirm_key = f"{key_prefix}_delete_confirm_open"
+            st.session_state.setdefault(delete_confirm_key, False)
             if st.button("Удалить", key=f"{key_prefix}_delete", icon=":material/delete:", width="stretch"):
-                delete_task(task_id)
-                st.rerun()
+                st.session_state[delete_confirm_key] = True
+
+            if st.session_state[delete_confirm_key]:
+                @st.dialog("Подтверждение удаления")
+                def _render_delete_confirmation() -> None:
+                    st.warning(
+                        f"Задача «{title}» (`{task_id}`) будет удалена. "
+                        "Это действие нельзя отменить."
+                    )
+                    confirmed = st.checkbox(
+                        "Я подтверждаю удаление этой задачи.",
+                        key=f"{key_prefix}_delete_confirmed",
+                    )
+                    confirm_cols = st.columns(2)
+                    with confirm_cols[0]:
+                        delete_clicked = st.button(
+                            "Подтвердить удаление",
+                            type="primary",
+                            key=f"{key_prefix}_delete_confirm_btn",
+                            disabled=not confirmed,
+                            icon=":material/delete_forever:",
+                        )
+                    with confirm_cols[1]:
+                        if st.button("Отмена", key=f"{key_prefix}_delete_cancel_btn"):
+                            st.session_state[delete_confirm_key] = False
+                            st.rerun()
+
+                    if not delete_clicked:
+                        return
+
+                    # Defense in depth: AppTest and future callers can trigger a
+                    # disabled widget programmatically, so never rely solely on
+                    # the button's disabled state for a destructive action.
+                    if not confirmed:
+                        st.error("Подтвердите удаление задачи.")
+                        return
+
+                    delete_task(task_id)
+                    st.session_state[delete_confirm_key] = False
+                    st.rerun()
+
+                _render_delete_confirmation()
 
 
 def render_next_task_callout(tasks: list[dict], project: str | None = None, *, active_runs: list[dict] | None = None) -> None:
@@ -2844,6 +2920,13 @@ _LAUNCH_FLASH_KEY = "exec_board_launch_flash"
 _LAUNCH_BOARD_LIMIT = 12
 _PROJECT_TREE_KEY = "exec_board_project_tree"
 
+# Flash keys for messages that must survive an immediate `st.rerun()` (same
+# pattern as `_LAUNCH_FLASH_KEY`): the frame that renders a message right
+# before `st.rerun()` is replaced by the rerun, so the message is stored here
+# and re-rendered (then popped) on the post-rerun frame instead.
+_IMPORT_TASK_FLASH_KEY = "import_task_package_flash"
+_PROJECT_SETTINGS_FLASH_KEY = "project_settings_saved_flash"
+
 
 def _render_project_tree_section(
     api: runtime_api.ExecutionCenterAPI,
@@ -3419,8 +3502,75 @@ def _quick_action_view_run(source: str, run_id: str) -> None:
         st.session_state.pending_nav = "runs"
 
 
-def render_workspace_home_page(api: runtime_api.ExecutionCenterAPI) -> None:
+def render_project_planning_intelligence(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    *,
+    selector_key: str,
+    recommendation_key_prefix: str,
+    backlog_reconcile_key_prefix: str | None = None,
+) -> str | None:
+    """Render the shared founder health/recommendation surface.
+
+    Workspace Home and Kanban deliberately delegate to the same component
+    functions here so their metrics, scoring, queue state, and launch behavior
+    cannot drift into separate implementations: the numbers come from
+    `project_intelligence.compute_project_intelligence` and the cards from
+    `recommendation_service.build_recommendation_views` on *both* pages, so
+    there is exactly one implementation of each to keep correct.
+
+    Only the Streamlit widget-key namespace differs per host page — each caller
+    passes its own prefixes so the two pages' pills/buttons never collide on
+    widget identity. `backlog_reconcile_key_prefix` is opt-in: backlog
+    reconciliation is a Kanban-only planning tool, not part of the founder
+    health/recommendation surface Workspace Home is meant to mirror.
+    """
+    project_filter = project_selector.render_project_selector(tasks, key=selector_key)
+    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
+    st.divider()
+
+    project_configs = project_config.load_project_configs()
+    with st.expander(
+        "Планирование и рекомендации",
+        icon=":material/auto_awesome:",
+        expanded=False,
+    ):
+        recommendations_panel.render_recommendations_panel(
+            tasks,
+            tasks_by_id,
+            ROOT,
+            api,
+            project_configs,
+            upsert_tasks,
+            project=project_filter,
+            key_prefix=recommendation_key_prefix,
+        )
+        if backlog_reconcile_key_prefix is not None:
+            backlog_reconcile_panel.render_backlog_reconcile_panel(
+                tasks,
+                ROOT,
+                project=project_filter,
+                key_prefix=backlog_reconcile_key_prefix,
+            )
+    return project_filter
+
+
+def render_workspace_home_page(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+) -> None:
     snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
+
+    render_project_planning_intelligence(
+        api,
+        tasks,
+        tasks_by_id,
+        selector_key="workspace_home_project_selector",
+        recommendation_key_prefix="workspace_home_reco",
+    )
+    st.divider()
 
     with st.container(horizontal=True):
         st.metric("Проекты", len(snapshot["projects"]), border=True)
@@ -4010,20 +4160,23 @@ def render_home_dashboard(
         # The gauge shows the same windowed health as the project-health card; the
         # status pill and caption describe what the supervisor is actually doing.
         window_success = _window_success_rate(runs)
-        # audit D5: count runs needing attention the same way the Execution Strip
-        # banner does — the non-superseded latest attempt of each task only — so
-        # this caption and the strip never show two different "attention" numbers
-        # on the same screen. `running` (the board live bucket above) stays as-is
-        # for the "Активные агенты" list; only the headline counts are
-        # canonicalised here.
-        _superseded_ids = live_board.superseded_run_ids(sessions)
-        run_counts = read_model.run_snapshot([r for r in runs if r.get("id") not in _superseded_ids])
+        # audit D5: count "needs attention" with the exact same actionable,
+        # dismiss-aware computation the Execution Strip banner and the Live Center
+        # headline use (`execution_strip.current_counts` — drops superseded,
+        # completed-task and operator-dismissed rows), so this caption, the strip
+        # and the top-bar glyph never show two different "attention" numbers on
+        # one screen. queue_entries=[] because attention/running don't depend on
+        # the durable queue.
+        run_counts = execution_strip.current_counts(
+            runs, tasks, [],
+            dismissed_attention_run_ids=st.session_state.get("exec_attention_dismissed", set()),
+        )
         if run_counts.attention:
             sup_status, sup_accent = "Требует внимания", "amber"
             sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.attention} прогонов требуют внимания"
-        elif run_counts.running:
+        elif run_counts.live:
             sup_status, sup_accent = "В работе", "green"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.running} прогонов выполняется"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.live} прогонов выполняется"
         else:
             sup_status, sup_accent = "Ожидает", "slate"
             sup_label = "Автопилот включён — ожидает задач" if settings.enabled else "Автопилот выключен"
@@ -4414,7 +4567,7 @@ if page_key == "dashboard":
     if dashboard_section == "Аналитика":
         render_dashboard_analytics(dashboard_api, tasks, tasks_by_id, task_counts)
     elif dashboard_section == "Репозитории и артефакты":
-        render_workspace_home_page(dashboard_api)
+        render_workspace_home_page(dashboard_api, tasks, tasks_by_id)
     else:
         render_home_dashboard(dashboard_api, tasks, task_counts)
 
@@ -4427,9 +4580,9 @@ elif page_key == "workspace_home":
     content_area.page_header(
         "Workspace Home",
         "Кросс-проектная сводка: репозитории, прогоны, артефакты и отчёты — "
-        "в одном месте, только для чтения.",
+        "в одном месте, с health-метриками и рекомендациями следующих действий.",
     )
-    render_workspace_home_page(get_execution_center_api())
+    render_workspace_home_page(get_execution_center_api(), tasks, tasks_by_id)
 
 
 # --------------------------------------------------------------------------
@@ -4745,6 +4898,15 @@ elif page_key == "create":
         "`{schema_version, package_id, tasks}` или простой список задач. Ничего не "
         "записывается в `data/tasks.json` до нажатия «Импортировать задачи»."
     )
+    # Result of the previous run's applied import, carried across `st.rerun()`
+    # via the same flash pattern as `_LAUNCH_FLASH_KEY`: a message rendered
+    # right before `st.rerun()` belongs to the pre-rerun frame, which the rerun
+    # replaces immediately — the operator (and `AppTest`'s element tree on
+    # streamlit >= 1.61, which no longer merges the discarded frame) never sees
+    # it unless it is re-rendered on the post-rerun frame like this.
+    import_task_flash = st.session_state.pop(_IMPORT_TASK_FLASH_KEY, None)
+    if import_task_flash:
+        st.success(import_task_flash)
     uploaded_package = st.file_uploader(
         "Файл пакета задач (JSON / YAML / Markdown / текст)",
         type=list(task_import.SUPPORTED_IMPORT_SUFFIXES),
@@ -4842,7 +5004,10 @@ elif page_key == "create":
                     # uncaught exception; nothing was written in either case.
                     st.error(f"Импорт не выполнен: {exc}")
                 else:
-                    st.success(
+                    # Flashed (not rendered inline) because the `st.rerun()`
+                    # below wipes this frame before the message would be seen —
+                    # the pop at the top of this section shows it post-rerun.
+                    st.session_state[_IMPORT_TASK_FLASH_KEY] = (
                         f"Импортировано задач: {len(import_result.imported_ids)}. "
                         f"Пропущено дубликатов: {len(import_result.skipped_duplicate_ids)}."
                     )
@@ -4874,29 +5039,14 @@ elif page_key == "waves":
 elif page_key == "kanban":
     st.subheader("Kanban", anchor="kanban")
 
-    project_filter = project_selector.render_project_selector(tasks, key="kanban_project_selector")
-    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
-    st.divider()
-
-    project_configs = project_config.load_project_configs()
-    with st.expander(
-        "Планирование и рекомендации",
-        icon=":material/auto_awesome:",
-        expanded=False,
-    ):
-        recommendations_panel.render_recommendations_panel(
-            tasks,
-            tasks_by_id,
-            ROOT,
-            get_execution_center_api(),
-            project_configs,
-            upsert_tasks,
-            project=project_filter,
-            key_prefix="kanban_reco",
-        )
-        backlog_reconcile_panel.render_backlog_reconcile_panel(
-            tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
-        )
+    project_filter = render_project_planning_intelligence(
+        get_execution_center_api(),
+        tasks,
+        tasks_by_id,
+        selector_key="kanban_project_selector",
+        recommendation_key_prefix="kanban_reco",
+        backlog_reconcile_key_prefix="kanban_reconcile",
+    )
     st.divider()
 
     # Options come from the tasks themselves (canonical priorities + any
@@ -5473,6 +5623,16 @@ elif page_key == "projects":
             "Эти значения автоматически наследуются новыми задачами проекта "
             "(workspace, branch, executor, prompt) на странице «Создать задачу»."
         )
+        # Outcome of the previous run's save, carried across `st.rerun()` via
+        # the `_LAUNCH_FLASH_KEY` flash pattern: advisory validation warnings
+        # and the save confirmation rendered right before `st.rerun()` belong
+        # to the pre-rerun frame, which the rerun replaces immediately — they
+        # must be re-rendered here on the post-rerun frame to be seen at all.
+        settings_flash = st.session_state.pop(_PROJECT_SETTINGS_FLASH_KEY, None)
+        if settings_flash:
+            for warning_message in settings_flash["warnings"]:
+                st.warning(warning_message)
+            st.success(settings_flash["success"])
 
         workspace_input = st.text_input(
             "Workspace по умолчанию",
@@ -5564,8 +5724,7 @@ elif page_key == "projects":
                     "owner": owner_input.strip(),
                 }
             )
-            for warning_message in project_config.validate_project_settings(candidate):
-                st.warning(warning_message)
+            settings_warnings = list(project_config.validate_project_settings(candidate))
 
             project_config.save_project_settings(
                 selected_project,
@@ -5581,7 +5740,14 @@ elif page_key == "projects":
                 current_milestone=candidate["current_milestone"],
                 owner=candidate["owner"],
             )
-            st.success("Настройки проекта сохранены.")
+            # Flashed (not rendered inline) because the `st.rerun()` below
+            # wipes this frame before the messages would be seen — the pop
+            # above the settings form shows them post-rerun. Warnings stay
+            # advisory: the save above already happened regardless.
+            st.session_state[_PROJECT_SETTINGS_FLASH_KEY] = {
+                "warnings": settings_warnings,
+                "success": "Настройки проекта сохранены.",
+            }
             st.rerun()
 
     with tab_chat:
@@ -5773,7 +5939,8 @@ elif page_key == "git_center":
     # (plus the app itself) so an operator can inspect any of them from one
     # place instead of only ever seeing AICC here.
     repos: list[tuple[str, Path]] = []
-    if (ROOT / ".git").is_dir():
+    # A linked worktree stores ``.git`` as a file, not a directory.
+    if git_info.get_status(ROOT).get("is_repo"):
         repos.append(("AICC (app)", ROOT))
     for pid in models.PROJECT_IDS:
         cfg = project_configs.get(pid, {})
@@ -5823,6 +5990,36 @@ elif page_key == "git_center":
 
             st.caption(f"Корень репозитория: `{repo_status['root']}`")
             st.caption(f"Последний коммит: `{repo_status['last_commit_hash']}` — {repo_status['last_commit_subject']}")
+
+            refresh_key = f"git_center_remote_refreshed::{repo_path.resolve()}"
+            if st.button(
+                "Обновить",
+                key=f"git_center_refresh_{repo_label}",
+                icon=":material/refresh:",
+                help="Выполнить git fetch и обновить сравнение с tracking-веткой.",
+            ):
+                with st.spinner("Обновляем данные remote…"):
+                    fetch_ok, fetch_error = git_info.fetch_remotes(repo_path)
+                if fetch_ok:
+                    st.session_state[refresh_key] = time.time()
+                    st.success("Данные remote обновлены.")
+                else:
+                    st.error(f"Не удалось обновить remote: {fetch_error}")
+
+            refreshed_at = st.session_state.get(refresh_key)
+            if isinstance(refreshed_at, (int, float)):
+                age_minutes = max(0, int((time.time() - refreshed_at) // 60))
+                st.caption(f"Данные remote: обновлено {age_minutes} мин. назад")
+                divergence = git_info.get_ahead_behind(repo_path)
+                if divergence.get("available"):
+                    with st.container(horizontal=True):
+                        st.metric("Ahead", divergence["ahead"], border=True)
+                        st.metric("Behind", divergence["behind"], border=True)
+                    st.caption(f"Сравнение: `{repo_status['branch']}` ↔ `{divergence['upstream']}`")
+                else:
+                    st.warning(str(divergence.get("error") or "Расхождение с remote недоступно."))
+            else:
+                st.caption("Данные remote ещё не обновлялись. Нажмите «Обновить», чтобы выполнить git fetch.")
 
             tab_files, tab_log, tab_diff, tab_branches, tab_remotes = st.tabs(
                 ["Изменённые файлы", "История коммитов", "Diff", "Ветки", "Remotes"]
