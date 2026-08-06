@@ -21,6 +21,7 @@ from command_center import (
     launch_service,
     models,
     project_config,
+    read_model,
     recommend,
     report_parser,
     storage,
@@ -35,19 +36,23 @@ from command_center import (
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
 from command_center.runtime import db as runtime_db
-from command_center.runtime import log_tail, project_overview, runs_read, scheduler, session_view, task_sync
+from command_center.runtime import log_tail, project_overview, runs_read, scheduler, session_view
 from command_center.runtime import identity as runtime_identity
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import (
+    aml_panel,
     autopilot_panel,
     backlog_proposals,
     backlog_reconcile_panel,
     board_style,
+    execution_metrics,
     execution_strip,
     home_dashboard,
+    inspector,
     live_board,
     waves_panel,
     content_area,
+    daily_audit_panel,
     portfolio_overview_panel,
     portfolio_panel,
     project_intelligence_panel,
@@ -56,6 +61,7 @@ from command_center.ui import (
     queue_panel,
     recommendations_panel,
     shell,
+    sidebar,
     tokens,
 )
 
@@ -185,12 +191,14 @@ NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
+    "aml": ("AML Monitoring", ":material/policy:"),
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
     "kanban": ("Kanban", ":material/view_kanban:"),
     "waves": ("Волны", ":material/waves:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
     "execution_center": ("Live Execution Center", ":material/bolt:"),
+    "daily_audit": ("Ежедневный аудит", ":material/fact_check:"),
     "runs": ("Журнал запусков", ":material/history:"),
     "timeline": ("Таймлайн", ":material/timeline:"),
     "projects": ("Проекты", ":material/folder_open:"),
@@ -200,7 +208,7 @@ NAV: dict[str, tuple[str, str]] = {
     "git_center": ("Git Center", ":material/commit:"),
     "workspace": ("Workspace Launcher", ":material/rocket_launch:"),
     "focus": ("Focus Mode", ":material/center_focus_strong:"),
-    "portfolio": ("Portfolio Execution", ":material/inventory_2:"),
+    "portfolio": ("Портфель", ":material/inventory_2:"),
     "portfolio_overview": ("Portfolio Overview", ":material/hub:"),
 }
 
@@ -374,12 +382,18 @@ def create_task(
     branch: str | None = None,
     executor: str | None = None,
     prompt: str | None = None,
+    untrusted_import: bool = False,
 ) -> dict:
     """Locked create — every page that adds a task to the Kanban board must
     call this (never `tasks.append(new_task_record(...)); save_tasks(tasks)`
     against its own possibly-stale in-memory `tasks` list, which is exactly
     the pattern that silently drops a concurrent writer's task). See
-    `tasks_repository.create_task`/module docstring."""
+    `tasks_repository.create_task`/module docstring.
+
+    `untrusted_import` stamps the provenance flag `agent_runner.is_untrusted_task`
+    gates on, so a task synthesized from untrusted report content (the "create
+    next task" widget, chat "convert message to task") is not laundered into a
+    trusted run — audit SEC-D-02, mirroring `backlog_proposals.apply_candidate`."""
     return tasks_repository.create_task(
         ROOT,
         project,
@@ -399,6 +413,7 @@ def create_task(
         branch=branch,
         executor=executor,
         prompt=prompt,
+        untrusted_import=untrusted_import,
     )
 
 
@@ -408,6 +423,10 @@ def update_task_status(task_id: str, new_status: str) -> dict | None:
 
 def delete_task(task_id: str) -> None:
     tasks_repository.delete_task(ROOT, task_id)
+    # Also remove the task's runtime.db footprint (session/run/event/report/
+    # completion cascade) so a deleted Kanban card leaves no orphan rows in the
+    # unified Runs/Timeline/metrics views (audit AR-1).
+    get_execution_center_api().delete_task(task_id)
 
 
 def task_label(task: dict) -> str:
@@ -625,6 +644,31 @@ def _save_message_as_report(conversation: dict, message: dict) -> Path:
     return path
 
 
+def _preselected_executor_id(*, cfg: dict, task: dict | None, options: list[str] | None = None) -> str:
+    """Which executor the launcher will preselect: the task's own, else the
+    project default, else `claude_code` — clamped to `options` (the project's
+    authorized providers) exactly as the confirmation dialog's selectbox
+    clamps it, so the pre-dialog preflight below can never warn about a
+    provider the dialog is not going to offer."""
+    configured = (task or {}).get("executor") or cfg.get("default_executor") or "claude_code"
+    if options and configured not in options:
+        return options[0]
+    return configured
+
+
+def _claude_cli_preflight(executor_id: str) -> str | None:
+    """The message to show when `executor_id` is Claude Code but its CLI is
+    not on PATH; `None` when nothing is wrong (or another provider is
+    selected — each provider carries its own availability probe).
+
+    Probes `runtime_supervisor.CLAUDE_BINARY`, the executable the v2 Session
+    Supervisor will actually exec, not a separately-guessed name."""
+    if executor_id != "claude_code":
+        return None
+    available, message = agent_runner.claude_cli_preflight(runtime_supervisor.CLAUDE_BINARY)
+    return None if available else message
+
+
 def render_agent_launcher(
     *,
     key_prefix: str,
@@ -647,8 +691,38 @@ def render_agent_launcher(
     repo_path = cfg.get("repository_path")
     confirm_key = f"{key_prefix}_confirm_open"
     st.session_state.setdefault(confirm_key, False)
+    task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
+
+    # Preflight (audit MINOR-2): a missing `claude` binary makes the run fail
+    # at exec time, which used to be discovered only *after* the operator had
+    # walked the entire confirmation flow. Say it here, next to the button
+    # that opens that flow. The dialog re-checks the *selected* provider
+    # below — this one reports on the provider it will preselect.
+    try:
+        preselectable_executors = list(project_config.allowed_execution_providers(project))
+    except project_config.ProviderAuthorizationError:
+        # A broken authorization policy blocks the launch outright and the
+        # dialog reports it in full; a CLI warning on top would only be noise.
+        preselectable_executors = []
+    if preselectable_executors:
+        cli_preflight_message = _claude_cli_preflight(
+            _preselected_executor_id(cfg=cfg, task=task_for_launch, options=preselectable_executors)
+        )
+        if cli_preflight_message:
+            st.warning(cli_preflight_message)
 
     if st.button("Запустить агента", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
+        # Every launch is confirmed from scratch: a previous dialog's ticked
+        # acknowledgements must never carry over into a new one, or an
+        # operator would silently inherit a "yes, launch on the wrong branch"
+        # from a state of the repository that no longer holds.
+        for stale_key in [
+            key
+            for key in st.session_state
+            if isinstance(key, str) and key.startswith(f"{key_prefix}_ack_")
+        ]:
+            del st.session_state[stale_key]
+        st.session_state.pop(f"{key_prefix}_confirmed", None)
         st.session_state[confirm_key] = True
 
     if not st.session_state[confirm_key]:
@@ -661,7 +735,6 @@ def render_agent_launcher(
     # this entire form into a sliver a few hundred pixels wide.
     @st.dialog("Подтверждение запуска агента", width="large")
     def _render_launch_confirmation() -> None:
-        task_for_launch = next((t for t in tasks if t.get("id") == task_id), None) if task_id else None
         selection = launch.resolve_workspace_path(task=task_for_launch, project_config=cfg)
 
         if not selection.path:
@@ -695,11 +768,9 @@ def render_agent_launcher(
         except project_config.ProviderAuthorizationError as exc:
             st.error(str(exc))
             return
-        configured_executor = (
-            (task_for_launch or {}).get("executor") or cfg.get("default_executor") or "claude_code"
+        configured_executor = _preselected_executor_id(
+            cfg=cfg, task=task_for_launch, options=executor_options
         )
-        if configured_executor not in executor_options:
-            configured_executor = executor_options[0]
         executor_id = st.selectbox(
             "Execution provider",
             executor_options,
@@ -716,6 +787,13 @@ def render_agent_launcher(
                 else f"Недоступен ({provider_availability.code}): {provider_availability.message}"
             )
             (st.caption if provider_availability.available else st.error)(availability_text)
+        # `ClaudeProvider.availability()` reports "configured", not "installed"
+        # (it never probes PATH), so the missing-binary case is caught here —
+        # still above the prompt, the confirmation checkbox and the launch
+        # button, never after them.
+        selected_cli_preflight_message = _claude_cli_preflight(executor_id)
+        if selected_cli_preflight_message:
+            st.error(selected_cli_preflight_message)
         prompt = st.text_area(
             "Промпт для агента", value=default_prompt, height=220, key=f"{key_prefix}_prompt"
         )
@@ -785,16 +863,49 @@ def render_agent_launcher(
                 action_ok, action_message = launch.copy_to_clipboard(full_prompt)
                 (st.success if action_ok else st.error)(action_message)
 
+        # Provenance-based capability gating (audit D7): an imported (untrusted)
+        # task runs read-only by default. Offer the operator an explicit, per-task
+        # elevation to full development capability (Bash) at the point of launch.
+        elevate_trust = False
+        untrusted_import = bool(
+            task_for_launch and agent_runner.is_untrusted_task(task_for_launch)
+        ) and task_type not in agent_runner.READ_ONLY_TASK_TYPES
+        if untrusted_import:
+            st.warning(
+                "Импортированная (недоверенная) задача — по умолчанию запускается "
+                "в безопасном read-only режиме (без Bash и изменения файлов)."
+            )
+            elevate_trust = st.checkbox(
+                "Доверять этой задаче: запустить с полными правами разработки (Bash). "
+                "Включайте только для задач из проверенного источника.",
+                value=bool(task_for_launch.get("trusted_execution_approved")),
+                key=f"{key_prefix}_elevate_trust",
+            )
         confirmed = st.checkbox(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
         )
-        warnings_ack = True
-        if validation.warnings:
-            warnings_ack = st.checkbox(
-                "Я подтверждаю запуск несмотря на предупреждения выше.",
-                key=f"{key_prefix}_warnings_ack",
-            )
+
+        # One acknowledgement per warning, keyed by its stable `code` — never a
+        # single collective "подтверждаю несмотря на предупреждения" checkbox.
+        # A branch mismatch and a dirty working tree are independent hazards
+        # (agent runs on the wrong branch vs. agent edits on top of
+        # uncommitted work); the shared checkbox let an operator who had only
+        # noticed one of them dismiss both in a single click, which is exactly
+        # the accidental launch this gate exists to prevent.
+        acknowledged: set[str] = set()
+        warning_issues = validation.warning_issues
+        if warning_issues:
+            st.markdown("**Подтвердите каждое предупреждение отдельно:**")
+        for issue in warning_issues:
+            if st.checkbox(
+                launch.warning_ack_label(issue),
+                key=f"{key_prefix}_ack_{issue.code}",
+            ):
+                acknowledged.add(issue.code)
+            st.caption(issue.message)
+        unacknowledged = validation.unacknowledged_warning_codes(acknowledged)
+
         action_cols = st.columns(2)
         with action_cols[0]:
             launch_clicked = st.button(
@@ -806,8 +917,9 @@ def render_agent_launcher(
                     # `prep.launchable` supersedes the raw `validation.can_launch`:
                     # a missing-but-provisionable workspace is launchable.
                     or not prep.launchable
-                    or not warnings_ack
+                    or bool(unacknowledged)
                     or not bool(provider_availability and provider_availability.available)
+                    or bool(selected_cli_preflight_message)
                 ),
                 icon=":material/play_arrow:",
             )
@@ -819,6 +931,22 @@ def render_agent_launcher(
         if not launch_clicked:
             return
 
+        # Persist the operator's D7 elevation decision for this untrusted task so
+        # the launch below — and every later launch — runs with the chosen
+        # capability. Set on the in-memory record too, since that is what the
+        # launch path reads this run. Absent/False keeps it read-only.
+        if untrusted_import:
+            task_for_launch["trusted_execution_approved"] = elevate_trust
+            elevate_task_id = task_for_launch.get("id")
+            if elevate_task_id:
+
+                def _persist_trust(tasks_list, _tid=elevate_task_id, _value=elevate_trust):
+                    for candidate in tasks_list:
+                        if candidate.get("id") == _tid:
+                            candidate["trusted_execution_approved"] = _value
+
+                tasks_repository.mutate_tasks(ROOT, _persist_trust)
+
         # Defense in depth: `disabled=` on the button above is the primary
         # gate, but a launch this consequential should not depend solely on
         # a widget attribute — re-check server-side before doing anything.
@@ -829,8 +957,23 @@ def render_agent_launcher(
         if not prep.launchable:
             st.error("Запуск заблокирован ошибками валидации выше — сначала устраните их.")
             return
-        if validation.warnings and not warnings_ack:
-            st.error("Подтвердите предупреждения выше перед запуском.")
+        if not confirmed:
+            st.error("Подтвердите запуск внешнего агента перед запуском.")
+            return
+        if unacknowledged:
+            missing = "; ".join(
+                launch.warning_ack_label(issue)
+                for issue in warning_issues
+                if issue.code in unacknowledged
+            )
+            st.error(f"Не подтверждены все предупреждения — запуск заблокирован: {missing}")
+            return
+        # Same defense in depth for the CLI preflight, and re-probed at click
+        # time: the operator may have installed the binary while this dialog
+        # was open, so this is a fresh check, not the render-time verdict.
+        click_time_preflight_message = _claude_cli_preflight(executor_id)
+        if click_time_preflight_message:
+            st.error(click_time_preflight_message)
             return
 
         # `selection.path` was already validated above (existence, is_dir,
@@ -841,9 +984,9 @@ def render_agent_launcher(
         resolved_workspace = Path(selection.path).expanduser().resolve()
 
         # Real, PID-tracked, cancellable v2 run — not a blocking call. The
-        # button click above already re-validated `confirmed`/`warnings_ack`
-        # server-side, so `confirmed=True` here reflects a genuine, already-
-        # checked confirmation, not a bypass of it.
+        # button click above already re-validated `confirmed` and every
+        # per-warning acknowledgement server-side, so `confirmed=True` here
+        # reflects a genuine, already-checked confirmation, not a bypass of it.
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=project,
@@ -978,9 +1121,19 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
                 parent_task_id=run.get("task_id"),
                 prior_run_id=run["id"],
                 workflow_stage=next_stage,
+                # The objective is drafted from the parent run's report output
+                # (untrusted agent text), so mark the follow-up untrusted — it
+                # launches read-only until an operator elevates it (SEC-D-02).
+                untrusted_import=True,
             )
             run["next_task_id"] = new_task["id"]
-            agent_runner.append_run(run)
+            # Only the v1.2 journal is writable here. A v2 run lives in runtime.db;
+            # re-appending it would write a duplicate/stale v2 snapshot into the
+            # legacy runs.jsonl and let the two stores diverge (audit AR-3). The
+            # new task still carries `parent_task_id`/`prior_run_id`, so the
+            # forward linkage is preserved regardless of the run's store.
+            if run.get("source") == "v1.2":
+                agent_runner.append_run(run)
             activity_log.log_event(
                 "next_task_created", project=project, task_id=new_task["id"], run_id=run["id"],
                 message=f"Создана задача из запуска {run['id'][:8]}",
@@ -1004,6 +1157,35 @@ def render_create_next_task_widget(run: dict, tasks: list[dict], key_prefix: str
 
 def _set_launch_status(task_id: str, status: str, note: str) -> None:
     tasks_repository.set_manual_launch_status(ROOT, task_id, status, note)
+
+
+def _render_manual_merge_button(
+    api: runtime_api.ExecutionCenterAPI,
+    completion: dict | None,
+    *,
+    key: str,
+) -> None:
+    if not session_view.manual_merge_available(completion):
+        return
+    if st.button(
+        "Сделать мердж",
+        key=key,
+        type="primary",
+        icon=":material/merge:",
+        help="Слияния выполняются строго последовательно; CI, ревью и конфликты проверяются повторно.",
+    ):
+        try:
+            updated = api.request_manual_merge(
+                completion["run_id"], confirmed=True
+            )
+        except Exception as exc:  # noqa: BLE001 - gate refusal belongs in the UI
+            st.error(f"Мердж не выполнен: {exc}")
+        else:
+            if updated and updated.get("completion_state") == "COMPLETED":
+                st.success("PR смёржен и подтверждён в целевой ветке.")
+            else:
+                st.success("PR смёржен; проверяется целевая ветка.")
+            st.rerun()
 
 
 def render_task_timeline(task: dict) -> None:
@@ -1030,6 +1212,8 @@ def render_task_card(
     tasks_by_id: dict[str, dict],
     key_prefix: str,
     git_status_cache: dict[str, dict],
+    completion: dict | None = None,
+    live_progress: tuple[int | None, str | None] | None = None,
     show_kanban_controls: bool = False,
 ) -> None:
     task_id = task.get("id")
@@ -1040,8 +1224,17 @@ def render_task_card(
         st.markdown(f"### {title}")
         st.caption(f"{task.get('project')} · {TASK_TYPE_LABELS.get(task.get('task_type'), task.get('task_type'))}")
 
-        progress = int(task.get("progress") or 0)
-        stage = task.get("current_stage") or models.EXECUTION_STAGES[0]
+        live_percent, live_stage = live_progress or (None, None)
+        progress = (
+            int(live_percent)
+            if live_percent is not None
+            else int(task.get("progress") or 0)
+        )
+        stage = (
+            live_stage
+            or task.get("current_stage")
+            or models.EXECUTION_STAGES[0]
+        )
         st.progress(progress / 100, text=f"{stage} — {progress}%")
 
         # Three distinct, visually separated clusters — planning state
@@ -1100,6 +1293,19 @@ def render_task_card(
                     models.VERDICT_LABELS.get(task["latest_verdict"], task["latest_verdict"]),
                     color="green" if passing else "red",
                 )
+
+        # Inspector select (UX-2c): one-tap to load this task into the
+        # top-bar Inspector pane without opening the full dialog.
+        with st.container(horizontal=True):
+            if st.button("🔍 В инспектор", key=f"{key_prefix}_inspect", icon=":material/search:", help="Открыть в Инспекторе"):
+                inspector.select_task(task_id)
+                st.rerun()
+
+        _render_manual_merge_button(
+            get_execution_center_api(),
+            completion,
+            key=f"{key_prefix}_manual_merge",
+        )
 
         with st.expander("Действия", icon=":material/tune:"):
             st.caption(f"ID: `{task_id}` · Создано: {task.get('created_at', '—')} · Обновлено: {task.get('updated_at', '—')}")
@@ -1204,10 +1410,11 @@ def render_task_card(
 
         if show_kanban_controls:
             current_status = task.get("status", KANBAN_COLUMNS[0])
+            status_options = task_view.kanban_status_options(current_status)
             new_status = st.selectbox(
                 "Статус",
-                KANBAN_COLUMNS,
-                index=KANBAN_COLUMNS.index(current_status) if current_status in KANBAN_COLUMNS else 0,
+                status_options,
+                index=status_options.index(current_status),
                 key=f"{key_prefix}_status_select",
                 label_visibility="collapsed",
             )
@@ -1215,9 +1422,51 @@ def render_task_card(
                 update_task_status(task_id, new_status)
                 st.rerun()
 
+            delete_confirm_key = f"{key_prefix}_delete_confirm_open"
+            st.session_state.setdefault(delete_confirm_key, False)
             if st.button("Удалить", key=f"{key_prefix}_delete", icon=":material/delete:", width="stretch"):
-                delete_task(task_id)
-                st.rerun()
+                st.session_state[delete_confirm_key] = True
+
+            if st.session_state[delete_confirm_key]:
+                @st.dialog("Подтверждение удаления")
+                def _render_delete_confirmation() -> None:
+                    st.warning(
+                        f"Задача «{title}» (`{task_id}`) будет удалена. "
+                        "Это действие нельзя отменить."
+                    )
+                    confirmed = st.checkbox(
+                        "Я подтверждаю удаление этой задачи.",
+                        key=f"{key_prefix}_delete_confirmed",
+                    )
+                    confirm_cols = st.columns(2)
+                    with confirm_cols[0]:
+                        delete_clicked = st.button(
+                            "Подтвердить удаление",
+                            type="primary",
+                            key=f"{key_prefix}_delete_confirm_btn",
+                            disabled=not confirmed,
+                            icon=":material/delete_forever:",
+                        )
+                    with confirm_cols[1]:
+                        if st.button("Отмена", key=f"{key_prefix}_delete_cancel_btn"):
+                            st.session_state[delete_confirm_key] = False
+                            st.rerun()
+
+                    if not delete_clicked:
+                        return
+
+                    # Defense in depth: AppTest and future callers can trigger a
+                    # disabled widget programmatically, so never rely solely on
+                    # the button's disabled state for a destructive action.
+                    if not confirmed:
+                        st.error("Подтвердите удаление задачи.")
+                        return
+
+                    delete_task(task_id)
+                    st.session_state[delete_confirm_key] = False
+                    st.rerun()
+
+                _render_delete_confirmation()
 
 
 def render_next_task_callout(tasks: list[dict], project: str | None = None, *, active_runs: list[dict] | None = None) -> None:
@@ -1291,6 +1540,14 @@ def get_execution_center_api() -> runtime_api.ExecutionCenterAPI:
     """
     api = runtime_api.ExecutionCenterAPI()
     api.reconcile()
+    # Opt-in background sync (audit MAJOR-8): keep the run->task projection
+    # current on a host that runs unattended (no Live Execution Center tab open
+    # to drive the tick). Off by default — the interactive app relies on a tab's
+    # refresh. Started once per server process (this function is
+    # `@st.cache_resource`) and shares `tick`'s host-wide `pipeline_lock`, so it
+    # never races the page tick.
+    if os.environ.get("AICC_BACKGROUND_SYNC"):
+        task_pipeline.start_background_sync(ROOT, api, project_config.load_project_configs)
     return api
 
 
@@ -1463,13 +1720,11 @@ def _execution_center_display_status(session: dict) -> str:
     `progress` legitimately never reaches 100. Downgrading it to Requires
     Attention was the bug behind "a successful analysis shows as needing
     attention" — read-only completed runs stay `Completed`."""
-    status = session["status"]
-    progress = session.get("progress")
-    if status == session_view.STATUS_COMPLETED and progress is not None and progress < 100:
-        if session_view.is_read_only_task_type(session.get("task_type")):
-            return status
-        return session_view.STATUS_REQUIRES_ATTENTION
-    return status
+    return session_view.operator_display_status(
+        session["status"],
+        progress=session.get("progress"),
+        task_type=session.get("task_type"),
+    )
 
 
 def _execution_center_record_heartbeat(run_id: str, pid: int | None, now: datetime) -> None:
@@ -1565,7 +1820,9 @@ def _build_execution_center_sessions(
     return sessions, tasks_by_id
 
 
-def _render_execution_center_completion(session: dict) -> None:
+def _render_execution_center_completion(
+    api: runtime_api.ExecutionCenterAPI, session: dict
+) -> None:
     """Compact "autonomous completion" panel for a session card. Reads only
     `session["completion"]` (a pure projection built in `session_view`) — no
     orchestration happens here. Clearly separates "process finished" from "task
@@ -1616,6 +1873,12 @@ def _render_execution_center_completion(session: dict) -> None:
         if completion["recommended_action"]:
             note = st.warning if (completion["requires_human"] or completion["display"] == "Requires Attention") else st.info
             note(f"Рекомендуемое действие: {completion['recommended_action']}")
+        if completion.get("manual_merge_available"):
+            _render_manual_merge_button(
+                api,
+                api.get_completion(session["run_id"]),
+                key=f"exec_manual_merge_{session['run_id']}",
+            )
 
 
 _PROMPT_PREVIEW_CHARS = 700
@@ -1664,6 +1927,12 @@ def _task_detail_dialog(task: dict, tasks_by_id: dict[str, dict]) -> None:
         st.markdown(f"🎯 **Цель.** {task['goal']}")
     if task.get("pull_request_url"):
         st.link_button("Pull Request", task["pull_request_url"], icon=":material/merge:")
+    completion = get_execution_center_api().get_completion_by_task(task.get("id"))
+    _render_manual_merge_button(
+        get_execution_center_api(),
+        completion,
+        key=f"task_detail_manual_merge_{task.get('id')}",
+    )
 
     st.markdown("**Зависимости**")
     _render_dependency_tree(task, tasks_by_id)
@@ -1775,6 +2044,10 @@ def _render_execution_center_card(
         header_cols = st.columns([3, 1])
         header_cols[0].markdown(f"##### {session['task_title']}")
         header_cols[1].badge(display_status, color=_execution_center_status_badge_color(display_status))
+        # Inspector select (UX-2c): load this run into the top-bar Inspector.
+        if st.button("🔍 В инспектор", key=f"exec_card_inspect_{run_id}", icon=":material/search:", help="Открыть прогон в Инспекторе"):
+            inspector.select_run(run_id)
+            st.rerun()
         # `display_status` is repeated here as plain caption text (not just
         # the `st.badge` pill above) so the run's display status stays
         # queryable in tests and screen readers alike.
@@ -1872,7 +2145,7 @@ def _render_execution_center_card(
         elif session["last_error"]:
             st.error(f"Последняя ошибка: {session['last_error']}")
 
-        _render_execution_center_completion(session)
+        _render_execution_center_completion(api, session)
 
         # Localized labels (Russian) throughout — the console UI is otherwise
         # Russian, and an English row of controls in the middle of it was one of
@@ -2193,7 +2466,9 @@ def _render_inline_reports() -> None:
             st.markdown(read_text(chosen))
 
 
-def _render_board_summary(board: dict[str, list[dict]]) -> None:
+def _render_board_summary(
+    board: dict[str, list[dict]], counts: execution_metrics.ExecutionCounts
+) -> None:
     """One line that answers "what is the state of the machine" before any
     scrolling. Deliberately the first thing rendered — the previous layout led
     with the planner's wave, so this answer was several screens down.
@@ -2201,7 +2476,13 @@ def _render_board_summary(board: dict[str, list[dict]]) -> None:
     Rendered as `board_style`'s tinted, accented tiles rather than flat
     `st.metric` boxes: a running count and a failure count must not look
     identical, which four grey boxes made them."""
-    board_style.stat_tiles(board)
+    board_style.stat_tiles(
+        board,
+        counts={
+            bucket: counts.for_bucket(bucket)
+            for bucket in live_board.BUCKET_ORDER
+        },
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2546,7 +2827,9 @@ def _render_attention_triage_row(
 def _render_board_sections(
     api: runtime_api.ExecutionCenterAPI,
     board: dict[str, list[dict]],
+    tasks: list[dict],
     tasks_by_id: dict[str, dict],
+    queue_entries: list[dict],
     *,
     now: datetime,
 ) -> None:
@@ -2569,7 +2852,14 @@ def _render_board_sections(
 
     _render_attention_triage(api, board[live_board.BUCKET_ATTENTION], tasks_by_id, now=now)
 
-    _render_waiting_section(api, board[live_board.BUCKET_WAITING], tasks_by_id, now=now)
+    _render_waiting_section(
+        api,
+        board[live_board.BUCKET_WAITING],
+        tasks,
+        tasks_by_id,
+        queue_entries,
+        now=now,
+    )
 
     done = board[live_board.BUCKET_DONE]
     if done:
@@ -2581,7 +2871,9 @@ def _render_board_sections(
 def _render_waiting_section(
     api: runtime_api.ExecutionCenterAPI,
     waiting_sessions: list[dict],
+    tasks: list[dict],
     tasks_by_id: dict[str, dict],
+    queue_entries: list[dict],
     *,
     now: datetime,
 ) -> None:
@@ -2601,8 +2893,9 @@ def _render_waiting_section(
        is nearly always empty — which is exactly why the old section looked
        broken.
     """
-    entries = execution_queue.load_queue(ROOT)
-    open_entries = [e for e in entries if e.get("state") in execution_queue.OPEN_STATES]
+    open_entries = [
+        e for e in queue_entries if e.get("state") in execution_queue.OPEN_STATES
+    ]
     open_entries.sort(key=lambda e: (e.get("state") != execution_queue.STATE_READY, e.get("added_at") or ""))
 
     total = len(open_entries) + len(waiting_sessions)
@@ -2616,30 +2909,17 @@ def _render_waiting_section(
         )
         return
 
-    st.caption(
-        "Задачи в очереди запуска: «готова» стартует, как только освободится слот; "
-        "«ждёт» — держится причиной (обычно незавершённые зависимости)."
+    queue_panel.render_execution_queue_panel(
+        tasks,
+        tasks_by_id,
+        ROOT,
+        api,
+        project_config.load_project_configs(),
+        upsert_tasks,
+        key_prefix="exec_queue",
+        entries=open_entries,
+        show_heading=False,
     )
-    for entry in open_entries[:_BOARD_HISTORY_LIMIT]:
-        task = tasks_by_id.get(entry.get("task_id")) or {}
-        title = task.get("title") or entry.get("task_id") or "—"
-        is_ready = entry.get("state") == execution_queue.STATE_READY
-        with st.container(border=True):
-            row = st.columns([6, 2, 2], vertical_alignment="center")
-            row[0].markdown(f"**{title}**")
-            with row[1]:
-                st.badge("готова" if is_ready else "ждёт", color="green" if is_ready else "orange")
-            with row[2]:
-                if st.button(
-                    "Детали", key=f"exec_wait_detail_{entry.get('id')}", icon=":material/task_alt:",
-                    disabled=entry.get("task_id") not in tasks_by_id, width="stretch",
-                ):
-                    _open_task_detail(entry["task_id"])
-                    st.rerun()
-            st.caption(
-                f"Проект **{entry.get('project') or '—'}** · "
-                + (entry.get("reason") or ("готова к запуску — ждёт свободного слота" if is_ready else "ожидает"))
-            )
 
     if waiting_sessions:
         st.caption("Прогоны, готовящиеся к старту (обычно исчезают за секунды):")
@@ -2650,6 +2930,13 @@ def _render_waiting_section(
 _LAUNCH_FLASH_KEY = "exec_board_launch_flash"
 _LAUNCH_BOARD_LIMIT = 12
 _PROJECT_TREE_KEY = "exec_board_project_tree"
+
+# Flash keys for messages that must survive an immediate `st.rerun()` (same
+# pattern as `_LAUNCH_FLASH_KEY`): the frame that renders a message right
+# before `st.rerun()` is replaced by the rerun, so the message is stored here
+# and re-rendered (then popped) on the post-rerun frame instead.
+_IMPORT_TASK_FLASH_KEY = "import_task_package_flash"
+_PROJECT_SETTINGS_FLASH_KEY = "project_settings_saved_flash"
 
 
 def _render_project_tree_section(
@@ -2986,12 +3273,14 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     # board.
     tick_result = _maybe_run_autopilot_tick(api)
 
-    def _sync_mutator(fresh_tasks: list[dict]) -> tuple[list[dict], list[dict]]:
-        return fresh_tasks, task_sync.reconcile_and_sync(api, fresh_tasks)
-
-    tasks, _mutated_tasks = tasks_repository.mutate_tasks(
-        ROOT, _sync_mutator, persist_if=lambda result: bool(result[1])
-    )
+    # Reconcile live runs + re-project execution state, then project every
+    # *verified* completion onto the Kanban `Done` lane. The completion
+    # projection previously ran only inside the (default-off) autopilot tick, so
+    # a merge verified present in the target branch never reached the board
+    # unless autopilot was enabled — stranding genuinely merged tasks in Backlog
+    # with their dependents blocked (audit DATA-D2). `sync_on_refresh` is
+    # idempotent and persists only on change, so it is safe on every refresh.
+    tasks, _projected_done_ids = task_pipeline.sync_on_refresh(ROOT, api)
 
     # Queue readiness has no poller of its own (see `execution_queue`'s
     # module docstring — no hidden scheduler); it piggybacks on this
@@ -3031,8 +3320,22 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
             if s["run_id"] not in hidden_attention_run_ids
         ]
 
+    queue_entries = execution_queue.load_queue(ROOT)
+    dismissed_attention = st.session_state.get(_ATTENTION_DISMISSED_KEY, set())
+    visible_board = {
+        bucket: list(rows)
+        for bucket, rows in board.items()
+    }
+    if dismissed_attention:
+        visible_board[live_board.BUCKET_ATTENTION] = [
+            row
+            for row in visible_board[live_board.BUCKET_ATTENTION]
+            if row.get("run_id") not in dismissed_attention
+        ]
+    counts = execution_metrics.counts_for_snapshot(visible_board, queue_entries)
+
     board_style.begin()
-    _render_board_summary(board)
+    _render_board_summary(board, counts)
     _render_console_actions(tasks, tasks_by_id)
 
     # Wide main column for what the operator acts on; narrow side column for
@@ -3046,7 +3349,14 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
 
     main, side = st.columns([3, 1], gap="medium")
     with main:
-        _render_board_sections(api, board, tasks_by_id, now=now)
+        _render_board_sections(
+            api,
+            board,
+            tasks,
+            tasks_by_id,
+            queue_entries,
+            now=now,
+        )
         selected_project = st.session_state.get(_PROJECT_TREE_KEY)
         if selected_project:
             _render_project_tree_section(api, selected_project, tasks, tasks_by_id, running_task_ids)
@@ -3065,36 +3375,31 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     st.session_state["exec_center_last_refreshed_at"] = now.strftime("%H:%M:%S")
 
 
-# Four fixed-interval pollers (2/3/4/5s) — `st.fragment(run_every=...)`
+# Three fixed-interval monitoring pollers (15/30/60s) —
+# `st.fragment(run_every=...)`
 # requires a static interval per decorated function, so a user-configurable
 # interval is implemented as a small fixed set of pollers, dispatched to by
 # `render_live_execution_center` below, rather than any unmanaged background
 # thread or a dynamically-parameterized refresh mechanism.
-@st.fragment(run_every=2.0)
-def _render_live_execution_center_poll_2s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+@st.fragment(run_every=15.0)
+def _render_live_execution_center_poll_15s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     _render_live_execution_center_body(api, tasks)
 
 
-@st.fragment(run_every=3.0)
-def _render_live_execution_center_poll_3s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+@st.fragment(run_every=30.0)
+def _render_live_execution_center_poll_30s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     _render_live_execution_center_body(api, tasks)
 
 
-@st.fragment(run_every=4.0)
-def _render_live_execution_center_poll_4s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
-    _render_live_execution_center_body(api, tasks)
-
-
-@st.fragment(run_every=5.0)
-def _render_live_execution_center_poll_5s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+@st.fragment(run_every=60.0)
+def _render_live_execution_center_poll_60s(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
     _render_live_execution_center_body(api, tasks)
 
 
 _EXECUTION_CENTER_POLLERS = {
-    2: _render_live_execution_center_poll_2s,
-    3: _render_live_execution_center_poll_3s,
-    4: _render_live_execution_center_poll_4s,
-    5: _render_live_execution_center_poll_5s,
+    15: _render_live_execution_center_poll_15s,
+    30: _render_live_execution_center_poll_30s,
+    60: _render_live_execution_center_poll_60s,
 }
 
 
@@ -3105,27 +3410,45 @@ def render_live_execution_center(api: runtime_api.ExecutionCenterAPI, tasks: lis
     linked Kanban task's `launch_status` on every render — see
     `task_sync.reconcile_and_sync` (always the existing `Supervisor`, never
     a second execution engine)."""
-    header_cols = st.columns([1, 1, 1, 2])
+    # One-time migration from the old always-on 2-5 second poller. That mode
+    # rebuilt the entire interactive board while the operator was clicking or
+    # typing. The default is now stable/manual; monitoring remains an explicit
+    # opt-in at a humane cadence.
+    if not st.session_state.get("exec_center_refresh_v2_migrated"):
+        st.session_state["exec_center_auto_refresh"] = False
+        st.session_state["exec_center_refresh_interval"] = 30
+        st.session_state["exec_center_refresh_v2_migrated"] = True
+
+    header_cols = st.columns([1.4, 1, 1, 2])
     with header_cols[0]:
+        # session_state (seeded by the v2 migration above) is the single source
+        # of truth for this keyed widget; passing `value=` alongside a
+        # session-state-set key is what Streamlit warns about, so it is omitted.
         auto_refresh = st.toggle(
-            "Автообновление", value=st.session_state.get("exec_center_auto_refresh", True), key="exec_center_auto_refresh"
+            "Режим мониторинга",
+            key="exec_center_auto_refresh",
+            help="Периодически обновляет всю доску. Выключите во время работы с карточками.",
         )
     with header_cols[1]:
+        # Sanitize any stale/invalid stored value, then let the keyed widget read
+        # it directly — no `index=` default, which Streamlit forbids alongside a
+        # session-state-set key.
+        if st.session_state.get("exec_center_refresh_interval") not in _EXECUTION_CENTER_POLLERS:
+            st.session_state["exec_center_refresh_interval"] = 30
         interval = st.selectbox(
             "Интервал (с)",
-            [2, 3, 4, 5],
-            index=[2, 3, 4, 5].index(st.session_state.get("exec_center_refresh_interval", 5)),
+            list(_EXECUTION_CENTER_POLLERS),
             key="exec_center_refresh_interval",
         )
     with header_cols[2]:
         st.write("")
-        refresh_clicked = st.button("Обновить сейчас", icon=":material/refresh:", key="exec_center_refresh_now")
+        st.button("Обновить сейчас", icon=":material/refresh:", key="exec_center_refresh_now")
     with header_cols[3]:
         st.write("")
         st.caption(f"Обновлено: {st.session_state.get('exec_center_last_refreshed_at') or '—'}")
 
-    if refresh_clicked:
-        st.rerun()
+    # The button click has already caused this script run, so no second
+    # ``st.rerun`` is needed. The old explicit rerun doubled the repaint.
 
     # The autopilot surface renders *before* the poller fragment below, so its
     # controls stay interactive at a fixed position instead of being torn down
@@ -3190,8 +3513,75 @@ def _quick_action_view_run(source: str, run_id: str) -> None:
         st.session_state.pending_nav = "runs"
 
 
-def render_workspace_home_page(api: runtime_api.ExecutionCenterAPI) -> None:
+def render_project_planning_intelligence(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    *,
+    selector_key: str,
+    recommendation_key_prefix: str,
+    backlog_reconcile_key_prefix: str | None = None,
+) -> str | None:
+    """Render the shared founder health/recommendation surface.
+
+    Workspace Home and Kanban deliberately delegate to the same component
+    functions here so their metrics, scoring, queue state, and launch behavior
+    cannot drift into separate implementations: the numbers come from
+    `project_intelligence.compute_project_intelligence` and the cards from
+    `recommendation_service.build_recommendation_views` on *both* pages, so
+    there is exactly one implementation of each to keep correct.
+
+    Only the Streamlit widget-key namespace differs per host page — each caller
+    passes its own prefixes so the two pages' pills/buttons never collide on
+    widget identity. `backlog_reconcile_key_prefix` is opt-in: backlog
+    reconciliation is a Kanban-only planning tool, not part of the founder
+    health/recommendation surface Workspace Home is meant to mirror.
+    """
+    project_filter = project_selector.render_project_selector(tasks, key=selector_key)
+    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
+    st.divider()
+
+    project_configs = project_config.load_project_configs()
+    with st.expander(
+        "Планирование и рекомендации",
+        icon=":material/auto_awesome:",
+        expanded=False,
+    ):
+        recommendations_panel.render_recommendations_panel(
+            tasks,
+            tasks_by_id,
+            ROOT,
+            api,
+            project_configs,
+            upsert_tasks,
+            project=project_filter,
+            key_prefix=recommendation_key_prefix,
+        )
+        if backlog_reconcile_key_prefix is not None:
+            backlog_reconcile_panel.render_backlog_reconcile_panel(
+                tasks,
+                ROOT,
+                project=project_filter,
+                key_prefix=backlog_reconcile_key_prefix,
+            )
+    return project_filter
+
+
+def render_workspace_home_page(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+) -> None:
     snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
+
+    render_project_planning_intelligence(
+        api,
+        tasks,
+        tasks_by_id,
+        selector_key="workspace_home_project_selector",
+        recommendation_key_prefix="workspace_home_reco",
+    )
+    st.divider()
 
     with st.container(horizontal=True):
         st.metric("Проекты", len(snapshot["projects"]), border=True)
@@ -3339,6 +3729,7 @@ def build_commands() -> list[dict]:
     commands = [
         {"label": f"Перейти: {label}", "icon": icon, "action": ("nav", key)}
         for key, (label, icon) in NAV.items()
+        if key not in sidebar.HIDDEN_FROM_SIDEBAR
     ]
     commands.extend(
         {"label": f"Новая задача: {project}", "icon": ":material/add_task:", "action": ("new_task", project)}
@@ -3346,6 +3737,13 @@ def build_commands() -> list[dict]:
     )
     return commands
 
+
+# Data loading happens before the shell render so the top command bar (search,
+# live glyph, Inspector) has the task map + api available without a second pass.
+tasks = load_tasks()
+tasks_by_id = {task["id"]: task for task in tasks}
+task_counts = read_model.task_snapshot(tasks)
+project_configs = project_config.load_project_configs()
 
 page_key = shell.render_shell(
     page_title="AI Command Center",
@@ -3356,14 +3754,20 @@ page_key = shell.render_shell(
     nav=NAV,
     project_count=len(models.PROJECT_IDS),
     on_open_palette=_open_command_palette,
+    tasks_by_id=tasks_by_id,
+    api=get_execution_center_api(),
 )
 
-tasks = load_tasks()
-tasks_by_id = {task["id"]: task for task in tasks}
-project_configs = project_config.load_project_configs()
+
+def _dismiss_command_palette() -> None:
+    st.session_state.show_command_palette = False
 
 
-@st.dialog("Командная палитра", width="large")
+@st.dialog(
+    "Командная палитра",
+    width="large",
+    on_dismiss=_dismiss_command_palette,
+)
 def _command_palette_dialog() -> None:
     query = st.text_input(
         "Поиск",
@@ -3407,7 +3811,7 @@ if st.session_state.show_command_palette:
 # it updates every 5 s on its own without blanking the page behind it. Rendered
 # before the page dispatch so it is visible on every page (pages that call
 # `st.stop()` have already mounted it by then).
-execution_strip.render_execution_strip(get_execution_center_api())
+execution_strip.render_execution_strip(get_execution_center_api(), ROOT)
 
 
 # --------------------------------------------------------------------------
@@ -3507,7 +3911,11 @@ _ACTIVITY_LABELS: dict[str, str] = {
 }
 
 
-def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]) -> None:
+def render_home_dashboard(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    counts: read_model.TaskSnapshot,
+) -> None:
     """The Home dashboard from the approved design — KPI tiles, execution queue,
     project health, recent activity, a Kanban overview and quick actions, with an
     AI-Supervisor side panel. Pure presentation over the live task/run state via
@@ -3525,12 +3933,12 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         s["display_status"] = _execution_center_display_status(s)
     board = live_board.split_board(sessions, display_status="display_status")
 
-    active = [t for t in tasks if t.get("status") != "Done"]
-    done = [t for t in tasks if t.get("status") == "Done"]
     running = board[live_board.BUCKET_LIVE]
-    needs_review = [t for t in tasks if t.get("launch_status") == "Needs Review"]
-    projects_with_tasks = {t.get("project") for t in active if t.get("project")}
-    attention = board[live_board.BUCKET_ATTENTION]
+    projects_with_tasks = {
+        project_config.canonical_project_id(t.get("project")) or t.get("project")
+        for t in tasks
+        if t.get("project")
+    }
 
     greeting = f"{_home_greeting()} {owner}" if owner else _home_greeting()
     st.markdown(f"### {greeting}")
@@ -3587,11 +3995,29 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
     # than a duplicated, misleading one.
     home_dashboard.kpi_tiles([
         home_dashboard.Kpi("Проекты", len(projects_with_tasks),
-                           "все активны" if not attention else f"{len(attention)} требуют внимания",
+                           (
+                               f"{counts.attention} задач требуют внимания"
+                               if counts.attention
+                               else "нет задач, требующих внимания"
+                           ),
                            "📁", "violet", ()),
         home_dashboard.Kpi("Агенты", len(running), runs_delta_txt, "🤖", "blue", ()),
-        home_dashboard.Kpi("Задачи", len(active), f"{len(done)} завершено", "✓", "green", ()),
-        home_dashboard.Kpi("Ревью", len(needs_review), f"{len(needs_review)} ожидают", "★", "amber", ()),
+        home_dashboard.Kpi(
+            "Задачи",
+            counts.total,
+            f"{counts.active} активных · {counts.done} завершено",
+            "✓",
+            "green",
+            (),
+        ),
+        home_dashboard.Kpi(
+            "Ревью",
+            counts.by_lane["Review"],
+            f"{counts.by_lane['Review']} в колонке Review",
+            "★",
+            "amber",
+            (),
+        ),
     ])
 
     # Clickable KPI deep-links (UX-2b): the inert HTML tiles above cannot host
@@ -3661,7 +4087,7 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
             # 200-capped run list. The old `len(running)*20` / `len(attention)*10`
             # multipliers were magic numbers dressing up counts as percentages.
             window_success = _window_success_rate(runs)
-            task_ratio = int(100 * len(done) / len(tasks)) if tasks else 0
+            task_ratio = int(100 * counts.done / counts.total) if counts.total else 0
             if window_success is None:
                 home_dashboard.health_gauge(0, "Нет данных за неделю", accent="slate")
             else:
@@ -3701,18 +4127,21 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
 
         with col_k:
             home_dashboard.card_open("Обзор Kanban", "Доска")
-            accents = ["slate", "blue", "green", "amber", "violet"]
-            cols = []
-            for i, lane in enumerate(models.KANBAN_STATUSES):
-                n = sum(1 for t in tasks if t.get("status") == lane)
-                cols.append((lane, n, accents[i % len(accents)]))
+            accents = ["slate", "blue", "green", "amber", "red", "violet"]
+            overview_lanes = list(read_model.CANONICAL_LANES)
+            cols = [
+                (lane, counts.by_lane[lane], accents[i % len(accents)])
+                for i, lane in enumerate(overview_lanes)
+            ]
+            if counts.other:
+                cols.append(("Другие", counts.other, "amber"))
             home_dashboard.kanban_overview(cols)
             home_dashboard.card_close()
             # Clickable Kanban columns (UX-2b): each lane count deep-links to the
             # Kanban board (the page-level filter defaults to "Все", so the
             # operator lands on the full board and can filter further).
-            kbtns = st.columns(len(models.KANBAN_STATUSES))
-            for i, lane in enumerate(models.KANBAN_STATUSES):
+            kbtns = st.columns(len(overview_lanes))
+            for i, lane in enumerate(overview_lanes):
                 with kbtns[i]:
                     if st.button(
                         f"→ {lane}",
@@ -3742,12 +4171,23 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         # The gauge shows the same windowed health as the project-health card; the
         # status pill and caption describe what the supervisor is actually doing.
         window_success = _window_success_rate(runs)
-        if attention:
+        # audit D5: count "needs attention" with the exact same actionable,
+        # dismiss-aware computation the Execution Strip banner and the Live Center
+        # headline use (`execution_strip.current_counts` — drops superseded,
+        # completed-task and operator-dismissed rows), so this caption, the strip
+        # and the top-bar glyph never show two different "attention" numbers on
+        # one screen. queue_entries=[] because attention/running don't depend on
+        # the durable queue.
+        run_counts = execution_strip.current_counts(
+            runs, tasks, [],
+            dismissed_attention_run_ids=st.session_state.get("exec_attention_dismissed", set()),
+        )
+        if run_counts.attention:
             sup_status, sup_accent = "Требует внимания", "amber"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(attention)} прогонов требуют внимания"
-        elif running:
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.attention} прогонов требуют внимания"
+        elif run_counts.live:
             sup_status, sup_accent = "В работе", "green"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {len(running)} прогонов выполняется"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.live} прогонов выполняется"
         else:
             sup_status, sup_accent = "Ожидает", "slate"
             sup_label = "Автопилот включён — ожидает задач" if settings.enabled else "Автопилот выключен"
@@ -3758,10 +4198,16 @@ def render_home_dashboard(api: runtime_api.ExecutionCenterAPI, tasks: list[dict]
         home_dashboard.card_open("Проекты")
         proj_rows = []
         for p in sorted(projects_with_tasks):
-            p_active = [t for t in active if project_config.project_matches(t.get("project"), p)]
+            project_tasks = [
+                t for t in tasks if project_config.project_matches(t.get("project"), p)
+            ]
+            project_counts = read_model.task_snapshot(project_tasks)
+            p_active = [
+                t for t in project_tasks if t.get("status") in read_model.ACTIVE_LANES
+            ]
             p_att = [t for t in p_active if t.get("launch_status") in ("Failed", "Requires Attention", "Blocked")]
             proj_rows.append({
-                "icon": "▪", "name": p, "meta": f"{len(p_active)} активных",
+                "icon": "▪", "name": p, "meta": f"{project_counts.active} активных",
                 "right": "Внимание" if p_att else "OK", "right_accent": "amber" if p_att else "green",
             })
         home_dashboard.simple_rows(proj_rows or [{"icon": "▪", "name": "Нет активных проектов", "meta": ""}])
@@ -3896,6 +4342,11 @@ def render_project_chat(project: str, tasks: list[dict], tasks_by_id: dict[str, 
                                     conv_task_type,
                                     "Backlog",
                                     goal=objective_clean,
+                                    # An assistant message is untrusted agent output;
+                                    # converting it to a task must not launder that into
+                                    # a trusted run (SEC-D-02). A user's own message stays
+                                    # trusted.
+                                    untrusted_import=(message["role"] == "assistant"),
                                 )
                                 activity_log.log_event(
                                     "task_created_from_message", project=active_conversation["project"],
@@ -4016,8 +4467,125 @@ def _latest_roadmap_report_text(project: str) -> str | None:
     return read_text(latest)
 
 
+def render_dashboard_analytics(
+    api: runtime_api.ExecutionCenterAPI,
+    tasks: list[dict],
+    tasks_by_id: dict[str, dict],
+    counts: read_model.TaskSnapshot,
+) -> None:
+    """Compact cross-project analytics for the consolidated main dashboard."""
+    active_tasks = [task for task in tasks if task.get("status") in read_model.ACTIVE_LANES]
+    blocked_tasks = [task for task in tasks if task.get("status") == "Blocked"]
+    completion_rate = (
+        round(counts.done / counts.total * 100) if counts.total else 0
+    )
+
+    with st.container(horizontal=True):
+        st.metric("Всего задач", counts.total, border=True)
+        st.metric("Активные", counts.active, border=True)
+        st.metric("В статусе Blocked", counts.blocked, border=True)
+        st.metric(
+            "Выполнено",
+            f"{counts.done} ({completion_rate}%)",
+            border=True,
+        )
+        if counts.other:
+            st.metric("Другие статусы", counts.other, border=True)
+        st.metric("Требуют внимания", counts.attention, border=True)
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("#### Проекты")
+        for project in models.PROJECT_IDS:
+            project_tasks = [
+                task
+                for task in tasks
+                if project_config.project_matches(task.get("project"), project)
+            ]
+            project_counts = read_model.task_snapshot(project_tasks)
+            with st.container(border=True):
+                cols = st.columns([3, 1, 1, 1, 1])
+                cols[0].markdown(f"**{project}**")
+                cols[1].metric("Актив.", project_counts.active)
+                cols[2].metric("Blocked", project_counts.blocked)
+                cols[3].metric("Готово", project_counts.done)
+                if cols[4].button(
+                    "Открыть",
+                    key=f"dashboard_analytics_project_{project}",
+                    icon=":material/arrow_forward:",
+                ):
+                    st.session_state.pending_nav = "projects"
+                    st.session_state.pending_project_browser = project
+                    st.rerun()
+
+    with right:
+        st.markdown("#### Приоритеты")
+        priority_counts = {
+            priority: sum(
+                1 for task in active_tasks if task.get("priority") == priority
+            )
+            for priority in task_view.kanban_priority_options(active_tasks)
+        }
+        if any(priority_counts.values()):
+            st.bar_chart(priority_counts)
+        else:
+            st.info("Нет активных задач.")
+
+        st.markdown("#### Фактическая загрузка агентов")
+        settings = task_pipeline.pipeline_settings.load_settings(ROOT)
+        load = scheduler.build_load_snapshot(api.db_path)
+        registry = scheduler.default_registry(
+            max_concurrency=settings.max_agent_concurrency
+        )
+        for agent in registry.all():
+            used = int(load.running_by_agent.get(agent.agent_id, 0))
+            free = max(0, agent.max_concurrency - used) if agent.available else 0
+            tone = "🟢" if agent.available and free else "🟠" if agent.available else "🔴"
+            st.caption(
+                f"{tone} `{agent.agent_id}` — {used}/{agent.max_concurrency}"
+                + (f" · свободно {free}" if agent.available else " · недоступен")
+            )
+
+    st.markdown("#### Требуют решения")
+    if not blocked_tasks:
+        st.success("Заблокированных задач нет.")
+    for task in blocked_tasks[:10]:
+        unmet = unmet_dependencies(task, tasks_by_id)
+        names = ", ".join(
+            tasks_by_id.get(dep_id, {}).get("title") or dep_id for dep_id in unmet
+        )
+        with st.container(border=True):
+            cols = st.columns([5, 1])
+            cols[0].markdown(
+                f"**{task.get('title') or 'Без названия'}** · {task.get('project')}"
+            )
+            cols[0].caption(f"Ожидает: {names or 'уточнения причины'}")
+            if cols[1].button(
+                "Kanban",
+                key=f"dashboard_blocked_{task.get('id')}",
+                icon=":material/view_kanban:",
+            ):
+                st.session_state.pending_nav = "kanban"
+                st.rerun()
+
+
 if page_key == "dashboard":
-    render_home_dashboard(get_execution_center_api(), tasks)
+    dashboard_api = get_execution_center_api()
+    dashboard_section = st.segmented_control(
+        "Раздел",
+        ["Обзор", "Аналитика", "Репозитории и артефакты"],
+        default="Обзор",
+        key="dashboard_section",
+    )
+    # Unlike ``st.tabs``, this renders only the selected section.  Repository
+    # discovery and analytics no longer execute invisibly on every overview
+    # refresh, which keeps the home page responsive on large workspaces.
+    if dashboard_section == "Аналитика":
+        render_dashboard_analytics(dashboard_api, tasks, tasks_by_id, task_counts)
+    elif dashboard_section == "Репозитории и артефакты":
+        render_workspace_home_page(dashboard_api, tasks, tasks_by_id)
+    else:
+        render_home_dashboard(dashboard_api, tasks, task_counts)
 
 
 # --------------------------------------------------------------------------
@@ -4028,9 +4596,17 @@ elif page_key == "workspace_home":
     content_area.page_header(
         "Workspace Home",
         "Кросс-проектная сводка: репозитории, прогоны, артефакты и отчёты — "
-        "в одном месте, только для чтения.",
+        "в одном месте, с health-метриками и рекомендациями следующих действий.",
     )
-    render_workspace_home_page(get_execution_center_api())
+    render_workspace_home_page(get_execution_center_api(), tasks, tasks_by_id)
+
+
+# --------------------------------------------------------------------------
+# AML Monitoring
+# --------------------------------------------------------------------------
+
+elif page_key == "aml":
+    aml_panel.render()
 
 
 # --------------------------------------------------------------------------
@@ -4038,25 +4614,32 @@ elif page_key == "workspace_home":
 # --------------------------------------------------------------------------
 
 elif page_key == "executive":
-    st.subheader("Исполнительная панель")
+    st.subheader("Исполнительная панель", anchor="executive")
 
     render_next_task_callout(
         tasks,
         active_runs=get_execution_center_api().list_runs(states=runtime_db.EXECUTION_CENTER_ACTIVE_STATES),
     )
 
-    active_tasks = [task for task in tasks if task.get("status") != "Done"]
-    completed_tasks = [task for task in tasks if task.get("status") == "Done"]
-    blocked_tasks = [task for task in active_tasks if is_blocked(task, tasks_by_id)]
-    blocked_ids = {task["id"] for task in blocked_tasks}
-    completion_rate = f"{(len(completed_tasks) / len(tasks) * 100):.0f}%" if tasks else "—"
+    active_tasks = [
+        task for task in tasks if task.get("status") in read_model.ACTIVE_LANES
+    ]
+    blocked_tasks = [task for task in tasks if task.get("status") == "Blocked"]
+    completion_rate = (
+        f"{(task_counts.done / task_counts.total * 100):.0f}%"
+        if task_counts.total
+        else "—"
+    )
     total_estimate = sum(task.get("estimate_hours", 0.0) for task in active_tasks)
 
     with st.container(horizontal=True):
-        st.metric("Всего задач", len(tasks), border=True)
-        st.metric("Активные", len(active_tasks), border=True)
-        st.metric("Заблокированные", len(blocked_tasks), border=True)
-        st.metric("Выполнено", f"{len(completed_tasks)} ({completion_rate})", border=True)
+        st.metric("Всего задач", task_counts.total, border=True)
+        st.metric("Активные", task_counts.active, border=True)
+        st.metric("В статусе Blocked", task_counts.blocked, border=True)
+        st.metric("Выполнено", f"{task_counts.done} ({completion_rate})", border=True)
+        if task_counts.other:
+            st.metric("Другие статусы", task_counts.other, border=True)
+        st.metric("Требуют внимания", task_counts.attention, border=True)
         st.metric("Оценка нагрузки", format_estimate(total_estimate), border=True)
 
     st.divider()
@@ -4070,18 +4653,16 @@ elif page_key == "executive":
             # Canonical-id match (shared helper) so display-name tasks count
             # under their project — consistent with the Kanban lane and pill.
             project_tasks = [task for task in tasks if project_config.project_matches(task.get("project"), project)]
-            p_active = sum(1 for task in project_tasks if task.get("status") != "Done")
-            p_blocked = sum(1 for task in project_tasks if task["id"] in blocked_ids)
-            p_done = sum(1 for task in project_tasks if task.get("status") == "Done")
+            project_counts = read_model.task_snapshot(project_tasks)
             status_file = project_status_file_path(project)
 
             with st.container(border=True):
                 header_cols = st.columns([2, 1, 1, 1])
                 header_cols[0].markdown(f"**{project}**")
                 header_cols[0].caption(statuses.get(project, "—"))
-                header_cols[1].metric("Активн.", p_active)
-                header_cols[2].metric("Блок.", p_blocked)
-                header_cols[3].metric("Готово", p_done)
+                header_cols[1].metric("Активн.", project_counts.active)
+                header_cols[2].metric("Blocked", project_counts.blocked)
+                header_cols[3].metric("Готово", project_counts.done)
                 st.caption(f"Статус-файл обновлён: {format_mtime(status_file)}")
 
     with right:
@@ -4180,7 +4761,7 @@ elif page_key == "executive":
 # --------------------------------------------------------------------------
 
 elif page_key == "create":
-    st.subheader("Создание AI-задачи")
+    st.subheader("Создание AI-задачи", anchor="create-task")
 
     open_tasks = [task for task in tasks if task.get("status") != "Done"]
 
@@ -4287,35 +4868,39 @@ elif page_key == "create":
         elif task_type not in TASK_TYPES:
             st.error("Неизвестный тип задачи.")
         else:
+            final_executor = (
+                None if override_executor == "(унаследовано из проекта)" else override_executor
+            )
+            create_task(
+                project,
+                title_clean,
+                task_type,
+                initial_status,
+                goal=objective_clean,
+                notes=notes.strip(),
+                priority=priority,
+                owner=owner.strip(),
+                estimate_hours=float(estimate),
+                depends_on=dependencies,
+                workspace_path=override_workspace.strip() or inherited["workspace_path"],
+                branch=override_branch.strip() or inherited["branch"],
+                executor=final_executor or inherited["executor"],
+                prompt=override_prompt.strip() or inherited["prompt"],
+            )
+            st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
+
             with st.spinner("Выполняется scripts/start-task.sh..."):
                 ok, stdout, stderr = run_start_task_script(project, task_type, objective_clean)
 
             if ok:
-                final_executor = (
-                    None if override_executor == "(унаследовано из проекта)" else override_executor
-                )
-                create_task(
-                    project,
-                    title_clean,
-                    task_type,
-                    initial_status,
-                    goal=objective_clean,
-                    notes=notes.strip(),
-                    priority=priority,
-                    owner=owner.strip(),
-                    estimate_hours=float(estimate),
-                    depends_on=dependencies,
-                    workspace_path=override_workspace.strip() or inherited["workspace_path"],
-                    branch=override_branch.strip() or inherited["branch"],
-                    executor=final_executor or inherited["executor"],
-                    prompt=override_prompt.strip() or inherited["prompt"],
-                )
-                st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
                 if stdout:
                     with st.expander("Вывод скрипта"):
                         st.code(stdout, language=None)
             else:
-                st.error("Не удалось выполнить scripts/start-task.sh.")
+                st.warning(
+                    "Задача сохранена в Kanban, но scripts/start-task.sh не смог "
+                    "сгенерировать Markdown-файл."
+                )
                 details = stderr or stdout
                 if details:
                     with st.expander("Подробности ошибки", expanded=True):
@@ -4324,19 +4909,59 @@ elif page_key == "create":
     st.divider()
     st.markdown("#### Импорт пакета задач")
     st.caption(
-        "Загрузите JSON-файл со списком задач (например, пакет от Founder-аудита) — "
-        "поддерживаются как «конверт» `{schema_version, package_id, tasks}`, так и "
-        "простой список задач. Ничего не записывается в `data/tasks.json` до нажатия "
-        "«Импортировать задачи»."
+        "Загрузите файл или вставьте пакет задач (например, пакет от Founder-аудита). "
+        "Поддерживаются JSON, YAML, Markdown и простой текст, в двух формах: «конверт» "
+        "`{schema_version, package_id, tasks}` или простой список задач. Ничего не "
+        "записывается в `data/tasks.json` до нажатия «Импортировать задачи»."
     )
+    # Result of the previous run's applied import, carried across `st.rerun()`
+    # via the same flash pattern as `_LAUNCH_FLASH_KEY`: a message rendered
+    # right before `st.rerun()` belongs to the pre-rerun frame, which the rerun
+    # replaces immediately — the operator (and `AppTest`'s element tree on
+    # streamlit >= 1.61, which no longer merges the discarded frame) never sees
+    # it unless it is re-rendered on the post-rerun frame like this.
+    import_task_flash = st.session_state.pop(_IMPORT_TASK_FLASH_KEY, None)
+    if import_task_flash:
+        st.success(import_task_flash)
     uploaded_package = st.file_uploader(
-        "JSON-пакет задач", type=["json"], key="import_task_package_uploader"
+        "Файл пакета задач (JSON / YAML / Markdown / текст)",
+        type=list(task_import.SUPPORTED_IMPORT_SUFFIXES),
+        key="import_task_package_uploader",
     )
+    pasted_package = st.text_area(
+        "…или вставьте пакет сюда",
+        key="import_task_package_paste",
+        height=120,
+        placeholder='{"tasks": [ … ]}   ·   YAML   ·   Markdown c ```json / ```yaml-блоком',
+    )
+    paste_format = st.selectbox(
+        "Формат вставленного текста",
+        ("авто", "json", "yaml", "markdown"),
+        key="import_task_package_paste_format",
+        help="«авто» распознаёт JSON или YAML. Для вставленного Markdown выберите его явно.",
+    )
+
+    parsed_package = None
+    import_parse_error: task_import.TaskImportError | None = None
     if uploaded_package is not None:
+        # Pass the real filename so the parser can pick YAML/Markdown by
+        # extension, not just sniff JSON/YAML out of the raw bytes.
         try:
-            parsed_package = task_import.parse_task_package(uploaded_package.getvalue())
+            parsed_package = task_import.parse_task_package(
+                uploaded_package.getvalue(), filename=uploaded_package.name
+            )
         except task_import.TaskImportError as exc:
-            st.error(f"Ошибка разбора пакета: {exc}")
+            import_parse_error = exc
+    elif pasted_package.strip():
+        fmt = None if paste_format == "авто" else paste_format
+        try:
+            parsed_package = task_import.parse_task_package(pasted_package, fmt=fmt)
+        except task_import.TaskImportError as exc:
+            import_parse_error = exc
+
+    if import_parse_error is not None or parsed_package is not None:
+        if import_parse_error is not None:
+            st.error(f"Ошибка разбора пакета: {import_parse_error}")
         else:
             import_validation = task_import.validate_task_package(parsed_package)
             import_preview = task_import.build_import_preview(ROOT, parsed_package, import_validation)
@@ -4395,7 +5020,10 @@ elif page_key == "create":
                     # uncaught exception; nothing was written in either case.
                     st.error(f"Импорт не выполнен: {exc}")
                 else:
-                    st.success(
+                    # Flashed (not rendered inline) because the `st.rerun()`
+                    # below wipes this frame before the message would be seen —
+                    # the pop at the top of this section shows it post-rerun.
+                    st.session_state[_IMPORT_TASK_FLASH_KEY] = (
                         f"Импортировано задач: {len(import_result.imported_ids)}. "
                         f"Пропущено дубликатов: {len(import_result.skipped_duplicate_ids)}."
                     )
@@ -4407,7 +5035,7 @@ elif page_key == "create":
 # --------------------------------------------------------------------------
 
 elif page_key == "chat":
-    st.subheader("Чат по проекту")
+    st.subheader("Чат по проекту", anchor="project-chat")
     # The chat now lives as the 'Чат' tab inside the project view; this page is
     # kept so an existing deep link still resolves, and delegates to the same
     # `render_project_chat` the tab uses. (task 02661825)
@@ -4425,27 +5053,15 @@ elif page_key == "waves":
     waves_panel.render_waves_page(tasks, tasks_by_id, ROOT, project=project_filter)
 
 elif page_key == "kanban":
-    st.subheader("Kanban")
+    st.subheader("Kanban", anchor="kanban")
 
-    project_filter = project_selector.render_project_selector(tasks, key="kanban_project_selector")
-    project_intelligence_panel.render_project_intelligence_strip(tasks, project=project_filter)
-    st.divider()
-
-    project_configs = project_config.load_project_configs()
-    recommendations_panel.render_recommendations_panel(
+    project_filter = render_project_planning_intelligence(
+        get_execution_center_api(),
         tasks,
         tasks_by_id,
-        ROOT,
-        get_execution_center_api(),
-        project_configs,
-        upsert_tasks,
-        project=project_filter,
-        key_prefix="kanban_reco",
-    )
-    st.divider()
-
-    backlog_reconcile_panel.render_backlog_reconcile_panel(
-        tasks, ROOT, project=project_filter, key_prefix="kanban_reconcile"
+        selector_key="kanban_project_selector",
+        recommendation_key_prefix="kanban_reco",
+        backlog_reconcile_key_prefix="kanban_reconcile",
     )
     st.divider()
 
@@ -4464,17 +5080,61 @@ elif page_key == "kanban":
     filtered_tasks = task_view.filter_kanban_tasks(
         tasks, project=project_filter, priorities=priority_filter
     )
+    filtered_counts = read_model.task_snapshot(filtered_tasks)
 
     kanban_git_status_cache: dict[str, dict] = {}
+    kanban_api = get_execution_center_api()
+    current_run_ids = [
+        task["current_run_id"]
+        for task in filtered_tasks
+        if task.get("current_run_id")
+    ]
+    completions_by_run = kanban_api.get_completions_for_runs(current_run_ids)
+    completions_by_task = {
+        row["task_id"]: row for row in completions_by_run.values()
+    }
+    current_run_id_set = set(current_run_ids)
+    current_runs_by_id = {
+        run["id"]: run
+        for run in kanban_api.list_runs(limit=200)
+        if run.get("id") in current_run_id_set
+    }
+    kanban_now = datetime.now()
+
+    def _kanban_live_progress(task: dict) -> tuple[int | None, str | None] | None:
+        run = current_runs_by_id.get(task.get("current_run_id"))
+        if run is None:
+            return None
+        status = session_view.derive_status(
+            run,
+            awaiting_handshake=session_view.is_awaiting_handshake(run),
+        )
+        estimate = task.get("estimate_hours")
+        reference_seconds = float(estimate) * 3600 if estimate else run.get(
+            "timeout_seconds"
+        )
+        return session_view.derive_live_progress(
+            status,
+            session_view.completion_view(
+                completions_by_task.get(task.get("id"))
+            ),
+            task_type=run.get("task_type") or task.get("task_type"),
+            elapsed_seconds=session_view.elapsed_seconds(
+                run.get("started_at"), run.get("completed_at"), kanban_now
+            ),
+            timeout_seconds=reference_seconds,
+            stage_progress=task.get("progress"),
+            stage_label=task.get("current_stage"),
+        )
 
     # Полноширинные вертикальные дорожки Kanban.
     # Горизонтальная разметка через st.columns сжимала карточки
     # и делала заголовки и элементы управления нечитаемыми.
-    for status in KANBAN_COLUMNS:
+    for status in read_model.CANONICAL_LANES:
         with st.container(border=True):
             status_tasks = [task for task in filtered_tasks if task.get("status") == status]
             st.markdown(f"**{status}**")
-            st.caption(f"{len(status_tasks)} задач")
+            st.caption(f"{filtered_counts.by_lane[status]} задач")
 
             if not status_tasks:
                 st.caption("Пусто")
@@ -4486,28 +5146,38 @@ elif page_key == "kanban":
                     tasks_by_id=tasks_by_id,
                     key_prefix=f"kanban_{task.get('id')}",
                     git_status_cache=kanban_git_status_cache,
+                    completion=completions_by_task.get(task.get("id")),
+                    live_progress=_kanban_live_progress(task),
                     show_kanban_controls=True,
                 )
 
-    st.divider()
-    queue_panel.render_execution_queue_panel(
-        tasks,
-        tasks_by_id,
-        ROOT,
-        get_execution_center_api(),
-        project_configs,
-        upsert_tasks,
-        project=project_filter,
-        key_prefix="kanban_queue",
-    )
-
+    if filtered_counts.other:
+        with st.container(border=True):
+            other_tasks = [
+                task
+                for task in filtered_tasks
+                if task.get("status") not in read_model.CANONICAL_LANES
+            ]
+            st.markdown("**Другие статусы**")
+            st.caption(f"{filtered_counts.other} задач")
+            for task in other_tasks:
+                render_task_card(
+                    task,
+                    tasks=tasks,
+                    tasks_by_id=tasks_by_id,
+                    key_prefix=f"kanban_{task.get('id')}",
+                    git_status_cache=kanban_git_status_cache,
+                    completion=completions_by_task.get(task.get("id")),
+                    live_progress=_kanban_live_progress(task),
+                    show_kanban_controls=True,
+                )
 
 # --------------------------------------------------------------------------
 # AI Agents
 # --------------------------------------------------------------------------
 
 elif page_key == "agents":
-    st.subheader("AI-агенты")
+    st.subheader("AI-агенты", anchor="agents")
     st.caption("Каталог типов задач, поддерживаемых scripts/start-task.sh")
 
     generated_files = artifacts.list_markdown_files(GENERATED_DIR)
@@ -4515,8 +5185,7 @@ elif page_key == "agents":
     for task_type in TASK_TYPES:
         meta = AGENT_ROLES[task_type]
         type_tasks = [task for task in tasks if task.get("task_type") == task_type]
-        active_count = sum(1 for task in type_tasks if task.get("status") != "Done")
-        done_count = len(type_tasks) - active_count
+        type_counts = read_model.task_snapshot(type_tasks)
         generated_count = sum(1 for path in generated_files if artifacts.infer_task_type_from_filename(path) == task_type)
 
         with st.container(border=True):
@@ -4524,8 +5193,8 @@ elif page_key == "agents":
             st.caption(f"`{task_type}` · {meta['summary']}")
 
             metric_cols = st.columns(3)
-            metric_cols[0].metric("Активные задачи", active_count)
-            metric_cols[1].metric("Завершено", done_count)
+            metric_cols[0].metric("Активные задачи", type_counts.active)
+            metric_cols[1].metric("Завершено", type_counts.done)
             metric_cols[2].metric("Сгенерировано файлов", generated_count)
 
             with st.expander("Правила выполнения"):
@@ -4565,7 +5234,7 @@ elif page_key == "agents":
 # --------------------------------------------------------------------------
 
 elif page_key == "execution_center":
-    st.subheader("Live Execution Center")
+    st.subheader("Live Execution Center", anchor="execution-center")
     st.caption(
         "Канонический монитор выполнения: реальные PID-отслеживаемые прогоны через "
         "v2 Session Supervisor (command_center.runtime) — источник истины для статуса "
@@ -4576,11 +5245,66 @@ elif page_key == "execution_center":
 
 
 # --------------------------------------------------------------------------
+# Persistent daily product/engineering audit
+# --------------------------------------------------------------------------
+
+elif page_key == "daily_audit":
+    daily_audit_panel.render_daily_audit_page(get_execution_center_api().db_path)
+
+
+# --------------------------------------------------------------------------
 # Run journal
 # --------------------------------------------------------------------------
 
 elif page_key == "runs":
-    st.subheader("Журнал запусков")
+    st.subheader("Журнал запусков", anchor="runs")
+    runs_view = st.segmented_control(
+        "Представление",
+        ["Список", "Таймлайн"],
+        default="Список",
+        key="runs_view_mode",
+    )
+    if runs_view == "Таймлайн":
+        project_filter = st.selectbox(
+            "Фильтр по проекту",
+            ["Все"] + models.PROJECT_IDS,
+            key="runs_timeline_project_filter",
+        )
+        events = build_timeline_events(
+            tasks,
+            runs=runs_read.list_unified_runs(
+                get_execution_center_api().db_path, root=ROOT
+            ),
+            activity_events=activity_log.load_activity(limit=200),
+            limit=200,
+        )
+        if project_filter != "Все":
+            events = [
+                event
+                for event in events
+                if project_config.project_matches(
+                    event.get("project"), project_filter
+                )
+            ]
+        if not events:
+            st.info("Событий пока нет.")
+        else:
+            current_date: str | None = None
+            for event in events[:150]:
+                event_date = datetime.fromtimestamp(event["ts"]).strftime(
+                    "%d.%m.%Y"
+                )
+                if event_date != current_date:
+                    current_date = event_date
+                    st.markdown(f"#### {current_date}")
+                time_str = datetime.fromtimestamp(event["ts"]).strftime("%H:%M")
+                project_tag = (
+                    f" · {event['project']}" if event.get("project") else ""
+                )
+                st.caption(
+                    f"{event['icon']} {time_str}{project_tag} — {event['label']}"
+                )
+        st.stop()
 
     # Unified runs (v2 runtime.db + legacy v1.2 journal) — the old
     # `agent_runner.load_runs()` read only the v1.2 journal, which is empty on
@@ -4747,7 +5471,7 @@ elif page_key == "runs":
 # --------------------------------------------------------------------------
 
 elif page_key == "timeline":
-    st.subheader("Таймлайн")
+    st.subheader("Таймлайн", anchor="timeline")
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="timeline_project_filter")
 
@@ -4779,7 +5503,7 @@ elif page_key == "timeline":
 # --------------------------------------------------------------------------
 
 elif page_key == "projects":
-    st.subheader("Проекты")
+    st.subheader("Проекты", anchor="projects")
 
     project_choice = st.selectbox("Проект", ["Все", *models.PROJECT_IDS], key="project_browser_select")
 
@@ -4798,6 +5522,14 @@ elif page_key == "projects":
             with st.container(border=True):
                 st.markdown(f"**{project_configs[overview_pid]['display_name']}** (`{overview_pid}`)")
                 st.caption(f"{len(pid_active)} активных · {len(pid_done)} завершено · всего {len(pid_tasks)}")
+                if st.button(
+                    "Открыть проект",
+                    key=f"project_overview_open_{overview_pid}",
+                    icon=":material/arrow_forward:",
+                    width="stretch",
+                ):
+                    st.session_state["pending_project_browser"] = overview_pid
+                    st.rerun()
         st.stop()
 
     selected_project = project_choice
@@ -4907,6 +5639,16 @@ elif page_key == "projects":
             "Эти значения автоматически наследуются новыми задачами проекта "
             "(workspace, branch, executor, prompt) на странице «Создать задачу»."
         )
+        # Outcome of the previous run's save, carried across `st.rerun()` via
+        # the `_LAUNCH_FLASH_KEY` flash pattern: advisory validation warnings
+        # and the save confirmation rendered right before `st.rerun()` belong
+        # to the pre-rerun frame, which the rerun replaces immediately — they
+        # must be re-rendered here on the post-rerun frame to be seen at all.
+        settings_flash = st.session_state.pop(_PROJECT_SETTINGS_FLASH_KEY, None)
+        if settings_flash:
+            for warning_message in settings_flash["warnings"]:
+                st.warning(warning_message)
+            st.success(settings_flash["success"])
 
         workspace_input = st.text_input(
             "Workspace по умолчанию",
@@ -4998,8 +5740,7 @@ elif page_key == "projects":
                     "owner": owner_input.strip(),
                 }
             )
-            for warning_message in project_config.validate_project_settings(candidate):
-                st.warning(warning_message)
+            settings_warnings = list(project_config.validate_project_settings(candidate))
 
             project_config.save_project_settings(
                 selected_project,
@@ -5015,7 +5756,14 @@ elif page_key == "projects":
                 current_milestone=candidate["current_milestone"],
                 owner=candidate["owner"],
             )
-            st.success("Настройки проекта сохранены.")
+            # Flashed (not rendered inline) because the `st.rerun()` below
+            # wipes this frame before the messages would be seen — the pop
+            # above the settings form shows them post-rerun. Warnings stay
+            # advisory: the save above already happened regardless.
+            st.session_state[_PROJECT_SETTINGS_FLASH_KEY] = {
+                "warnings": settings_warnings,
+                "success": "Настройки проекта сохранены.",
+            }
             st.rerun()
 
     with tab_chat:
@@ -5105,7 +5853,7 @@ elif page_key == "projects":
 # --------------------------------------------------------------------------
 
 elif page_key == "generated":
-    st.subheader("Сгенерированные задачи")
+    st.subheader("Сгенерированные задачи", anchor="generated-tasks")
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="gen_filter")
 
@@ -5142,7 +5890,7 @@ elif page_key == "generated":
 # --------------------------------------------------------------------------
 
 elif page_key == "reports":
-    st.subheader("Отчёты")
+    st.subheader("Отчёты", anchor="reports")
 
     project_filter = st.selectbox("Фильтр по проекту", ["Все"] + models.PROJECT_IDS, key="report_filter")
 
@@ -5187,7 +5935,7 @@ elif page_key == "reports":
 # --------------------------------------------------------------------------
 
 elif page_key == "context":
-    st.subheader("Глобальный контекст")
+    st.subheader("Глобальный контекст", anchor="context")
 
     for name in GLOBAL_FILES:
         path = ROOT / name
@@ -5200,14 +5948,15 @@ elif page_key == "context":
 # --------------------------------------------------------------------------
 
 elif page_key == "git_center":
-    st.subheader("Git Center")
+    st.subheader("Git Center", anchor="git-center")
 
     # Multi-repo: the portfolio spans several configured repositories, not just
     # the app's own cwd. Surface every project's configured repository_path
     # (plus the app itself) so an operator can inspect any of them from one
     # place instead of only ever seeing AICC here.
     repos: list[tuple[str, Path]] = []
-    if (ROOT / ".git").is_dir():
+    # A linked worktree stores ``.git`` as a file, not a directory.
+    if git_info.get_status(ROOT).get("is_repo"):
         repos.append(("AICC (app)", ROOT))
     for pid in models.PROJECT_IDS:
         cfg = project_configs.get(pid, {})
@@ -5257,6 +6006,36 @@ elif page_key == "git_center":
 
             st.caption(f"Корень репозитория: `{repo_status['root']}`")
             st.caption(f"Последний коммит: `{repo_status['last_commit_hash']}` — {repo_status['last_commit_subject']}")
+
+            refresh_key = f"git_center_remote_refreshed::{repo_path.resolve()}"
+            if st.button(
+                "Обновить",
+                key=f"git_center_refresh_{repo_label}",
+                icon=":material/refresh:",
+                help="Выполнить git fetch и обновить сравнение с tracking-веткой.",
+            ):
+                with st.spinner("Обновляем данные remote…"):
+                    fetch_ok, fetch_error = git_info.fetch_remotes(repo_path)
+                if fetch_ok:
+                    st.session_state[refresh_key] = time.time()
+                    st.success("Данные remote обновлены.")
+                else:
+                    st.error(f"Не удалось обновить remote: {fetch_error}")
+
+            refreshed_at = st.session_state.get(refresh_key)
+            if isinstance(refreshed_at, (int, float)):
+                age_minutes = max(0, int((time.time() - refreshed_at) // 60))
+                st.caption(f"Данные remote: обновлено {age_minutes} мин. назад")
+                divergence = git_info.get_ahead_behind(repo_path)
+                if divergence.get("available"):
+                    with st.container(horizontal=True):
+                        st.metric("Ahead", divergence["ahead"], border=True)
+                        st.metric("Behind", divergence["behind"], border=True)
+                    st.caption(f"Сравнение: `{repo_status['branch']}` ↔ `{divergence['upstream']}`")
+                else:
+                    st.warning(str(divergence.get("error") or "Расхождение с remote недоступно."))
+            else:
+                st.caption("Данные remote ещё не обновлялись. Нажмите «Обновить», чтобы выполнить git fetch.")
 
             tab_files, tab_log, tab_diff, tab_branches, tab_remotes = st.tabs(
                 ["Изменённые файлы", "История коммитов", "Diff", "Ветки", "Remotes"]
@@ -5309,7 +6088,7 @@ elif page_key == "git_center":
 # --------------------------------------------------------------------------
 
 elif page_key == "workspace":
-    st.subheader("Workspace Launcher")
+    st.subheader("Workspace Launcher", anchor="workspace-launcher")
     st.caption("Быстрый переход к рабочим пространствам проектов и обзор git worktree.")
 
     st.markdown("#### Git worktrees")
@@ -5333,18 +6112,19 @@ elif page_key == "workspace":
     for project in models.PROJECT_IDS:
         project_file = project_status_file_path(project)
         context_name = CONTEXT_FILES.get(project)
-        project_active = sum(
-            1
+        project_tasks = [
+            task
             for task in tasks
-            if project_config.project_matches(task.get("project"), project) and task.get("status") != "Done"
-        )
+            if project_config.project_matches(task.get("project"), project)
+        ]
+        project_counts = read_model.task_snapshot(project_tasks)
         project_generated = artifacts.list_markdown_files(GENERATED_DIR / project)
         last_activity = format_mtime(project_generated[0]) if project_generated else "—"
 
         with st.container(border=True):
             header_cols = st.columns([3, 1, 1])
             header_cols[0].markdown(f"**{project}**")
-            header_cols[1].metric("Активные", project_active)
+            header_cols[1].metric("Активные", project_counts.active)
             header_cols[2].caption(f"Активность: {last_activity}")
 
             st.code(str(project_file), language=None)
@@ -5384,7 +6164,7 @@ elif page_key == "focus":
         st.session_state.pending_nav = "dashboard"
         st.rerun()
 
-    st.subheader("Focus Mode")
+    st.subheader("Focus Mode", anchor="focus")
 
     active_tasks = [task for task in tasks if task.get("status") != "Done"]
 
@@ -5442,14 +6222,13 @@ elif page_key == "focus":
                 st.divider()
 
                 _focus_status = task.get("status", "Backlog")
+                _focus_status_options = task_view.kanban_status_options(_focus_status)
                 new_status = st.selectbox(
                     "Статус",
-                    KANBAN_COLUMNS,
-                    # Guard like the task card / Kanban do: a non-canonical status
-                    # (e.g. "Blocked", which the board treats as live but is not a
-                    # column) would make .index() raise ValueError and crash Focus
-                    # Mode (audit M1). Fall back to the first column instead.
-                    index=KANBAN_COLUMNS.index(_focus_status) if _focus_status in KANBAN_COLUMNS else 0,
+                    _focus_status_options,
+                    # Preserve a legacy/unknown value while viewing the page;
+                    # selecting another option is the explicit migration.
+                    index=_focus_status_options.index(_focus_status),
                     key=f"focus_status_{task_id}",
                 )
                 if new_status != task.get("status"):
@@ -5471,12 +6250,23 @@ elif page_key == "focus":
 # --------------------------------------------------------------------------
 
 elif page_key == "portfolio":
-    st.subheader("Portfolio Execution")
-    portfolio_panel.render_portfolio_execution_panel(
-        root=ROOT,
-        execution_center_api=get_execution_center_api(),
+    st.subheader("Портфель", anchor="portfolio")
+    portfolio_section = st.segmented_control(
+        "Раздел",
+        ["Обзор", "Исполнение"],
+        default="Исполнение",
+        key="portfolio_section",
     )
+    if portfolio_section == "Исполнение":
+        portfolio_panel.render_portfolio_execution_panel(
+            root=ROOT,
+            execution_center_api=get_execution_center_api(),
+        )
+    else:
+        portfolio_overview_panel.render_portfolio_overview_panel(root=ROOT)
 
 elif page_key == "portfolio_overview":
-    st.subheader("Portfolio Overview")
+    st.caption(
+        "Обзор портфеля объединён со страницей «Портфель»; этот адрес сохранён для старых закладок."
+    )
     portfolio_overview_panel.render_portfolio_overview_panel(root=ROOT)

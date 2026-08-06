@@ -14,8 +14,18 @@ import pytest
 
 from command_center.runtime import db as runtime_db
 from command_center.runtime.completion import CompletionState
-from command_center.runtime.completion_service import CompletionOrchestrator
-from command_center.runtime.github import STATE_CLOSED, STATE_OPEN, FakeGitHubClient, GitHubError, PullRequestState
+from command_center.runtime.completion_service import (
+    CompletionOrchestrator,
+    ManualMergeError,
+)
+from command_center.runtime.github import (
+    CHECKS_FAILING,
+    STATE_CLOSED,
+    STATE_OPEN,
+    FakeGitHubClient,
+    GitHubError,
+    PullRequestState,
+)
 from tests.completion_helpers import (
     build_repo,
     make_task_branch,
@@ -104,6 +114,45 @@ def test_scenario_a_manual_merge_awaits(env):
     row = runtime_db.get_completion(db_path, run["id"])
     assert row["completion_state"] == CompletionState.AWAITING_MERGE
     assert gh.merged == []  # never auto-merged
+
+
+def test_manual_merge_action_merges_once_and_verifies_target(env):
+    db_path, remote, work, tmp = env
+    branch = "task/aicc-manual-button"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    gh = FakeGitHubClient(
+        on_merge=lambda pr: merge_into_main(
+            remote, tmp, pr.head_ref, squash=False
+        )
+    )
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg={"default_branch": "main"})
+    orch.advance(run["id"], now=NOW)
+
+    row = orch.request_manual_merge(run["id"], confirmed=True, now=NOW)
+
+    assert row["completion_state"] == CompletionState.COMPLETED
+    assert gh.merged == [row["pull_request_number"]]
+
+
+def test_manual_merge_rechecks_red_ci_and_refuses(env):
+    db_path, _remote, work, _tmp = env
+    branch = "task/aicc-manual-red-ci"
+    make_task_branch(work, branch)
+    run = seed_completed_run(db_path, repository_path=str(work), branch=branch)
+
+    gh = FakeGitHubClient()
+    orch = CompletionOrchestrator(db_path, github=gh)
+    orch.begin_completion(run, project_cfg={"default_branch": "main"})
+    orch.advance(run["id"], now=NOW)
+    gh._by_branch[branch].checks_state = CHECKS_FAILING
+
+    with pytest.raises(ManualMergeError, match="CI не прошёл"):
+        orch.request_manual_merge(run["id"], confirmed=True, now=NOW)
+
+    assert gh.merged == []
 
 
 # ============================================================================
@@ -507,8 +556,10 @@ def test_step_verify_recovers_late_merge_commit_oid(env):
         """merge() reports success but with no merge-commit oid; the stored PR
         keeps the real oid, so a later discover() reveals it."""
 
-        def merge_pull_request(self, repo, *, number, method="squash"):
-            pr = super().merge_pull_request(repo, number=number, method=method)
+        def merge_pull_request(self, repo, *, number, method="squash", match_head_oid=None):
+            pr = super().merge_pull_request(
+                repo, number=number, method=method, match_head_oid=match_head_oid
+            )
             return dataclasses.replace(pr, merge_commit=None)
 
     gh = LateOidGitHub(on_merge=lambda pr: merge_into_main(remote, tmp, pr.head_ref, squash=True))

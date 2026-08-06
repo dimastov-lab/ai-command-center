@@ -8,6 +8,24 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### D1 final gate — cross-platform smoke pass (partial)
+
+- **Verification record added**: `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md` records the D1 final gate
+  (`docs/desktop/IMPLEMENTATION_ROADMAP.md` §"D1 final gate") smoke pass against
+  `DESKTOP_INCREMENT_1.md` §2's acceptance criteria. macOS Apple Silicon (real hardware): pass —
+  `pytest-qt` desktop suite green (28/28), `ruff check .` clean, real native-Qt launch with no
+  `streamlit`/`app.py` import on the startup path, and window-geometry/theme persistence verified
+  across a simulated restart. Windows 11 x64: not performed — no such machine was reachable from
+  this session, so the gate remains open (`AICC-D1-GATE` stays **Review**, not **Done**) pending a
+  Windows-hardware pass.
+
+### Version contract
+
+- **Canonical application version**: `command_center.__version__` now exposes the
+  current `2.0.0` release line. The historical `v2.0.0-sprint1` tag remains an
+  immutable prerelease milestone; the final `v2.0.0` tag is created only from a
+  validated commit after this change reaches `main`.
+
 ### Integrated runtime safety and architecture reconciliation
 
 #### Added
@@ -46,6 +64,12 @@ functional application milestones of `app.py`.
 - **Runtime documentation**: README, current-state, architecture, changelog, and ADR 0005 are
   reconciled with schema 11, queue locking, workspace provisioning, scheduler and autonomy
   boundaries, and CI.
+- **Per-warning launch confirmation** (Founder audit MAJOR-4): the launch confirmation dialog no
+  longer clears a dirty working tree and a branch mismatch with one shared "подтверждаю несмотря на
+  предупреждения" checkbox. Each warning now renders its own acknowledgement, keyed by its stable
+  issue code, and the launch stays blocked — button `disabled=` plus the server-side re-check —
+  until every one is ticked. Acknowledgements are also cleared each time the dialog is opened, so a
+  previous launch's confirmations are never inherited.
 
 ### Portfolio Execution and Intelligence
 

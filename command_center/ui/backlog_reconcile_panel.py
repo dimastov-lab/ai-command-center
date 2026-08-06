@@ -89,5 +89,12 @@ def render_backlog_reconcile_panel(
                 st.rerun()
             if delete_clicked:
                 tasks_repository.delete_task(root, finding.task_id)
+                # Cascade the runtime.db footprint too so a reconciled delete
+                # leaves no orphan session/run/report rows (audit AR-1). Ideally
+                # routed through the ExecutionCenterAPI facade; done inline here
+                # as this panel holds no api handle (tracked under AR-7).
+                from command_center.runtime import db as runtime_db
+
+                runtime_db.delete_task(runtime_db.resolve_db_path(root), finding.task_id)
                 st.toast(f"Удалено: {finding.title}")
                 st.rerun()

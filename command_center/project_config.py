@@ -23,6 +23,8 @@ from command_center import git_info, models, storage
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = storage.resolve_data_dir(ROOT)
 CONFIG_FILE = DATA_DIR / "project_config.json"
+# Dedicated lock file guarding the config read-modify-write (audit AR-5).
+CONFIG_LOCK_FILE = DATA_DIR / "project_config.lock"
 CONFIG_EXAMPLE_FILE = DATA_DIR / "project_config.example.json"
 
 # Engineering-environment defaults a new task inherits from its project (see
@@ -80,8 +82,8 @@ DISPLAY_NAMES: dict[str, str] = {
     "AICOS": "AICOS",
     "PRODUCT": "AIOS Product",
     "ECOSYSTEM": "Ecosystem",
-    "ESF": "ESF Enterprise Platform",
-    "AML": "AML Governance Platform",
+    "ESF": "ESF Корпоративная платформа",
+    "AML": "AML Платформа управления рисками",
     "BANK": "Bank Strategy",
     "LEGAL": "Legal",
     "BUSINESS": "Business",
@@ -265,13 +267,16 @@ def save_allowed_agents(project_id: str, allowed_agents: list[str]) -> None:
     unknown = sorted(set(allowed_agents) - EXECUTION_PROVIDER_IDS)
     if unknown:
         raise ProviderAuthorizationError(f"Unknown execution provider(s): {unknown!r}.")
-    overrides = _read_overrides()
-    project_override = overrides.get(project_id)
-    if not isinstance(project_override, dict):
-        project_override = {}
-    project_override["allowed_agents"] = list(dict.fromkeys(allowed_agents))
-    overrides[project_id] = project_override
-    storage.atomic_write_json(CONFIG_FILE, overrides)
+    # Lock the whole read-modify-write so a concurrent config writer can't
+    # lost-update this change (audit AR-5).
+    with storage.file_lock(CONFIG_LOCK_FILE):
+        overrides = _read_overrides()
+        project_override = overrides.get(project_id)
+        if not isinstance(project_override, dict):
+            project_override = {}
+        project_override["allowed_agents"] = list(dict.fromkeys(allowed_agents))
+        overrides[project_id] = project_override
+        storage.atomic_write_json(CONFIG_FILE, overrides)
 
 
 def validate_repository_path(path_str: str) -> tuple[bool, str]:
@@ -291,15 +296,17 @@ def validate_repository_path(path_str: str) -> tuple[bool, str]:
 def save_repository_path(project_id: str, repository_path: str | None) -> None:
     if project_id not in models.PROJECT_IDS:
         raise ValueError(f"Unknown project: {project_id}")
-    overrides = _read_overrides()
-    entry = overrides.get(project_id)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    if repository_path:
-        entry["repository_path"] = repository_path
-    else:
-        entry.pop("repository_path", None)
-    overrides[project_id] = entry
-    storage.atomic_write_json(CONFIG_FILE, overrides)
+    # Lock the whole read-modify-write (audit AR-5).
+    with storage.file_lock(CONFIG_LOCK_FILE):
+        overrides = _read_overrides()
+        entry = overrides.get(project_id)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        if repository_path:
+            entry["repository_path"] = repository_path
+        else:
+            entry.pop("repository_path", None)
+        overrides[project_id] = entry
+        storage.atomic_write_json(CONFIG_FILE, overrides)
 
 
 def is_sensitive(project_id: str) -> bool:
@@ -446,16 +453,18 @@ def save_project_settings(project_id: str, **fields: object) -> None:
     if unknown:
         raise ValueError(f"Unknown project config field(s): {sorted(unknown)}")
 
-    overrides = _read_overrides()
-    entry = overrides.get(project_id)
-    entry = dict(entry) if isinstance(entry, dict) else {}
-    for key, value in fields.items():
-        if value in (None, ""):
-            entry.pop(key, None)
-        else:
-            entry[key] = value
-    overrides[project_id] = entry
-    storage.atomic_write_json(CONFIG_FILE, overrides)
+    # Lock the whole read-modify-write (audit AR-5).
+    with storage.file_lock(CONFIG_LOCK_FILE):
+        overrides = _read_overrides()
+        entry = overrides.get(project_id)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        for key, value in fields.items():
+            if value in (None, ""):
+                entry.pop(key, None)
+            else:
+                entry[key] = value
+        overrides[project_id] = entry
+        storage.atomic_write_json(CONFIG_FILE, overrides)
 
 
 def task_defaults_from_project(cfg: dict) -> dict:

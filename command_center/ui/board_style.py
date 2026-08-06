@@ -237,7 +237,9 @@ def begin() -> None:
     st.markdown("<div class='aicc-board'>", unsafe_allow_html=True)
 
 
-def stat_tiles(board: dict[str, list[dict]]) -> None:
+def stat_tiles(
+    board: dict[str, list[dict]], *, counts: dict[str, int] | None = None
+) -> None:
     """The four state counts as tinted, accented tiles instead of flat metrics.
 
     A zero tile is muted rather than coloured — an empty "attention" count is
@@ -251,7 +253,7 @@ def stat_tiles(board: dict[str, list[dict]]) -> None:
     cells = []
     for bucket in order:
         tone = _BUCKET_TONE[bucket]
-        count = len(board[bucket])
+        count = counts[bucket] if counts is not None else len(board[bucket])
         zero = " aicc-zero" if count == 0 else ""
         label = html.escape(live_board.BUCKET_TITLES[bucket])
         cells.append(

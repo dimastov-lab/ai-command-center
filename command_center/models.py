@@ -199,6 +199,7 @@ EXECUTION_STAGES: list[str] = [
     "Validation",
     "Tests Passed",
     "PR Ready",
+    "Completed Locally",
     "Merged",
 ]
 
@@ -211,6 +212,7 @@ STAGE_PROGRESS: dict[str, int] = {
     "Validation": 75,
     "Tests Passed": 90,
     "PR Ready": 95,
+    "Completed Locally": 100,
     "Merged": 100,
 }
 
@@ -325,9 +327,29 @@ def new_timeline_event(event_type: str, message: str = "") -> dict:
     }
 
 
+# Upper bound on a task's UI timeline. `tasks.json` is JSON-parsed on every
+# Streamlit rerun (and by five 2-5s fragment pollers); an unbounded timeline
+# (measured up to 6,067 events on one task) bloated the file to ~7 MB / ~18 ms
+# per parse — 151% of it was timeline. Bounding to the most-recent N events keeps
+# the store small and the parse fast. The authoritative, complete run history
+# lives in `runtime.db` `run_event`; this only caps the task's own display log.
+MAX_TIMELINE_EVENTS = 100
+
+
+def trim_timeline(task: dict) -> dict:
+    """Keep only the most-recent `MAX_TIMELINE_EVENTS` timeline entries. Mutates
+    and returns `task`. A no-op when the timeline is already within bound or
+    absent."""
+    timeline = task.get("timeline")
+    if isinstance(timeline, list) and len(timeline) > MAX_TIMELINE_EVENTS:
+        task["timeline"] = timeline[-MAX_TIMELINE_EVENTS:]
+    return task
+
+
 def append_timeline_event(task: dict, event_type: str, message: str = "") -> dict:
     task.setdefault("timeline", [])
     task["timeline"].append(new_timeline_event(event_type, message))
+    trim_timeline(task)
     return task
 
 

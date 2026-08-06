@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 
+from command_center.desktop import i18n
 from command_center.desktop.navigation_item import DISABLED_TOOLTIP
 from command_center.desktop.sections import SECTIONS
 
@@ -81,13 +82,13 @@ def test_home_empty_state_navigates_to_projects(shell, qtbot):
 def test_navigation_item_accessibility(shell):
     items = shell.sidebar.items()
     # Enabled item: accessible name is the visible label.
-    assert items["home"].accessibleName() == "Home"
+    assert items["home"].accessibleName() == i18n.SECTION_LABELS["home"]
     # Disabled item: accessible description mirrors the visible tooltip.
     sessions = items["sessions"]
-    assert sessions.accessibleName() == "Sessions"
+    assert sessions.accessibleName() == i18n.SECTION_LABELS["sessions"]
     assert sessions.accessibleDescription() == DISABLED_TOOLTIP
     assert sessions.toolTip() == DISABLED_TOOLTIP
 
 
 def test_sidebar_has_accessible_name(shell):
-    assert shell.sidebar.accessibleName() == "Primary navigation"
+    assert shell.sidebar.accessibleName() == i18n.NAV_ACCESSIBLE

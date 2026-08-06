@@ -1,0 +1,1992 @@
+{
+  "schema_version": "1",
+  "package_id": "aicc-master-roadmap-h1",
+  "generated_from": {
+    "authority_record": "DR-ROADMAP-AUTHORITY-001 (docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md)",
+    "audit_reconciliation": "docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md",
+    "desktop_sequence": "docs/desktop/IMPLEMENTATION_ROADMAP.md + docs/desktop/DESKTOP_INCREMENT_1.md",
+    "reconciled_against_commit": "bd9f05b",
+    "reconciled_against_branch": "docs/canonical-master-roadmap"
+  },
+  "human_readable_companion": "docs/roadmap/MASTER_PRODUCT_ROADMAP.md",
+  "scope": {
+    "horizon": "H1 — committed next (DR-ROADMAP-AUTHORITY-001 §6)",
+    "project": "AICC only — the sole in-scope-to-build product (§3)",
+    "excluded": [
+      "H2 candidates (AICC-D2-001..004, AICC-GIT-001, AICC-INT-001, ADR 0001 Tier B) — committed only per item after the AICC-GOV-F4A triage (§7 Deferred)",
+      "H3 aspirational items (AIOS-DIST-*, AICC-DIST-*, FED-*, MARKET-*, *-ENT-*, AICC-SELF-*, GLOBAL-001) — direction only (§6 H3)",
+      "PORTFOLIO and PLATFORM scoped items — no canonical project home (§7 R3)",
+      "AIOS / AICOS / PRODUCT program-roadmap rows — tracked products with their own roadmaps, not built here (§3)"
+    ]
+  },
+  "vocabularies": {
+    "project_ids": "command_center/models.py PROJECT_IDS (9 ids); every row uses AICC",
+    "statuses": "command_center/models.py KANBAN_STATUSES",
+    "priorities": "command_center/models.py TASK_PRIORITIES",
+    "task_types": "command_center/artifacts.py TASK_TYPES"
+  },
+  "capacity": {
+    "max_global_concurrency_default": 2,
+    "max_agent_concurrency_default": 2,
+    "concurrency_bounds": [
+      1,
+      16
+    ],
+    "source": "command_center/pipeline_settings.py DEFAULT_MAX_GLOBAL_CONCURRENCY / DEFAULT_MAX_AGENT_CONCURRENCY / MIN_CONCURRENCY / MAX_CONCURRENCY",
+    "wave_cap_applied": 2,
+    "note": "Waves are scheduled at the live default cap of 2. Raising max_global_concurrency does not widen a wave that is limited by file-level conflicts instead."
+  },
+  "worktree_constraints": {
+    "rule": "One agent = one task = one branch = one worktree (CURRENT_STATE.md Global Operating Rule 2).",
+    "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+    "worktree_root": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees",
+    "naming": "<worktree_root>/<branch with '/' replaced by '-'>",
+    "provisioning": "command_center/workspace_provisioning.py provisions offline via `git worktree add`; it never performs an implicit network fetch, and an ambiguous remote-tracking match fails closed.",
+    "one_branch_one_worktree": "workspace_provisioning._conflicting_worktree rejects a branch already checked out in another worktree of the same repository.",
+    "main_branch_guard": "workspace_provisioning.MAIN_BRANCH_NAMES / is_feature_task keep feature and audit work out of the primary working tree. Rows whose branch is `main` are the already-merged Done rows and require no worktree.",
+    "existing_worktrees_at_generation": 77,
+    "existing_under_worktree_root": 25,
+    "prunable_at_generation": 1,
+    "hygiene_note": "77 worktrees are already registered (7 of them daily-audit worktrees, 1 prunable). Run `git worktree prune` and reclaim finished worktrees before scheduling a wave, or worktree provisioning competes for disk with abandoned trees."
+  },
+  "parallel_schedule": [
+    {
+      "wave": "P01",
+      "tasks": [
+        "AICC-GOV-F2",
+        "AICC-D1-GATE"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P02",
+      "tasks": [
+        "AICC-AUDIT-W2-004",
+        "AICC-GOV-F3"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P03",
+      "tasks": [
+        "AICC-D2A",
+        "AICC-GOV-F5"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P04",
+      "tasks": [
+        "AICC-D2B",
+        "AICC-AUDIT-W2-001"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P05",
+      "tasks": [
+        "AICC-D2C",
+        "AICC-AUDIT-W0-006"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P06",
+      "tasks": [
+        "AICC-D2D",
+        "AICC-AUDIT-W1-002"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P07",
+      "tasks": [
+        "AICC-D2-GATE",
+        "AICC-AUDIT-W1-004"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P08",
+      "tasks": [
+        "AICC-D3A",
+        "AICC-D3B"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P09",
+      "tasks": [
+        "AICC-D3-GATE",
+        "AICC-AUDIT-W1-005"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P10",
+      "tasks": [
+        "AICC-AUDIT-W1-006",
+        "AICC-AUDIT-W1-007"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P11",
+      "tasks": [
+        "AICC-AUDIT-W2-002",
+        "AICC-D4A"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P12",
+      "tasks": [
+        "AICC-D4B",
+        "AICC-AUDIT-W1-009"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P13",
+      "tasks": [
+        "AICC-AUDIT-W2-006",
+        "AICC-AUDIT-W4-003"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P14",
+      "tasks": [
+        "AICC-AUDIT-W4-004",
+        "AICC-D4-GATE"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P15",
+      "tasks": [
+        "AICC-GOV-F1",
+        "AICC-GOV-F4A"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P16",
+      "tasks": [
+        "AICC-GOV-F4B"
+      ],
+      "bound_by": "dependencies — nothing else is eligible"
+    }
+  ],
+  "critical_path": {
+    "length": 10,
+    "path": [
+      "AICC-D1-GATE",
+      "AICC-D2A",
+      "AICC-D2B",
+      "AICC-D2C",
+      "AICC-D2D",
+      "AICC-D2-GATE",
+      "AICC-D3A",
+      "AICC-D3-GATE",
+      "AICC-D4A",
+      "AICC-D4-GATE"
+    ],
+    "note": "Longest chain of not-yet-Done rows. AICC-AUDIT-W2-004 is a co-equal soft entry into AICC-D2A and is on the schedule's critical path even where it is not on the hard-dependency path."
+  },
+  "folded": [
+    {
+      "id": "AICC-AUDIT-W3-002",
+      "disposition": "Duplicate — folded into AICC-D2A/D2B/D2C/D2D",
+      "reason": "The audit reconciliation classified it Still Open with the note 'This is stage D2 of the frozen scope'. Decomposing AICC-D1-001 into D1A-D4 makes the same work appear twice; the D2 stage tasks carry it with finer granularity and explicit acceptance criteria. Kept here for traceability; it is not a separate row."
+    }
+  ],
+  "import_guidance": "NOT IMPORTED and NOT LAUNCHED. This package supersedes docs/audits/FOUNDER_AUDIT_9761459_STILL_OPEN_IMPORT_PACKAGE.json — import one or the other, never both, since 13 ids are shared by design for dedup stability. Rows with status 'Done' are historical traceability; a founder may filter them out before applying. Any apply must go through scripts/import_tasks.py --apply or the in-app uploader, re-validated against the live store first, and must not precede AICC-GOV-F2.",
+  "task_count": 34,
+  "tasks": [
+    {
+      "id": "AICC-D1A",
+      "title": "D1A — Dependency and package skeleton",
+      "goal": "Add PySide6 as a separate desktop dependency and create the command_center/desktop package skeleton.",
+      "prompt": "Add PySide6 as a separate desktop dependency and create the command_center/desktop package skeleton.\n\nDefinition of Done: `import command_center.desktop` succeeds after installing requirements-desktop.txt; the existing suite is unaffected; a smoke test asserts no QApplication is constructed at import time.\n\nForbidden scope: No widget code, no window, no app.py changes.\n\nEvidence / current state at main bd9f05b: Done at bd9f05b: requirements-desktop.txt pins PySide6>=6.6,<7.0 with an in-file D1A reference; requirements-dev.txt:17 adds pytest-qt>=4.4,<5.0; command_center/desktop/__init__.py and __main__.py exist. Confirms AUDIT-W3-001 (Done) in FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md.",
+      "status": "Done",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "main",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "requirements-desktop.txt",
+        "requirements-dev.txt",
+        "command_center/desktop/"
+      ],
+      "definition_of_done": "`import command_center.desktop` succeeds after installing requirements-desktop.txt; the existing suite is unaffected; a smoke test asserts no QApplication is constructed at import time.",
+      "forbidden_scope": "No widget code, no window, no app.py changes.",
+      "evidence": "Done at bd9f05b: requirements-desktop.txt pins PySide6>=6.6,<7.0 with an in-file D1A reference; requirements-dev.txt:17 adds pytest-qt>=4.4,<5.0; command_center/desktop/__init__.py and __main__.py exist. Confirms AUDIT-W3-001 (Done) in FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D1-GATE",
+        "AICC-D1B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Already Done — verified against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 0,
+      "parallel_group": null,
+      "parallel_slot": null
+    },
+    {
+      "id": "AICC-D1B",
+      "title": "D1B — Main window and application lifecycle",
+      "goal": "Implement the one-QApplication/one-main-window lifecycle with QSettings-backed window geometry persistence.",
+      "prompt": "Implement the one-QApplication/one-main-window lifecycle with QSettings-backed window geometry persistence.\n\nDefinition of Done: Launching the entry point shows an empty native window; closing and relaunching restores the previous geometry; a pytest-qt test round-trips geometry through QSettings.\n\nForbidden scope: No sidebar, no navigation, no theming.\n\nEvidence / current state at main bd9f05b: Done at bd9f05b: command_center/desktop/main_window.py, app.py and __main__.py exist; tests/desktop/test_lifecycle.py and test_settings_persistence.py cover the lifecycle and persistence round-trip.",
+      "status": "Done",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D1A"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "main",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/desktop/main_window.py",
+        "command_center/desktop/__main__.py"
+      ],
+      "definition_of_done": "Launching the entry point shows an empty native window; closing and relaunching restores the previous geometry; a pytest-qt test round-trips geometry through QSettings.",
+      "forbidden_scope": "No sidebar, no navigation, no theming.",
+      "evidence": "Done at bd9f05b: command_center/desktop/main_window.py, app.py and __main__.py exist; tests/desktop/test_lifecycle.py and test_settings_persistence.py cover the lifecycle and persistence round-trip.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D1-GATE",
+        "AICC-D1C"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Already Done — verified against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 0,
+      "parallel_group": null,
+      "parallel_slot": null
+    },
+    {
+      "id": "AICC-D1C",
+      "title": "D1C — Navigation and themes",
+      "goal": "Implement Sidebar/NavigationItem (nine sections, six disabled), TopBar, placeholder pages and Light/Dark/System theming.",
+      "prompt": "Implement Sidebar/NavigationItem (nine sections, six disabled), TopBar, placeholder pages and Light/Dark/System theming.\n\nDefinition of Done: All nine sections render (three active-placeholder, six disabled); navigation switches the visible page; disabled items are inert and skipped in Tab order; theme switching persists across restart.\n\nForbidden scope: No real data on any page.\n\nEvidence / current state at main bd9f05b: Done at bd9f05b: command_center/desktop/sections.py declares 9 sections; sidebar.py, navigation_item.py, top_bar.py, theme.py, tokens.py and pages/{home,projects,settings_page}.py exist; tests/desktop/test_shell_navigation.py, test_theme.py, test_top_bar.py cover the criteria.",
+      "status": "Done",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D1B"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "branch": "main",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/desktop/sidebar.py",
+        "command_center/desktop/theme.py",
+        "command_center/desktop/pages/"
+      ],
+      "definition_of_done": "All nine sections render (three active-placeholder, six disabled); navigation switches the visible page; disabled items are inert and skipped in Tab order; theme switching persists across restart.",
+      "forbidden_scope": "No real data on any page.",
+      "evidence": "Done at bd9f05b: command_center/desktop/sections.py declares 9 sections; sidebar.py, navigation_item.py, top_bar.py, theme.py, tokens.py and pages/{home,projects,settings_page}.py exist; tests/desktop/test_shell_navigation.py, test_theme.py, test_top_bar.py cover the criteria.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D1-GATE"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Already Done — verified against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 0,
+      "parallel_group": null,
+      "parallel_slot": null
+    },
+    {
+      "id": "AICC-D1-GATE",
+      "title": "D1 final gate — record the cross-platform acceptance pass",
+      "goal": "Verify DESKTOP_INCREMENT_1.md §2's full D1 acceptance-criteria list on a real macOS (Apple Silicon) and a real Windows 11 x64 machine, and record the result.",
+      "prompt": "Verify DESKTOP_INCREMENT_1.md §2's full D1 acceptance-criteria list on a real macOS (Apple Silicon) and a real Windows 11 x64 machine, and record the result.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §2's acceptance-criteria list passes on both target platforms; the full pytest-qt suite is green; the manual smoke pass on both platforms is recorded in-repo.\n\nForbidden scope: No scope creep into D2 content while closing this gate.\n\nEvidence / current state at main bd9f05b: OPEN at bd9f05b — new finding of this roadmap, not carried from the audit. D1A-D1C ship the code and docs/desktop/DESKTOP_INCREMENT_1.md:5 states \"D1 ... has shipped\", but IMPLEMENTATION_ROADMAP.md §'D1 final gate' also requires a \"manual smoke pass on both platforms, recorded\". No such record exists: a repository-wide search of docs/, reports/ and CHANGELOG.md finds no macOS/Windows D1 smoke record. This gate is therefore the true head of the desktop critical path, and D2A must not start before it closes.",
+      "status": "Review",
+      "priority": "High",
+      "task_type": "final_gate",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D1A",
+        "AICC-D1B",
+        "AICC-D1C"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/verify-desktop-d1-final-gate",
+      "branch": "verify/desktop-d1-final-gate",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §2's acceptance-criteria list passes on both target platforms; the full pytest-qt suite is green; the manual smoke pass on both platforms is recorded in-repo.",
+      "forbidden_scope": "No scope creep into D2 content while closing this gate.",
+      "evidence": "OPEN at bd9f05b — new finding of this roadmap, not carried from the audit. D1A-D1C ship the code and docs/desktop/DESKTOP_INCREMENT_1.md:5 states \"D1 ... has shipped\", but IMPLEMENTATION_ROADMAP.md §'D1 final gate' also requires a \"manual smoke pass on both platforms, recorded\". No such record exists: a repository-wide search of docs/, reports/ and CHANGELOG.md finds no macOS/Windows D1 smoke record. This gate is therefore the true head of the desktop critical path, and D2A must not start before it closes.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D2A"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": true,
+      "critical_path_position": 1,
+      "downstream_chain_length": 10,
+      "parallel_group": "P01",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-D2A",
+      "title": "D2A — Application service adapter",
+      "goal": "Create command_center/application/ and implement the Workspace Home adapter wrapping build_workspace_home_snapshot, constructing the one application-wide ExecutionCenterAPI.",
+      "prompt": "Create command_center/application/ and implement the Workspace Home adapter wrapping build_workspace_home_snapshot, constructing the one application-wide ExecutionCenterAPI.\n\nDefinition of Done: The adapter is callable from plain pytest with no QApplication and returns the same snapshot shape build_workspace_home_snapshot already returns; tests reuse tests/test_workspace_home.py scenarios through the adapter and confirm no field is dropped or altered.\n\nForbidden scope: No Qt import in command_center/application; no widget code.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/application/ does not exist. Soft-ordered after AICC-AUDIT-W2-004 because that row adds Project Intelligence/Recommendations to the Workspace Home surface, and this adapter's acceptance criterion is 'the same snapshot shape' — building the adapter first would validate it against a shape that is about to change.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D1-GATE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d2a-application-adapter",
+      "branch": "feature/desktop-d2a-application-adapter",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D2",
+      "horizon": "H1",
+      "soft_depends_on": [
+        "AICC-AUDIT-W2-004"
+      ],
+      "components": [
+        "command_center/application/__init__.py",
+        "command_center/application/workspace_home_adapter.py"
+      ],
+      "definition_of_done": "The adapter is callable from plain pytest with no QApplication and returns the same snapshot shape build_workspace_home_snapshot already returns; tests reuse tests/test_workspace_home.py scenarios through the adapter and confirm no field is dropped or altered.",
+      "forbidden_scope": "No Qt import in command_center/application; no widget code.",
+      "evidence": "Not started at bd9f05b: command_center/application/ does not exist. Soft-ordered after AICC-AUDIT-W2-004 because that row adds Project Intelligence/Recommendations to the Workspace Home surface, and this adapter's acceptance criterion is 'the same snapshot shape' — building the adapter first would validate it against a shape that is about to change.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D2-GATE",
+        "AICC-D2B",
+        "AICC-D2C"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D1-GATE.",
+      "on_critical_path": true,
+      "critical_path_position": 2,
+      "downstream_chain_length": 9,
+      "parallel_group": "P03",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D2B",
+      "title": "D2B — Async worker framework",
+      "goal": "Implement the QThreadPool/QRunnable/signal pattern generic enough to wrap any command_center.application adapter call, plus the cooperative-cancellation flag.",
+      "prompt": "Implement the QThreadPool/QRunnable/signal pattern generic enough to wrap any command_center.application adapter call, plus the cooperative-cancellation flag.\n\nDefinition of Done: A sample adapter call executed through the worker framework returns its result via a Qt signal on the GUI thread; a pytest-qt test verifies the GUI thread still processes a queued event while a deliberately slow adapter call runs on the worker thread.\n\nForbidden scope: No forceful thread termination; no second threading mechanism alongside QThreadPool.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/desktop/workers.py does not exist.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D2A"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d2b-async-workers",
+      "branch": "feature/desktop-d2b-async-workers",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D2",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/desktop/workers.py"
+      ],
+      "definition_of_done": "A sample adapter call executed through the worker framework returns its result via a Qt signal on the GUI thread; a pytest-qt test verifies the GUI thread still processes a queued event while a deliberately slow adapter call runs on the worker thread.",
+      "forbidden_scope": "No forceful thread termination; no second threading mechanism alongside QThreadPool.",
+      "evidence": "Not started at bd9f05b: command_center/desktop/workers.py does not exist.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D2-GATE",
+        "AICC-D2C"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D2A.",
+      "on_critical_path": true,
+      "critical_path_position": 3,
+      "downstream_chain_length": 8,
+      "parallel_group": "P04",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D2C",
+      "title": "D2C — Workspace Home layout",
+      "goal": "Implement the desktop Home page's real layout per WORKSPACE_HOME_SPEC.md §1-§9, wired through the D2A adapter and the D2B worker framework.",
+      "prompt": "Implement the desktop Home page's real layout per WORKSPACE_HOME_SPEC.md §1-§9, wired through the D2A adapter and the D2B worker framework.\n\nDefinition of Done: WORKSPACE_HOME_SPEC.md §1-§9 render correctly for a populated scenario (>=1 configured project, >=1 run, >=1 artifact, >=1 report, >=1 activity event), covered by pytest-qt rendering tests.\n\nForbidden scope: No edge-state handling (that is D2D); no Quick Actions beyond the navigation-only ones already approved in WORKSPACE_HOME_SPEC.md §9.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/desktop/pages/home.py is still an EmptyState placeholder whose docstring states D1 forbids real data wiring; components/ holds only empty_state.py and page_header.py. This row and AICC-D2D together are the whole of the folded-in audit row AUDIT-W3-002 ('Портировать Workspace Home на desktop').",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D2A",
+        "AICC-D2B"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d2c-workspace-home-layout",
+      "branch": "feature/desktop-d2c-workspace-home-layout",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D2",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/desktop/pages/home.py",
+        "command_center/desktop/components/"
+      ],
+      "definition_of_done": "WORKSPACE_HOME_SPEC.md §1-§9 render correctly for a populated scenario (>=1 configured project, >=1 run, >=1 artifact, >=1 report, >=1 activity event), covered by pytest-qt rendering tests.",
+      "forbidden_scope": "No edge-state handling (that is D2D); no Quick Actions beyond the navigation-only ones already approved in WORKSPACE_HOME_SPEC.md §9.",
+      "evidence": "Not started at bd9f05b: command_center/desktop/pages/home.py is still an EmptyState placeholder whose docstring states D1 forbids real data wiring; components/ holds only empty_state.py and page_header.py. This row and AICC-D2D together are the whole of the folded-in audit row AUDIT-W3-002 ('Портировать Workspace Home на desktop').",
+      "folds_in": [
+        "AICC-AUDIT-W3-002"
+      ],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D2-GATE",
+        "AICC-D2D"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-D2D"
+      ],
+      "conflict_files": {
+        "command_center/desktop/pages/home.py": [
+          "AICC-D2D"
+        ]
+      },
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D2A, AICC-D2B.",
+      "on_critical_path": true,
+      "critical_path_position": 4,
+      "downstream_chain_length": 7,
+      "parallel_group": "P05",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D2D",
+      "title": "D2D — Edge states and accessibility",
+      "goal": "Implement EmptyState/ErrorState/LoadingSkeleton, wire every WORKSPACE_HOME_SPEC.md §15 edge case, add the accessible-name/description wiring, and verify the dual-layer BANK/LEGAL redaction regression.",
+      "prompt": "Implement EmptyState/ErrorState/LoadingSkeleton, wire every WORKSPACE_HOME_SPEC.md §15 edge case, add the accessible-name/description wiring, and verify the dual-layer BANK/LEGAL redaction regression.\n\nDefinition of Done: WORKSPACE_HOME_SPEC.md §15's full edge-state table renders correctly and the BANK/LEGAL dual-layer test (snapshot-level + rendered-widget-level) passes, mirroring tests/test_workspace_home_ui.py's structure.\n\nForbidden scope: No new redaction logic in command_center.desktop / command_center.application — every redaction guarantee is inherited from command_center.workspace_home unchanged.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: only components/empty_state.py exists; there is no ErrorState, LoadingSkeleton or desktop-side redaction regression test. Carries the safety half of the final-goal Desktop parity gate (DR-ROADMAP-AUTHORITY-001 §2.1: parity 'preserving every sensitivity/redaction guarantee already implemented'). Soft-ordered after AICC-GOV-F5 because this row implements WORKSPACE_HOME_SPEC.md §15's edge-state table, which still says 'all-six-unconfigured' — building it before F5 corrects the language would encode a six-project assertion against a nine-id registry.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D2C"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d2d-edge-states-accessibility",
+      "branch": "feature/desktop-d2d-edge-states-accessibility",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D2",
+      "horizon": "H1",
+      "soft_depends_on": [
+        "AICC-GOV-F5"
+      ],
+      "components": [
+        "command_center/desktop/components/",
+        "command_center/desktop/pages/home.py"
+      ],
+      "definition_of_done": "WORKSPACE_HOME_SPEC.md §15's full edge-state table renders correctly and the BANK/LEGAL dual-layer test (snapshot-level + rendered-widget-level) passes, mirroring tests/test_workspace_home_ui.py's structure.",
+      "forbidden_scope": "No new redaction logic in command_center.desktop / command_center.application — every redaction guarantee is inherited from command_center.workspace_home unchanged.",
+      "evidence": "Not started at bd9f05b: only components/empty_state.py exists; there is no ErrorState, LoadingSkeleton or desktop-side redaction regression test. Carries the safety half of the final-goal Desktop parity gate (DR-ROADMAP-AUTHORITY-001 §2.1: parity 'preserving every sensitivity/redaction guarantee already implemented'). Soft-ordered after AICC-GOV-F5 because this row implements WORKSPACE_HOME_SPEC.md §15's edge-state table, which still says 'all-six-unconfigured' — building it before F5 corrects the language would encode a six-project assertion against a nine-id registry.",
+      "folds_in": [
+        "AICC-AUDIT-W3-002"
+      ],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D2-GATE"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-D2C"
+      ],
+      "conflict_files": {
+        "command_center/desktop/pages/home.py": [
+          "AICC-D2C"
+        ]
+      },
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D2C.",
+      "on_critical_path": true,
+      "critical_path_position": 5,
+      "downstream_chain_length": 6,
+      "parallel_group": "P06",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D2-GATE",
+      "title": "D2 final gate — Native Workspace Home acceptance",
+      "goal": "Verify DESKTOP_INCREMENT_1.md §3's D2 acceptance criteria as a whole.",
+      "prompt": "Verify DESKTOP_INCREMENT_1.md §3's D2 acceptance criteria as a whole.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §3's full list passes; full pytest/pytest-qt suite green.\n\nForbidden scope: No scope creep into D3 content while closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D2A-D2D, none of which has started.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "final_gate",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D2A",
+        "AICC-D2B",
+        "AICC-D2C",
+        "AICC-D2D"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/verify-desktop-d2-final-gate",
+      "branch": "verify/desktop-d2-final-gate",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D2",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §3's full list passes; full pytest/pytest-qt suite green.",
+      "forbidden_scope": "No scope creep into D3 content while closing this gate.",
+      "evidence": "Blocked at bd9f05b by D2A-D2D, none of which has started.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D3A",
+        "AICC-D3B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D2A, AICC-D2B, AICC-D2C, AICC-D2D.",
+      "on_critical_path": true,
+      "critical_path_position": 6,
+      "downstream_chain_length": 5,
+      "parallel_group": "P07",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D3A",
+      "title": "D3A — Projects page",
+      "goal": "Implement the desktop Projects page (repository-path viewing/editing) and its command_center.application adapter wrapping existing project_config functions verbatim.",
+      "prompt": "Implement the desktop Projects page (repository-path viewing/editing) and its command_center.application adapter wrapping existing project_config functions verbatim.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §4's Projects-related acceptance criteria pass; adapter-level pytest tests reuse tests/test_project_config.py scenarios; pytest-qt tests cover the edit/validate/save flow.\n\nForbidden scope: No new path-validation logic outside project_config.validate_repository_path.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/desktop/pages/projects.py exists only as a D1C placeholder and command_center/application/projects_adapter.py does not exist.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D2-GATE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d3a-projects-page",
+      "branch": "feature/desktop-d3a-projects-page",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D3",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/desktop/pages/projects.py",
+        "command_center/application/projects_adapter.py"
+      ],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §4's Projects-related acceptance criteria pass; adapter-level pytest tests reuse tests/test_project_config.py scenarios; pytest-qt tests cover the edit/validate/save flow.",
+      "forbidden_scope": "No new path-validation logic outside project_config.validate_repository_path.",
+      "evidence": "Not started at bd9f05b: command_center/desktop/pages/projects.py exists only as a D1C placeholder and command_center/application/projects_adapter.py does not exist.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D3-GATE"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D2-GATE.",
+      "on_critical_path": true,
+      "critical_path_position": 7,
+      "downstream_chain_length": 4,
+      "parallel_group": "P08",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D3B",
+      "title": "D3B — Settings and platform integration",
+      "goal": "Create command_center/platform/ with the full PLATFORM_BEHAVIOR.md §3 contract and implement the Settings page, replacing D1B/D1C's minimal QSettings stand-in.",
+      "prompt": "Create command_center/platform/ with the full PLATFORM_BEHAVIOR.md §3 contract and implement the Settings page, replacing D1B/D1C's minimal QSettings stand-in.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §4's Settings/platform-related acceptance criteria pass on both target platforms; command_center.platform has per-platform monkeypatched pytest tests; a pytest-qt test covers the Settings persistence round-trip.\n\nForbidden scope: No OS-specific branching anywhere outside command_center.platform.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/platform/ does not exist; desktop/settings.py is the D1B/D1C QSettings stand-in. Hard dependency recomputed from AICC-D3A to AICC-D2-GATE: IMPLEMENTATION_ROADMAP.md lists D3A as D3B's dependency but adds 'may proceed in parallel with D3A if no shared file conflicts arise, since Projects and Settings touch different pages'. The file lists confirm disjoint touchpoints, so the true hard predecessor is the D2 final gate.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D2-GATE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d3b-platform-settings",
+      "branch": "feature/desktop-d3b-platform-settings",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D3",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/platform/",
+        "command_center/desktop/pages/settings_page.py"
+      ],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §4's Settings/platform-related acceptance criteria pass on both target platforms; command_center.platform has per-platform monkeypatched pytest tests; a pytest-qt test covers the Settings persistence round-trip.",
+      "forbidden_scope": "No OS-specific branching anywhere outside command_center.platform.",
+      "evidence": "Not started at bd9f05b: command_center/platform/ does not exist; desktop/settings.py is the D1B/D1C QSettings stand-in. Hard dependency recomputed from AICC-D3A to AICC-D2-GATE: IMPLEMENTATION_ROADMAP.md lists D3A as D3B's dependency but adds 'may proceed in parallel with D3A if no shared file conflicts arise, since Projects and Settings touch different pages'. The file lists confirm disjoint touchpoints, so the true hard predecessor is the D2 final gate.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D3-GATE"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D2-GATE.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 4,
+      "parallel_group": "P08",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-D3-GATE",
+      "title": "D3 final gate — Projects and Settings acceptance",
+      "goal": "Verify DESKTOP_INCREMENT_1.md §4's D3 acceptance criteria as a whole, on both target platforms.",
+      "prompt": "Verify DESKTOP_INCREMENT_1.md §4's D3 acceptance criteria as a whole, on both target platforms.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §4's full list passes on both platforms; full suite green; a manual cross-platform smoke pass for Projects/Settings is recorded.\n\nForbidden scope: No scope creep into D4 packaging concerns while closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D3A and D3B.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "final_gate",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D3A",
+        "AICC-D3B"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/verify-desktop-d3-final-gate",
+      "branch": "verify/desktop-d3-final-gate",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D3",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §4's full list passes on both platforms; full suite green; a manual cross-platform smoke pass for Projects/Settings is recorded.",
+      "forbidden_scope": "No scope creep into D4 packaging concerns while closing this gate.",
+      "evidence": "Blocked at bd9f05b by D3A and D3B.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D4A",
+        "AICC-D4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D3A, AICC-D3B.",
+      "on_critical_path": true,
+      "critical_path_position": 8,
+      "downstream_chain_length": 3,
+      "parallel_group": "P09",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D4A",
+      "title": "D4A — macOS packaging",
+      "goal": "Produce an unsigned development .app/DMG via PyInstaller and verify resource-path resolution is identical packaged and unpacked.",
+      "prompt": "Produce an unsigned development .app/DMG via PyInstaller and verify resource-path resolution is identical packaged and unpacked.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §5's macOS acceptance criteria pass on a clean Apple Silicon machine; the manual clean-machine smoke checklist is recorded.\n\nForbidden scope: No signing or notarization.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: packaging/ does not exist.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D3-GATE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d4a-macos-packaging",
+      "branch": "feature/desktop-d4a-macos-packaging",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D4",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "packaging/macos/"
+      ],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §5's macOS acceptance criteria pass on a clean Apple Silicon machine; the manual clean-machine smoke checklist is recorded.",
+      "forbidden_scope": "No signing or notarization.",
+      "evidence": "Not started at bd9f05b: packaging/ does not exist.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D4-GATE"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D3-GATE.",
+      "on_critical_path": true,
+      "critical_path_position": 9,
+      "downstream_chain_length": 2,
+      "parallel_group": "P11",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-D4B",
+      "title": "D4B — Windows packaging",
+      "goal": "Produce an unsigned development .exe/installer via PyInstaller and verify resource-path resolution on Windows.",
+      "prompt": "Produce an unsigned development .exe/installer via PyInstaller and verify resource-path resolution on Windows.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §5's Windows acceptance criteria pass on a clean Windows 11 x64 machine; the manual clean-machine smoke checklist is recorded.\n\nForbidden scope: No production signing.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: packaging/ does not exist. IMPLEMENTATION_ROADMAP.md explicitly allows D4B to proceed in parallel with D4A; the two touch disjoint directories.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D3-GATE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-desktop-d4b-windows-packaging",
+      "branch": "feature/desktop-d4b-windows-packaging",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D4",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "packaging/windows/"
+      ],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §5's Windows acceptance criteria pass on a clean Windows 11 x64 machine; the manual clean-machine smoke checklist is recorded.",
+      "forbidden_scope": "No production signing.",
+      "evidence": "Not started at bd9f05b: packaging/ does not exist. IMPLEMENTATION_ROADMAP.md explicitly allows D4B to proceed in parallel with D4A; the two touch disjoint directories.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-D4-GATE"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D3-GATE.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P12",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-D4-GATE",
+      "title": "D4 final gate — Desktop Increment 1 closure",
+      "goal": "Verify DESKTOP_INCREMENT_1.md §6's final Desktop Increment 1 acceptance criteria in full, across both platforms. This gate closes Desktop Increment 1 and satisfies the final goal's Desktop parity gate.",
+      "prompt": "Verify DESKTOP_INCREMENT_1.md §6's final Desktop Increment 1 acceptance criteria in full, across both platforms. This gate closes Desktop Increment 1 and satisfies the final goal's Desktop parity gate.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §6's complete list passes; full suite green; both platforms' clean-machine smoke checklists recorded as passing.\n\nForbidden scope: No work toward any post-Increment-1 feature (run start/cancel, streaming, embedded terminal, signing, server mode, SSO, AICOS interfaces) begins as part of closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D4A and D4B.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "final_gate",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-D4A",
+        "AICC-D4B"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/verify-desktop-d4-final-gate",
+      "branch": "verify/desktop-d4-final-gate",
+      "base_branch": "main",
+      "track": "desktop-increment-1",
+      "stage": "D4",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [],
+      "definition_of_done": "DESKTOP_INCREMENT_1.md §6's complete list passes; full suite green; both platforms' clean-machine smoke checklists recorded as passing.",
+      "forbidden_scope": "No work toward any post-Increment-1 feature (run start/cancel, streaming, embedded terminal, signing, server mode, SSO, AICOS interfaces) begins as part of closing this gate.",
+      "evidence": "Blocked at bd9f05b by D4A and D4B.",
+      "folds_in": [],
+      "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [
+        "AICC-D1-001"
+      ],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-D4A, AICC-D4B.",
+      "on_critical_path": true,
+      "critical_path_position": 10,
+      "downstream_chain_length": 1,
+      "parallel_group": "P14",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-GOV-F2",
+      "title": "F2 — Restore data/tasks.json project-id integrity",
+      "goal": "Re-validate and remap every live task whose `project` value does not resolve against models.PROJECT_IDS, through scripts/import_tasks.py, so the data-integrity success gate can pass.",
+      "prompt": "Re-validate and remap every live task whose `project` value does not resolve against models.PROJECT_IDS, through scripts/import_tasks.py, so the data-integrity success gate can pass.\n\nDefinition of Done: 100% of rows in the live data/tasks.json carry a `project` that resolves via project_config.normalize_project_id; the remap is performed through the validating scripts/import_tasks.py / command_center.task_import pipeline (never by direct JSON replacement); tasks_repository.validate_tasks emits no unknown-project warning on load; the founder approves the per-row remapping table before it is applied.\n\nForbidden scope: No extension of PROJECT_NAME_ALIASES or PROJECT_IDS to make bad values resolve (DR-ROADMAP-AUTHORITY-001 §7 R4 — that needs the F3 ADR). No direct write to tasks.json.\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §2.3 records this success gate as currently FAILING, §7 R1(d) attributes it to the rejected roadmap/program importer, and §8 F2 flags it for the founder. ROADMAP_RECONCILIATION.md Conflict 2 (HIGH, ACTIVE) measured 26 of 56 live rows with non-resolving `project` values. This checkout carries only data/*.example.* files, so the live store at /Users/dmitrijcernikov/Projects/ai-command-center/data/tasks.json must be re-measured at execution time — the 26/56 figure is the last recorded measurement, not a current one. Highest priority in the package: §7 A3 puts the registry/import-integrity Blocker ahead of any new feature work.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "remediation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/fix-tasks-json-project-integrity",
+      "branch": "fix/tasks-json-project-integrity",
+      "base_branch": "main",
+      "track": "governance",
+      "stage": "GOV",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "data/tasks.json",
+        "scripts/import_tasks.py"
+      ],
+      "definition_of_done": "100% of rows in the live data/tasks.json carry a `project` that resolves via project_config.normalize_project_id; the remap is performed through the validating scripts/import_tasks.py / command_center.task_import pipeline (never by direct JSON replacement); tasks_repository.validate_tasks emits no unknown-project warning on load; the founder approves the per-row remapping table before it is applied.",
+      "forbidden_scope": "No extension of PROJECT_NAME_ALIASES or PROJECT_IDS to make bad values resolve (DR-ROADMAP-AUTHORITY-001 §7 R4 — that needs the F3 ADR). No direct write to tasks.json.",
+      "evidence": "DR-ROADMAP-AUTHORITY-001 §2.3 records this success gate as currently FAILING, §7 R1(d) attributes it to the rejected roadmap/program importer, and §8 F2 flags it for the founder. ROADMAP_RECONCILIATION.md Conflict 2 (HIGH, ACTIVE) measured 26 of 56 live rows with non-resolving `project` values. This checkout carries only data/*.example.* files, so the live store at /Users/dmitrijcernikov/Projects/ai-command-center/data/tasks.json must be re-measured at execution time — the 26/56 figure is the last recorded measurement, not a current one. Highest priority in the package: §7 A3 puts the registry/import-integrity Blocker ahead of any new feature work.",
+      "folds_in": [],
+      "source": "docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md §8",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 1,
+      "parallel_group": "P01",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-GOV-F3",
+      "title": "F3 — Write the missing project-registry ADR",
+      "goal": "Record the 9-project PROJECT_IDS registry and the validating task-import pipeline in a new ADR, so the canonical registry has an architecture-tier record rather than only a decision record.",
+      "prompt": "Record the 9-project PROJECT_IDS registry and the validating task-import pipeline in a new ADR, so the canonical registry has an architecture-tier record rather than only a decision record.\n\nDefinition of Done: A new ADR (next free number, 0008) records: the canonical 9-id PROJECT_IDS registry and the sensitive subset; PROJECT_NAME_ALIASES' documented folding rule (case and whitespace only, not underscores); normalize_project_id's fail-to-None contract; and the rule that registry changes require an ADR rather than a script workaround. DECISIONS.md or the ADR index links it.\n\nForbidden scope: No edit to ADR 0001-0007 (authority hierarchy tier 2: new decisions get a new ADR).\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §8 F3: 'ADR 0004/0005 were written for other topics (autonomy), so the registry ADR recommended by Reconciliation §4.1 still does not exist.' Confirmed at bd9f05b: docs/adr/ holds 0001-0007 and none of them covers the registry. §2.4's documentation-truth gate requires it.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "architecture_review",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/docs-adr-0008-project-registry",
+      "branch": "docs/adr-0008-project-registry",
+      "base_branch": "main",
+      "track": "governance",
+      "stage": "GOV",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "docs/adr/",
+        "DECISIONS.md"
+      ],
+      "definition_of_done": "A new ADR (next free number, 0008) records: the canonical 9-id PROJECT_IDS registry and the sensitive subset; PROJECT_NAME_ALIASES' documented folding rule (case and whitespace only, not underscores); normalize_project_id's fail-to-None contract; and the rule that registry changes require an ADR rather than a script workaround. DECISIONS.md or the ADR index links it.",
+      "forbidden_scope": "No edit to ADR 0001-0007 (authority hierarchy tier 2: new decisions get a new ADR).",
+      "evidence": "DR-ROADMAP-AUTHORITY-001 §8 F3: 'ADR 0004/0005 were written for other topics (autonomy), so the registry ADR recommended by Reconciliation §4.1 still does not exist.' Confirmed at bd9f05b: docs/adr/ holds 0001-0007 and none of them covers the registry. §2.4's documentation-truth gate requires it.",
+      "folds_in": [],
+      "source": "docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md §8",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [
+        "AICC-GOV-F1",
+        "AICC-GOV-F5"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 8,
+      "parallel_group": "P02",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-GOV-F1",
+      "title": "F1 — Refresh README.md and CHANGELOG.md against main",
+      "goal": "Bring the product-facing summaries up to what is actually on main (ADR 0001-0007 work, the validating task-import pipeline, the 9-project registry), closing Reconciliation Conflict 3.",
+      "prompt": "Bring the product-facing summaries up to what is actually on main (ADR 0001-0007 work, the validating task-import pipeline, the 9-project registry), closing Reconciliation Conflict 3.\n\nDefinition of Done: README.md and CHANGELOG.md describe main's actual behaviour and carry the canonical 9-project registry, citing the F3 ADR; every 'six projects' statement is corrected; no claim in either file contradicts command_center/* (authority tier 1).\n\nForbidden scope: No runtime code change; documentation only.\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §8 F1 and §5 tier 4 ('currently the stalest tier'); ROADMAP_RECONCILIATION.md Conflict 3 (MEDIUM-HIGH) — README/CHANGELOG do not document roughly half of what is shipped. Sequenced after F3 so the registry statement it must write is the one the ADR records.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "remediation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-GOV-F3"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/docs-refresh-readme-changelog",
+      "branch": "docs/refresh-readme-changelog",
+      "base_branch": "main",
+      "track": "governance",
+      "stage": "GOV",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "README.md",
+        "CHANGELOG.md"
+      ],
+      "definition_of_done": "README.md and CHANGELOG.md describe main's actual behaviour and carry the canonical 9-project registry, citing the F3 ADR; every 'six projects' statement is corrected; no claim in either file contradicts command_center/* (authority tier 1).",
+      "forbidden_scope": "No runtime code change; documentation only.",
+      "evidence": "DR-ROADMAP-AUTHORITY-001 §8 F1 and §5 tier 4 ('currently the stalest tier'); ROADMAP_RECONCILIATION.md Conflict 3 (MEDIUM-HIGH) — README/CHANGELOG do not document roughly half of what is shipped. Sequenced after F3 so the registry statement it must write is the one the ADR records.",
+      "folds_in": [],
+      "source": "docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md §8",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-GOV-F3.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 1,
+      "parallel_group": "P15",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-GOV-F5",
+      "title": "F5 — Correct the 'six projects' language in the desktop document set",
+      "goal": "Replace the stale six-project statements in docs/desktop/PRODUCT_VISION.md §1/§5 and WORKSPACE_HOME_SPEC.md with the canonical nine-id registry.",
+      "prompt": "Replace the stale six-project statements in docs/desktop/PRODUCT_VISION.md §1/§5 and WORKSPACE_HOME_SPEC.md with the canonical nine-id registry.\n\nDefinition of Done: No document in docs/desktop/ states a six-project registry; each corrected passage cites the F3 ADR; the WORKSPACE_HOME_SPEC.md §15 'all-six-unconfigured' edge case is restated in registry-agnostic terms so AICC-D2D implements the right assertion.\n\nForbidden scope: No change to the frozen D1-D4 scope decisions in DESKTOP_INCREMENT_1.md.\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §8 F5 and §7 A2. Directly feeds AICC-D2D, whose edge-state table is specified by WORKSPACE_HOME_SPEC.md §15 and currently says 'all-six-unconfigured'.",
+      "status": "Backlog",
+      "priority": "Low",
+      "task_type": "remediation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-GOV-F3"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/docs-desktop-canonical-registry-language",
+      "branch": "docs/desktop-canonical-registry-language",
+      "base_branch": "main",
+      "track": "governance",
+      "stage": "GOV",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "docs/desktop/PRODUCT_VISION.md",
+        "docs/desktop/WORKSPACE_HOME_SPEC.md"
+      ],
+      "definition_of_done": "No document in docs/desktop/ states a six-project registry; each corrected passage cites the F3 ADR; the WORKSPACE_HOME_SPEC.md §15 'all-six-unconfigured' edge case is restated in registry-agnostic terms so AICC-D2D implements the right assertion.",
+      "forbidden_scope": "No change to the frozen D1-D4 scope decisions in DESKTOP_INCREMENT_1.md.",
+      "evidence": "DR-ROADMAP-AUTHORITY-001 §8 F5 and §7 A2. Directly feeds AICC-D2D, whose edge-state table is specified by WORKSPACE_HOME_SPEC.md §15 and currently says 'all-six-unconfigured'.",
+      "folds_in": [],
+      "source": "docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md §8",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [],
+      "soft_blocks": [
+        "AICC-D2D"
+      ],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-GOV-F3.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 7,
+      "parallel_group": "P03",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-GOV-F4A",
+      "title": "F4a — Triage the two untriaged backlogs (ADR 0001 Tier B, program-roadmap H2 concepts)",
+      "goal": "Run the single triage pass DR-ROADMAP-AUTHORITY-001 §7 Deferred prescribes over its D2 and D3 backlogs, classifying every item Done / Still-Open / Superseded / Duplicate against current main.",
+      "prompt": "Run the single triage pass DR-ROADMAP-AUTHORITY-001 §7 Deferred prescribes over its D2 and D3 backlogs, classifying every item Done / Still-Open / Superseded / Duplicate against current main.\n\nDefinition of Done: Every ADR 0001 'Tier B' item and every program-roadmap H2 concept (AICC-D2-001..004, AICC-GIT-001, AICC-INT-001) carries one of the four classes with cited code/test evidence; the known overlaps named in §7 are resolved explicitly (AICC-GIT-001 vs audit MINOR-4/NIT-1; AICC-SELF-001 vs the audit's Wave 4 Self-Development; AICC-D1-002 vs the shipped task_import.py); Still-Open items are converted into a task package but not imported.\n\nForbidden scope: No PORTFOLIO/PLATFORM-scoped item and no H3 item enters committed scope (§7 R3). No merging of overlaps 'mechanically' — each is resolved with evidence.\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §7 Deferred D2/D3 and §8 F4. The third backlog (D1, the audit's 33 rows) is already triaged — FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md, 14 Done / 14 Still-Open / 4 Superseded / 1 Duplicate — so only D2 and D3 remain.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "review",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/docs-triage-tier-b-and-h2-candidates",
+      "branch": "docs/triage-tier-b-and-h2-candidates",
+      "base_branch": "main",
+      "track": "governance",
+      "stage": "GOV",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "docs/adr/0001-engineering-control-center-v2-increment-1.md",
+        "roadmap/program/",
+        "docs/roadmap/"
+      ],
+      "definition_of_done": "Every ADR 0001 'Tier B' item and every program-roadmap H2 concept (AICC-D2-001..004, AICC-GIT-001, AICC-INT-001) carries one of the four classes with cited code/test evidence; the known overlaps named in §7 are resolved explicitly (AICC-GIT-001 vs audit MINOR-4/NIT-1; AICC-SELF-001 vs the audit's Wave 4 Self-Development; AICC-D1-002 vs the shipped task_import.py); Still-Open items are converted into a task package but not imported.",
+      "forbidden_scope": "No PORTFOLIO/PLATFORM-scoped item and no H3 item enters committed scope (§7 R3). No merging of overlaps 'mechanically' — each is resolved with evidence.",
+      "evidence": "DR-ROADMAP-AUTHORITY-001 §7 Deferred D2/D3 and §8 F4. The third backlog (D1, the audit's 33 rows) is already triaged — FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md, 14 Done / 14 Still-Open / 4 Superseded / 1 Duplicate — so only D2 and D3 remain.",
+      "folds_in": [],
+      "source": "docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md §8",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 1,
+      "parallel_group": "P15",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-GOV-F4B",
+      "title": "F4b — Audit-closure gate: refreshed Founder Audit against main",
+      "goal": "Re-run the Founder Functional Audit against current main once the still-open remediation rows have landed, closing the final goal's audit-closure success gate.",
+      "prompt": "Re-run the Founder Functional Audit against current main once the still-open remediation rows have landed, closing the final goal's audit-closure success gate.\n\nDefinition of Done: FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md's required steps 1-5 are executed against current main; every Blocker is closed or explicitly accepted with a recorded rationale; the refreshed audit supersedes the 9761459 snapshot and its status tracker is updated.\n\nForbidden scope: No remediation work inside the audit branch — findings only.\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §2.5 (audit-closure gate) and §8 F4. Depends on every still-open audit remediation row in this package; the dependency list is computed, not hand-written.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "review",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-AUDIT-W0-006",
+        "AICC-AUDIT-W1-002",
+        "AICC-AUDIT-W1-004",
+        "AICC-AUDIT-W1-005",
+        "AICC-AUDIT-W1-006",
+        "AICC-AUDIT-W1-007",
+        "AICC-AUDIT-W1-009",
+        "AICC-AUDIT-W2-001",
+        "AICC-AUDIT-W2-002",
+        "AICC-AUDIT-W2-004",
+        "AICC-AUDIT-W2-006",
+        "AICC-AUDIT-W4-003",
+        "AICC-AUDIT-W4-004"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/audit-refreshed-founder-audit",
+      "branch": "audit/refreshed-founder-audit",
+      "base_branch": "main",
+      "track": "governance",
+      "stage": "GOV",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "docs/audits/"
+      ],
+      "definition_of_done": "FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md's required steps 1-5 are executed against current main; every Blocker is closed or explicitly accepted with a recorded rationale; the refreshed audit supersedes the 9761459 snapshot and its status tracker is updated.",
+      "forbidden_scope": "No remediation work inside the audit branch — findings only.",
+      "evidence": "DR-ROADMAP-AUTHORITY-001 §2.5 (audit-closure gate) and §8 F4. Depends on every still-open audit remediation row in this package; the dependency list is computed, not hand-written.",
+      "folds_in": [],
+      "source": "docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md §8",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "blocks": [],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-AUDIT-W0-006, AICC-AUDIT-W1-002, AICC-AUDIT-W1-004, AICC-AUDIT-W1-005, AICC-AUDIT-W1-006, AICC-AUDIT-W1-007, AICC-AUDIT-W1-009, AICC-AUDIT-W2-001, AICC-AUDIT-W2-002, AICC-AUDIT-W2-004, AICC-AUDIT-W2-006, AICC-AUDIT-W4-003, AICC-AUDIT-W4-004.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 1,
+      "parallel_group": "P16",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-AUDIT-W0-006",
+      "title": "Добавить containment-проверку для project в путях отчётов Portfolio",
+      "goal": "Исключить теоретическую возможность записи отчёта вне reports/ через непровалидированное поле project из Portfolio-карточки.",
+      "prompt": "Исключить теоретическую возможность записи отчёта вне reports/ через непровалидированное поле project из Portfolio-карточки.\n\nЧто добавить: Валидация project против models.PROJECT_IDS либо применение паттерна _assert_within_root (как уже сделано в portfolio_launch.py) перед report_path_for/db.create_run.\n\nЧто исправляется: report_path_for строит REPORTS_ROOT / project / filename без allowlist/containment-проверки, в отличие от аналогичного кода в portfolio_launch.py.\n\nDefinition of Done: Тест: Portfolio-карточка с project, содержащим '../', не может привести к записи файла вне reports/.\n\nКомпонент: command_center/agent_runner.py, command_center/runtime/reports.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-9 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: report_path_for() still interpolates run['project'] into REPORTS_ROOT/<project>/... with no allowlist or _assert_within_root; only the read side (resolve_report_path) is contained. No test for a card whose project contains '../'.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "remediation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/fix-portfolio-report-path-containment",
+      "branch": "fix/portfolio-report-path-containment",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W0",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/agent_runner.py",
+        "command_center/runtime/reports.py"
+      ],
+      "definition_of_done": "Тест: Portfolio-карточка с project, содержащим '../', не может привести к записи файла вне reports/.",
+      "forbidden_scope": "",
+      "evidence": "report_path_for() still interpolates run['project'] into REPORTS_ROOT/<project>/... with no allowlist or _assert_within_root; only the read side (resolve_report_path) is contained. No test for a card whose project contains '../'.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W0-006",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-9",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.3",
+      "release_note": "Устранён потенциальный path-traversal через поле project Portfolio-карточки.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W1-009",
+        "AICC-AUDIT-W4-003"
+      ],
+      "conflict_files": {
+        "command_center/agent_runner.py": [
+          "AICC-AUDIT-W1-009"
+        ],
+        "command_center/runtime/reports.py": [
+          "AICC-AUDIT-W4-003"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P05",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W1-002",
+      "title": "Согласовать scripts/start-task.sh с полным реестром PROJECT_IDS",
+      "goal": "Исключить молчаливый отказ формы 'Создать задачу' для AICOS/BUSINESS/PERSONAL.",
+      "prompt": "Исключить молчаливый отказ формы 'Создать задачу' для AICOS/BUSINESS/PERSONAL.\n\nЧто добавить: Расширение case-выражения на все 6 project id из models.PROJECT_IDS, либо (альтернатива) вывод формы 'Создать задачу' из зависимости от успешного выполнения этого скрипта.\n\nЧто исправляется: start-task.sh поддерживает только AIOS/BANK/LEGAL; app.py:2178 не сохраняет задачу, если скрипт завершился с ошибкой.\n\nDefinition of Done: Создание задачи для любого из 6 канонических проектов через главную форму работает одинаково; тест покрывает все 6 project id.\n\nКомпонент: scripts/start-task.sh\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-2 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: scripts/start-task.sh still hard-codes AIOS/BANK/LEGAL, and the Create Task form still only persists the task when the script exits 0 (app.py:4528-4556). The registry has grown to 9 ids, so the gap is wider than at audit time.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "remediation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/fix-start-task-full-registry",
+      "branch": "fix/start-task-full-registry",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "scripts/start-task.sh"
+      ],
+      "definition_of_done": "Создание задачи для любого из 6 канонических проектов через главную форму работает одинаково; тест покрывает все 6 project id.",
+      "forbidden_scope": "",
+      "evidence": "scripts/start-task.sh still hard-codes AIOS/BANK/LEGAL, and the Create Task form still only persists the task when the script exits 0 (app.py:4528-4556). The registry has grown to 9 ids, so the gap is wider than at audit time.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W1-002",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-2",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.3",
+      "release_note": "Форма создания задачи теперь работает для всех проектов реестра, не только трёх.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P06",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W1-004",
+      "title": "Усилить проверку ветки/чистоты дерева в launch confirmation",
+      "goal": "Снизить риск случайного запуска агента на неверной ветке или поверх незакоммиченных изменений.",
+      "prompt": "Снизить риск случайного запуска агента на неверной ветке или поверх незакоммиченных изменений.\n\nЧто добавить: Раздельные, более заметные подтверждения для branch-mismatch и dirty-tree вместо одного общего чекбокса 'подтверждаю несмотря на предупреждения'.\n\nЧто исправляется: launch.validate_launch трактует расхождение ветки и грязное дерево как один мягкий warning, снимаемый одним чекбоксом.\n\nDefinition of Done: UI-тест подтверждает, что для dirty tree и для branch mismatch требуется явное отдельное подтверждение каждого условия.\n\nКомпонент: command_center/launch.py, app.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-4 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: Launch confirmation surfaces branch mismatch and dirty tree, but both are still cleared by a single shared 'подтверждаю несмотря на предупреждения' checkbox (app.py:797-800).",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/improve-launch-confirmation-warnings",
+      "branch": "improve/launch-confirmation-warnings",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/launch.py",
+        "app.py"
+      ],
+      "definition_of_done": "UI-тест подтверждает, что для dirty tree и для branch mismatch требуется явное отдельное подтверждение каждого условия.",
+      "forbidden_scope": "",
+      "evidence": "Launch confirmation surfaces branch mismatch and dirty tree, but both are still cleared by a single shared 'подтверждаю несмотря на предупреждения' checkbox (app.py:797-800).",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W1-004",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-4",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.4",
+      "release_note": "Более явные предупреждения при запуске агента на грязном дереве или неверной ветке.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W1-007",
+        "AICC-AUDIT-W1-009",
+        "AICC-AUDIT-W2-002",
+        "AICC-AUDIT-W4-004"
+      ],
+      "conflict_files": {
+        "app.py": [
+          "AICC-AUDIT-W1-007",
+          "AICC-AUDIT-W1-009",
+          "AICC-AUDIT-W2-002",
+          "AICC-AUDIT-W4-004"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P07",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W1-005",
+      "title": "Добавить явную защиту от git worktree/branch операций над main",
+      "goal": "Не полагаться только на косвенную защиту git (отказ создать второй worktree на занятой ветке).",
+      "prompt": "Не полагаться только на косвенную защиту git (отказ создать второй worktree на занятой ветке).\n\nЧто добавить: Явная проверка resolved_branch != 'main' (и других защищённых веток) перед созданием worktree/ветки, с понятной ошибкой.\n\nЧто исправляется: _validate_branch_name не запрещает main; защита сегодня существует только потому что git сам отказывает.\n\nDefinition of Done: Тест: попытка запустить Portfolio-задачу с branch: main отклоняется с понятной ошибкой до вызова git worktree add.\n\nКомпонент: command_center/portfolio_launch.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-5 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: portfolio_launch._validate_branch_name only calls `git check-ref-format`; there is no protected-branch allowlist and no test rejecting `branch: main` before `git worktree add`.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/fix-portfolio-main-branch-guard",
+      "branch": "fix/portfolio-main-branch-guard",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/portfolio_launch.py"
+      ],
+      "definition_of_done": "Тест: попытка запустить Portfolio-задачу с branch: main отклоняется с понятной ошибкой до вызова git worktree add.",
+      "forbidden_scope": "",
+      "evidence": "portfolio_launch._validate_branch_name only calls `git check-ref-format`; there is no protected-branch allowlist and no test rejecting `branch: main` before `git worktree add`.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W1-005",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-5",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.4",
+      "release_note": "Явная защита от случайного создания worktree на ветке main.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W1-006"
+      ],
+      "conflict_files": {
+        "command_center/portfolio_launch.py": [
+          "AICC-AUDIT-W1-006"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P09",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W1-006",
+      "title": "Добавить восстановление после зависшего Portfolio claim-lock",
+      "goal": "Не требовать ручного вмешательства оператора при обычном сценарии аварийного завершения процесса.",
+      "prompt": "Не требовать ручного вмешательства оператора при обычном сценарии аварийного завершения процесса.\n\nЧто добавить: Обнаружение lock-файлов старше разумного порога / без живого владеющего процесса, с безопасным автоматическим или полу-автоматическим (кнопка в UI с подтверждением) освобождением.\n\nЧто исправляется: _claim не имеет механизма очистки осиротевшего лока; сегодня только ручное удаление файла оператором.\n\nDefinition of Done: Тест: лок-файл, оставленный имитацией аварийного завершения (нет живого процесса-владельца), корректно обнаруживается и может быть безопасно снят без риска гонки с реально идущим запуском.\n\nКомпонент: command_center/portfolio_launch.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-6 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: portfolio_launch._claim documents that an orphaned claim lock is cleared by the operator deleting the file by hand, and deliberately exposes no in-app helper. No staleness detection, no UI recovery.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/improve-portfolio-stale-lock-recovery",
+      "branch": "improve/portfolio-stale-lock-recovery",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/portfolio_launch.py"
+      ],
+      "definition_of_done": "Тест: лок-файл, оставленный имитацией аварийного завершения (нет живого процесса-владельца), корректно обнаруживается и может быть безопасно снят без риска гонки с реально идущим запуском.",
+      "forbidden_scope": "",
+      "evidence": "portfolio_launch._claim documents that an orphaned claim lock is cleared by the operator deleting the file by hand, and deliberately exposes no in-app helper. No staleness detection, no UI recovery.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W1-006",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-6",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.4",
+      "release_note": "Portfolio-запуск теперь восстанавливается после аварийного завершения процесса без ручного вмешательства.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W1-005"
+      ],
+      "conflict_files": {
+        "command_center/portfolio_launch.py": [
+          "AICC-AUDIT-W1-005"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P10",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-AUDIT-W1-007",
+      "title": "Добавить подтверждение перед удалением задачи",
+      "goal": "Привести удаление задачи к тому же уровню защиты, что уже применяется для запуска/отмены run.",
+      "prompt": "Привести удаление задачи к тому же уровню защиты, что уже применяется для запуска/отмены run.\n\nЧто добавить: Тот же паттерн confirm-диалога (session-state based), что уже используется для launch/cancel, перед вызовом delete_task.\n\nЧто исправляется: Кнопка 'Удалить' вызывает delete_task немедленно по одному клику, без подтверждения, в отличие от остальных потенциально опасных действий приложения.\n\nDefinition of Done: UI-тест: клик 'Удалить' без подтверждения не удаляет задачу; повторное явное подтверждение удаляет.\n\nКомпонент: app.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-7 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: app.py:1268-1270 deletes on the first click of 'Удалить' with no confirmation step.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/fix-task-delete-confirmation",
+      "branch": "fix/task-delete-confirmation",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "app.py"
+      ],
+      "definition_of_done": "UI-тест: клик 'Удалить' без подтверждения не удаляет задачу; повторное явное подтверждение удаляет.",
+      "forbidden_scope": "",
+      "evidence": "app.py:1268-1270 deletes on the first click of 'Удалить' with no confirmation step.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W1-007",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MAJOR-7",
+      "original_dependencies": [
+        "AUDIT-W0-004"
+      ],
+      "dropped_dependencies": [
+        "AUDIT-W0-004"
+      ],
+      "target_version": "v1.3",
+      "release_note": "Удаление задачи теперь требует явного подтверждения.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W1-004",
+        "AICC-AUDIT-W1-009",
+        "AICC-AUDIT-W2-002",
+        "AICC-AUDIT-W4-004"
+      ],
+      "conflict_files": {
+        "app.py": [
+          "AICC-AUDIT-W1-004",
+          "AICC-AUDIT-W1-009",
+          "AICC-AUDIT-W2-002",
+          "AICC-AUDIT-W4-004"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P10",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W1-009",
+      "title": "Добавить pre-flight проверку бинарника claude в основной лаунчер",
+      "goal": "Не заставлять founder проходить весь confirmation-флоу, чтобы узнать об отсутствии бинарника claude только в момент запуска.",
+      "prompt": "Не заставлять founder проходить весь confirmation-флоу, чтобы узнать об отсутствии бинарника claude только в момент запуска.\n\nЧто добавить: Вызов claude_cli_available() в render_agent_launcher до показа confirmation UI, с понятным сообщением если бинарник не найден.\n\nЧто исправляется: claude_cli_available() подключена только к чат-фиче, не к основному лаунчеру задач.\n\nDefinition of Done: UI-тест: при отсутствующем claude в PATH лаунчер показывает предупреждение до, а не после подтверждения запуска.\n\nКомпонент: app.py, command_center/agent_runner.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MINOR-2 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: agent_runner.claude_cli_available() exists but is only wired into chat_service.py:109; the main launcher never calls it.",
+      "status": "Backlog",
+      "priority": "Low",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/improve-claude-binary-preflight-check",
+      "branch": "improve/claude-binary-preflight-check",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W1",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "app.py",
+        "command_center/agent_runner.py"
+      ],
+      "definition_of_done": "UI-тест: при отсутствующем claude в PATH лаунчер показывает предупреждение до, а не после подтверждения запуска.",
+      "forbidden_scope": "",
+      "evidence": "agent_runner.claude_cli_available() exists but is only wired into chat_service.py:109; the main launcher never calls it.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W1-009",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MINOR-2",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.3",
+      "release_note": "Раннее предупреждение об отсутствующем Claude CLI перед попыткой запуска.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W0-006",
+        "AICC-AUDIT-W1-004",
+        "AICC-AUDIT-W1-007",
+        "AICC-AUDIT-W2-002",
+        "AICC-AUDIT-W4-004"
+      ],
+      "conflict_files": {
+        "command_center/agent_runner.py": [
+          "AICC-AUDIT-W0-006"
+        ],
+        "app.py": [
+          "AICC-AUDIT-W1-004",
+          "AICC-AUDIT-W1-007",
+          "AICC-AUDIT-W2-002",
+          "AICC-AUDIT-W4-004"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P12",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W2-001",
+      "title": "Ввести единую каноническую схему задачи",
+      "goal": "Заменить 3+ конкурирующих формы задачи (base + workflow-расширение + execution-расширение, объединяемые только через normalize_task на чтении) единой схемой.",
+      "prompt": "Заменить 3+ конкурирующих формы задачи (base + workflow-расширение + execution-расширение, объединяемые только через normalize_task на чтении) единой схемой.\n\nЧто добавить: Одна каноническая структура (dataclass/TypedDict) для Task, с явной версией схемы и явной миграцией существующих записей tasks.json.\n\nЧто исправляется: Отсутствие единой модели затрудняет валидацию, batch-импорт и приводит к расхождению боевых данных со схемой (Finding B-1).\n\nDefinition of Done: Один источник истины для формы задачи, используемый везде; миграция существующего tasks.json проходит без потери данных; тесты обновлены.\n\nКомпонент: command_center/models.py, command_center/tasks_repository.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#5.1 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: Task shape is still base fields + normalize_task_workflow + normalize_task_execution merged on read. tasks_repository.validate_tasks added integrity surfacing (BLOCKER-4), but there is no single canonical structure, no task schema version, and no migration.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "architecture_review",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/architecture-canonical-task-schema",
+      "branch": "architecture/canonical-task-schema",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W2",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/models.py",
+        "command_center/tasks_repository.py"
+      ],
+      "definition_of_done": "Один источник истины для формы задачи, используемый везде; миграция существующего tasks.json проходит без потери данных; тесты обновлены.",
+      "forbidden_scope": "",
+      "evidence": "Task shape is still base fields + normalize_task_workflow + normalize_task_execution merged on read. tasks_repository.validate_tasks added integrity surfacing (BLOCKER-4), but there is no single canonical structure, no task schema version, and no migration.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W2-001",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#5.1",
+      "original_dependencies": [
+        "AUDIT-W0-005"
+      ],
+      "dropped_dependencies": [
+        "AUDIT-W0-005"
+      ],
+      "target_version": "v1.4",
+      "release_note": "Единая модель задачи вместо нескольких частично совместимых форм.",
+      "blocks": [
+        "AICC-AUDIT-W2-002",
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W2-002"
+      ],
+      "conflict_files": {
+        "command_center/models.py": [
+          "AICC-AUDIT-W2-002"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 3,
+      "parallel_group": "P04",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W2-002",
+      "title": "Добавить обнаружение циклов зависимостей задач",
+      "goal": "Не допускать создания циклических зависимостей между задачами (A depends_on B, B depends_on A).",
+      "prompt": "Не допускать создания циклических зависимостей между задачами (A depends_on B, B depends_on A).\n\nЧто добавить: Проверка на цикл при сохранении depends_on; UI dependency-picker исключает варианты, создающие цикл.\n\nЧто исправляется: Сегодня ничего не мешает создать цикл; project_intelligence._longest_blocked_chain сам документирован как не cycle-safe и только ограничивает глубину обхода.\n\nDefinition of Done: Тест: попытка сохранить задачу с циклической зависимостью отклоняется с понятной ошибкой.\n\nКомпонент: command_center/models.py, app.py (dependency picker)\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#5.1 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: models.is_blocked/unmet_dependencies do no cycle detection. Kahn-style cycle handling exists only in portfolio_intelligence for Portfolio cards, not for task depends_on.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [
+        "AICC-AUDIT-W2-001"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-dependency-cycle-detection",
+      "branch": "feature/dependency-cycle-detection",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W2",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/models.py",
+        "app.py (dependency picker)"
+      ],
+      "definition_of_done": "Тест: попытка сохранить задачу с циклической зависимостью отклоняется с понятной ошибкой.",
+      "forbidden_scope": "",
+      "evidence": "models.is_blocked/unmet_dependencies do no cycle detection. Kahn-style cycle handling exists only in portfolio_intelligence for Portfolio cards, not for task depends_on.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W2-002",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#5.1",
+      "original_dependencies": [
+        "AUDIT-W2-001"
+      ],
+      "dropped_dependencies": [],
+      "target_version": "v1.4",
+      "release_note": "Циклические зависимости между задачами теперь запрещены.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W1-004",
+        "AICC-AUDIT-W1-007",
+        "AICC-AUDIT-W1-009",
+        "AICC-AUDIT-W2-001",
+        "AICC-AUDIT-W4-004"
+      ],
+      "conflict_files": {
+        "app.py": [
+          "AICC-AUDIT-W1-004",
+          "AICC-AUDIT-W1-007",
+          "AICC-AUDIT-W1-009",
+          "AICC-AUDIT-W4-004"
+        ],
+        "command_center/models.py": [
+          "AICC-AUDIT-W2-001"
+        ]
+      },
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-AUDIT-W2-001.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P11",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-AUDIT-W2-004",
+      "title": "Показать Project Intelligence / Recommendations на Workspace Home",
+      "goal": "Дать founder единую точку входа с рекомендациями, а не только на странице Kanban.",
+      "prompt": "Дать founder единую точку входа с рекомендациями, а не только на странице Kanban.\n\nЧто добавить: Встраивание существующих панелей project_intelligence_panel/recommendations_panel в Workspace Home.\n\nЧто исправляется: Сегодня обе панели подключены только к Kanban.\n\nDefinition of Done: Workspace Home показывает те же рекомендации/health-метрики, что и Kanban, без дублирования логики вычисления.\n\nКомпонент: command_center/workspace_home.py, command_center/ui/project_intelligence_panel.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#5.2 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: render_workspace_home_page (app.py:3301) renders metrics/projects/runs/artifacts/reports only. project_intelligence_panel and recommendations_panel are still wired to the Kanban page alone (app.py:4669, 4678).",
+      "status": "Backlog",
+      "priority": "Low",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-workspace-home-intelligence",
+      "branch": "feature/workspace-home-intelligence",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W2",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/workspace_home.py",
+        "command_center/ui/project_intelligence_panel.py"
+      ],
+      "definition_of_done": "Workspace Home показывает те же рекомендации/health-метрики, что и Kanban, без дублирования логики вычисления.",
+      "forbidden_scope": "",
+      "evidence": "render_workspace_home_page (app.py:3301) renders metrics/projects/runs/artifacts/reports only. project_intelligence_panel and recommendations_panel are still wired to the Kanban page alone (app.py:4669, 4678).",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W2-004",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#5.2",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.4",
+      "release_note": "Рекомендации и health-метрики проектов теперь видны на Workspace Home.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [
+        "AICC-D2A"
+      ],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 10,
+      "parallel_group": "P02",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-AUDIT-W2-006",
+      "title": "Добавить ahead/behind и git fetch в git_info.py",
+      "goal": "Дать founder реальную видимость расхождения с remote в Git Center.",
+      "prompt": "Дать founder реальную видимость расхождения с remote в Git Center.\n\nЧто добавить: Опциональный (не автоматический на каждый рендер) git fetch + вычисление ahead/behind, с явным индикатором 'обновлено N минут назад'.\n\nЧто исправляется: git_info.py сегодня не вычисляет ahead/behind вообще и никогда не делает git fetch.\n\nDefinition of Done: Git Center показывает ahead/behind после явного действия пользователя ('Обновить'), не автоматически на каждый rerun (чтобы не делать сетевой fetch неявно).\n\nКомпонент: command_center/git_info.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MINOR-4 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: git_info.py exposes get_status/get_log/get_diff_stat/get_branches/get_remotes/get_worktrees — no ahead/behind computation and no fetch of any kind.",
+      "status": "Backlog",
+      "priority": "Low",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-git-ahead-behind",
+      "branch": "feature/git-ahead-behind",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W2",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/git_info.py"
+      ],
+      "definition_of_done": "Git Center показывает ahead/behind после явного действия пользователя ('Обновить'), не автоматически на каждый rerun (чтобы не делать сетевой fetch неявно).",
+      "forbidden_scope": "",
+      "evidence": "git_info.py exposes get_status/get_log/get_diff_stat/get_branches/get_remotes/get_worktrees — no ahead/behind computation and no fetch of any kind.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W2-006",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#MINOR-4",
+      "original_dependencies": [],
+      "dropped_dependencies": [],
+      "target_version": "v1.4",
+      "release_note": "Git Center теперь может показывать расхождение с remote-веткой.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [],
+      "conflict_files": {},
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P13",
+      "parallel_slot": 1
+    },
+    {
+      "id": "AICC-AUDIT-W4-003",
+      "title": "Автоматический сборщик результатов run в Reports/Timeline",
+      "goal": "Автоматически связывать завершённый run с записью в Reports/Timeline без ручного шага.",
+      "prompt": "Автоматически связывать завершённый run с записью в Reports/Timeline без ручного шага.\n\nЧто добавить: Хук на завершение run (используя усиленную фоновую синхронизацию из AUDIT-W1-008), который гарантированно создаёт связанную запись в Reports/Timeline.\n\nЧто исправляется: Сегодня это зависит от открытой страницы Live Execution Center (см. MAJOR-8).\n\nDefinition of Done: Тест: run завершается в фоне, соответствующий отчёт и запись в Timeline появляются без открытия Live Execution Center.\n\nКомпонент: command_center/runtime/reports.py, command_center/report_parser.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#15 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: Half delivered: Supervisor._supervise persists the report at process exit (supervisor.py:1899-1910), independent of any open page. The task-level Timeline event still comes from task_sync, which runs page-driven or via the opt-in AICC_BACKGROUND_SYNC daemon — so the 'guaranteed' half of the DoD is not met by default.",
+      "status": "Backlog",
+      "priority": "Low",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-auto-result-collector",
+      "branch": "feature/auto-result-collector",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W4",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "command_center/runtime/reports.py",
+        "command_center/report_parser.py"
+      ],
+      "definition_of_done": "Тест: run завершается в фоне, соответствующий отчёт и запись в Timeline появляются без открытия Live Execution Center.",
+      "forbidden_scope": "",
+      "evidence": "Half delivered: Supervisor._supervise persists the report at process exit (supervisor.py:1899-1910), independent of any open page. The task-level Timeline event still comes from task_sync, which runs page-driven or via the opt-in AICC_BACKGROUND_SYNC daemon — so the 'guaranteed' half of the DoD is not met by default.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W4-003",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#15",
+      "original_dependencies": [
+        "AUDIT-W1-008"
+      ],
+      "dropped_dependencies": [
+        "AUDIT-W1-008"
+      ],
+      "target_version": "v2.1",
+      "release_note": "Отчёты и таймлайн теперь обновляются автоматически после завершения запуска.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W0-006"
+      ],
+      "conflict_files": {
+        "command_center/runtime/reports.py": [
+          "AICC-AUDIT-W0-006"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P13",
+      "parallel_slot": 2
+    },
+    {
+      "id": "AICC-AUDIT-W4-004",
+      "title": "UI подтверждения founder для оркестратор-инициированных запусков",
+      "goal": "Гарантировать, что даже при включённом AI Orchestrator (AUDIT-W4-002) ни один запуск не происходит без явного человеческого решения founder.",
+      "prompt": "Гарантировать, что даже при включённом AI Orchestrator (AUDIT-W4-002) ни один запуск не происходит без явного человеческого решения founder.\n\nЧто добавить: Отдельный, явно видимый approval-экран для пакетов запусков, предложенных оркестратором, с полным списком задач/веток/worktree перед подтверждением.\n\nЧто исправляется: Без этого AUDIT-W4-002 не может быть безопасно включён по умолчанию.\n\nDefinition of Done: Тест: пакетный запуск, предложенный оркестратором, не начинается без явного клика founder на экране подтверждения, показывающем полный список.\n\nКомпонент: app.py, command_center/ui/queue_panel.py\nИсточник: FULL_FOUNDER_FUNCTIONAL_AUDIT.md#15 (Founder Functional Audit 9761459)\nСверено с origin/main 5eed19c: No batch-approval surface exists. ui/proposals_panel.py is a per-proposal inbox that deliberately does not dispatch, and the task_pipeline autopilot launches directly once enabled. Original dependency AUDIT-W4-002 is Superseded, so this row now stands on its own as the missing safety surface over the shipped autopilot.",
+      "status": "Backlog",
+      "priority": "Low",
+      "task_type": "implementation",
+      "project": "AICC",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/feature-orchestrator-approval-gate",
+      "branch": "feature/orchestrator-approval-gate",
+      "base_branch": "main",
+      "track": "audit-remediation",
+      "stage": "W4",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "components": [
+        "app.py",
+        "command_center/ui/queue_panel.py"
+      ],
+      "definition_of_done": "Тест: пакетный запуск, предложенный оркестратором, не начинается без явного клика founder на экране подтверждения, показывающем полный список.",
+      "forbidden_scope": "",
+      "evidence": "No batch-approval surface exists. ui/proposals_panel.py is a per-proposal inbox that deliberately does not dispatch, and the task_pipeline autopilot launches directly once enabled. Original dependency AUDIT-W4-002 is Superseded, so this row now stands on its own as the missing safety surface over the shipped autopilot.",
+      "folds_in": [],
+      "source": "FOUNDER_FUNCTIONAL_AUDIT_9761459",
+      "authority": "DR-ROADMAP-AUTHORITY-001",
+      "decomposes": [],
+      "reconciled_against_commit": "bd9f05b",
+      "audit_task_id": "AUDIT-W4-004",
+      "audit_source": "FULL_FOUNDER_FUNCTIONAL_AUDIT.md#15",
+      "original_dependencies": [
+        "AUDIT-W4-002"
+      ],
+      "dropped_dependencies": [
+        "AUDIT-W4-002"
+      ],
+      "target_version": "v2.1",
+      "release_note": "Добавлен обязательный экран подтверждения для автоматически предложенных запусков.",
+      "blocks": [
+        "AICC-GOV-F4B"
+      ],
+      "soft_blocks": [],
+      "conflicts_with": [
+        "AICC-AUDIT-W1-004",
+        "AICC-AUDIT-W1-007",
+        "AICC-AUDIT-W1-009",
+        "AICC-AUDIT-W2-002"
+      ],
+      "conflict_files": {
+        "app.py": [
+          "AICC-AUDIT-W1-004",
+          "AICC-AUDIT-W1-007",
+          "AICC-AUDIT-W1-009",
+          "AICC-AUDIT-W2-002"
+        ]
+      },
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "downstream_chain_length": 2,
+      "parallel_group": "P14",
+      "parallel_slot": 1
+    }
+  ]
+}

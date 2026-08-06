@@ -65,6 +65,8 @@ class ExecutionCenterAPI:
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
         executor_id: str = "claude_code",
         max_global_concurrency: int | None = None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
     ) -> dict:
         """Launch a run. The final prompt sent to `claude` is always built
         internally from `instruction` plus whatever `context_service.
@@ -109,6 +111,8 @@ class ExecutionCenterAPI:
             executor_id=executor_id,
             canonical_repository_path=project_config.get_project_config(project).get("repository_path"),
             max_global_concurrency=max_global_concurrency,
+            untrusted=untrusted,
+            operator_elevated=operator_elevated,
         )
         db.append_run_event(self.db_path, run["id"], "context_manifest", manifest)
         run = dict(run)
@@ -121,6 +125,12 @@ class ExecutionCenterAPI:
 
     def list_tasks(self, *, project: str | None = None) -> list[dict]:
         return db.list_tasks(self.db_path, project=project)
+
+    def delete_task(self, task_id: str) -> bool:
+        """Remove a task's runtime.db footprint (session/run/event/report/
+        completion cascade). Call alongside `tasks_repository.delete_task` so a
+        deleted Kanban card leaves no orphan runtime rows (audit AR-1)."""
+        return db.delete_task(self.db_path, task_id)
 
     def list_sessions(self, *, task_id: str | None = None) -> list[dict]:
         return db.list_sessions(self.db_path, task_id=task_id)
@@ -189,6 +199,17 @@ class ExecutionCenterAPI:
         """Advance every due, non-terminal completion row once. Delegates to the
         Supervisor; safe to call on demand (bounded)."""
         return self.supervisor.advance_completions(now=now, limit=limit, github=github)
+
+    def request_manual_merge(
+        self, run_id: str, *, confirmed: bool, github=None
+    ) -> dict:
+        """Merge one task explicitly; the completion service re-checks every
+        gate and owns the global sequential merge slot."""
+        from command_center.runtime.completion_service import CompletionOrchestrator
+
+        return CompletionOrchestrator(
+            self.db_path, github=github
+        ).request_manual_merge(run_id, confirmed=confirmed)
 
     # ------------------------------------------------------------------
     # Autonomy proposals (AICC-AUTONOMY-002) — the pre-execution decision
