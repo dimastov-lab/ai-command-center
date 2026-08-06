@@ -152,7 +152,8 @@ def test_customers_due_for_review_never_reviewed(c_db: Path) -> None:
     conn = sqlite3.connect(c_db)
     old_date = (datetime.now(UTC) - timedelta(days=100)).isoformat()
     conn.execute("UPDATE customers SET created_at=? WHERE id=?", (old_date, c["id"]))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
     due = customer_store.get_customers_due_for_review(c_db)
     assert any(d["id"] == c["id"] for d in due)
