@@ -171,7 +171,9 @@ def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
+        # Strip timezone so arithmetic with naive `now` (datetime.now()) is consistent.
+        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     except (ValueError, TypeError):
         return None
 
