@@ -23,7 +23,8 @@
       "memory"
     ],
     "command_center/daily_audit_backend.py": [
-      "audit"
+      "audit",
+      "orchestration"
     ],
     "command_center/execution_queue.py": [
       "queue"
