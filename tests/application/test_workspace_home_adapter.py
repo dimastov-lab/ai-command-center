@@ -1,7 +1,6 @@
 """WorkspaceHomeAdapter tests — plain pytest, no QApplication (ARCHITECTURE.md §5)."""
 from __future__ import annotations
 from pathlib import Path
-import pytest
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.application.workspace_home_adapter import WorkspaceHomeAdapter
 
