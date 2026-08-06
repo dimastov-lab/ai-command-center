@@ -329,11 +329,8 @@ def upsert_tasks(tasks: list[dict]) -> None:
     `queue_panel`: both mutate a subset of `tasks_by_id`'s dicts in place
     (via `execution_queue.launch_ready`, exactly like `launch_service`) and
     need to commit exactly those changes. Locked bulk upsert, not a blind
-    overwrite of this script run's entire (possibly-stale) `tasks` snapshot —
-    each task is written via `get_repository(ROOT).upsert()`."""
-    _repo = tasks_repository.get_repository(ROOT)
-    for t in tasks:
-        _repo.upsert(t)
+    overwrite of this script run's entire (possibly-stale) `tasks` snapshot."""
+    tasks_repository.get_repository(ROOT).upsert_all(tasks)
 
 
 def new_task_record(

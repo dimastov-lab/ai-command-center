@@ -97,7 +97,7 @@ def aicc_dict_to_create_request(task: dict[str, Any]) -> tuple[CreateTaskRequest
         CreateTaskRequest(
             subject_ref=subject_ref,
             type=task_type,
-            title=task.get("title", "Untitled")[:512],
+            title=(task.get("title") or "Untitled")[:512],
             priority=priority,
             payload=payload,
         ),
@@ -171,6 +171,7 @@ class AIOSIdMap:
         return {}
 
     def _save(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
         os.replace(tmp, self._path)
@@ -222,6 +223,10 @@ class AIOSTasksRepository:
         elif target_state == "completed":
             result = self._client.tasks.complete(aios_id)
         return aios_task_to_aicc_dict(result.data)
+
+    def upsert_all(self, tasks: list[dict[str, Any]]) -> None:
+        for task in tasks:
+            self.upsert(task)
 
     def upsert(self, task_dict: dict[str, Any]) -> None:
         aicc_id = task_dict.get("id", "")

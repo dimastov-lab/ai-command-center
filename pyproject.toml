@@ -39,7 +39,7 @@ exclude_lines = [
 ]
 
 [tool.uv.sources]
-aios = { path = "../../../aios" }
+aios = { path = "../aios" }
 
 [dependency-groups]
 dev = [

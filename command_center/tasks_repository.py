@@ -538,6 +538,9 @@ class JSONTasksRepository:
     def upsert(self, task_dict: dict) -> None:
         upsert_task(self._root, task_dict)
 
+    def upsert_all(self, tasks: list[dict]) -> None:
+        upsert_tasks(self._root, tasks)
+
     def update_status(self, task_id: str, new_status: str) -> dict | None:
         return update_task_status(self._root, task_id, new_status)
 
