@@ -35,6 +35,8 @@ dated "**Resolved since this reconciliation**" note in their own section below:
 - W1-007 (`AICC-AUDIT-W1-007`) — resolved 2026-08-06, verified on `main` 2026-08-07.
 - W1-009 (`AICC-AUDIT-W1-009`) — resolved 2026-08-06, verified on `main` 2026-08-07.
 - W2-006 (`AICC-AUDIT-W2-006`) — resolved 2026-08-06, verified on `main` 2026-08-07.
+- W1-005 (`AICC-AUDIT-W1-005`) — resolved, verified on `main` @ `744a09c` 2026-08-07. Landed
+  after the first closure pass, by a different route than its own (closed) PR #85.
 - W1-006 (`AICC-AUDIT-W1-006`) — **partially** resolved 2026-08-06; the service half landed, the
   UI recovery action did not. Stays Still Open.
 
@@ -166,7 +168,7 @@ branch mismatch are now two independent acknowledgements, which is the DoD.
 Tests: `tests/test_launch.py` (`warning_ack_label` / `unacknowledged_warning_codes` cases) — pass.
 Git: `acdfe7c`; PR #88 merged 2026-08-06.
 
-### AUDIT-W1-005 — Защита от git worktree/branch операций над `main` — **Still Open**
+### AUDIT-W1-005 — Защита от git worktree/branch операций над `main` — **Resolved**
 
 `portfolio_launch._validate_branch_name` (line 190) only delegates to `git check-ref-format`,
 which accepts `main`; there is no protected-branch list and no pre-`git worktree add` rejection.
@@ -182,6 +184,30 @@ described above. PR #85 (`fix/portfolio-main-branch-guard`) was **closed unmerge
 is not an ancestor of `main`, so the attempt at this row produced nothing on `main`. The live task
 record `AICC-AUDIT-W1-005` is nevertheless still marked `In Progress` and links that dead PR —
 the store is stale here, not the code.
+
+**Resolved since this reconciliation (verified on `main` @ `744a09c`, 2026-08-07).** The guard
+landed after the first closure pass, by a different route than PR #85 — which remains closed
+unmerged. `command_center/portfolio_launch.py:127` now defines
+`PROTECTED_BRANCH_NAMES = frozenset({"main", "master"})`, and `_validate_branch_name` (line 209)
+rejects a protected name at line 214, **before** delegating to `git check-ref-format`, returning a
+Russian blocker naming both the branch and the protected set.
+
+The check is reached on the real launch path, and the rejection lands before any git call. The
+chain is `launch_portfolio_task` (line 1381) → `build_launch_plan` (line 757) → `resolve_branch`
+(line 235, called at line 797) → `_validate_branch_name` (called at line 262 on the card
+override). `build_launch_plan` appends the error to `blockers` (line 799), which clears
+`plan.launchable`; `launch_portfolio_task` returns the blocker at line 1407, so `create_worktree`
+(defined line 1283, called at line 1488) is never reached. Both plan builders are pure and
+read-only by contract, so the guard runs with no side effects.
+
+The comparison is `name.casefold()`, so on a case-insensitive filesystem `Main`/`MAIN` — which
+resolve to the same loose ref as `main` — are rejected too rather than being left to `git worktree
+add`'s late "a branch named 'Main' already exists".
+The DoD's test now exists: `tests/test_portfolio_launch.py::test_launch_rejects_protected_branch_before_worktree_add`
+(line 936), parametrized over every protected name plus its capitalized and upper-case variants,
+stubs `create_worktree` with an unconditional `pytest.fail` and asserts the rejection message —
+i.e. it proves git is never called. Git: `8808fc5` (guard + tests), `0408c3e` (casefold
+hardening); both ancestors of `main` @ `744a09c`.
 
 ### AUDIT-W1-006 — Восстановление после зависшего Portfolio claim-lock — **Still Open**
 

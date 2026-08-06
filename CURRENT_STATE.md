@@ -23,7 +23,11 @@ Current position:
   finalization so slow persistence cannot cause a false timeout or late signal.
 - Normal task-v2 launches require explicit confirmation before any provisioning, may create an
   isolated worktree offline, and fail closed unless source repository, expected branch, worktree
-  isolation and configured status policy verify before process launch.
+  isolation and configured status policy verify before process launch. When the workspace comes
+  from the task rather than the project, the worktree-isolation check uses the task's own
+  `repository_path` as the source repository (`launch_service.prepare_task_launch`, `744a09c`), so
+  a project spanning more than one repository no longer produces a false
+  `workspace_belongs_to_repository` failure.
 - Application-owned execution-queue mutations hold a same-host cooperative OS advisory lock across
   the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
 - `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
@@ -44,26 +48,39 @@ Current position:
   `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
-- Founder Functional Audit `9761459` is **closed** (2026-08-07). Of its 14 Still Open rows, 6 are
-  remediated and verified on `main` (report-path containment, per-warning launch acknowledgement,
+- Founder Functional Audit `9761459` is **closed** (2026-08-07, re-verified against `main`
+  @ `744a09c`). Of its 14 Still Open rows, 7 are remediated and verified on `main` (report-path
+  containment, per-warning launch acknowledgement, Portfolio protected-branch guard,
   task-delete confirmation, `claude` pre-flight, Workspace Home intelligence, git ahead/behind +
   fetch), 1 is partial (Portfolio stale-claim recovery: service half only), 1 is folded into the
-  desktop D2 stage tasks, and 6 remain open as `AICC-AUDIT-W*` rows in
+  desktop D2 stage tasks, and 5 remain open as `AICC-AUDIT-W*` rows in
   `docs/roadmap/MASTER_ROADMAP_TASKS.json`. See
   `docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §Closure.
 
 Current boundaries:
-- Six audit remediations remain outstanding and are the known functional gaps: `scripts/start-task.sh`
-  accepts 3 of the 11 registered project ids; Portfolio has no protected-branch guard before
-  `git worktree add`; there is no canonical task schema and no dependency-cycle detection; run
-  results reach a task's Timeline only page-driven or under `AICC_BACKGROUND_SYNC`; and the
-  autopilot has no founder batch-confirmation surface before it launches.
+- Five audit remediations remain outstanding and are the known functional gaps: `scripts/start-task.sh`
+  accepts 3 of the 11 registered project ids; there is no canonical task schema; there is no
+  dependency-cycle detection on task writes (cycles surface only as a read-only `break_cycle`
+  recommendation in Portfolio Overview); run results reach a task's Timeline only page-driven or
+  under `AICC_BACKGROUND_SYNC`; and the autopilot has no founder batch-confirmation surface before
+  it launches.
+- Portfolio now refuses `main`/`master` (and their case variants) as a task branch before
+  `git worktree add` runs — `portfolio_launch.PROTECTED_BRANCH_NAMES`, checked on the
+  `launch_portfolio_task` → `build_launch_plan` → `resolve_branch` path, which returns the blocker
+  before `create_worktree` is called. Stale-claim recovery is still service-only:
+  `recover_stale_claim` exists but has no production call site, so an orphaned claim is still
+  cleared by deleting `data/portfolio_locks/<task_id>.lock` by hand.
 - `data/tasks.json` is out of sync with the roadmap for the audit-remediation track: it holds 7 of
-  13 `AICC-AUDIT-W*` rows and three of those contradict `main`. Reconciliation is tracked as
-  `AICC-GOV-F2`; a refreshed audit against current `main` is tracked as `AICC-GOV-F4B`.
+  13 `AICC-AUDIT-W*` rows, and only 2 of those 7 both are correct and read correctly. Three carry a
+  status contradicting `main` (`W0-006` and `W1-004` sit in `Backlog` though shipped; `W1-005` is
+  still `In Progress` against a closed PR though the fix has shipped) and two more (`W1-007`,
+  `W2-004`) are `Done` and correct but read as failed in the UI. `launch_status` is
+  `"Requires Attention"` on 6 of the 7 and carries no signal on this track. Reconciliation is
+  tracked as `AICC-GOV-F2`; a refreshed audit against current `main` is tracked as `AICC-GOV-F4B`.
 - **Known regression on `main`:** `app.py:3339` calls the removed
   `execution_queue.reconcile_missing_run_links`, so rendering the Live Execution Center raises
-  `AttributeError`. Introduced by `81833da`; untracked as of this update.
+  `AttributeError`. Introduced by `81833da`; confirmed still present at `744a09c` and untracked as
+  of this update.
 - Normal task launches require explicit user action. Scheduler `ASSIGN` results are point-in-time
   advice, not persisted claims; task-id/capacity decisions may race before the separate launch, and
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
