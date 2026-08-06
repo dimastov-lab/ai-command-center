@@ -185,7 +185,7 @@ def test_create_update_delete_and_import_all_share_one_lock_and_lose_nothing(tmp
     processes = [
         ctx.Process(target=_mp_create_worker, args=(data_dir, "AIOS", 5, "MIXCREATE", barrier)),
         ctx.Process(target=_mp_import_worker, args=(data_dir, import_ids, barrier)),
-        ctx.Process(target=_mp_update_status_worker, args=(data_dir, to_update["id"], "Done", barrier)),
+        ctx.Process(target=_mp_update_status_worker, args=(data_dir, to_update["id"], "Review", barrier)),
         ctx.Process(target=_mp_delete_worker, args=(data_dir, to_delete["id"], barrier)),
     ]
     for p in processes:
@@ -199,7 +199,7 @@ def test_create_update_delete_and_import_all_share_one_lock_and_lose_nothing(tmp
     # 2 seeded - 1 deleted + 5 created + 5 imported = 11
     assert len(stored) == 11, f"expected 11 records, got {len(stored)}"
     assert to_delete["id"] not in stored
-    assert stored[to_update["id"]]["status"] == "Done"
+    assert stored[to_update["id"]]["status"] == "Review"
     assert set(import_ids) <= set(stored.keys())
     created_titles = {t["title"] for t in stored.values() if t["title"].startswith("MIXCREATE")}
     assert len(created_titles) == 5

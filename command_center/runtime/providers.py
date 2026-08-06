@@ -691,12 +691,13 @@ class ClaudeProvider:
             model=model,
             untrusted=untrusted,
             operator_elevated=operator_elevated,
+            prompt_in_argv=False,
         )
         return LaunchSpec(
             argv=tuple(argv),
             environment=dict(os.environ),
-            stdin_text=None,
-            audit_metadata={"provider_id": self.id, **_prompt_audit(prompt, "argv")},
+            stdin_text=prompt,
+            audit_metadata={"provider_id": self.id, **_prompt_audit(prompt, "stdin")},
         )
 
     @staticmethod

@@ -85,6 +85,24 @@
   }
 }
 
+.execution-header, .execution-footer { padding: 1rem 1.5rem; display: flex; align-items: center; justify-content: space-between; gap: .8rem; flex-wrap: wrap; }
+.execution-header h1 { margin: 0; color: var(--tx); font-size: 1.15rem; }
+.execution-header p { margin: .2rem 0 0; color: var(--tx3); font-size: .78rem; }
+.execution-back { border: 1px solid var(--gline); border-radius: 10px; padding: .55rem .9rem; color: var(--tx); background: rgba(255,255,255,.04); cursor: pointer; }
+.execution-layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 1.25rem; align-items: start; }
+.execution-nav { padding: 1rem; display: grid; gap: .25rem; position: sticky; top: 1.5rem; }
+.execution-main { display: flex; flex-direction: column; gap: 1.25rem; min-width: 0; }
+.execution-filters { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+.execution-filters button { border: 1px solid var(--gline); border-radius: 999px; padding: .4rem .7rem; color: var(--tx3); background: transparent; cursor: pointer; font-size: .7rem; }
+.execution-filters button.active { color: var(--tx); border-color: var(--accent-2); background: rgba(124,92,255,.16); }
+.execution-list { display: grid; gap: .55rem; }
+.execution-row { border: 1px solid var(--gline); border-radius: 12px; padding: .8rem .9rem; background: rgba(255,255,255,.025); display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(280px, 1fr); gap: 1rem; }
+.execution-primary, .execution-meta { display: grid; gap: .28rem; min-width: 0; }
+.execution-primary strong { color: var(--tx); font-size: .84rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.execution-primary > span:last-child, .execution-meta span { color: var(--tx3); font-size: .7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.execution-state { font-size: .64rem; font-weight: 700; letter-spacing: .08em; }
+@media (max-width: 760px) { .execution-layout { grid-template-columns: 1fr; } .execution-nav { position: static; grid-template-columns: 1fr 1fr; } .execution-row { grid-template-columns: 1fr; } }
+
 .split-grid {
   display: grid;
   grid-template-columns: 1.2fr 1fr;

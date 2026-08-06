@@ -254,3 +254,71 @@ def serialize_home(snap: dict[str, Any]) -> dict[str, Any]:
         "overview": _overview(snap, activity),
         "status": _status(raw_projects),
     }
+
+
+def serialize_execution(snap: dict[str, Any]) -> dict[str, Any]:
+    """Map the workspace snapshot to the public, read-only Execution DTO.
+
+    Sensitive projects are excluded row-for-row. The snapshot already applies
+    field allowlists, but exclusion prevents even lifecycle metadata from
+    revealing BANK/LEGAL activity on the public web surface.
+    """
+    raw_projects = snap.get("projects") or []
+    sensitive_ids = {p.get("id") for p in raw_projects if _is_sensitive(p)}
+    project_names = {
+        p.get("id"): p.get("name") or p.get("display_name") or p.get("id")
+        for p in raw_projects
+        if not _is_sensitive(p)
+    }
+    active = _active_runs(snap)
+    recent = snap.get("recent_runs") or []
+    reports = {
+        (r.get("source"), r.get("run_id")): r
+        for r in (snap.get("reports") or [])
+        if r.get("project") not in sensitive_ids
+    }
+
+    runs: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any]] = set()
+    for run in [*active, *recent]:
+        if run.get("project") in sensitive_ids:
+            continue
+        identity = (run.get("source"), run.get("run_id") or run.get("id"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        report = reports.get(identity) or {}
+        runs.append(
+            {
+                "id": identity[1] or "",
+                "source": identity[0] or "",
+                "title": run.get("title") or run.get("task_type") or identity[1] or "Run",
+                "project": run.get("project") or "",
+                "project_name": project_names.get(run.get("project"), run.get("project") or ""),
+                "task_type": run.get("task_type") or "",
+                "state": run.get("state") or run.get("status") or "UNKNOWN",
+                "created_at": run.get("created_at"),
+                "started_at": run.get("started_at"),
+                "completed_at": run.get("completed_at"),
+                "duration_seconds": run.get("duration_seconds"),
+                "exit_code": run.get("exit_code"),
+                "failure_reason": run.get("failure_reason"),
+                "verdict": report.get("verdict"),
+            }
+        )
+
+    state_counts = {state: 0 for state in ("PREPARED", "QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "UNKNOWN")}
+    for run in runs:
+        state = run["state"]
+        state_counts[state] = state_counts.get(state, 0) + 1
+
+    return {
+        "summary": {
+            "visible_runs": len(runs),
+            "active": sum(state_counts.get(s, 0) for s in ("PREPARED", "QUEUED", "RUNNING")),
+            "completed": state_counts.get("COMPLETED", 0),
+            "needs_attention": sum(state_counts.get(s, 0) for s in ("FAILED", "INTERRUPTED", "UNKNOWN")),
+        },
+        "state_counts": state_counts,
+        "runs": runs,
+    }

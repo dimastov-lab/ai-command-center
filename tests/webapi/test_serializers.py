@@ -13,7 +13,7 @@ output DTO field is derived from these real keys.
 
 from __future__ import annotations
 
-from command_center.webapi.serializers import serialize_home
+from command_center.webapi.serializers import serialize_execution, serialize_home
 from command_center.workspace_home import _ACTIVITY_ALLOWED_FIELDS, _RUN_ALLOWED_FIELDS
 
 
@@ -312,3 +312,28 @@ def test_serialize_home_activity_feed_excludes_sensitive_project_rows():
 
     assert [a["project"] for a in out["activity"]] == ["AICC"]
     assert out["overview"]["recent_activity_count"] == 1
+
+
+def test_serialize_execution_excludes_sensitive_runs_and_reports_real_states():
+    snap = _snapshot(
+        recent_runs=[
+            {
+                "run_id": "done-1", "source": "v2", "project": "AICC",
+                "task_type": "review", "state": "COMPLETED", "exit_code": 0,
+                "created_at": "2026-07-28T08:00:00", "duration_seconds": 42,
+            },
+            {
+                "run_id": "bank-1", "source": "v2", "project": "BANK",
+                "task_type": "implementation", "state": "FAILED", "exit_code": 1,
+            },
+        ]
+    )
+
+    out = serialize_execution(snap)
+
+    assert [run["id"] for run in out["runs"]] == ["r1", "r2", "done-1"]
+    assert out["summary"] == {"visible_runs": 3, "active": 2, "completed": 1, "needs_attention": 0}
+    assert out["state_counts"]["RUNNING"] == 1
+    assert out["state_counts"]["QUEUED"] == 1
+    assert out["state_counts"]["COMPLETED"] == 1
+    assert all(run["project"] != "BANK" for run in out["runs"])

@@ -1,3 +1,4 @@
+import json
 import subprocess
 
 from command_center import report_parser
@@ -201,6 +202,38 @@ def test_sync_task_from_run_session_expired_triggers_executor_failover(tmp_path)
     assert task["launch_status"] == "Ready"
     assert task.get("failed_executors") == ["claude_code"]
     assert task["timeline"][-1]["type"] == "executor_failed"
+
+
+def test_provider_failure_projection_is_idempotent_across_refresh_and_restart(tmp_path):
+    """A provider failure returns the task to Ready, but repeated read-model
+    reconciliation must not manufacture another terminal event pair."""
+    db_path = tmp_path / "runtime-idempotent-provider.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path,
+        state="FAILED",
+        completed_at="2026-01-01T00:01:00",
+        failure_reason="provider_api_error",
+        provider_id="claude_code",
+    )
+    task = _make_task(executor="claude_code")
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is True
+    first_events = list(task["timeline"])
+    assert task["launch_status"] == "Ready"
+    assert task["terminal_projection_run_id"] == run["id"]
+
+    for _ in range(100):
+        # JSON round-trip models a fresh Streamlit process/restart.
+        restarted_task = json.loads(json.dumps(task))
+        assert task_sync.sync_task_from_run(restarted_task, run, db_path=db_path) is False
+        assert restarted_task["timeline"] == first_events
+        task = restarted_task
+
+    assert [event["type"] for event in task["timeline"]].count(
+        "launch_requires_attention"
+    ) == 1
+    assert [event["type"] for event in task["timeline"]].count("executor_failed") == 1
 
 
 def test_sync_task_from_run_quota_limit_triggers_executor_failover(tmp_path):

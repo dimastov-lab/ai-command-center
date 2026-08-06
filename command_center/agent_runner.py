@@ -111,6 +111,7 @@ PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
 READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
 # empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
@@ -137,15 +138,12 @@ PERMISSION_MODE_BY_PROFILE: dict[str, str] = {
 
 
 def profile_for_task_type(task_type: str) -> str:
-    """The execution profile a `task_type` resolves to: `PROFILE_READ_ONLY`
-    for exactly `READ_ONLY_TASK_TYPES`, `PROFILE_TRUSTED_DEVELOPMENT` for
-    everything else — the same membership check `build_command`/
-    `runtime.supervisor.build_claude_command` already branched on before
-    this was named, preserved exactly (an unrecognized/future task_type
-    still resolves to `PROFILE_TRUSTED_DEVELOPMENT`, matching that existing
-    "else" branch; `READ_ONLY_TASK_TYPES` is the explicit allow-list here,
-    not the other way around)."""
-    return PROFILE_READ_ONLY if task_type in READ_ONLY_TASK_TYPES else PROFILE_TRUSTED_DEVELOPMENT
+    """Resolve capabilities with mutation denied unless explicitly allowed.
+
+    Only reviewed implementation/remediation types receive development
+    capabilities. Unknown and future task types fail closed as read-only.
+    """
+    return PROFILE_TRUSTED_DEVELOPMENT if task_type in MUTATING_TASK_TYPES else PROFILE_READ_ONLY
 
 
 def is_untrusted_source(source: str | None) -> bool:
@@ -177,7 +175,7 @@ def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevat
     explicitly elevated it — so a malicious imported task cannot silently obtain
     arbitrary local shell. A trusted (operator-authored) task is unchanged, so
     with `untrusted=False` this is identical to `profile_for_task_type`."""
-    if task_type in READ_ONLY_TASK_TYPES:
+    if task_type not in MUTATING_TASK_TYPES:
         return PROFILE_READ_ONLY
     if untrusted and not operator_elevated:
         return PROFILE_READ_ONLY
@@ -266,8 +264,34 @@ class RunnerError(Exception):
     """Raised when a run cannot even be attempted (validation failure)."""
 
 
-def claude_cli_available() -> bool:
-    return shutil.which(CLAUDE_BINARY) is not None
+def claude_cli_available(binary: str | None = None) -> bool:
+    """Is the Claude Code CLI resolvable on PATH?
+
+    `binary` lets a caller probe the executable *its own* launch path will
+    exec rather than this module's `CLAUDE_BINARY`: the v2 Session Supervisor
+    resolves its own (`runtime.supervisor.CLAUDE_BINARY`, honouring
+    `AICC_CLAUDE_BINARY`), so a preflight for a v2 launch must ask about that
+    one — otherwise it reports on a binary nobody is going to run."""
+    return shutil.which(binary or CLAUDE_BINARY) is not None
+
+
+def claude_cli_preflight(binary: str | None = None) -> tuple[bool, str]:
+    """`(available, message)` for the Claude Code CLI — the same probe as
+    `claude_cli_available`, plus the operator-facing explanation to render
+    when it fails.
+
+    Exists so a launch entry point can state the reason *before* the operator
+    walks a confirmation flow, instead of surfacing a bare `FileNotFoundError`
+    at exec time (audit MINOR-2). Project Chat keeps its own, mode-specific
+    wording for the same probe (`chat_service.ClaudeCodeChatProvider`)."""
+    resolved = binary or CLAUDE_BINARY
+    if claude_cli_available(resolved):
+        return True, ""
+    return False, (
+        f"CLI `{resolved}` не найден в PATH — запуск Claude Code завершится ошибкой ещё до "
+        "старта агента. Установите Claude Code (`npm install -g @anthropic-ai/claude-code`) "
+        "и убедитесь, что бинарник доступен в PATH, либо выберите другой execution provider."
+    )
 
 
 def validate_repository(project_id: str, repository_path: str) -> Path:
@@ -666,11 +690,9 @@ def resolve_report_path(run: dict) -> Path | None:
     Runs/Reports pages. Returns None (never raises) if `report_path` is missing or
     resolves outside REPORTS_ROOT.
     """
-    report_path = run.get("report_path")
-    if not report_path:
-        return None
-    candidate = (ROOT / report_path).resolve()
-    reports_root = REPORTS_ROOT.resolve()
-    if candidate != reports_root and reports_root not in candidate.parents:
-        return None
-    return candidate
+    # One resolver serves both runtime generations.  In particular, it must
+    # not join the stored reference to the code root when AICC_REPORTS_ROOT is
+    # configured independently.
+    from command_center.runtime import reports as runtime_reports
+
+    return runtime_reports.resolve_report_path(run.get("report_path"))

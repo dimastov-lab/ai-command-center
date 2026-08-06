@@ -79,6 +79,10 @@ REVIEW_VERDICT_REJECTED = "rejected"
 _BACKOFF_BASE_SECONDS = 30
 _BACKOFF_CAP_SECONDS = 3600
 _MAX_STEPS_PER_ADVANCE = 8
+# One completion-side git action is capped at 60s; the longest local commit
+# path can execute three such commands. Five minutes leaves a safety margin and
+# prevents the scheduler lease from expiring during a privileged side effect.
+_PUBLICATION_FENCE_EXTENSION = timedelta(minutes=5)
 DEFAULT_REMOTE = "origin"
 DEFAULT_BASE_BRANCH = "main"
 MERGE_LOCK_FILE_NAME = "completion_merge.lock"
@@ -115,6 +119,10 @@ class MergeSlotBusyError(RuntimeError):
     """Another completion currently owns the one global merge slot."""
 
 
+class CompletionFenceLostError(RuntimeError):
+    """A persisted scheduler fence closed before a publication side effect."""
+
+
 class CompletionOrchestrator:
     """Advances completion rows. Dependencies (GitHub client, evaluator) are
     injected so tests can substitute in-memory doubles and a fixed clock."""
@@ -125,10 +133,85 @@ class CompletionOrchestrator:
         *,
         github: object | None = None,
         evaluator: CompletionEvaluator | None = None,
+        publication_fence_clock=None,
     ) -> None:
         self.db_path = db_path
         self.github = github if github is not None else GitHubClient()
         self.evaluator = evaluator or CompletionEvaluator()
+        self._publication_fence_clock = publication_fence_clock or (
+            lambda: datetime.now().astimezone()
+        )
+
+    def _assert_publication_fence(
+        self,
+        row: dict,
+        *,
+        policy: CompletionPolicy | None = None,
+        renew_for_action: bool = False,
+    ) -> None:
+        """Fail closed when a fenced daily campaign no longer owns a live lease."""
+        policy = policy or CompletionPolicy.from_json(row.get("policy_json"))
+        campaign_id = policy.publication_fence_campaign_id
+        owner = policy.publication_fence_owner
+        if not campaign_id and not owner:
+            return
+        if not campaign_id or not owner:
+            raise CompletionFenceLostError("publication fence policy is incomplete")
+        try:
+            with runtime_db.connect(self.db_path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                schedule = connection.execute(
+                    """SELECT active_campaign_id, lease_owner, lease_until
+                       FROM daily_audit_schedule WHERE singleton = 1"""
+                ).fetchone()
+                if schedule is None or not schedule["lease_until"]:
+                    raise CompletionFenceLostError("daily-audit lease is absent")
+                try:
+                    lease_until = datetime.fromisoformat(schedule["lease_until"])
+                except (TypeError, ValueError) as exc:
+                    raise CompletionFenceLostError(
+                        "daily-audit lease timestamp is malformed"
+                    ) from exc
+                checked_at = self._publication_fence_clock()
+                if lease_until.tzinfo is not None:
+                    checked_at = checked_at.astimezone(lease_until.tzinfo)
+                elif checked_at.tzinfo is not None:
+                    checked_at = checked_at.replace(tzinfo=None)
+                if (
+                    schedule["active_campaign_id"] != campaign_id
+                    or schedule["lease_owner"] != owner
+                    or lease_until <= checked_at
+                ):
+                    raise CompletionFenceLostError(
+                        f"daily-audit campaign {campaign_id!r} no longer owns a live lease"
+                    )
+                if renew_for_action:
+                    extended_until = max(
+                        lease_until,
+                        checked_at + _PUBLICATION_FENCE_EXTENSION,
+                    )
+                    cursor = connection.execute(
+                        """UPDATE daily_audit_schedule
+                           SET lease_until = ?, updated_at = ?
+                           WHERE singleton = 1 AND active_campaign_id = ?
+                             AND lease_owner = ? AND lease_until = ?""",
+                        (
+                            extended_until.isoformat(),
+                            checked_at.isoformat(),
+                            campaign_id,
+                            owner,
+                            schedule["lease_until"],
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise CompletionFenceLostError(
+                            "daily-audit lease changed before publication renewal"
+                        )
+                connection.commit()
+        except CompletionFenceLostError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a publication fence must fail closed
+            raise CompletionFenceLostError("publication fence state is unavailable") from exc
 
     # -- seeding ------------------------------------------------------------------
     def begin_completion(
@@ -207,11 +290,13 @@ class CompletionOrchestrator:
             return AdvanceResult(run_id, start_state, start_state, row["last_reason_code"], changed=False)
 
         steps = 0
+        policy = CompletionPolicy.from_json(row.get("policy_json"))
         while steps < _MAX_STEPS_PER_ADVANCE:
             steps += 1
             state = row["completion_state"]
             if state in _TERMINAL:
                 break
+            self._assert_publication_fence(row, policy=policy)
             new_row, progressed = self._step(row, now=now)
             row = new_row
             if not progressed:
@@ -225,6 +310,86 @@ class CompletionOrchestrator:
             changed=row["completion_state"] != start_state,
         )
 
+    def advance_safely(
+        self,
+        run_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> AdvanceResult | None:
+        """Advance one named row with the same retry/concurrency envelope as the poller.
+
+        This targeted entry point is useful to a campaign that owns one
+        completion and must not advance unrelated due rows. Expected transient
+        and concurrency failures are persisted or treated as benign; they never
+        escape and accidentally restart the owning campaign from scratch.
+        """
+        now = now or _now()
+        try:
+            return self.advance(run_id, now=now)
+        except runtime_db.LostUpdateError:
+            # Another advancer won the compare-and-set race. Its persisted state
+            # is authoritative; this row can be observed again on the next poll.
+            return None
+        except CompletionFenceLostError as exc:
+            fresh = runtime_db.get_completion(self.db_path, run_id)
+            if fresh is None or fresh["completion_state"] in _TERMINAL:
+                return None
+            try:
+                self._mark_attention(
+                    fresh,
+                    now=now,
+                    reason_code=ReasonCode.PUBLICATION_FENCE_LOST,
+                    recommended=f"Publication cancelled: {exc}.",
+                )
+            except runtime_db.LostUpdateError:
+                pass
+            return None
+        except runtime_db.InvalidCompletionTransitionError as exc:
+            fresh = runtime_db.get_completion(self.db_path, run_id)
+            if fresh is None or fresh["completion_state"] in _TERMINAL:
+                return None
+            try:
+                self._mark_attention(
+                    fresh,
+                    now=now,
+                    reason_code=ReasonCode.RETRY_LIMIT_REACHED,
+                    recommended=f"Illegal completion transition: {exc}",
+                )
+            except runtime_db.LostUpdateError:
+                pass
+            return None
+        except (GitHubError, git_ops.GitOpsError) as exc:
+            try:
+                self._schedule_retry(
+                    run_id,
+                    now=now,
+                    reason_code=ReasonCode.RETRY_LIMIT_REACHED,
+                    message=f"Transient failure, will retry: {exc}",
+                )
+            except runtime_db.LostUpdateError:
+                pass
+            return None
+        except MergeSlotBusyError:
+            try:
+                self._defer_for_merge_slot(run_id, now=now)
+            except runtime_db.LostUpdateError:
+                pass
+            return None
+        except Exception as exc:  # noqa: BLE001 - isolate one completion failure
+            fresh = runtime_db.get_completion(self.db_path, run_id)
+            if fresh is None:
+                return None
+            try:
+                self._mark_attention(
+                    fresh,
+                    now=now,
+                    reason_code=ReasonCode.RETRY_LIMIT_REACHED,
+                    recommended=f"Completion advance failed: {exc}",
+                )
+            except (KeyError, runtime_db.LostUpdateError):
+                pass
+            return None
+
     def advance_pending(
         self, *, now: datetime | None = None, limit: int = 50
     ) -> list[AdvanceResult]:
@@ -237,58 +402,9 @@ class CompletionOrchestrator:
         )
         results: list[AdvanceResult] = []
         for row in due:
-            try:
-                results.append(self.advance(row["run_id"], now=now))
-            except runtime_db.LostUpdateError:
-                # Benign concurrent progress: another advancer (a second
-                # autopilot tick, an on-demand `advance_completions` call) won
-                # the compare-and-set race and already moved this row forward.
-                # This is NOT a failure — the winning actor's transition is
-                # persisted and correct. Skip without terminalizing the row and
-                # without bumping any retry/recovery counter; the row (if still
-                # non-terminal) is simply picked up on the next due poll.
-                continue
-            except runtime_db.InvalidCompletionTransitionError as exc:
-                # Defense in depth. With CAS-before-guard ordering in
-                # `db.update_completion`, a stale advancer now loses with
-                # `LostUpdateError`, so reaching here means the transition was
-                # illegal at the *current* row version. Re-read to separate a
-                # benign race (another worker already terminalized or removed the
-                # row — its result stands) from a genuine state-machine error,
-                # and never abort the batch either way.
-                fresh = runtime_db.get_completion(self.db_path, row["run_id"])
-                if fresh is None or fresh["completion_state"] in _TERMINAL:
-                    continue
-                self._mark_attention(
-                    fresh, now=now, reason_code=ReasonCode.RETRY_LIMIT_REACHED,
-                    recommended=f"Illegal completion transition: {exc}",
-                )
-            except (GitHubError, git_ops.GitOpsError) as exc:
-                # Transient infrastructure failure (GitHub/network/git remote):
-                # schedule a backoff retry rather than giving up. Repeated
-                # failures eventually escalate to REQUIRES_ATTENTION.
-                self._schedule_retry(
-                    row["run_id"], now=now, reason_code=ReasonCode.RETRY_LIMIT_REACHED,
-                    message=f"Transient failure, will retry: {exc}",
-                )
-            except MergeSlotBusyError:
-                self._defer_for_merge_slot(row["run_id"], now=now)
-            except Exception as exc:  # noqa: BLE001 - isolate one row's failure
-                fresh = runtime_db.get_completion(self.db_path, row["run_id"])
-                if fresh is None:
-                    # The completion row genuinely disappeared between listing
-                    # and advancing — its run/task was deleted and the row
-                    # cascaded away (legitimate concurrent cleanup). There is
-                    # nothing left to escalate: skip. (This also guards
-                    # `_mark_attention` itself, whose CAS would otherwise raise
-                    # a fresh KeyError against the now-missing row.)
-                    continue
-                self._mark_attention(
-                    fresh,
-                    now=now,
-                    reason_code=ReasonCode.RETRY_LIMIT_REACHED,
-                    recommended=f"Completion advance failed: {exc}",
-                )
+            result = self.advance_safely(row["run_id"], now=now)
+            if result is not None:
+                results.append(result)
         return results
 
     def request_manual_merge(
@@ -510,6 +626,9 @@ class CompletionOrchestrator:
         # own linked worktree is ever touched (isolation enforced upstream).
         if pre.reason_code == ReasonCode.UNCOMMITTED_CHANGES:
             try:
+                self._assert_publication_fence(
+                    row, policy=policy, renew_for_action=True
+                )
                 git_ops.commit_all(
                     Path(repo),
                     message=f"{(task or {}).get('title') or 'task'} (agent run {row['run_id'][:8]})",
@@ -738,6 +857,7 @@ class CompletionOrchestrator:
                 self.db_path, row["run_id"], EV_REMOTE_BRANCH_MISSING, reason_code=ReasonCode.PR_MISSING,
                 message=f"Remote branch {branch!r} missing; pushing.",
             )
+        self._assert_publication_fence(row, policy=policy, renew_for_action=True)
         git_ops.push_branch(repo, remote=remote, branch=branch)
         # First-time publication of this branch on the remote — not a recovery
         # recreation (that path lives in `_recover_pull_request` and keeps the
@@ -761,6 +881,7 @@ class CompletionOrchestrator:
             )
         else:
             title, body = _pr_content(task, row, rstate, base_branch=base_branch, branch=branch)
+            self._assert_publication_fence(row, policy=policy, renew_for_action=True)
             pr = self.github.create_pull_request(repo, base=base_branch, head=branch, title=title, body=body)
             runtime_db.append_completion_event(
                 self.db_path, row["run_id"], EV_PR_CREATED, reason_code=ReasonCode.PR_OPEN,
@@ -800,6 +921,9 @@ class CompletionOrchestrator:
             # restart: if a replacement already exists, the evaluator would have
             # seen an OPEN PR and never reached this recovery path.
             if not rstate.remote_branch_exists:
+                self._assert_publication_fence(
+                    row, policy=policy, renew_for_action=True
+                )
                 git_ops.push_branch(repo, remote=remote, branch=branch)
                 runtime_db.append_completion_event(
                     self.db_path, row["run_id"], EV_REMOTE_BRANCH_RECREATED,
@@ -812,6 +936,9 @@ class CompletionOrchestrator:
                 title, body = _pr_content(
                     task, row, rstate, base_branch=base_branch, branch=branch, replaced_pr=closed_number
                 )
+                self._assert_publication_fence(
+                    row, policy=policy, renew_for_action=True
+                )
                 replacement = self.github.create_pull_request(
                     repo, base=base_branch, head=branch, title=title, body=body
                 )
@@ -820,6 +947,8 @@ class CompletionOrchestrator:
                 message=f"Replacement pull request #{replacement.number} for closed #{closed_number}.",
                 metadata={"replacement_pr": replacement.number, "replaced_pr": closed_number},
             )
+        except CompletionFenceLostError:
+            raise
         except Exception as exc:  # noqa: BLE001
             runtime_db.append_completion_event(
                 self.db_path, row["run_id"], EV_RECOVERY_FAILED, reason_code=ReasonCode.RECOVERY_NOT_POSSIBLE,
@@ -869,6 +998,9 @@ class CompletionOrchestrator:
                         f"Completion {row['run_id']!r} changed before merge."
                     )
                 repo = Path(fresh["repository_path"])
+                self._assert_publication_fence(
+                    fresh, policy=policy, renew_for_action=True
+                )
                 runtime_db.append_completion_event(
                     self.db_path, fresh["run_id"], EV_MERGE_STARTED,
                     reason_code=ReasonCode.READY_TO_MERGE,
