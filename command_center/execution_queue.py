@@ -405,63 +405,99 @@ LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR = "no_available_executor"
 
 
 def select_available_executor(
-    task: dict, cfg: dict, *, preferred_executor: str | None = None
+    task: dict,
+    cfg: dict,
+    *,
+    preferred_executor: str | None = None,
+    load_snapshot=None,
 ) -> str | None:
-    """Pick the first *available* executor for this task, trying them in
-    preference order and skipping any that already failed to start
-    (``task["failed_executors"]``) or whose binary is unreachable
-    (``provider.availability()``).
+    """Pick the best *available* executor for this task.
 
-    Preference order: the task's own ``executor`` first (the configured
-    choice), then the remaining ``allowed_agents`` from the project config in
-    listed order. A provider whose ``availability()`` probe returns
-    ``available=False`` is skipped — so a machine without ``codex`` or with
-    an uninstalled ``ollama`` is never selected. A provider already in
-    ``task["failed_executors"]`` (set by ``task_sync`` when a run died on
-    startup with no output — e.g. an expired OAuth token that
-    ``availability()`` cannot detect) is also skipped, so the next launch
-    automatically falls through to the next agent in the chain without
-    manual intervention.
+    When ``load_snapshot`` is a ``scheduler.LoadSnapshot`` (built once per
+    ``launch_ready`` batch from ``runtime.db``), the selection is
+    **load-aware**: among all viable candidates the executor with the most
+    spare concurrency capacity is chosen, so idle agents are preferred over
+    ones already running tasks. The explicitly configured executor (the
+    task's own ``executor`` or the caller's ``preferred_executor``) is still
+    tried first — but only if it has capacity; if it is at its concurrency
+    limit and another executor has spare slots, the other one wins.
 
-    Returns ``None`` when every allowed executor is unavailable or has
-    already failed — the caller skips the launch with
-    ``LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`` so the task stays queued for an
-    operator to fix the agent (re-authenticate, install, …) rather than
-    silently doing nothing.
+    Capability check: ``ollama`` (and any future capability-restricted
+    executor) is only eligible for task types it can actually run —
+    read-only types (review, audit, …). An implementation task silently
+    skips ``ollama`` rather than dispatching to a provider that will refuse
+    it at launch time.
+
+    A provider whose ``availability()`` probe returns ``available=False``
+    (binary missing, daemon unreachable, …) is never selected. A provider
+    already in ``task["failed_executors"]`` (set by ``task_sync`` when a run
+    died at startup) is also skipped, triggering automatic fallover to the
+    next eligible agent.
+
+    Returns ``None`` when every allowed executor is ineligible — the caller
+    emits ``LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`` and the task stays queued.
     """
     from command_center.runtime import providers as runtime_providers
+    from command_center.runtime import scheduler as runtime_scheduler
 
     allowed = list(cfg.get("allowed_agents") or [])
-    configured = (
-        preferred_executor
-        or task.get("executor")
-        or (allowed[0] if allowed else "claude_code")
-    )
-
-    # Preference order: configured executor first, then the rest of allowed.
-    tried: set[str] = set()
-    preference: list[str] = []
-    if configured not in tried:
-        preference.append(configured)
-        tried.add(configured)
-    for aid in allowed:
-        if aid not in tried:
-            preference.append(aid)
-            tried.add(aid)
-
+    explicit_executor = preferred_executor or task.get("executor")
+    task_type = task.get("task_type") or "implementation"
+    required_caps = runtime_scheduler.capabilities_for_task_type(task_type)
     failed = set(task.get("failed_executors") or [])
 
-    for executor_id in preference:
-        if executor_id in failed:
-            continue
-        provider = runtime_providers.get_provider(executor_id)
-        if provider is None:
-            continue
-        if not provider.availability().available:
-            continue
-        return executor_id
+    running_by_executor: dict[str, int] = {}
+    if load_snapshot is not None:
+        running_by_executor = dict(load_snapshot.running_by_agent)
 
-    return None
+    def _viable(executor_id: str) -> bool:
+        if executor_id in failed:
+            return False
+        try:
+            provider = runtime_providers.get_provider(executor_id)
+        except ValueError:
+            return False
+        if not provider.availability().available:
+            return False
+        # Capability gate: ollama only matches read-only task types.
+        executor_caps = runtime_scheduler.capabilities_for_executor(executor_id)
+        if runtime_scheduler.CAP_ANY not in executor_caps:
+            if not (required_caps <= executor_caps):
+                return False
+        return True
+
+    # Build a deduped candidate list: explicit executor first (if any),
+    # then the rest of allowed_agents in configured order. When neither
+    # an explicit executor nor allowed_agents is configured, fall back to
+    # "claude_code" (the system default) so unconfigured tasks still launch.
+    all_ids: list[str] = []
+    seen: set[str] = set()
+    if explicit_executor:
+        all_ids.append(explicit_executor)
+        seen.add(explicit_executor)
+    for eid in allowed:
+        if eid not in seen:
+            all_ids.append(eid)
+            seen.add(eid)
+    if not all_ids:
+        all_ids = ["claude_code"]
+
+    DEFAULT_MAX_CONCURRENCY = 2
+    candidates: list[tuple[str, int, bool]] = []  # (executor_id, spare, is_explicit)
+    for executor_id in all_ids:
+        if not _viable(executor_id):
+            continue
+        spare = DEFAULT_MAX_CONCURRENCY - running_by_executor.get(executor_id, 0)
+        candidates.append((executor_id, spare, executor_id == explicit_executor))
+
+    if not candidates:
+        return None
+
+    # Sort: most spare capacity first; explicit executor wins on equal capacity.
+    # Python's sort is stable, so configured list order is the tiebreak when
+    # spare capacity and explicit-flag are both equal.
+    candidates.sort(key=lambda c: (-c[1], not c[2]))
+    return candidates[0][0]
 
 
 def select_remediation_executor(task: dict, cfg: dict) -> str | None:
@@ -584,6 +620,16 @@ def launch_ready(
     # subprocess spawn.
     launched_patches: dict[str, dict] = {}
 
+    # Build a load snapshot once for the whole batch so executor selection is
+    # capacity-aware. A single read avoids repeated DB round-trips and ensures
+    # all entries in this batch see the same baseline load (intra-batch launches
+    # are reflected by the global concurrency counter, not this snapshot).
+    try:
+        from command_center.runtime import scheduler as _sched
+        _load_snapshot = _sched.build_load_snapshot(runtime_db.resolve_db_path(root))
+    except Exception:  # noqa: BLE001
+        _load_snapshot = None
+
     # Global concurrency cap (audit H3). launch_ready is a direct entry point
     # (the queue's "launch all READY" button, portfolio launches) that bypasses
     # the scheduler's cap, so a batch could spawn one agent per READY entry
@@ -687,6 +733,7 @@ def launch_ready(
             task,
             cfg,
             preferred_executor=planned_executor,
+            load_snapshot=_load_snapshot,
         )
         if selected_executor is None:
             results.append(
