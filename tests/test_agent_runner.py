@@ -186,12 +186,8 @@ def test_profile_for_task_type_trusted_development(task_type):
     assert agent_runner.profile_for_task_type(task_type) == agent_runner.PROFILE_TRUSTED_DEVELOPMENT
 
 
-def test_profile_for_unknown_task_type_defaults_to_trusted_development():
-    """Unknown/future task types are not silently read-only-restricted —
-    they fall to whichever profile the caller's own `task_type in
-    READ_ONLY_TASK_TYPES` check already applied to "everything else"; making
-    this explicit here pins that this never flips to read-only by accident."""
-    assert agent_runner.profile_for_task_type("some_future_task_type") == agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+def test_profile_for_unknown_task_type_fails_closed_as_read_only():
+    assert agent_runner.profile_for_task_type("some_future_task_type") == agent_runner.PROFILE_READ_ONLY
 
 
 def test_trusted_development_profile_permits_read_search_edit_write_bash():
@@ -432,18 +428,20 @@ def test_report_path_uses_project_task_and_agent():
 
 
 def test_resolve_report_path_accepts_a_real_report_under_reports_root(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_runner, "REPORTS_ROOT", tmp_path / "reports")
+    from command_center.runtime import reports
+
+    monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path / "reports")
     (tmp_path / "reports" / "AIOS").mkdir(parents=True)
     (tmp_path / "reports" / "AIOS" / "report.md").write_text("hello")
     run = {"report_path": "reports/AIOS/report.md"}
-    monkeypatch.setattr(agent_runner, "ROOT", tmp_path)
     resolved = agent_runner.resolve_report_path(run)
     assert resolved == (tmp_path / "reports" / "AIOS" / "report.md").resolve()
 
 
 def test_resolve_report_path_rejects_traversal_outside_reports_root(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_runner, "REPORTS_ROOT", tmp_path / "reports")
-    monkeypatch.setattr(agent_runner, "ROOT", tmp_path)
+    from command_center.runtime import reports
+
+    monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path / "reports")
     secret = tmp_path / "secret.txt"
     secret.write_text("should never be read via a run record")
     run = {"report_path": "../secret.txt"}
@@ -451,8 +449,9 @@ def test_resolve_report_path_rejects_traversal_outside_reports_root(tmp_path, mo
 
 
 def test_resolve_report_path_rejects_absolute_escape(tmp_path, monkeypatch):
-    monkeypatch.setattr(agent_runner, "REPORTS_ROOT", tmp_path / "reports")
-    monkeypatch.setattr(agent_runner, "ROOT", tmp_path)
+    from command_center.runtime import reports
+
+    monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path / "reports")
     run = {"report_path": "/etc/passwd"}
     assert agent_runner.resolve_report_path(run) is None
 

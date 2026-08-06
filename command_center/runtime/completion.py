@@ -323,6 +323,7 @@ class ReasonCode:
     RECOVERABLE = "RECOVERABLE"
     NO_PR_NOT_IN_TARGET = "NO_PR_NOT_IN_TARGET"
     RETRY_LIMIT_REACHED = "RETRY_LIMIT_REACHED"
+    PUBLICATION_FENCE_LOST = "PUBLICATION_FENCE_LOST"
     # Independent review gate (blocking, pre-pull-request).
     REVIEW_PENDING = "REVIEW_PENDING"
     REVIEW_APPROVED = "REVIEW_APPROVED"
@@ -363,6 +364,10 @@ class CompletionPolicy:
     merge_mode: str = MERGE_MANUAL
     merge_method: str = MERGE_METHOD_SQUASH
     max_retries: int = DEFAULT_MAX_RETRIES
+    # Optional persisted scheduler fence for privileged daily-audit
+    # publication. Ordinary completion rows leave both fields unset.
+    publication_fence_campaign_id: str | None = None
+    publication_fence_owner: str | None = None
 
     def __post_init__(self) -> None:
         if self.merge_mode not in MERGE_MODES:
@@ -388,6 +393,8 @@ class CompletionPolicy:
             "merge_mode": self.merge_mode,
             "merge_method": self.merge_method,
             "max_retries": self.max_retries,
+            "publication_fence_campaign_id": self.publication_fence_campaign_id,
+            "publication_fence_owner": self.publication_fence_owner,
         }
 
     def to_json(self) -> str:
@@ -405,6 +412,16 @@ class CompletionPolicy:
             merge_mode=str(data.get("merge_mode", MERGE_MANUAL)),
             merge_method=str(data.get("merge_method", MERGE_METHOD_SQUASH)),
             max_retries=int(data.get("max_retries", DEFAULT_MAX_RETRIES)),
+            publication_fence_campaign_id=(
+                str(data["publication_fence_campaign_id"])
+                if data.get("publication_fence_campaign_id")
+                else None
+            ),
+            publication_fence_owner=(
+                str(data["publication_fence_owner"])
+                if data.get("publication_fence_owner")
+                else None
+            ),
         )
 
     @classmethod
@@ -450,6 +467,16 @@ class CompletionPolicy:
             ):
                 if key in source and source[key] is not None:
                     merged[key] = source[key]
+        # Publication fencing is a privileged completion capability: task
+        # packages and project config are data inputs, so they must never be
+        # able to claim or renew a daily-audit lease. Only the explicit trusted
+        # operator/backend override channel may persist these two values.
+        for key in (
+            "publication_fence_campaign_id",
+            "publication_fence_owner",
+        ):
+            if key in (overrides or {}) and overrides[key] is not None:
+                merged[key] = overrides[key]
         return cls.from_dict(merged)
 
 

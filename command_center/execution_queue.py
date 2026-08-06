@@ -86,6 +86,7 @@ STATE_WAITING = "waiting"
 STATE_READY = "ready"
 STATE_LAUNCHED = "launched"
 STATE_CANCELLED = "cancelled"
+STATE_ATTENTION = "attention"
 
 # Non-terminal — still tracked, still re-evaluated on every checkpoint.
 OPEN_STATES: frozenset[str] = frozenset({STATE_WAITING, STATE_READY})
@@ -326,6 +327,30 @@ def evaluate_readiness(entries: list[dict], tasks_by_id: dict[str, dict]) -> lis
     return updated
 
 
+def reconcile_missing_run_links(root: Path, entries: list[dict]) -> list[dict]:
+    """Turn a broken launched→run link into a durable, inspectable tombstone.
+
+    A crash, manual database replacement or retention mistake must not leave a
+    queue row claiming that work launched while its execution silently
+    disappears. The original run id is retained as evidence and reconciliation
+    is idempotent.
+    """
+    db_path = runtime_db.resolve_db_path(root)
+    updated: list[dict] = []
+    for original in entries:
+        entry = dict(original)
+        run_id = entry.get("run_id")
+        if entry.get("state") == STATE_LAUNCHED and run_id and runtime_db.get_run(db_path, run_id) is None:
+            entry["state"] = STATE_ATTENTION
+            entry["reason"] = "связанный запуск отсутствует; требуется проверка"
+            entry["missing_run_tombstone"] = {
+                "run_id": run_id,
+                "detected_at": entry.get("missing_run_tombstone", {}).get("detected_at") or models.iso_now(),
+            }
+        updated.append(entry)
+    return updated
+
+
 def reevaluate_and_persist(root: Path, tasks_by_id: dict[str, dict]) -> list[dict]:
     """The single call the UI layer makes at each of the four checkpoints
     (app load, manual refresh, after a task-state change, after a run
@@ -436,6 +461,33 @@ def select_available_executor(
         return executor_id
 
     return None
+
+
+def select_remediation_executor(task: dict, cfg: dict) -> str | None:
+    """Select an executor for an explicit operator-requested remediation.
+
+    Normal scheduling never retries an executor recorded in
+    ``failed_executors``.  That is correct for unattended failover, but it made
+    the Fix button a permanent dead end when a project had only one provider
+    and the operator had re-authenticated it.  An explicit remediation first
+    tries normal failover, then re-probes the configured provider and permits
+    one new attempt when it is currently available.  Active-run exclusivity in
+    ``execute_agent_launch_v2`` remains the idempotency boundary for double
+    clicks and concurrent sessions.
+    """
+    selected = select_available_executor(task, cfg)
+    if selected is not None:
+        return selected
+
+    from command_center.runtime import providers as runtime_providers
+
+    allowed = list(cfg.get("allowed_agents") or [])
+    configured = task.get("executor") or (allowed[0] if allowed else "claude_code")
+    if allowed and configured not in allowed:
+        return None
+    provider = runtime_providers.get_provider(configured)
+    availability = provider.availability()
+    return configured if availability.available else None
 
 
 @dataclass

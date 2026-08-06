@@ -36,3 +36,29 @@ def test_legit_values_are_preserved(tmp_path, monkeypatch):
     assert path.parent == tmp_path / "AICC-Proj"
     assert path.name.startswith("20260729-120000_run-abc123")
     assert path.suffix == ".md"
+
+
+def test_split_root_reference_survives_restart(tmp_path, monkeypatch):
+    reports_root = tmp_path / "external-artifacts" / "reports"
+    monkeypatch.setattr(reports, "REPORTS_ROOT", reports_root)
+    path = reports_root / "AIOS" / "result.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("verified result", encoding="utf-8")
+
+    stored = reports.stored_report_path(path)
+    assert stored == "reports/AIOS/result.md"
+    # Resolution depends only on the persisted reference and configured root,
+    # not on a process-local absolute path or the source checkout root.
+    assert reports.resolve_report_path(stored) == path.resolve()
+
+
+def test_report_resolver_rejects_traversal_and_symlink_escape(tmp_path, monkeypatch):
+    reports_root = tmp_path / "reports"
+    reports_root.mkdir()
+    outside = tmp_path / "private.md"
+    outside.write_text("secret", encoding="utf-8")
+    monkeypatch.setattr(reports, "REPORTS_ROOT", reports_root)
+
+    assert reports.resolve_report_path("reports/../../private.md") is None
+    (reports_root / "escape.md").symlink_to(outside)
+    assert reports.resolve_report_path("reports/escape.md") is None

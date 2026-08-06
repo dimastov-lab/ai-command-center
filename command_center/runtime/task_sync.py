@@ -178,8 +178,23 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     mutated = False
 
     is_new_run_for_task = task.get("current_run_id") != run["id"]
+    if (
+        not is_new_run_for_task
+        and status in session_view.TERMINAL_DISPLAY_STATUSES
+        and task.get("terminal_projection_run_id") == run["id"]
+    ):
+        return False
+    # ``launch_status`` cannot be the idempotency key: provider failures are
+    # deliberately projected back to ``Ready`` for failover/retry, which made
+    # every subsequent UI refresh re-append the same terminal and
+    # ``executor_failed`` events.  Persist the run whose terminal facts were
+    # projected instead.  A new remediation attempt has a new run id and is
+    # therefore projected independently, while reload/restart remains a no-op.
     already_finalized_for_this_run = (
-        not is_new_run_for_task and task.get("launch_status") in _TERMINAL_LAUNCH_STATUSES
+        not is_new_run_for_task
+        and (
+            task.get("launch_status") in _TERMINAL_LAUNCH_STATUSES
+        )
     )
 
     if is_new_run_for_task:
@@ -209,6 +224,7 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         # `Completed` run's launch status depends on `task["progress"]`
         # *after* this call's own stage advancement, not before it.
         _apply_terminal_fields(task, run, status=status, db_path=db_path)
+        task["terminal_projection_run_id"] = run["id"]
         mutated = True
 
     target_launch_status = _resolve_target_launch_status(status, task)

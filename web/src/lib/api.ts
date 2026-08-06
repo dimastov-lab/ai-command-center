@@ -92,3 +92,32 @@ export async function fetchHome(): Promise<HomeDTO> {
   if (!r.ok) throw new Error('home failed')
   return r.json()
 }
+
+export type ExecutionRun = {
+  id: string
+  source: string
+  title: string
+  project: string
+  project_name: string
+  task_type: string
+  state: string
+  created_at: string | null
+  started_at: string | null
+  completed_at: string | null
+  duration_seconds: number | null
+  exit_code: number | null
+  failure_reason: string | null
+  verdict: string | null
+}
+
+export type ExecutionDTO = {
+  summary: { visible_runs: number; active: number; completed: number; needs_attention: number }
+  state_counts: Record<string, number>
+  runs: ExecutionRun[]
+}
+
+export async function fetchExecution(): Promise<ExecutionDTO> {
+  const r = await fetch('/api/execution')
+  if (!r.ok) throw new Error('execution failed')
+  return r.json()
+}

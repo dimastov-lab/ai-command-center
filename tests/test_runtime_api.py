@@ -197,7 +197,7 @@ def test_sensitive_project_confirmed_content_is_included(project_id, git_repo, c
         confirmed_items=["file:secret.md"],
     )
     stored_run = db.get_run(api.db_path, run["id"])
-    assert "TOP SECRET FINANCIAL DATA" in stored_run["prompt"]
+    assert stored_run["prompt"] == "[redacted: prompt transported via stdin]"
     assert run["context_manifest"]["included_content_keys"] == ["file:secret.md"]
     assert run["context_manifest"]["excluded_content_keys"] == []
     api.supervisor.wait_for_run(run["id"], timeout=10)
@@ -213,7 +213,7 @@ def test_non_sensitive_project_retains_automatic_inclusion(git_repo, configure_p
         confirmed_items=None,
     )
     stored_run = db.get_run(api.db_path, run["id"])
-    assert "ordinary project notes" in stored_run["prompt"]
+    assert stored_run["prompt"] == "[redacted: prompt transported via stdin]"
     assert run["context_manifest"]["included_content_keys"] == ["file:notes.md"]
     api.supervisor.wait_for_run(run["id"], timeout=10)
 
@@ -255,8 +255,7 @@ def test_outbound_manifest_exactly_identifies_what_left_the_machine(git_repo, co
     assert manifest_events[0]["payload"] == manifest
 
     stored_run = db.get_run(api.db_path, run["id"])
-    assert "confirmed content" in stored_run["prompt"]
-    assert "unconfirmed content" not in stored_run["prompt"]
+    assert stored_run["prompt"] == "[redacted: prompt transported via stdin]"
     api.supervisor.wait_for_run(run["id"], timeout=10)
 
 

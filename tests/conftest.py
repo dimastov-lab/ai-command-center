@@ -22,6 +22,22 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def restore_main_module_after_streamlit_apptest():
+    """Keep AppTest's temporary ``__main__`` from poisoning spawn workers.
+
+    Streamlit replaces ``sys.modules["__main__"]`` on each run.  A later
+    multiprocessing test using the spawn start method otherwise re-executes
+    Streamlit's deleted temporary script instead of pytest's real entrypoint.
+    """
+    original = sys.modules.get("__main__")
+    yield
+    if original is None:
+        sys.modules.pop("__main__", None)
+    else:
+        sys.modules["__main__"] = original
+
 _TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="aicc_test_data_"))
 os.environ["AICC_DATA_DIR"] = str(_TEST_DATA_DIR)
 

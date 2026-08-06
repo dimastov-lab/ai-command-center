@@ -56,6 +56,14 @@ REQUIRED_TASK_FIELDS: tuple[str, ...] = ("id", "project", "title", "status")
 _warned_signatures: set[str] = set()
 
 
+class CompletionEvidenceRequired(ValueError):
+    """A planning mutation attempted to assert verified engineering delivery.
+
+    ``Done`` releases dependent tasks, so only the completion projector may
+    write it after result and target-branch verification.
+    """
+
+
 def _warn_once(signature: str, msg: str, *args: object) -> None:
     if signature in _warned_signatures:
         return
@@ -417,21 +425,20 @@ def update_task_status(root: Path, task_id: str, new_status: str) -> dict | None
     still runs `save_tasks` on the unchanged fresh list, harmless but see
     `persist_if` if that ever needs to change)."""
 
+    if new_status == "Done":
+        raise CompletionEvidenceRequired(
+            "Done is completion-owned: a task reaches it only after its result "
+            "and target branch have been verified"
+        )
+
     def _mutator(tasks: list[dict]) -> dict | None:
         for task in tasks:
             if task.get("id") == task_id:
                 task["status"] = new_status
                 task["updated_at"] = models.iso_now()
-                if new_status == "Done":
-                    # A manual/administrative move to Done is NOT evidence of a
-                    # merge — only the completion projection (gated on a target-
-                    # verified merge) may claim "Merged". Record the move
-                    # truthfully and leave the execution stage untouched, so a
-                    # stale "Merged" is never stamped onto a task that nothing
-                    # actually merged (audit DATA-D3).
-                    models.append_timeline_event(
-                        task, "status_changed", f"Задача переведена в статус {new_status}."
-                    )
+                models.append_timeline_event(
+                    task, "status_changed", f"Задача переведена в статус {new_status}."
+                )
                 return task
         return None
 
