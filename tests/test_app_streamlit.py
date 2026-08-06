@@ -908,7 +908,12 @@ def test_launcher_launches_claude_against_task_workspace_not_project_repository(
 def _refuse_claude(monkeypatch, reason: str) -> None:
     """Let `git_info`'s read-only status calls through (they share the same
     `subprocess` module object) while making an actual `claude` launch a hard
-    test failure."""
+    test failure.
+
+    Also stubs `agent_runner.claude_cli_preflight` so the launch button is
+    not disabled by the binary-not-on-PATH pre-flight check in CI environments
+    where `claude` is intentionally absent.  The anti-launch guard above still
+    catches any real exec attempt."""
     real_run = subprocess.run
 
     def fail_if_claude_launched(command, **kwargs):
@@ -917,6 +922,9 @@ def _refuse_claude(monkeypatch, reason: str) -> None:
         return real_run(command, **kwargs)
 
     monkeypatch.setattr(agent_runner.subprocess, "run", fail_if_claude_launched)
+    # Stub the shutil.which-based preflight so the button isn't disabled in
+    # environments where the claude binary is not installed (e.g. CI).
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda _binary=None: (True, ""))
 
 
 def test_launcher_requires_a_separate_ack_for_dirty_tree_and_branch_mismatch(monkeypatch, tmp_path):
