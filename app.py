@@ -673,6 +673,17 @@ def render_agent_launcher(
     st.session_state.setdefault(confirm_key, False)
 
     if st.button("Запустить агента", key=f"{key_prefix}_open_btn", icon=":material/smart_toy:"):
+        # Every launch is confirmed from scratch: a previous dialog's ticked
+        # acknowledgements must never carry over into a new one, or an
+        # operator would silently inherit a "yes, launch on the wrong branch"
+        # from a state of the repository that no longer holds.
+        for stale_key in [
+            key
+            for key in st.session_state
+            if isinstance(key, str) and key.startswith(f"{key_prefix}_ack_")
+        ]:
+            del st.session_state[stale_key]
+        st.session_state.pop(f"{key_prefix}_confirmed", None)
         st.session_state[confirm_key] = True
 
     if not st.session_state[confirm_key]:
@@ -831,12 +842,27 @@ def render_agent_launcher(
             "Я подтверждаю запуск внешнего агента с указанными параметрами.",
             key=f"{key_prefix}_confirmed",
         )
-        warnings_ack = True
-        if validation.warnings:
-            warnings_ack = st.checkbox(
-                "Я подтверждаю запуск несмотря на предупреждения выше.",
-                key=f"{key_prefix}_warnings_ack",
-            )
+
+        # One acknowledgement per warning, keyed by its stable `code` — never a
+        # single collective "подтверждаю несмотря на предупреждения" checkbox.
+        # A branch mismatch and a dirty working tree are independent hazards
+        # (agent runs on the wrong branch vs. agent edits on top of
+        # uncommitted work); the shared checkbox let an operator who had only
+        # noticed one of them dismiss both in a single click, which is exactly
+        # the accidental launch this gate exists to prevent.
+        acknowledged: set[str] = set()
+        warning_issues = validation.warning_issues
+        if warning_issues:
+            st.markdown("**Подтвердите каждое предупреждение отдельно:**")
+        for issue in warning_issues:
+            if st.checkbox(
+                launch.warning_ack_label(issue),
+                key=f"{key_prefix}_ack_{issue.code}",
+            ):
+                acknowledged.add(issue.code)
+            st.caption(issue.message)
+        unacknowledged = validation.unacknowledged_warning_codes(acknowledged)
+
         action_cols = st.columns(2)
         with action_cols[0]:
             launch_clicked = st.button(
@@ -848,7 +874,7 @@ def render_agent_launcher(
                     # `prep.launchable` supersedes the raw `validation.can_launch`:
                     # a missing-but-provisionable workspace is launchable.
                     or not prep.launchable
-                    or not warnings_ack
+                    or bool(unacknowledged)
                     or not bool(provider_availability and provider_availability.available)
                 ),
                 icon=":material/play_arrow:",
@@ -887,8 +913,16 @@ def render_agent_launcher(
         if not prep.launchable:
             st.error("Запуск заблокирован ошибками валидации выше — сначала устраните их.")
             return
-        if validation.warnings and not warnings_ack:
-            st.error("Подтвердите предупреждения выше перед запуском.")
+        if not confirmed:
+            st.error("Подтвердите запуск внешнего агента перед запуском.")
+            return
+        if unacknowledged:
+            missing = "; ".join(
+                launch.warning_ack_label(issue)
+                for issue in warning_issues
+                if issue.code in unacknowledged
+            )
+            st.error(f"Не подтверждены все предупреждения — запуск заблокирован: {missing}")
             return
 
         # `selection.path` was already validated above (existence, is_dir,
@@ -899,9 +933,9 @@ def render_agent_launcher(
         resolved_workspace = Path(selection.path).expanduser().resolve()
 
         # Real, PID-tracked, cancellable v2 run — not a blocking call. The
-        # button click above already re-validated `confirmed`/`warnings_ack`
-        # server-side, so `confirmed=True` here reflects a genuine, already-
-        # checked confirmation, not a bypass of it.
+        # button click above already re-validated `confirmed` and every
+        # per-warning acknowledgement server-side, so `confirmed=True` here
+        # reflects a genuine, already-checked confirmation, not a bypass of it.
         try:
             run = launch_service.execute_agent_launch_v2(
                 project=project,
