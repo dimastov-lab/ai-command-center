@@ -6,11 +6,10 @@ Imports only from aios_sdk (public SDK), not from aios.* (boundary gate: ADR-000
 
 from __future__ import annotations
 
-import os
 from datetime import datetime, timezone
 from typing import Any
 
-from aios_sdk import AIOSClient, CreateTaskRequest, Task
+from aios_sdk import CreateTaskRequest, Task
 
 # ---------------------------------------------------------------------------
 # Priority mapping
