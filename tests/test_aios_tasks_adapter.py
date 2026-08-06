@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from command_center.application.aios_tasks import (
+import pytest
+
+pytest.importorskip("aios_sdk")
+
+from command_center.application.aios_tasks import (  # noqa: E402
     aicc_dict_to_create_request,
     aios_task_to_aicc_dict,
 )
-from aios_sdk import Task
+from aios_sdk import Task  # noqa: E402
 
 def _make_aicc_task(**overrides) -> dict:
     base = {

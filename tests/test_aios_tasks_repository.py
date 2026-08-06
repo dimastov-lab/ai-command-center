@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
-from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository
-from aios_sdk import AIOSClient
+pytest.importorskip("aios_sdk")
+
+from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository  # noqa: E402
+from aios_sdk import AIOSClient  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
