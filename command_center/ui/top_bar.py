@@ -12,29 +12,32 @@ from __future__ import annotations
 
 import streamlit as st
 
-from command_center import read_model
-from command_center.ui import inspector
+from command_center.ui import execution_strip, inspector
 
 
-def _live_status_glyph(api) -> str:
+def _live_status_glyph(api, tasks_by_id) -> str:
     """Compact ``⏺N ⏸M ⚠K`` summary of live execution — the one piece of
-    cross-page context an operator glances at the top bar for. Counts the
-    *non-superseded* latest attempt of each task through the shared read-model,
-    so ⚠ agrees with the Execution Strip and the AI-Supervisor caption instead of
-    showing an all-time FAILED tally that overstated attention (audit D5). One
-    bounded `list_runs` replaces the three all-time `count_runs` queries."""
+    cross-page context an operator glances at the top bar for. Uses the exact
+    same `execution_strip.current_counts` the strip banner and the Live Center
+    headline use — the *actionable* count, which drops superseded, completed-task
+    and operator-dismissed rows — so ⚠ shows one canonical number across the
+    strip, the AI-Supervisor caption and this glyph (audit D5). Attention/running
+    do not depend on the durable queue, so no queue load is needed here."""
     if api is None:
         return ""
-    runs = api.list_runs(limit=200)
-    live = [r for r in runs if r.get("id") not in read_model.superseded_run_ids(runs)]
-    snapshot = read_model.run_snapshot(live)
+    counts = execution_strip.current_counts(
+        api.list_runs(limit=200),
+        list((tasks_by_id or {}).values()),
+        [],
+        dismissed_attention_run_ids=st.session_state.get("exec_attention_dismissed", set()),
+    )
     parts = []
-    if snapshot.running:
-        parts.append(f"⏺ {snapshot.running}")
-    if snapshot.queued:
-        parts.append(f"⏸ {snapshot.queued}")
-    if snapshot.attention:
-        parts.append(f"⚠ {snapshot.attention}")
+    if counts.live:
+        parts.append(f"⏺ {counts.live}")
+    if counts.waiting:
+        parts.append(f"⏸ {counts.waiting}")
+    if counts.attention:
+        parts.append(f"⚠ {counts.attention}")
     return " · ".join(parts)
 
 
@@ -54,7 +57,7 @@ def render_top_bar(
         st.title(title)
         st.caption(caption)
     with status_col:
-        glyph = _live_status_glyph(api)
+        glyph = _live_status_glyph(api, tasks_by_id)
         if glyph:
             st.markdown(f"###### {glyph}")
     with search_col:
