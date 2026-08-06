@@ -14,14 +14,14 @@ resolution-markers = [
 
 [manifest.dependency-groups]
 dev = [
-    { name = "aios", directory = "../../../aios" },
+    { name = "aios", directory = "../aios" },
     { name = "pytest", specifier = ">=9.1.1" },
 ]
 
 [[package]]
 name = "aios"
 version = "0.2.1"
-source = { directory = "../../../aios" }
+source = { directory = "../aios" }
 dependencies = [
     { name = "cryptography" },
     { name = "fastapi" },
