@@ -172,6 +172,20 @@ def test_launch_calls_start_run_with_expected_inputs(monkeypatch, git_repo, conf
 
 
 def test_sensitive_launch_blocked_without_extra_confirmation(monkeypatch, git_repo, configure_project_repo):
+    """A forged click without the sensitivity acknowledgement must never launch.
+
+    Layered gate, outermost first: streamlit >= 1.61 enforces `disabled`
+    server-side — an incoming value for a disabled widget is discarded at
+    registration against the current run's `disabled=` predicate
+    (`streamlit/runtime/state/widgets.py`), so the forced `.click()` below is
+    inert before app code even sees it. The app's own `if not ready` re-check
+    ("Запуск заблокирован: подтвердите все необходимые пункты") stays in
+    `app.py` as defense in depth for the day the `disabled=` predicate and
+    `ready` diverge, but while they match it is unreachable by any client
+    message — on streamlit < 1.61 (where AppTest forged clicks did land) it was
+    the layer this test exercised directly. Either way the invariant asserted
+    here is the same: no `start_run`, no launch confirmation, gate still
+    engaged."""
     configure_project_repo("BANK", git_repo)
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -185,11 +199,19 @@ def test_sensitive_launch_blocked_without_extra_confirmation(monkeypatch, git_re
     at.selectbox(key="exec_center_launch_task_type").select("review").run()
     at.text_area(key="exec_center_launch_instruction").set_value("sensitive task").run()
     at.checkbox(key="exec_center_launch_confirm").check().run()
-    at = at.button(key="exec_center_launch_btn").click().run()
+
+    launch_button = at.button(key="exec_center_launch_btn")
+    assert launch_button.disabled is True  # the UI-level gate is engaged
+    at = launch_button.click().run()
 
     assert not calls, "start_run must not be called for a sensitive project without the extra confirmation"
     assert any("чувствительный" in w.value for w in at.warning)
-    assert any("заблокирован" in e.value for e in at.error)
+    # The forged click changed nothing: no launch confirmation appeared and the
+    # button is still disabled. (No assertion on the app-level "Запуск
+    # заблокирован" message: on streamlit >= 1.61 the forged click is discarded
+    # by the framework before that re-check can run.)
+    assert not any("Запуск создан" in s.value for s in at.success)
+    assert at.button(key="exec_center_launch_btn").disabled is True
 
 
 def test_sensitive_launch_accepted_with_confirmation(monkeypatch, git_repo, configure_project_repo):

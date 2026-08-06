@@ -2830,6 +2830,13 @@ _LAUNCH_FLASH_KEY = "exec_board_launch_flash"
 _LAUNCH_BOARD_LIMIT = 12
 _PROJECT_TREE_KEY = "exec_board_project_tree"
 
+# Flash keys for messages that must survive an immediate `st.rerun()` (same
+# pattern as `_LAUNCH_FLASH_KEY`): the frame that renders a message right
+# before `st.rerun()` is replaced by the rerun, so the message is stored here
+# and re-rendered (then popped) on the post-rerun frame instead.
+_IMPORT_TASK_FLASH_KEY = "import_task_package_flash"
+_PROJECT_SETTINGS_FLASH_KEY = "project_settings_saved_flash"
+
 
 def _render_project_tree_section(
     api: runtime_api.ExecutionCenterAPI,
@@ -3996,20 +4003,23 @@ def render_home_dashboard(
         # The gauge shows the same windowed health as the project-health card; the
         # status pill and caption describe what the supervisor is actually doing.
         window_success = _window_success_rate(runs)
-        # audit D5: count runs needing attention the same way the Execution Strip
-        # banner does — the non-superseded latest attempt of each task only — so
-        # this caption and the strip never show two different "attention" numbers
-        # on the same screen. `running` (the board live bucket above) stays as-is
-        # for the "Активные агенты" list; only the headline counts are
-        # canonicalised here.
-        _superseded_ids = live_board.superseded_run_ids(sessions)
-        run_counts = read_model.run_snapshot([r for r in runs if r.get("id") not in _superseded_ids])
+        # audit D5: count "needs attention" with the exact same actionable,
+        # dismiss-aware computation the Execution Strip banner and the Live Center
+        # headline use (`execution_strip.current_counts` — drops superseded,
+        # completed-task and operator-dismissed rows), so this caption, the strip
+        # and the top-bar glyph never show two different "attention" numbers on
+        # one screen. queue_entries=[] because attention/running don't depend on
+        # the durable queue.
+        run_counts = execution_strip.current_counts(
+            runs, tasks, [],
+            dismissed_attention_run_ids=st.session_state.get("exec_attention_dismissed", set()),
+        )
         if run_counts.attention:
             sup_status, sup_accent = "Требует внимания", "amber"
             sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.attention} прогонов требуют внимания"
-        elif run_counts.running:
+        elif run_counts.live:
             sup_status, sup_accent = "В работе", "green"
-            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.running} прогонов выполняется"
+            sup_label = f"Автопилот {'включён' if settings.enabled else 'выключен'} — {run_counts.live} прогонов выполняется"
         else:
             sup_status, sup_accent = "Ожидает", "slate"
             sup_label = "Автопилот включён — ожидает задач" if settings.enabled else "Автопилот выключен"
@@ -4731,6 +4741,15 @@ elif page_key == "create":
         "`{schema_version, package_id, tasks}` или простой список задач. Ничего не "
         "записывается в `data/tasks.json` до нажатия «Импортировать задачи»."
     )
+    # Result of the previous run's applied import, carried across `st.rerun()`
+    # via the same flash pattern as `_LAUNCH_FLASH_KEY`: a message rendered
+    # right before `st.rerun()` belongs to the pre-rerun frame, which the rerun
+    # replaces immediately — the operator (and `AppTest`'s element tree on
+    # streamlit >= 1.61, which no longer merges the discarded frame) never sees
+    # it unless it is re-rendered on the post-rerun frame like this.
+    import_task_flash = st.session_state.pop(_IMPORT_TASK_FLASH_KEY, None)
+    if import_task_flash:
+        st.success(import_task_flash)
     uploaded_package = st.file_uploader(
         "Файл пакета задач (JSON / YAML / Markdown / текст)",
         type=list(task_import.SUPPORTED_IMPORT_SUFFIXES),
@@ -4828,7 +4847,10 @@ elif page_key == "create":
                     # uncaught exception; nothing was written in either case.
                     st.error(f"Импорт не выполнен: {exc}")
                 else:
-                    st.success(
+                    # Flashed (not rendered inline) because the `st.rerun()`
+                    # below wipes this frame before the message would be seen —
+                    # the pop at the top of this section shows it post-rerun.
+                    st.session_state[_IMPORT_TASK_FLASH_KEY] = (
                         f"Импортировано задач: {len(import_result.imported_ids)}. "
                         f"Пропущено дубликатов: {len(import_result.skipped_duplicate_ids)}."
                     )
@@ -5459,6 +5481,16 @@ elif page_key == "projects":
             "Эти значения автоматически наследуются новыми задачами проекта "
             "(workspace, branch, executor, prompt) на странице «Создать задачу»."
         )
+        # Outcome of the previous run's save, carried across `st.rerun()` via
+        # the `_LAUNCH_FLASH_KEY` flash pattern: advisory validation warnings
+        # and the save confirmation rendered right before `st.rerun()` belong
+        # to the pre-rerun frame, which the rerun replaces immediately — they
+        # must be re-rendered here on the post-rerun frame to be seen at all.
+        settings_flash = st.session_state.pop(_PROJECT_SETTINGS_FLASH_KEY, None)
+        if settings_flash:
+            for warning_message in settings_flash["warnings"]:
+                st.warning(warning_message)
+            st.success(settings_flash["success"])
 
         workspace_input = st.text_input(
             "Workspace по умолчанию",
@@ -5550,8 +5582,7 @@ elif page_key == "projects":
                     "owner": owner_input.strip(),
                 }
             )
-            for warning_message in project_config.validate_project_settings(candidate):
-                st.warning(warning_message)
+            settings_warnings = list(project_config.validate_project_settings(candidate))
 
             project_config.save_project_settings(
                 selected_project,
@@ -5567,7 +5598,14 @@ elif page_key == "projects":
                 current_milestone=candidate["current_milestone"],
                 owner=candidate["owner"],
             )
-            st.success("Настройки проекта сохранены.")
+            # Flashed (not rendered inline) because the `st.rerun()` below
+            # wipes this frame before the messages would be seen — the pop
+            # above the settings form shows them post-rerun. Warnings stay
+            # advisory: the save above already happened regardless.
+            st.session_state[_PROJECT_SETTINGS_FLASH_KEY] = {
+                "warnings": settings_warnings,
+                "success": "Настройки проекта сохранены.",
+            }
             st.rerun()
 
     with tab_chat:
@@ -5759,7 +5797,8 @@ elif page_key == "git_center":
     # (plus the app itself) so an operator can inspect any of them from one
     # place instead of only ever seeing AICC here.
     repos: list[tuple[str, Path]] = []
-    if (ROOT / ".git").is_dir():
+    # A linked worktree stores ``.git`` as a file, not a directory.
+    if git_info.get_status(ROOT).get("is_repo"):
         repos.append(("AICC (app)", ROOT))
     for pid in models.PROJECT_IDS:
         cfg = project_configs.get(pid, {})
@@ -5809,6 +5848,36 @@ elif page_key == "git_center":
 
             st.caption(f"Корень репозитория: `{repo_status['root']}`")
             st.caption(f"Последний коммит: `{repo_status['last_commit_hash']}` — {repo_status['last_commit_subject']}")
+
+            refresh_key = f"git_center_remote_refreshed::{repo_path.resolve()}"
+            if st.button(
+                "Обновить",
+                key=f"git_center_refresh_{repo_label}",
+                icon=":material/refresh:",
+                help="Выполнить git fetch и обновить сравнение с tracking-веткой.",
+            ):
+                with st.spinner("Обновляем данные remote…"):
+                    fetch_ok, fetch_error = git_info.fetch_remotes(repo_path)
+                if fetch_ok:
+                    st.session_state[refresh_key] = time.time()
+                    st.success("Данные remote обновлены.")
+                else:
+                    st.error(f"Не удалось обновить remote: {fetch_error}")
+
+            refreshed_at = st.session_state.get(refresh_key)
+            if isinstance(refreshed_at, (int, float)):
+                age_minutes = max(0, int((time.time() - refreshed_at) // 60))
+                st.caption(f"Данные remote: обновлено {age_minutes} мин. назад")
+                divergence = git_info.get_ahead_behind(repo_path)
+                if divergence.get("available"):
+                    with st.container(horizontal=True):
+                        st.metric("Ahead", divergence["ahead"], border=True)
+                        st.metric("Behind", divergence["behind"], border=True)
+                    st.caption(f"Сравнение: `{repo_status['branch']}` ↔ `{divergence['upstream']}`")
+                else:
+                    st.warning(str(divergence.get("error") or "Расхождение с remote недоступно."))
+            else:
+                st.caption("Данные remote ещё не обновлялись. Нажмите «Обновить», чтобы выполнить git fetch.")
 
             tab_files, tab_log, tab_diff, tab_branches, tab_remotes = st.tabs(
                 ["Изменённые файлы", "История коммитов", "Diff", "Ветки", "Remotes"]
