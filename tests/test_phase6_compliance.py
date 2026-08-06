@@ -239,7 +239,7 @@ def test_customer_stats_empty(cu_db: Path) -> None:
 
 def test_customer_stats_kyc_rate(cu_db: Path) -> None:
     c1 = _customer(cu_db, name="A")
-    c2 = _customer(cu_db, name="B")
+    _customer(cu_db, name="B")
     customer_store.update_kyc_status(cu_db, c1["id"], kyc_status="verified", actor="Analyst")
     s = compliance_store.customer_stats(cu_db)
     assert s["total"] == 2

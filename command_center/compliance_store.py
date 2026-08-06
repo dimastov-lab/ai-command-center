@@ -7,17 +7,12 @@ No writes, no state changes — pure aggregation.
 from __future__ import annotations
 
 import sqlite3
-from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from command_center import (
-    alert_store,
-    case_store,
     customer_store,
-    sar_store,
 )
-from command_center import rule_engine
 
 
 # ---------------------------------------------------------------------------
