@@ -25,6 +25,12 @@ against the current repository state.
 Only the 14 **Still Open** rows are converted in
 `FOUNDER_AUDIT_9761459_STILL_OPEN_IMPORT_PACKAGE.json`. Nothing was imported.
 
+The table above is the reconciliation's finding **as of the run recorded at the top of this
+file** and is deliberately not rewritten as rows get fixed. Rows resolved since then carry a
+dated "**Resolved since this reconciliation**" note in their own section below:
+
+- W2-004 (`AICC-AUDIT-W2-004`) — resolved 2026-07-29.
+
 ---
 
 ## Wave 0
@@ -207,6 +213,20 @@ Tests: `tests/test_workspace_home.py::test_snapshot_all_projects_unconfigured_re
 `render_workspace_home_page` (app.py:3301-3400) renders metrics, projects, active/recent runs,
 artifacts and reports — and calls neither panel. Both are still wired only to the Kanban page
 (`app.py:4669` `render_project_intelligence_strip`, `app.py:4678` `render_recommendations_panel`).
+
+**Resolved since this reconciliation (2026-07-29).** Both surfaces were lifted out of the Kanban
+page body into `app.render_project_planning_intelligence`, which Workspace Home and Kanban now
+both call. Neither page computes anything itself: the health strip still comes from
+`project_intelligence.compute_project_intelligence` and the cards from
+`recommendation_service.build_recommendation_views`, so there is one implementation of each
+behind both entry points and they cannot drift. Only the Streamlit widget-key namespace differs
+(`workspace_home_*` vs `kanban_*`). Backlog reconciliation stays Kanban-only, via the helper's
+opt-in `backlog_reconcile_key_prefix`. See WORKSPACE_HOME_ARCHITECTURE.md §13 for why this adds
+no new mutation class.
+Tests: `tests/test_workspace_home_ui.py::test_workspace_home_shows_shared_health_metrics_and_recommendations`,
+`::test_workspace_home_health_metrics_match_kanban_and_the_shared_computation` (asserts Home's
+metric values equal both Kanban's and the shared computation's),
+`::test_workspace_home_recommends_the_same_tasks_as_kanban_with_its_own_widget_keys`.
 
 ### AUDIT-W2-005 — Судьба Universal Workspace scaffolding — **Done (resolved by removal)**
 
