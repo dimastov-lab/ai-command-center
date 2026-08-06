@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from command_center import git_info
+from command_center import capabilities, git_info
 
 # --------------------------------------------------------------------------
 # Status vocabulary (display-only — see module docstring)
@@ -33,6 +33,7 @@ STATUS_WAITING = "Waiting"
 STATUS_REQUIRES_ATTENTION = "Requires Attention"
 STATUS_BLOCKED = "Blocked"
 STATUS_INCOMPLETE = "Incomplete"
+STATUS_CAPABILITY_MISMATCH = "Capability Mismatch"
 STATUS_COMPLETED = "Completed"
 STATUS_FAILED = "Failed"
 STATUS_CANCELLED = "Cancelled"
@@ -59,11 +60,19 @@ LIVE_PROCESS_DISPLAY_STATUSES: frozenset[str] = frozenset(
 # `task_sync._apply_terminal_fields` still runs for them (report path,
 # verdict, etc.) exactly as it does for `FAILED`/`CANCELLED`.
 TERMINAL_DISPLAY_STATUSES: frozenset[str] = frozenset(
-    {STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_BLOCKED, STATUS_INCOMPLETE}
+    {
+        STATUS_COMPLETED,
+        STATUS_FAILED,
+        STATUS_CANCELLED,
+        STATUS_BLOCKED,
+        STATUS_INCOMPLETE,
+        STATUS_CAPABILITY_MISMATCH,
+    }
 )
 
 _BLOCKED_REASON_PREFIX = "blocked:"
 _INCOMPLETE_REASON_PREFIX = "incomplete:"
+_CAPABILITY_MISMATCH_REASON_PREFIX = capabilities.FAILURE_REASON_PREFIX
 
 # Default staleness threshold for the heartbeat liveness probe (see
 # `get_heartbeat_age`/`is_heartbeat_stale` below).
@@ -128,6 +137,11 @@ def derive_status(run: dict, *, awaiting_handshake: bool = False, heartbeat_stal
         return STATUS_COMPLETED
     if state == "FAILED":
         reason = run.get("failure_reason") or ""
+        # A pre-spawn executor-capability mismatch is a distinct, blocking
+        # preflight outcome — never conflated with a user denial or a Claude
+        # runtime failure (Required fix 8).
+        if reason.startswith(_CAPABILITY_MISMATCH_REASON_PREFIX):
+            return STATUS_CAPABILITY_MISMATCH
         if reason.startswith(_BLOCKED_REASON_PREFIX):
             return STATUS_BLOCKED
         if reason.startswith(_INCOMPLETE_REASON_PREFIX):
@@ -136,6 +150,29 @@ def derive_status(run: dict, *, awaiting_handshake: bool = False, heartbeat_stal
     if state == "CANCELLED":
         return STATUS_CANCELLED
     return STATUS_REQUIRES_ATTENTION
+
+
+def _split_caps(value: str | None) -> list[str]:
+    """A persisted comma-joined capability list back into a Python list
+    (empty list for NULL/empty — a legacy run row that predates the capability
+    columns)."""
+    if not value:
+        return []
+    return [item for item in value.split(",") if item]
+
+
+def capability_mismatch_detail(run: dict) -> str:
+    """The full, human-facing capability-mismatch sentence for a run, rebuilt
+    from its persisted `required_capabilities`/`granted_capabilities` columns
+    (never the raw machine `failure_reason` code). Falls back to the raw
+    `failure_reason` for a legacy row that recorded the code but not the sets."""
+    required = frozenset(_split_caps(run.get("required_capabilities")))
+    granted = frozenset(_split_caps(run.get("granted_capabilities")))
+    if required and granted is not None:
+        missing = required - granted
+        if missing:
+            return capabilities.build_mismatch_reason(missing, granted)
+    return run.get("failure_reason") or "Executor capability mismatch."
 
 
 def operator_display_status(
@@ -524,8 +561,15 @@ def build_session_view(
     # Explicit, unambiguous field for `Blocked`/`Incomplete` — distinct from
     # `last_error` (which also covers plain `Failed` stderr output) so the UI
     # can render "why this was blocked" without having to re-derive it from
-    # `status` + `last_error` itself (Required fix 7).
-    blocker_reason = run.get("failure_reason") if status in (STATUS_BLOCKED, STATUS_INCOMPLETE) else None
+    # `status` + `last_error` itself (Required fix 7). For a capability
+    # mismatch, render the full human sentence rebuilt from the persisted
+    # required/granted capability sets, not the machine `failure_reason` code.
+    if status == STATUS_CAPABILITY_MISMATCH:
+        blocker_reason = capability_mismatch_detail(run)
+    elif status in (STATUS_BLOCKED, STATUS_INCOMPLETE):
+        blocker_reason = run.get("failure_reason")
+    else:
+        blocker_reason = None
 
     return {
         "session_id": run.get("session_id"),
@@ -600,6 +644,14 @@ def build_session_view(
         "exit_code": run.get("exit_code"),
         "last_error": last_error,
         "blocker_reason": blocker_reason,
+        "capability_profile": run.get("capability_profile") or capabilities.profile_for_task_type(
+            run.get("task_type") or ""
+        ),
+        "capability_override": run.get("capability_override"),
+        "required_capabilities": _split_caps(run.get("required_capabilities")),
+        "granted_capabilities": _split_caps(run.get("granted_capabilities")),
+        "capability_preflight": run.get("capability_preflight"),
+        "command_policy": run.get("command_policy"),
         "prompt_version": run.get("prompt_version"),
         "prompt": run.get("prompt"),
         "report_path": report_path,
