@@ -210,7 +210,7 @@ class AIOSTasksRepository:
     def load_all(self) -> list[dict[str, Any]]:
         return [aios_task_to_aicc_dict(t) for t in self._client.tasks.iterate()]
 
-    def create(self, task_dict: dict[str, Any]) -> dict[str, Any]:
+    def create(self, task_dict: dict[str, Any], **_: Any) -> dict[str, Any]:
         req, target_state = aicc_dict_to_create_request(task_dict)
         result = self._client.tasks.create(req)
         aios_id = result.data.id

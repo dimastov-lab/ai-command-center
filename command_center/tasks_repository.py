@@ -522,7 +522,7 @@ class JSONTasksRepository:
     def load_all(self) -> list[dict]:
         return load_tasks(self._root)
 
-    def create(self, task_dict: dict) -> dict:
+    def create(self, task_dict: dict, *, timeout: float = TASKS_LOCK_TIMEOUT_SECONDS) -> dict:
         task_id = task_dict.get("id")
         if not task_id:
             raise ValueError("task_dict must have an 'id' field")
@@ -533,7 +533,7 @@ class JSONTasksRepository:
             tasks.append(task_dict)
             return task_dict
 
-        return mutate_tasks(self._root, _mutator)
+        return mutate_tasks(self._root, _mutator, timeout=timeout)
 
     def upsert(self, task_dict: dict) -> None:
         upsert_task(self._root, task_dict)

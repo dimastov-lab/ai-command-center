@@ -650,7 +650,7 @@ def apply_task_package(
 
         now = models.iso_now()
         new_records = [_build_task_record(item, parsed, now) for item in new_items]
-        imported = [_repo.create(task_dict) for task_dict in new_records]
+        imported = [_repo.create(task_dict, timeout=lock_timeout) for task_dict in new_records]
     except storage.LockTimeoutError as exc:
         raise TaskImportError(
             f"не удалось получить блокировку импорта задач за {lock_timeout:.0f}с: {tasks_repository.tasks_lock_path(root)}"
