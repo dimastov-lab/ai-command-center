@@ -42,7 +42,7 @@ PROJECT_ALIASES: dict[str, str] = {
 # site (`KANBAN_COLUMNS`, `PRIORITIES`) is unchanged.
 # --------------------------------------------------------------------------
 
-KANBAN_STATUSES: list[str] = ["Backlog", "Next", "In Progress", "Review", "Done"]
+KANBAN_STATUSES: list[str] = ["Backlog", "Next", "In Progress", "Review", "Done", "Closed"]
 
 TASK_PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
 
@@ -223,6 +223,7 @@ LAUNCH_STATUSES: list[str] = [
     "Blocked",
     "Incomplete",
     "Needs Review",
+    "Awaiting PR",
     "Completed",
     "Failed",
     "Requires Attention",
