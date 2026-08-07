@@ -70,6 +70,22 @@ def _save_state(state: dict, dry_run: bool = False) -> None:
 # Task helpers
 # ---------------------------------------------------------------------------
 
+def _validate_task_ids(task_ids: list[str]) -> None:
+    """Validate that all task IDs exist in the repository.
+
+    Raises SystemExit if any task ID is not found.
+    """
+    tasks = tasks_repository.load_tasks(ROOT)
+    task_id_set = {t["id"] for t in tasks}
+
+    missing = [tid for tid in task_ids if tid not in task_id_set]
+    if missing:
+        print(f"Error: The following task IDs do not exist:", file=sys.stderr)
+        for tid in missing:
+            print(f"  - {tid}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def _task_launch_status(task_id: str) -> str:
     tasks = tasks_repository.load_tasks(ROOT)
     t = next((t for t in tasks if t["id"] == task_id), None)
@@ -113,6 +129,8 @@ def main(task_ids: list[str], dry_run: bool = False) -> int:
     if not task_ids:
         print("Usage: run-sequence.py [--dry-run] TASK-ID [TASK-ID ...]", file=sys.stderr)
         return 1
+
+    _validate_task_ids(task_ids)
 
     if dry_run:
         print("[DRY-RUN] Running in dry-run mode — no tasks will be launched or state modified.", flush=True)
