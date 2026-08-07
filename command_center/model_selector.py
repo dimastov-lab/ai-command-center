@@ -1,32 +1,32 @@
 """Automatic model selection for task launches.
 
-Picks the cheapest Anthropic model that can reliably handle the task's
-complexity. Codex+Ollama is the future local path but requires ``aider``
-or a working codex sandbox — use ``select_model_local`` once those are set up.
+Priority: local (free) > cheap cloud > full cloud default.
 
-Priority: cheapest-viable cloud > full cloud default.
+  read-only types (review, final_gate, architecture_review)
+                 → Ollama qwen2.5-coder:7b  (free, local, text-only OK)
+  score 0-1      → Aider + qwen2.5-coder:7b (free, local, edits files)
+  score 2        → claude-haiku-4-5-20251001  (cheapest Anthropic with tools)
+  score 3        → claude-sonnet-4-5           (balanced, complex tasks)
 
-  score 0-1  → claude-haiku-4-5-20251001  (cheapest, supports full tool use)
-  score 2    → claude-sonnet-4-5           (balanced)
-  score 3    → None (caller/provider default, currently sonnet)
-
-The task may override auto-selection by setting a ``model`` field explicitly.
+The task may override auto-selection by setting ``model`` and/or ``executor``
+fields explicitly.
 """
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Cloud models (Anthropic)
-# ---------------------------------------------------------------------------
-HAIKU = "claude-haiku-4-5-20251001"    # cheapest with full tool use
-SONNET = "claude-sonnet-4-5"            # balanced
-# None → provider default
+from command_center.agent_runner import READ_ONLY_TASK_TYPES
 
 # ---------------------------------------------------------------------------
-# Future local models (Codex+Ollama — requires working sandbox & aider)
+# Cloud models (Anthropic) — fallback when local isn't enough
 # ---------------------------------------------------------------------------
-CODEX_OLLAMA_FAST = "ollama/qwen2.5-coder:1.5b"
-CODEX_OLLAMA_MED = "ollama/qwen2.5-coder:7b-instruct-q4_K_M"
-CODEX_OLLAMA_HEAVY = "ollama/qwen2.5-coder:14b"
+HAIKU = "claude-haiku-4-5-20251001"
+SONNET = "claude-sonnet-4-5"
+
+# ---------------------------------------------------------------------------
+# Local models via Aider + Ollama (free, edits files)
+# ---------------------------------------------------------------------------
+AIDER_FAST = "ollama/qwen2.5-coder:1.5b"
+AIDER_DEFAULT = "ollama/qwen2.5-coder:7b-instruct-q4_K_M"
+AIDER_HEAVY = "ollama/qwen2.5-coder:14b"
 
 # ---------------------------------------------------------------------------
 # Complexity keywords
@@ -50,7 +50,6 @@ def _score(task: dict) -> int:
         task.get("description") or "",
         task.get("prompt") or "",
     ]).lower()
-
     score = 1
     for kw in _COMPLEX_KEYWORDS:
         if kw in text:
@@ -67,7 +66,9 @@ def select_model(task: dict) -> tuple[str | None, str]:
     """Return ``(model, executor_id)`` for the given task.
 
     Explicit ``task["model"]`` and ``task["executor"]`` always win.
-    Falls back to Haiku for simple tasks and Sonnet for medium ones.
+    Read-only task types → free local Ollama (text-only, no edits needed).
+    Simple/medium implementation → free local Aider + Ollama.
+    Complex → cheapest viable Anthropic cloud model.
     """
     explicit_model = task.get("model")
     explicit_executor = task.get("executor")
@@ -75,20 +76,19 @@ def select_model(task: dict) -> tuple[str | None, str]:
     if explicit_model and explicit_executor:
         return explicit_model, explicit_executor
     if explicit_model:
-        executor = "codex" if explicit_model.startswith("ollama/") else "claude_code"
-        return explicit_model, executor
+        return explicit_model, "claude_code"
 
     task_type = (task.get("task_type") or "implementation").lower()
 
-    # Read-only / analysis: Ollama text-only (no file editing needed)
-    if task_type in ("read_only", "analysis", "research"):
-        return CODEX_OLLAMA_MED, "ollama"
+    # Read-only: no file editing needed → plain Ollama (free)
+    if task_type in READ_ONLY_TASK_TYPES:
+        return "qwen2.5-coder:7b-instruct-q4_K_M", "ollama"
 
-    # Implementation: cheapest cloud model that can handle the complexity
+    # Implementation: prefer local Aider for simple/medium, cloud for complex
     score = _score(task)
     if score <= 1:
-        return HAIKU, "claude_code"
+        return AIDER_DEFAULT, "aider"
     elif score == 2:
-        return SONNET, "claude_code"
+        return HAIKU, "claude_code"
     else:
-        return None, "claude_code"  # provider default
+        return SONNET, "claude_code"
