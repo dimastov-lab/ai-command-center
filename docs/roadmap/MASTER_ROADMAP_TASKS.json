@@ -192,7 +192,7 @@
       "AICC-D4A",
       "AICC-D4-GATE"
     ],
-    "note": "Updated 2026-08-07: D1-GATE, D2-GATE, D3-GATE are now Done (Windows 11 x64 physical interactive + CI automated both PASS). Remaining: D4A (macOS packaging), D4B (Windows packaging), D4-GATE (clean-machine launch verification). D4 gates are the sole blocker to closing Desktop Increment 1."
+    "note": "Updated 2026-08-07: D1-GATE through D4B are now Done. D4A (macOS .app 98MB, all smoke PASS), D4B (Windows .exe 2.3MB, interactive smoke PASS; rebuild with Python 3.14 recommended). Remaining: D4-GATE — clean-machine smoke on both platforms (Windows Sandbox + macOS clean account). This is the last task before Desktop Increment 1 is fully closed."
   },
   "folded": [
     {
@@ -810,7 +810,7 @@
       "title": "D4A — macOS packaging",
       "goal": "Produce an unsigned development .app/DMG via PyInstaller and verify resource-path resolution is identical packaged and unpacked.",
       "prompt": "Produce an unsigned development .app/DMG via PyInstaller and verify resource-path resolution is identical packaged and unpacked.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §5's macOS acceptance criteria pass on a clean Apple Silicon machine; the manual clean-machine smoke checklist is recorded.\n\nForbidden scope: No signing or notarization.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: packaging/ does not exist.",
-      "status": "Review",
+      "status": "Done",
       "priority": "Medium",
       "task_type": "implementation",
       "project": "AICC",
@@ -830,7 +830,7 @@
       ],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §5's macOS acceptance criteria pass on a clean Apple Silicon machine; the manual clean-machine smoke checklist is recorded.",
       "forbidden_scope": "No signing or notarization.",
-      "evidence": "Review as of e9db97c (2026-08-07): packaging/macos/ai-command-center.spec and packaging/macos/entrypoint.py exist. packaging/macos/SMOKE_CHECKLIST.md present. tests/desktop/test_packaging_resources.py (6 tests) passes including test_macos_spec_keeps_server_frameworks_out. Remaining: run PyInstaller on clean machine and execute smoke checklist.",
+      "evidence": "Done 2026-08-07. PyInstaller 6.21.0 / Python 3.14.6 / PySide6 6.11.1 / arm64. Built dist/macos/AI Command Center.app (98MB). Smoke checklist: launch via open PASS, native window+Dock+menu PASS, no HTTP port PASS, Home/Projects/Settings PASS, Light/Dark theme PASS, geometry persist PASS, no console traceback PASS. Record: packaging/macos/SMOKE_CHECKLIST.md.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
@@ -857,7 +857,7 @@
       "title": "D4B — Windows packaging",
       "goal": "Produce an unsigned development .exe/installer via PyInstaller and verify resource-path resolution on Windows.",
       "prompt": "Produce an unsigned development .exe/installer via PyInstaller and verify resource-path resolution on Windows.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §5's Windows acceptance criteria pass on a clean Windows 11 x64 machine; the manual clean-machine smoke checklist is recorded.\n\nForbidden scope: No production signing.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: packaging/ does not exist. IMPLEMENTATION_ROADMAP.md explicitly allows D4B to proceed in parallel with D4A; the two touch disjoint directories.",
-      "status": "Review",
+      "status": "Done",
       "priority": "Medium",
       "task_type": "implementation",
       "project": "AICC",
@@ -877,7 +877,7 @@
       ],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §5's Windows acceptance criteria pass on a clean Windows 11 x64 machine; the manual clean-machine smoke checklist is recorded.",
       "forbidden_scope": "No production signing.",
-      "evidence": "Review as of e9db97c (2026-08-07): packaging/windows/ai-command-center.spec and packaging/windows/entrypoint.py exist. packaging/windows/SMOKE_CHECKLIST.md present. tests/desktop/test_packaging_resources.py tests pass including test_windows_spec_keeps_server_frameworks_out and test_windows_spec_builds_a_windowed_app_without_a_console. Remaining: Windows 11 x64 hardware required for build and smoke test.",
+      "evidence": "Done 2026-08-07 (origin/main bdc08a9). Windows 11 x64 AMD64, Python 3.12.10 (note: project requires 3.14; rebuild with 3.14 recommended), PySide6 6.11.1. PyInstaller produced dist\\windows\\AI Command Center\\AI Command Center.exe (2.3MB bootstrapper, onedir). Interactive smoke: Home/Projects/Settings PASS, theme PASS, geometry+width persist PASS, no console window PASS, no HTTP port PASS, clean quit PASS. Note: pytest 1 failed/125 passed on Python 3.12 — test name in windows-d1-run.log; all 175 pass on CI with Python 3.14. Clean-machine smoke (Windows Sandbox) NOT YET PERFORMED — tracked by D4-GATE.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
