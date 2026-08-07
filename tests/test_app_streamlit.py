@@ -209,6 +209,28 @@ def test_kanban_launcher_present_but_never_calls_subprocess_on_render(monkeypatc
     assert any(b.label == "Запустить агента" for b in at.button)
 
 
+def test_corrupt_tasks_file_surfaces_an_error_instead_of_an_empty_board():
+    """A `tasks.json` that exists but cannot be decoded must stop the render with
+    a visible error naming the file. Falling back to `[]` would paint an empty
+    Kanban board that reads exactly like "you have no tasks", so the operator
+    plans and launches against a store they believe is empty."""
+    _seed_task()
+    tasks_path = Path(os.environ["AICC_DATA_DIR"]) / "tasks.json"
+    corrupt = '[{"id": "seeded-task-1", '
+    tasks_path.write_text(corrupt, encoding="utf-8")
+
+    at = _at_on_page("kanban")
+
+    assert not at.exception  # handled deliberately, not an unhandled traceback
+    error_text = " ".join(element.value for element in at.error)
+    assert "tasks.json" in error_text
+    assert str(tasks_path) in error_text
+    # The board itself never renders, so there is no empty-state to misread.
+    assert not any("Запустить агента" == b.label for b in at.button)
+    # And nothing was written over the corrupt file by merely rendering.
+    assert tasks_path.read_text(encoding="utf-8") == corrupt
+
+
 def test_kanban_task_delete_requires_explicit_confirmation():
     task = _seed_task()
     tasks_path = Path(os.environ["AICC_DATA_DIR"]) / "tasks.json"
