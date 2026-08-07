@@ -138,6 +138,14 @@ def main(task_ids: list[str], dry_run: bool = False) -> int:
             _launch(task_id, dry_run=dry_run)
             if not dry_run:
                 time.sleep(8)  # give supervisor time to pick up
+                # If launch was rejected (dirty tree, locked, etc.) retry until accepted
+                post_status = _task_launch_status(task_id)
+                while post_status not in RUNNING_STATUSES and post_status not in TERMINAL_STATUSES:
+                    print(f"[SEQ]   launch rejected ({post_status}), retrying in {POLL_INTERVAL}s…", flush=True)
+                    time.sleep(POLL_INTERVAL)
+                    _launch(task_id)
+                    time.sleep(8)
+                    post_status = _task_launch_status(task_id)
             else:
                 print("[DRY-RUN]   Would sleep 8s before polling", flush=True)
 
