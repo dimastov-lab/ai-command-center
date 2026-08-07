@@ -3344,10 +3344,6 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
         ]
 
     queue_entries = execution_queue.load_queue(ROOT)
-    reconciled_queue = execution_queue.reconcile_missing_run_links(ROOT, queue_entries)
-    if reconciled_queue != queue_entries:
-        execution_queue.save_queue(ROOT, reconciled_queue)
-        queue_entries = reconciled_queue
     dismissed_attention = st.session_state.get(_ATTENTION_DISMISSED_KEY, set())
     visible_board = {
         bucket: list(rows)
