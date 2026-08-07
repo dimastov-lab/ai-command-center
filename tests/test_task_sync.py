@@ -402,7 +402,9 @@ def test_sync_task_from_run_unknown_maps_to_requires_attention(tmp_path):
 
 def test_sync_task_from_run_cancelled_maps_to_failed_launch_status(tmp_path):
     """`models.LAUNCH_STATUSES` has no dedicated Cancelled value — this is
-    the documented simplification (see task_sync.py's module docstring)."""
+    the documented simplification (see task_sync.py's module docstring).
+    Cancelled tasks move to the "Closed" kanban lane to distinguish them
+    from "Failed" (which requires attention/recovery)."""
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)
     run = _make_run(db_path, state="CANCELLED", completed_at="2026-01-01T00:01:00")
@@ -411,6 +413,7 @@ def test_sync_task_from_run_cancelled_maps_to_failed_launch_status(tmp_path):
     task_sync.sync_task_from_run(task, run, db_path=db_path)
 
     assert task["launch_status"] == "Failed"
+    assert task["status"] == "Closed"
 
 
 def test_sync_task_from_run_blocked_maps_to_blocked_launch_status(tmp_path):

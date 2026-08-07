@@ -384,6 +384,19 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
             task.pop("provider_error_retry_count", None)
             mutated = True
 
+    # When a run is cancelled (user-initiated stop), move the task to the
+    # "Closed" kanban lane to signal this is a resolved-but-not-completed
+    # outcome, distinct from "Failed" (which requires attention/recovery).
+    if status == session_view.STATUS_CANCELLED:
+        if task.get("status") != "Closed":
+            task["status"] = "Closed"
+            models.append_timeline_event(
+                task,
+                "cancelled",
+                f"Прогон `{run['id'][:8]}` отменён оператором.",
+            )
+            mutated = True
+
     if task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
         mutated = True
