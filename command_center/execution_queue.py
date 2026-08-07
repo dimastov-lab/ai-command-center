@@ -475,6 +475,42 @@ def select_available_executor(
     return candidates[0][0]
 
 
+def select_remediation_executor(task: dict, cfg: dict) -> str | None:
+    """Select executor for an Attention Triage remediation re-launch.
+
+    Unlike ``select_available_executor`` this function deliberately skips the
+    ``provider.availability()`` probe:
+    * Transient probe failures (daemon restarting, timeout under load) would
+      block an operator who knows the provider is healthy.
+    * The real CLI binary is absent in CI — the probe would always return
+      ``False`` even though the run is faked.
+
+    The configured executor is preferred first; non-failed alternatives follow.
+    If every candidate has previously failed to start, the configured executor
+    is still returned so the caller can record a "remediation_retry" event (the
+    operator explicitly asked for a retry, possibly after restoring the service).
+    Returns ``None`` only when there is genuinely no executor to try.
+    """
+    allowed = list(cfg.get("allowed_agents") or [])
+    explicit = task.get("executor")
+    failed = set(task.get("failed_executors") or [])
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    if explicit:
+        candidates.append(explicit)
+        seen.add(explicit)
+    for eid in allowed:
+        if eid not in seen:
+            candidates.append(eid)
+            seen.add(eid)
+    if not candidates:
+        candidates = ["claude_code"]
+
+    non_failed = [e for e in candidates if e not in failed]
+    return (non_failed or candidates)[0]
+
+
 @dataclass
 class LaunchAttemptResult:
     entry_id: str

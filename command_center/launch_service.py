@@ -445,7 +445,19 @@ def execute_agent_launch_v2(
     if task is not None and executor_id == "claude_code" and model is None:
         auto_model, auto_executor = model_selector.select_model(task)
         model = auto_model
-        executor_id = auto_executor
+        # Only adopt the auto-selected executor when it is authorized for this
+        # project. A task whose project has not granted e.g. "aider" stays on
+        # "claude_code" with the cheapest viable cloud model — rather than
+        # raising ProviderAuthorizationError inside start_run after the auth
+        # check that runs at line ~361 already passed for "claude_code".
+        if auto_executor != "claude_code":
+            try:
+                project_config.require_execution_provider_allowed(project, auto_executor)
+                executor_id = auto_executor
+            except project_config.ProviderAuthorizationError:
+                pass  # keep executor_id as "claude_code"; model is already set
+        else:
+            executor_id = auto_executor
 
     title = (task or {}).get("title") or ("Codex CLI run" if executor_id == "codex" else prompt[:120])
 

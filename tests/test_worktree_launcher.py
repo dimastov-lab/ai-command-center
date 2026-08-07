@@ -108,7 +108,12 @@ def test_linked_worktree_validates(tmp_path):
     assert _check(validation, "registered_worktree").status == worktree_launcher.CHECK_OK
 
 
-def test_detached_head_warns_without_expected_branch(tmp_path):
+def test_detached_head_blocks_even_without_expected_branch(tmp_path):
+    """Detached HEAD is a blocking error regardless of whether a branch was expected.
+    A detached HEAD used to be a mere warning when expected_branch was None, but
+    commits on a detached HEAD belong to no branch and are lost to the next
+    git checkout — the hazard is in the repository state itself, not in the caller's
+    knowledge of it."""
     repo = tmp_path / "repo"
     _init_repo(repo)
     head = subprocess.run(
@@ -119,12 +124,9 @@ def test_detached_head_warns_without_expected_branch(tmp_path):
     validation = worktree_launcher.validate_worktree(
         repository_root=repo, worktree_path=repo, expected_branch=None
     )
-    # Detached HEAD is a confirmable warning, not a hard block, when no
-    # specific branch was expected.
-    assert validation.can_launch, _errors_of(validation)
-    assert validation.needs_confirmation
-    assert any("detached HEAD" in w for w in validation.warnings)
-    assert _check(validation, "branch").status == worktree_launcher.CHECK_WARNING
+    assert not validation.can_launch  # detached HEAD is now always a blocking error
+    assert any("detached" in e.lower() for e in validation.errors)
+    assert _check(validation, "branch").status == worktree_launcher.CHECK_FAILED
 
 
 def test_detached_head_is_a_hard_error_when_a_branch_was_expected(tmp_path):

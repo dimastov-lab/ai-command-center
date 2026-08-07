@@ -123,7 +123,9 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
     yet — see `sync_task_from_run`'s ordering)."""
     report_row = db.get_report(db_path, run["id"])
     if report_row:
-        task["report_path"] = report_row["path"]
+        candidate = report_row.get("path") or ""
+        if reports.resolve_report_path(candidate, project=run.get("project")) is not None:
+            task["report_path"] = candidate
 
     task["repository_path"] = run.get("repository_path")
     live_status = session_view.live_git_status(run.get("repository_path"))
