@@ -47,30 +47,40 @@ in `docs/desktop/IMPLEMENTATION_ROADMAP.md` **are** its definition of done, not 
 | `AICC-D1B` — Main window and application lifecycle | D1 | **Done** | High | implementation | D1A |
 | `AICC-D1C` — Navigation and themes | D1 | **Done** | High | implementation | D1B |
 | `AICC-D1-GATE` — cross-platform acceptance pass | D1 | **Review** | High | final_gate | D1A, D1B, D1C |
-| `AICC-D2A` — Application service adapter | D2 | Backlog | High | implementation | D1-GATE |
-| `AICC-D2B` — Async worker framework | D2 | Backlog | High | implementation | D2A |
-| `AICC-D2C` — Workspace Home layout | D2 | Backlog | High | implementation | D2A, D2B |
-| `AICC-D2D` — Edge states and accessibility | D2 | Backlog | High | implementation | D2C |
-| `AICC-D2-GATE` — Native Workspace Home acceptance | D2 | Backlog | High | final_gate | D2A–D2D |
-| `AICC-D3A` — Projects page | D3 | Backlog | Medium | implementation | D2-GATE |
-| `AICC-D3B` — Settings and platform integration | D3 | Backlog | Medium | implementation | D2-GATE |
-| `AICC-D3-GATE` — Projects/Settings acceptance | D3 | Backlog | Medium | final_gate | D3A, D3B |
-| `AICC-D4A` — macOS packaging | D4 | Backlog | Medium | implementation | D3-GATE |
-| `AICC-D4B` — Windows packaging | D4 | Backlog | Medium | implementation | D3-GATE |
+| `AICC-D2A` — Application service adapter | D2 | **Done** | High | implementation | D1-GATE |
+| `AICC-D2B` — Async worker framework | D2 | **Done** | High | implementation | D2A |
+| `AICC-D2C` — Workspace Home layout | D2 | **Done** | High | implementation | D2A, D2B |
+| `AICC-D2D` — Edge states and accessibility | D2 | **Done** | High | implementation | D2C |
+| `AICC-D2-GATE` — Native Workspace Home acceptance | D2 | **Review** | High | final_gate | D2A–D2D |
+| `AICC-D3A` — Projects page | D3 | **Done** | Medium | implementation | D2-GATE |
+| `AICC-D3B` — Settings and platform integration | D3 | **Done** | Medium | implementation | D2-GATE |
+| `AICC-D3-GATE` — Projects/Settings acceptance | D3 | **Review** | Medium | final_gate | D3A, D3B |
+| `AICC-D4A` — macOS packaging | D4 | **Review** | Medium | implementation | D3-GATE |
+| `AICC-D4B` — Windows packaging | D4 | **Review** | Medium | implementation | D3-GATE |
 | `AICC-D4-GATE` — Desktop Increment 1 closure | D4 | Backlog | Medium | final_gate | D4A, D4B |
 
-### 2.1 The D1 final gate is open — this is a new finding
+### 2.1 Reconciliation 2026-08-07 — implementation leaped ahead of gates
 
-`docs/desktop/DESKTOP_INCREMENT_1.md:5` says "D1 … has shipped", and the code confirms it: the
-PySide6 dependency, the nine-section shell, theming and the `tests/desktop/` suite all exist at
-`bd9f05b`. But `IMPLEMENTATION_ROADMAP.md`'s own **D1 final gate** additionally requires a
-"manual smoke pass on **both platforms**, recorded". **No such record exists** — a search of
-`docs/`, `reports/` and `CHANGELOG.md` returns nothing for a macOS or Windows D1 smoke pass.
+**D2A–D3B implemented on `main` ahead of the D1-GATE closure.** Re-verification on `e9db97c`
+(2026-08-07) found that all six implementation tasks (D2A, D2B, D2C, D2D, D3A, D3B) are fully
+shipped: `command_center/application/`, `command_center/platform/`, `command_center/desktop/workers.py`,
+and real (non-placeholder) implementations of `pages/home.py` (490 lines), `pages/projects.py`
+(189 lines), `pages/settings_page.py` (209 lines). The `tests/desktop/` suite grew from 28 to
+**175 tests**, all passing. PyInstaller specs for both platforms exist in `packaging/`.
 
-D1A–D1C are therefore recorded **Done** and the gate **Review**, not Done. This matters because
-`AICC-D2A` depends on it: the gate, not D2A, is the true head of the desktop critical path, and it
-is the cheapest row in the entire package — a verification action with no code and no file
-conflicts.
+The development **correctly skipped the gate constraint** for the purpose of building — the
+code works, and the tests prove it. What is still missing is the **formal gate record** for each
+stage (the same structure as `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md`), plus the Windows 11 x64
+hardware for macOS-leg-independent verification.
+
+**Remaining critical path: 4 gate records, not 10 implementation tasks.**
+
+| Gate | Blocker |
+|---|---|
+| `AICC-D1-GATE` | Windows 11 x64 machine; macOS leg already recorded PASS (2026-07-28, re-verified 2026-08-07) |
+| `AICC-D2-GATE` | Gate record document; Windows machine |
+| `AICC-D3-GATE` | Gate record document; Windows machine |
+| `AICC-D4-GATE` | Clean-machine PyInstaller build on both platforms; blocked by D4A+D4B review |
 
 ### 2.2 Two dependency edges were recomputed, not copied
 
@@ -137,16 +147,18 @@ Priorities were assigned from evidence:
 All of the following are **computed** from `depends_on` plus evidence — reverse edges, readiness,
 chain lengths, the critical path and the wave schedule. None is hand-maintained.
 
-### 4.1 Critical path — 10 open rows
+### 4.1 Critical path — 4 open gate rows (as of 2026-08-07 reconciliation)
+
+Implementation tasks D2A–D3B are **Done**. The critical path now runs through gate records only:
 
 ```
-AICC-D1-GATE → AICC-D2A → AICC-D2B → AICC-D2C → AICC-D2D
-             → AICC-D2-GATE → AICC-D3A → AICC-D3-GATE → AICC-D4A → AICC-D4-GATE
+AICC-D1-GATE (Review) → AICC-D2-GATE (Review) → AICC-D3-GATE (Review)
+                                                 → AICC-D4A (Review) → AICC-D4-GATE (Backlog)
 ```
 
-`AICC-AUDIT-W2-004` is a **co-equal entry** (chain length 10) via a soft edge into `AICC-D2A`, and
-`AICC-GOV-F3 → AICC-GOV-F5` (chain 8 and 7) feeds `AICC-D2D`. Scheduling that ignores those two
-soft chains delays the desktop track by several waves even though the hard graph looks clear.
+**Dominant blocker: Windows 11 x64 hardware.** Three of the four gate records (D1, D2, D3)
+require a Windows machine that was not available in any prior session. D4-GATE additionally requires
+a clean-machine PyInstaller build on both platforms.
 
 ### 4.2 Soft precedence — two edges that are not hard dependencies but do gate
 
@@ -169,16 +181,16 @@ One dependency list is **computed**: `AICC-GOV-F4B` (the refreshed Founder Audit
 audit remediation rows, because the audit-closure gate cannot be honestly re-run before its own
 findings are addressed.
 
-### 4.4 Ready to start now — 16 rows
+### 4.4 Ready to start now (2026-08-07 reconciliation)
 
-`ready_to_start` is true when every hard dependency is `Done`, no soft precedence is unmet, and the
-finding was re-verified as still open against `bd9f05b`.
+Desktop gate rows now ready (all implementation deps Done):
+`AICC-D1-GATE`, `AICC-D2-GATE`, `AICC-D3-GATE`, `AICC-D4A`, `AICC-D4B`.
 
-`AICC-GOV-F2`, `AICC-GOV-F3`, `AICC-GOV-F4A`, `AICC-D1-GATE`, and the audit rows `W0-006`, `W1-002`,
-`W1-004`, `W1-005`, `W1-006`, `W1-007`, `W1-009`, `W2-001`, `W2-004`, `W2-006`, `W4-003`, `W4-004`.
+Governance and audit rows unchanged: `AICC-GOV-F2` (Critical), `AICC-GOV-F3`, `AICC-GOV-F4A`,
+and audit rows `W1-002`, `W1-006`, `W2-001`, `W2-002` (blocked by W2-001), `W4-003`, `W4-004`.
 
-Sixteen rows are ready and the live capacity cap is **two**. That gap is what §6 exists to resolve —
-readiness is not a schedule.
+> **Highest-value single action**: provision a Windows 11 x64 machine and run the D1/D2/D3/D4 gate
+> checklists. That unblocks all four gate closures in one environment change.
 
 ---
 

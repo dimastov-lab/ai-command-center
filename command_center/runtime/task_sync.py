@@ -20,11 +20,15 @@ implies progress == 100" and the literal shape of the reported defect
 
 from __future__ import annotations
 
+import logging
+
 from command_center import models, project_config, report_parser
 from command_center.runtime import completion as completion_states
 from command_center.runtime import db, providers, reports, session_view
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.runtime.completion_service import CompletionOrchestrator
+
+logger = logging.getLogger(__name__)
 
 # Session-view display status -> Kanban `models.LAUNCH_STATUSES` value, for
 # every status *except* `STATUS_COMPLETED` — a genuinely-completed run does
@@ -123,7 +127,26 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
     yet — see `sync_task_from_run`'s ordering)."""
     report_row = db.get_report(db_path, run["id"])
     if report_row:
-        task["report_path"] = report_row["path"]
+        stored = report_row["path"]
+        # A run's report must live in that run's own `reports/<project>/`
+        # directory — the only place `reports.save_report` ever writes one.
+        # The row is normally written by the supervisor from
+        # `reports.stored_report_path`, but `legacy_import` copies whatever
+        # string a v1.2 `data/runs.jsonl` row carried, so a hand-edited or
+        # imported record can propose `../../../etc/passwd` (or another
+        # project's report) here. Publishing it onto the task would put that
+        # reference in front of every reader of the board — and every UI that
+        # renders the file behind it. An out-of-bounds reference is dropped,
+        # not stored: no link is strictly better than a wrong one.
+        if reports.resolve_report_path(stored, project=run.get("project")) is not None:
+            task["report_path"] = stored
+        else:
+            logger.warning(
+                "Refusing report path %r for run %s (project %r): outside reports/<project>/",
+                stored,
+                run["id"],
+                run.get("project"),
+            )
 
     task["repository_path"] = run.get("repository_path")
     live_status = session_view.live_git_status(run.get("repository_path"))

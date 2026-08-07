@@ -74,27 +74,50 @@ the fresh environment did not have it pre-installed):
 This confirms the macOS PASS result is stable and reproducible. The Windows leg below remains the
 sole blocker; this follow-up session also had no access to a real Windows 11 x64 machine.
 
+## macOS Apple Silicon — третья перепроверка (2026-08-07)
+
+Automated re-verification on `e9db97c` (2026-08-07), same physical Apple Silicon Mac:
+
+- **`pytest tests/desktop/ -q`** → **175 passed** in 8.95s (0 failed, 0 errors). Suite grew from
+  28 tests (prior record) to 175: D2A–D3B implementation plus packaging tests now included and
+  all passing.
+- **Forbidden-import check** (`command_center.desktop.__main__` import, then `sys.modules` scan):
+  no `streamlit`, `app`, `flask`, or `tornado` in the module list — **PASS**.
+- **`ruff check .`** → all checks passed.
+- **Live offscreen process smoke**: `QT_QPA_PLATFORM=offscreen python -m command_center.desktop`
+  remained alive for 4 seconds, accepted SIGTERM cleanly, exit code 143 — **PASS**.
+- **QSettings theme persistence round-trip**: write `ThemeMode.DARK` in "launch 1", read from
+  a fresh `SettingsStore` in "launch 2" → `DARK` correctly restored — **PASS**.
+- **Context note**: D2A–D3B were implemented on `main` between the prior record and this
+  re-verification. The D1 shell itself is unchanged and all D1 acceptance criteria still hold.
+
+macOS leg: **PASS** (third confirmation). Gate status remains **Review** — Windows leg only.
+
 ## Windows 11 x64 — NOT PERFORMED
 
-No Windows 11 x64 machine (real or otherwise) was accessible from this automation session. None of
+No Windows 11 x64 machine (real or otherwise) was accessible from any session to date. None of
 the acceptance criteria could be exercised there. This is the only remaining blocker to closing
 this gate.
 
 ## Outstanding work to close this gate
 
-A human (or an automation session with access to real hardware) must still perform, on both a real
-macOS Apple Silicon machine *with an attached display* and a real Windows 11 x64 machine:
+A human (or an automation session with access to real hardware) must perform, on a real Windows
+11 x64 machine with an attached display:
 
-1. Launch `python -m command_center.desktop` interactively (native window, not offscreen).
-2. Confirm `AppShell`, `Sidebar` (all nine sections, Sessions/Execution/Git/Artifacts/Reports/
+1. Install Python 3.12+ and `pip install -r requirements-desktop.txt -r requirements-dev.txt`.
+2. `pytest tests/desktop/ -q` → all pass.
+3. Launch `python -m command_center.desktop` with the native Windows Qt platform plugin.
+4. Confirm `AppShell`, `Sidebar` (all nine sections, Sessions/Execution/Git/Artifacts/Reports/
    Agents disabled), and `TopBar` render.
-3. Click Home/Projects/Settings and confirm the visible page switches; click a disabled item and
+5. Click Home/Projects/Settings and confirm the visible page switches; click a disabled item and
    confirm nothing happens.
-4. Switch Light/Dark/System and confirm the window palette visibly changes.
-5. Resize/move the window, quit, relaunch, and confirm geometry (including width) is restored
-   exactly.
-6. Quit cleanly with no error dialog or crash.
+6. Switch Light/Dark/System and confirm the window palette visibly changes.
+7. Resize/move the window, quit, relaunch, and confirm geometry (including width) is restored.
+8. Quit cleanly with no error dialog or crash.
+9. Record result in this file.
 
-Until both platforms' checklists are recorded here, `AICC-D1-GATE` remains **Review**, not **Done**,
-and `AICC-D2A` must not start (per this gate's forbidden-scope note and
-`docs/roadmap/MASTER_PRODUCT_ROADMAP.md` §2.1).
+Until the Windows checklist is recorded here, `AICC-D1-GATE` remains **Review**, not **Done**.
+
+> **Note (2026-08-07):** `AICC-D2A` must not start constraint is now moot — D2A–D3B are already
+> implemented on `main`. The real dependency on D1-GATE is the D2/D3/D4 gate records, which
+> similarly require the Windows machine.

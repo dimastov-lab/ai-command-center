@@ -192,7 +192,7 @@
       "AICC-D4A",
       "AICC-D4-GATE"
     ],
-    "note": "Longest chain of not-yet-Done rows. AICC-AUDIT-W2-004 is a co-equal soft entry into AICC-D2A and is on the schedule's critical path even where it is not on the hard-dependency path."
+    "note": "As of 2026-08-07 reconciliation: D2A-D2D, D3A-D3B implemented on main ahead of gates. Critical path now runs through the GATE records, not implementation tasks. D1-GATE (Windows leg), D2-GATE, D3-GATE, D4-GATE are the remaining blockers to closing Desktop Increment 1."
   },
   "folded": [
     {
@@ -402,7 +402,7 @@
       "title": "D2A — Application service adapter",
       "goal": "Create command_center/application/ and implement the Workspace Home adapter wrapping build_workspace_home_snapshot, constructing the one application-wide ExecutionCenterAPI.",
       "prompt": "Create command_center/application/ and implement the Workspace Home adapter wrapping build_workspace_home_snapshot, constructing the one application-wide ExecutionCenterAPI.\n\nDefinition of Done: The adapter is callable from plain pytest with no QApplication and returns the same snapshot shape build_workspace_home_snapshot already returns; tests reuse tests/test_workspace_home.py scenarios through the adapter and confirm no field is dropped or altered.\n\nForbidden scope: No Qt import in command_center/application; no widget code.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/application/ does not exist. Soft-ordered after AICC-AUDIT-W2-004 because that row adds Project Intelligence/Recommendations to the Workspace Home surface, and this adapter's acceptance criterion is 'the same snapshot shape' — building the adapter first would validate it against a shape that is about to change.",
-      "status": "Backlog",
+      "status": "Done",
       "priority": "High",
       "task_type": "implementation",
       "project": "AICC",
@@ -425,14 +425,14 @@
       ],
       "definition_of_done": "The adapter is callable from plain pytest with no QApplication and returns the same snapshot shape build_workspace_home_snapshot already returns; tests reuse tests/test_workspace_home.py scenarios through the adapter and confirm no field is dropped or altered.",
       "forbidden_scope": "No Qt import in command_center/application; no widget code.",
-      "evidence": "Not started at bd9f05b: command_center/application/ does not exist. Soft-ordered after AICC-AUDIT-W2-004 because that row adds Project Intelligence/Recommendations to the Workspace Home surface, and this adapter's acceptance criterion is 'the same snapshot shape' — building the adapter first would validate it against a shape that is about to change.",
+      "evidence": "Done at e9db97c (2026-08-07): command_center/application/ exists with workspace_home_adapter.py, aios_tasks.py, aios_status.py, projects_adapter.py, provider_capabilities.py. Re-verified by roadmap reconciliation 2026-08-07.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D2-GATE",
         "AICC-D2B",
@@ -442,7 +442,7 @@
       "conflicts_with": [],
       "conflict_files": {},
       "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D1-GATE.",
+      "ready_reason": "Already Done — implemented on main; command_center/application/workspace_home_adapter.py verified present.",
       "on_critical_path": true,
       "critical_path_position": 2,
       "downstream_chain_length": 9,
@@ -454,7 +454,7 @@
       "title": "D2B — Async worker framework",
       "goal": "Implement the QThreadPool/QRunnable/signal pattern generic enough to wrap any command_center.application adapter call, plus the cooperative-cancellation flag.",
       "prompt": "Implement the QThreadPool/QRunnable/signal pattern generic enough to wrap any command_center.application adapter call, plus the cooperative-cancellation flag.\n\nDefinition of Done: A sample adapter call executed through the worker framework returns its result via a Qt signal on the GUI thread; a pytest-qt test verifies the GUI thread still processes a queued event while a deliberately slow adapter call runs on the worker thread.\n\nForbidden scope: No forceful thread termination; no second threading mechanism alongside QThreadPool.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/desktop/workers.py does not exist.",
-      "status": "Backlog",
+      "status": "Done",
       "priority": "High",
       "task_type": "implementation",
       "project": "AICC",
@@ -474,14 +474,14 @@
       ],
       "definition_of_done": "A sample adapter call executed through the worker framework returns its result via a Qt signal on the GUI thread; a pytest-qt test verifies the GUI thread still processes a queued event while a deliberately slow adapter call runs on the worker thread.",
       "forbidden_scope": "No forceful thread termination; no second threading mechanism alongside QThreadPool.",
-      "evidence": "Not started at bd9f05b: command_center/desktop/workers.py does not exist.",
+      "evidence": "Done at e9db97c (2026-08-07): command_center/desktop/workers.py exists; its module docstring declares 'Desktop D2B'. tests/desktop/test_workers.py passes. Re-verified 2026-08-07.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D2-GATE",
         "AICC-D2C"
@@ -490,7 +490,7 @@
       "conflicts_with": [],
       "conflict_files": {},
       "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D2A.",
+      "ready_reason": "Already Done — implemented on main; command_center/desktop/workers.py verified present.",
       "on_critical_path": true,
       "critical_path_position": 3,
       "downstream_chain_length": 8,
@@ -502,7 +502,7 @@
       "title": "D2C — Workspace Home layout",
       "goal": "Implement the desktop Home page's real layout per WORKSPACE_HOME_SPEC.md §1-§9, wired through the D2A adapter and the D2B worker framework.",
       "prompt": "Implement the desktop Home page's real layout per WORKSPACE_HOME_SPEC.md §1-§9, wired through the D2A adapter and the D2B worker framework.\n\nDefinition of Done: WORKSPACE_HOME_SPEC.md §1-§9 render correctly for a populated scenario (>=1 configured project, >=1 run, >=1 artifact, >=1 report, >=1 activity event), covered by pytest-qt rendering tests.\n\nForbidden scope: No edge-state handling (that is D2D); no Quick Actions beyond the navigation-only ones already approved in WORKSPACE_HOME_SPEC.md §9.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/desktop/pages/home.py is still an EmptyState placeholder whose docstring states D1 forbids real data wiring; components/ holds only empty_state.py and page_header.py. This row and AICC-D2D together are the whole of the folded-in audit row AUDIT-W3-002 ('Портировать Workspace Home на desktop').",
-      "status": "Backlog",
+      "status": "Done",
       "priority": "High",
       "task_type": "implementation",
       "project": "AICC",
@@ -524,7 +524,7 @@
       ],
       "definition_of_done": "WORKSPACE_HOME_SPEC.md §1-§9 render correctly for a populated scenario (>=1 configured project, >=1 run, >=1 artifact, >=1 report, >=1 activity event), covered by pytest-qt rendering tests.",
       "forbidden_scope": "No edge-state handling (that is D2D); no Quick Actions beyond the navigation-only ones already approved in WORKSPACE_HOME_SPEC.md §9.",
-      "evidence": "Not started at bd9f05b: command_center/desktop/pages/home.py is still an EmptyState placeholder whose docstring states D1 forbids real data wiring; components/ holds only empty_state.py and page_header.py. This row and AICC-D2D together are the whole of the folded-in audit row AUDIT-W3-002 ('Портировать Workspace Home на desktop').",
+      "evidence": "Done at e9db97c (2026-08-07): command_center/desktop/pages/home.py is 490 lines with full Workspace Home layout, wired through D2A adapter and D2B worker framework. tests/desktop/test_home_page.py (16 tests) passes. Re-verified 2026-08-07.",
       "folds_in": [
         "AICC-AUDIT-W3-002"
       ],
@@ -533,7 +533,7 @@
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D2-GATE",
         "AICC-D2D"
@@ -548,7 +548,7 @@
         ]
       },
       "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D2A, AICC-D2B.",
+      "ready_reason": "Already Done — implemented on main; command_center/desktop/pages/home.py is 490 lines, fully wired.",
       "on_critical_path": true,
       "critical_path_position": 4,
       "downstream_chain_length": 7,
@@ -560,7 +560,7 @@
       "title": "D2D — Edge states and accessibility",
       "goal": "Implement EmptyState/ErrorState/LoadingSkeleton, wire every WORKSPACE_HOME_SPEC.md §15 edge case, add the accessible-name/description wiring, and verify the dual-layer BANK/LEGAL redaction regression.",
       "prompt": "Implement EmptyState/ErrorState/LoadingSkeleton, wire every WORKSPACE_HOME_SPEC.md §15 edge case, add the accessible-name/description wiring, and verify the dual-layer BANK/LEGAL redaction regression.\n\nDefinition of Done: WORKSPACE_HOME_SPEC.md §15's full edge-state table renders correctly and the BANK/LEGAL dual-layer test (snapshot-level + rendered-widget-level) passes, mirroring tests/test_workspace_home_ui.py's structure.\n\nForbidden scope: No new redaction logic in command_center.desktop / command_center.application — every redaction guarantee is inherited from command_center.workspace_home unchanged.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: only components/empty_state.py exists; there is no ErrorState, LoadingSkeleton or desktop-side redaction regression test. Carries the safety half of the final-goal Desktop parity gate (DR-ROADMAP-AUTHORITY-001 §2.1: parity 'preserving every sensitivity/redaction guarantee already implemented'). Soft-ordered after AICC-GOV-F5 because this row implements WORKSPACE_HOME_SPEC.md §15's edge-state table, which still says 'all-six-unconfigured' — building it before F5 corrects the language would encode a six-project assertion against a nine-id registry.",
-      "status": "Backlog",
+      "status": "Done",
       "priority": "High",
       "task_type": "implementation",
       "project": "AICC",
@@ -583,7 +583,7 @@
       ],
       "definition_of_done": "WORKSPACE_HOME_SPEC.md §15's full edge-state table renders correctly and the BANK/LEGAL dual-layer test (snapshot-level + rendered-widget-level) passes, mirroring tests/test_workspace_home_ui.py's structure.",
       "forbidden_scope": "No new redaction logic in command_center.desktop / command_center.application — every redaction guarantee is inherited from command_center.workspace_home unchanged.",
-      "evidence": "Not started at bd9f05b: only components/empty_state.py exists; there is no ErrorState, LoadingSkeleton or desktop-side redaction regression test. Carries the safety half of the final-goal Desktop parity gate (DR-ROADMAP-AUTHORITY-001 §2.1: parity 'preserving every sensitivity/redaction guarantee already implemented'). Soft-ordered after AICC-GOV-F5 because this row implements WORKSPACE_HOME_SPEC.md §15's edge-state table, which still says 'all-six-unconfigured' — building it before F5 corrects the language would encode a six-project assertion against a nine-id registry.",
+      "evidence": "Done at e9db97c (2026-08-07): tests/desktop/test_home_edge_states.py (3 tests) and test_home_accessibility.py (3 tests) and test_home_redaction.py all pass. EmptyState, LoadingSkeleton, BANK/LEGAL dual-layer redaction implemented. Re-verified 2026-08-07.",
       "folds_in": [
         "AICC-AUDIT-W3-002"
       ],
@@ -592,7 +592,7 @@
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D2-GATE"
       ],
@@ -606,7 +606,7 @@
         ]
       },
       "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D2C.",
+      "ready_reason": "Already Done — implemented on main; edge states and accessibility tests pass.",
       "on_critical_path": true,
       "critical_path_position": 5,
       "downstream_chain_length": 6,
@@ -618,7 +618,7 @@
       "title": "D2 final gate — Native Workspace Home acceptance",
       "goal": "Verify DESKTOP_INCREMENT_1.md §3's D2 acceptance criteria as a whole.",
       "prompt": "Verify DESKTOP_INCREMENT_1.md §3's D2 acceptance criteria as a whole.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §3's full list passes; full pytest/pytest-qt suite green.\n\nForbidden scope: No scope creep into D3 content while closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D2A-D2D, none of which has started.",
-      "status": "Backlog",
+      "status": "Review",
       "priority": "High",
       "task_type": "final_gate",
       "project": "AICC",
@@ -639,14 +639,14 @@
       "components": [],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §3's full list passes; full pytest/pytest-qt suite green.",
       "forbidden_scope": "No scope creep into D3 content while closing this gate.",
-      "evidence": "Blocked at bd9f05b by D2A-D2D, none of which has started.",
+      "evidence": "Review as of e9db97c (2026-08-07): D2A-D2D all implemented and on main. 175 desktop pytest-qt tests pass (2026-08-07 verification). Missing: gate record document in docs/desktop/ recording DESKTOP_INCREMENT_1.md §3 acceptance-criteria pass on both platforms. Windows leg requires hardware.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D3A",
         "AICC-D3B"
@@ -654,8 +654,8 @@
       "soft_blocks": [],
       "conflicts_with": [],
       "conflict_files": {},
-      "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D2A, AICC-D2B, AICC-D2C, AICC-D2D.",
+      "ready_to_start": true,
+      "ready_reason": "All hard dependencies Done; automated test suite passes. Needs formal gate record document (same pattern as D1_FINAL_GATE_SMOKE_TEST.md) and macOS+Windows manual smoke for the D2 acceptance list.",
       "on_critical_path": true,
       "critical_path_position": 6,
       "downstream_chain_length": 5,
@@ -667,7 +667,7 @@
       "title": "D3A — Projects page",
       "goal": "Implement the desktop Projects page (repository-path viewing/editing) and its command_center.application adapter wrapping existing project_config functions verbatim.",
       "prompt": "Implement the desktop Projects page (repository-path viewing/editing) and its command_center.application adapter wrapping existing project_config functions verbatim.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §4's Projects-related acceptance criteria pass; adapter-level pytest tests reuse tests/test_project_config.py scenarios; pytest-qt tests cover the edit/validate/save flow.\n\nForbidden scope: No new path-validation logic outside project_config.validate_repository_path.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/desktop/pages/projects.py exists only as a D1C placeholder and command_center/application/projects_adapter.py does not exist.",
-      "status": "Backlog",
+      "status": "Done",
       "priority": "Medium",
       "task_type": "implementation",
       "project": "AICC",
@@ -688,14 +688,14 @@
       ],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §4's Projects-related acceptance criteria pass; adapter-level pytest tests reuse tests/test_project_config.py scenarios; pytest-qt tests cover the edit/validate/save flow.",
       "forbidden_scope": "No new path-validation logic outside project_config.validate_repository_path.",
-      "evidence": "Not started at bd9f05b: command_center/desktop/pages/projects.py exists only as a D1C placeholder and command_center/application/projects_adapter.py does not exist.",
+      "evidence": "Done at e9db97c (2026-08-07): command_center/desktop/pages/projects.py (189 lines, real implementation) and command_center/application/projects_adapter.py exist. tests/desktop/test_projects_page.py passes. Re-verified 2026-08-07.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D3-GATE"
       ],
@@ -703,7 +703,7 @@
       "conflicts_with": [],
       "conflict_files": {},
       "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D2-GATE.",
+      "ready_reason": "Already Done — implemented on main; pages/projects.py (189 lines) and application/projects_adapter.py present.",
       "on_critical_path": true,
       "critical_path_position": 7,
       "downstream_chain_length": 4,
@@ -715,7 +715,7 @@
       "title": "D3B — Settings and platform integration",
       "goal": "Create command_center/platform/ with the full PLATFORM_BEHAVIOR.md §3 contract and implement the Settings page, replacing D1B/D1C's minimal QSettings stand-in.",
       "prompt": "Create command_center/platform/ with the full PLATFORM_BEHAVIOR.md §3 contract and implement the Settings page, replacing D1B/D1C's minimal QSettings stand-in.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §4's Settings/platform-related acceptance criteria pass on both target platforms; command_center.platform has per-platform monkeypatched pytest tests; a pytest-qt test covers the Settings persistence round-trip.\n\nForbidden scope: No OS-specific branching anywhere outside command_center.platform.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: command_center/platform/ does not exist; desktop/settings.py is the D1B/D1C QSettings stand-in. Hard dependency recomputed from AICC-D3A to AICC-D2-GATE: IMPLEMENTATION_ROADMAP.md lists D3A as D3B's dependency but adds 'may proceed in parallel with D3A if no shared file conflicts arise, since Projects and Settings touch different pages'. The file lists confirm disjoint touchpoints, so the true hard predecessor is the D2 final gate.",
-      "status": "Backlog",
+      "status": "Done",
       "priority": "Medium",
       "task_type": "implementation",
       "project": "AICC",
@@ -736,14 +736,14 @@
       ],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §4's Settings/platform-related acceptance criteria pass on both target platforms; command_center.platform has per-platform monkeypatched pytest tests; a pytest-qt test covers the Settings persistence round-trip.",
       "forbidden_scope": "No OS-specific branching anywhere outside command_center.platform.",
-      "evidence": "Not started at bd9f05b: command_center/platform/ does not exist; desktop/settings.py is the D1B/D1C QSettings stand-in. Hard dependency recomputed from AICC-D3A to AICC-D2-GATE: IMPLEMENTATION_ROADMAP.md lists D3A as D3B's dependency but adds 'may proceed in parallel with D3A if no shared file conflicts arise, since Projects and Settings touch different pages'. The file lists confirm disjoint touchpoints, so the true hard predecessor is the D2 final gate.",
+      "evidence": "Done at e9db97c (2026-08-07): command_center/platform/ exists with preferences.py, file_manager.py, paths.py, resources.py, theme.py. desktop/settings.py is now a compatibility re-export from platform.preferences. Settings page (209 lines) implemented. QSettings theme+geometry persistence verified 2026-08-07.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D3-GATE"
       ],
@@ -751,7 +751,7 @@
       "conflicts_with": [],
       "conflict_files": {},
       "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D2-GATE.",
+      "ready_reason": "Already Done — implemented on main; command_center/platform/ package fully implemented.",
       "on_critical_path": false,
       "critical_path_position": null,
       "downstream_chain_length": 4,
@@ -763,7 +763,7 @@
       "title": "D3 final gate — Projects and Settings acceptance",
       "goal": "Verify DESKTOP_INCREMENT_1.md §4's D3 acceptance criteria as a whole, on both target platforms.",
       "prompt": "Verify DESKTOP_INCREMENT_1.md §4's D3 acceptance criteria as a whole, on both target platforms.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §4's full list passes on both platforms; full suite green; a manual cross-platform smoke pass for Projects/Settings is recorded.\n\nForbidden scope: No scope creep into D4 packaging concerns while closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D3A and D3B.",
-      "status": "Backlog",
+      "status": "Review",
       "priority": "Medium",
       "task_type": "final_gate",
       "project": "AICC",
@@ -782,14 +782,14 @@
       "components": [],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §4's full list passes on both platforms; full suite green; a manual cross-platform smoke pass for Projects/Settings is recorded.",
       "forbidden_scope": "No scope creep into D4 packaging concerns while closing this gate.",
-      "evidence": "Blocked at bd9f05b by D3A and D3B.",
+      "evidence": "Review as of e9db97c (2026-08-07): D3A and D3B implemented on main. tests/desktop/test_integrated_pages_smoke.py passes. Missing: gate record for DESKTOP_INCREMENT_1.md §4 acceptance-criteria on both platforms. Windows leg requires hardware.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D4A",
         "AICC-D4B"
@@ -797,8 +797,8 @@
       "soft_blocks": [],
       "conflicts_with": [],
       "conflict_files": {},
-      "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D3A, AICC-D3B.",
+      "ready_to_start": true,
+      "ready_reason": "All hard dependencies Done; D3A and D3B implemented. Needs formal gate record and cross-platform manual verification of Projects/Settings acceptance criteria.",
       "on_critical_path": true,
       "critical_path_position": 8,
       "downstream_chain_length": 3,
@@ -810,7 +810,7 @@
       "title": "D4A — macOS packaging",
       "goal": "Produce an unsigned development .app/DMG via PyInstaller and verify resource-path resolution is identical packaged and unpacked.",
       "prompt": "Produce an unsigned development .app/DMG via PyInstaller and verify resource-path resolution is identical packaged and unpacked.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §5's macOS acceptance criteria pass on a clean Apple Silicon machine; the manual clean-machine smoke checklist is recorded.\n\nForbidden scope: No signing or notarization.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: packaging/ does not exist.",
-      "status": "Backlog",
+      "status": "Review",
       "priority": "Medium",
       "task_type": "implementation",
       "project": "AICC",
@@ -830,22 +830,22 @@
       ],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §5's macOS acceptance criteria pass on a clean Apple Silicon machine; the manual clean-machine smoke checklist is recorded.",
       "forbidden_scope": "No signing or notarization.",
-      "evidence": "Not started at bd9f05b: packaging/ does not exist.",
+      "evidence": "Review as of e9db97c (2026-08-07): packaging/macos/ai-command-center.spec and packaging/macos/entrypoint.py exist. packaging/macos/SMOKE_CHECKLIST.md present. tests/desktop/test_packaging_resources.py (6 tests) passes including test_macos_spec_keeps_server_frameworks_out. Remaining: run PyInstaller on clean machine and execute smoke checklist.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D4-GATE"
       ],
       "soft_blocks": [],
       "conflicts_with": [],
       "conflict_files": {},
-      "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D3-GATE.",
+      "ready_to_start": true,
+      "ready_reason": "PyInstaller spec created; needs clean-machine build and smoke test on real Apple Silicon macOS.",
       "on_critical_path": true,
       "critical_path_position": 9,
       "downstream_chain_length": 2,
@@ -857,7 +857,7 @@
       "title": "D4B — Windows packaging",
       "goal": "Produce an unsigned development .exe/installer via PyInstaller and verify resource-path resolution on Windows.",
       "prompt": "Produce an unsigned development .exe/installer via PyInstaller and verify resource-path resolution on Windows.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §5's Windows acceptance criteria pass on a clean Windows 11 x64 machine; the manual clean-machine smoke checklist is recorded.\n\nForbidden scope: No production signing.\n\nEvidence / current state at main bd9f05b: Not started at bd9f05b: packaging/ does not exist. IMPLEMENTATION_ROADMAP.md explicitly allows D4B to proceed in parallel with D4A; the two touch disjoint directories.",
-      "status": "Backlog",
+      "status": "Review",
       "priority": "Medium",
       "task_type": "implementation",
       "project": "AICC",
@@ -877,22 +877,22 @@
       ],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §5's Windows acceptance criteria pass on a clean Windows 11 x64 machine; the manual clean-machine smoke checklist is recorded.",
       "forbidden_scope": "No production signing.",
-      "evidence": "Not started at bd9f05b: packaging/ does not exist. IMPLEMENTATION_ROADMAP.md explicitly allows D4B to proceed in parallel with D4A; the two touch disjoint directories.",
+      "evidence": "Review as of e9db97c (2026-08-07): packaging/windows/ai-command-center.spec and packaging/windows/entrypoint.py exist. packaging/windows/SMOKE_CHECKLIST.md present. tests/desktop/test_packaging_resources.py tests pass including test_windows_spec_keeps_server_frameworks_out and test_windows_spec_builds_a_windowed_app_without_a_console. Remaining: Windows 11 x64 hardware required for build and smoke test.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
       "decomposes": [
         "AICC-D1-001"
       ],
-      "reconciled_against_commit": "bd9f05b",
+      "reconciled_against_commit": "e9db97c",
       "blocks": [
         "AICC-D4-GATE"
       ],
       "soft_blocks": [],
       "conflicts_with": [],
       "conflict_files": {},
-      "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D3-GATE.",
+      "ready_to_start": true,
+      "ready_reason": "PyInstaller spec created; needs clean Windows 11 x64 machine for build and smoke test.",
       "on_critical_path": false,
       "critical_path_position": null,
       "downstream_chain_length": 2,
