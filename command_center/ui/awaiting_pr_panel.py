@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -299,6 +300,42 @@ def _render_traffic_light(task_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Run metadata line (когда завершено / из какой ветки / какой коммит)
+# ---------------------------------------------------------------------------
+
+def _format_completed_at(raw: str | None) -> str:
+    """ISO timestamp → `07.08.2026 09:46`. Нераспознанное значение возвращаем
+    как есть — лучше показать сырую строку, чем потерять её."""
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def _render_run_meta(task: dict, completion: dict | None) -> None:
+    comp = completion or {}
+    when = _format_completed_at(task.get("last_run_at") or comp.get("updated_at"))
+    branch = task.get("branch") or comp.get("branch") or ""
+    commit = task.get("commit_hash") or comp.get("head_commit") or ""
+
+    parts: list[str] = []
+    if when:
+        parts.append(f"Завершено: {when}")
+    if branch:
+        parts.append(f"ветка: {branch}")
+    if commit:
+        parts.append(f"коммит: {str(commit)[:7]}")
+    if parts:
+        st.caption(" • ".join(parts))
+
+
+# ---------------------------------------------------------------------------
 # Main render
 # ---------------------------------------------------------------------------
 
@@ -370,7 +407,8 @@ def render_awaiting_pr_panel(
             ttype = task.get("task_type") or task.get("type") or ""
             st.markdown(f"**{task.get('title') or tid}**  `{proj}`  _{ttype}_")
 
-        # ---- traffic light ----
+        # ---- run metadata + traffic light ----
+        _render_run_meta(task, completion)
         _render_traffic_light(tid)
 
         # ---- three action buttons ----
