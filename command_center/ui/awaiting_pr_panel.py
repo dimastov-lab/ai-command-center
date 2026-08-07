@@ -359,8 +359,8 @@ def render_awaiting_pr_panel(
         f"{len(pending)} задач выполнены агентом — нужен пулреквест для доставки в основную ветку."
     )
 
-    # ---- bulk "select all" + bulk Done ----
-    col_all, col_bulk_done, _ = st.columns([1, 2.5, 5.5])
+    # ---- bulk "select all" + bulk Done + bulk Tests ----
+    col_all, col_bulk_done, col_bulk_tests, _ = st.columns([1, 2.5, 2.5, 2.5])
     if col_all.button("Все", key=f"{key_prefix}_select_all"):
         for t in pending:
             st.session_state[f"{key_prefix}_sel_{t['id']}"] = True
@@ -381,6 +381,35 @@ def render_awaiting_pr_panel(
             )
             st.session_state.pop(f"{key_prefix}_sel_{tid}", None)
         st.rerun()
+
+    if col_bulk_tests.button(
+        f"🧪 Тесты ({len(selected)})" if selected else "🧪 Тесты для выбранных",
+        key=f"{key_prefix}_bulk_tests",
+        disabled=not selected,
+    ):
+        selected_tasks = [t for t in pending if t["id"] in selected]
+        tasks_without_pr = [t for t in selected_tasks if not _get_pr_url(t)]
+        if tasks_without_pr:
+            st.error(
+                f"⚠️ {len(tasks_without_pr)} задач без открытого ПР. "
+                f"Сначала создайте ПР для них."
+            )
+        else:
+            passed_count = 0
+            failed_count = 0
+            with st.spinner(f"Запускаю тесты для {len(selected_tasks)} задач…"):
+                for task in selected_tasks:
+                    _action_run_tests(task, root, project_configs)
+                    result = _get_test_result(task["id"])
+                    if result == "green":
+                        passed_count += 1
+                    elif result == "red":
+                        failed_count += 1
+
+            st.success(
+                f"✅ Тесты завершены: {passed_count} зелёных, {failed_count} красных"
+            )
+            st.rerun()
 
     st.divider()
 
