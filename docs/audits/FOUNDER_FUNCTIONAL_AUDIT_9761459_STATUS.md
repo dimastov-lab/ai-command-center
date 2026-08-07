@@ -1,10 +1,16 @@
 # Founder Functional Audit 9761459 — Status
 
-**CLOSED 2026-08-07.** This audit is closed as an *audit*: every one of its 33 task candidates has
-been reconciled, classified and either resolved or handed to a tracked roadmap row. Nothing from
-`9761459` is now carried only by this document. The residual work is listed in §"Closure" below
-and lives in `docs/roadmap/MASTER_ROADMAP_TASKS.json`, not here. Do not reopen this file to track
-progress — track the `AICC-AUDIT-W*` rows.
+**CLOSED 2026-08-07**, merge-verified against `origin/main` @ `fb3da7f` the same day. This audit is
+closed as an *audit*: every one of its 33 task candidates has been reconciled, classified and
+either resolved or handed to a tracked roadmap row. Nothing from `9761459` is now carried only by
+this document. The residual work is listed in §"Closure" below and lives in
+`docs/roadmap/MASTER_ROADMAP_TASKS.json`, not here. Do not reopen this file to track progress —
+track the `AICC-AUDIT-W*` rows.
+
+Final disposition of the 14 rows the reconciliation left Still Open, all read on `origin/main`
+(not on a task record, and not on an unpushed local branch): **7 merged**, **1 merged but still
+partial** (W1-006), **1 folded** into the desktop D2 tasks (W3-002), **5 still open**. The seven
+merged rows are now `Done` in the roadmap JSON. Detail: §"Merge verification".
 
 ## Audit baseline
 
@@ -69,6 +75,9 @@ The package is not currently compatible with the active `task_import.py` schema.
 
 Verified against `main` @ `744a09c` on 2026-08-07 by reading the code, not the task records — the
 task records and the PR links proved unreliable in both directions (see the two warnings below).
+Re-verified against the **merged** branch `origin/main` @ `fb3da7f` the same day — see
+"Merge verification" below, which is the authoritative pass: `744a09c` is a *local* commit that
+was never pushed.
 
 Of the 14 rows the reconciliation left **Still Open**:
 
@@ -129,6 +138,60 @@ set it fails; with only `AICC_DATA_DIR` or only `AICC_BACKGROUND_SYNC` set it pa
 unset it passes. `reports/` is gitignored (`.gitignore:35`), so CI and a clean checkout never see
 it. Run this evidence set with the `AICC_*` variables stripped.
 
+### Merge verification, 2026-08-07 (`origin/main` @ `fb3da7f`) — authoritative
+
+Every prior pass in this document verified against the **local** `main`. That is not the same
+branch. At the time of this pass the local checkout had **diverged** from the shared branch:
+
+| | |
+| --- | --- |
+| Local `main` | `c41e9bd` — 2 commits *not* pushed (`744a09c`, `c41e9bd`) |
+| `origin/main` | `fb3da7f` — 8 commits *not* present locally, incl. the merge of PR #141 |
+| Relationship | diverged; neither is an ancestor of the other |
+
+So "verified on `main`" in the sections above means "verified on a local branch that no one else
+can see". This pass re-reads every row on `origin/main` @ `fb3da7f`, which is what "merged"
+actually means. **The verdict does not change** — all nine evidence commits
+(`7bfb025`, `acdfe7c`, `8808fc5`, `0408c3e`, `1eb942a`, `ca4261d`, `f6ff08f`, `b2b94f3`,
+`8f4e3fc`) are confirmed ancestors of `origin/main`, and each row's *code* was re-read there
+rather than inferred from the commit being present:
+
+| Row | Outcome | Read on `origin/main` |
+| --- | --- | --- |
+| W0-006 | Merged | `runtime/reports.py:_safe_path_component` sanitizes the `project` component inside `report_path_for` (line 56) |
+| W1-004 | Merged | one acknowledgement per warning keyed by `code`; `unacknowledged_warning_codes` gates the button (`app.py:903-977`) |
+| W1-005 | Merged | `portfolio_launch.PROTECTED_BRANCH_NAMES` (line 127) + `casefold()` in `_validate_branch_name` (line 214) |
+| W1-007 | Merged | two-step delete confirmation in `app.py` (`*_delete_confirm_open`, 10 references) |
+| W1-009 | Merged | `agent_runner.claude_cli_preflight` (line 271), wired at `app.py:682/722/808/988` |
+| W2-004 | Merged | `render_project_planning_intelligence` (`app.py:3535`), called at 3596 and 5117 |
+| W2-006 | Merged | `git_info.fetch_remotes` (line 122) + `get_ahead_behind` (line 133) |
+| W1-006 | Merged, still partial | `recover_stale_claim` (`portfolio_launch.py:514`) — still **no production call site**; the only caller on `origin/main` is `tests/test_portfolio_launch.py:548` |
+| W1-002 | Still open | `scripts/start-task.sh` still accepts only `AIOS`, `BANK`/`BANK_STRATEGY`, `LEGAL` |
+| W2-001 | Still open | no task-schema module under `command_center/` |
+| W2-002 | Still open | no cycle detection on any `tasks_repository` write path; cycles remain a read-only `break_cycle` recommendation in `portfolio_intelligence` |
+| W4-003 | Still open | run→Timeline collection is still opt-in behind `AICC_BACKGROUND_SYNC` (`task_pipeline.start_background_sync`, line 2286) |
+| W4-004 | Still open | no founder batch-confirmation surface |
+| W3-002 | Folded | into `AICC-D2A`/`D2B`/`D2C`/`D2D`; not a code claim |
+
+Test evidence, run in a detached worktree at `origin/main` @ `fb3da7f` with the ambient `AICC_*`
+variables stripped and `AICC_DATA_DIR`/`AICC_REPORTS_ROOT` redirected to temp dirs:
+`tests/test_launch.py`, `tests/test_git_info.py`, `tests/test_runtime_report_path_containment.py`,
+`tests/test_report_path_containment.py`, `tests/test_workspace_home_ui.py`,
+`tests/test_portfolio_launch.py` — **170 passed, 0 failed**. The single failure recorded in the
+previous pass is gone; see "Defect found while closing" for why.
+
+`docs/roadmap/MASTER_ROADMAP_TASKS.json` was updated by this pass: the seven merged rows moved
+`Backlog` → `Done` with their evidence recorded in `ready_reason`. Before this, all 13
+`AICC-AUDIT-W*` rows read `Backlog` regardless of what had shipped, so the roadmap — the tracker
+this document hands residual work to — carried no signal on this track either. Six rows remain
+`Backlog` and are genuinely open (the five above plus W1-006, which is partial).
+
+**Carry-over, not an audit row:** the local-only commit `744a09c` ("use task-level
+`repository_path` for workspace isolation when workspace comes from task", 9 lines in
+`launch_service.py`) is **not on `origin/main`** — `prepare_task_launch` there still reads
+`source_repository_path` from the project config only. Anything describing that fix as delivered
+is describing the local checkout. It needs to be pushed or re-landed.
+
 ### Warning 1 — a merged PR is not proof, and a closed PR is not disproof
 
 Three rows contradict their own task records, in opposite directions:
@@ -176,7 +239,24 @@ signal at all.
 The six rows absent from the store (W1-002, W1-006, W1-009, W2-002, W2-006, W4-004) exist only in
 the roadmap JSON. Reconciling the store against the roadmap is part of `AICC-GOV-F2`.
 
-### Defect found while closing (not an audit row)
+### Defect found while closing (not an audit row) — RESOLVED on `origin/main`
+
+**Resolved 2026-08-07 on `origin/main` @ `fb3da7f`.** `command_center/execution_queue.py:907`
+defines `reconcile_missing_run_links` again — restored by `b2134c4` ("fix(queue): add
+reconcile_missing_run_links to backfill lost run_id", +33 lines), which reached the shared branch
+through the PR #141 merge. The call site at `app.py:3339` is unchanged and now resolves, so the
+Live Execution Center no longer raises. This is why the evidence set is 170 passed / 0 failed on
+`origin/main` where it was 169/1 on the local branch:
+`tests/test_workspace_home_ui.py::test_quick_action_launch_run_navigates_to_execution_center_prefilled`
+passes there.
+
+The crash is still reproducible on the **local** `main` (`c41e9bd`), which predates the fix — the
+local branch defines the name nowhere under `command_center/` while `app.py:3339` still calls it.
+That is a symptom of the divergence recorded under "Merge verification", not a live defect on the
+shared branch, and it clears when the local branch is brought up to date. No separate task is
+needed.
+
+The original finding, kept for the record:
 
 `app.py:3339` calls `execution_queue.reconcile_missing_run_links(...)`, which **no longer exists**:
 commit `81833da` ("load-aware executor selection") deliberately removed it from
@@ -186,17 +266,18 @@ Center therefore raises `AttributeError`. Reproduced by
 This is a live page-crashing regression on `main` and is independent of the audit; it needs its own
 task.
 
-**Still live at `744a09c` (re-checked 2026-08-07).** The five commits added since the first closure
-pass did not touch it: the name is defined nowhere under `command_center/`, and `app.py:3339`
-remains its only reference in the tree. It is the one genuine test failure in this document's
-evidence set, and it reproduces as an `AttributeError` raised from
-`_render_live_execution_center_body` (`app.py:3339`) via `render_live_execution_center`
-(`app.py:3484`).
+~~**Still live at `744a09c` (re-checked 2026-08-07).**~~ The five commits added since the first
+closure pass did not touch it: the name is defined nowhere under `command_center/`, and
+`app.py:3339` remains its only reference in that tree. It reproduces as an `AttributeError` raised
+from `_render_live_execution_center_body` (`app.py:3339`) via `render_live_execution_center`
+(`app.py:3484`). **Superseded** — this held only for the local branch; `b2134c4` on `origin/main`
+restores the function, as recorded at the head of this section.
 
 ## Source-of-truth warning
 
 This historical audit must not be treated as the current source of truth. Its task candidates
-were reconciled against `origin/main` `5eed19c` and re-verified against `main` `744a09c` — read
+were reconciled against `origin/main` `5eed19c` and last re-verified against `origin/main`
+`fb3da7f` (see "Merge verification"; the earlier `744a09c` pass ran on an unpushed local branch) — read
 `FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md` instead of this document's findings for
 the current state of each row. The findings *narrative* in
 `FOUNDER_FUNCTIONAL_AUDIT_9761459.md` has not been re-audited and remains a `9761459` snapshot.

@@ -40,6 +40,16 @@ dated "**Resolved since this reconciliation**" note in their own section below:
 - W1-006 (`AICC-AUDIT-W1-006`) — **partially** resolved 2026-08-06; the service half landed, the
   UI recovery action did not. Stays Still Open.
 
+**Merge verification, 2026-08-07.** Every "verified on `main`" note above was written against a
+*local* `main` that had diverged from the shared branch and was never pushed. All seven resolved
+rows plus W1-006's partial were re-read on `origin/main` @ `fb3da7f` and **all of their evidence
+commits are confirmed ancestors of it**, so the notes hold as written — but the branch they name
+is `origin/main`, not the local one. The seven are now `Done` in
+`docs/roadmap/MASTER_ROADMAP_TASKS.json`; W1-006 stays open (its `recover_stale_claim` still has
+no production call site on `origin/main`). The five untouched rows — W1-002, W2-001, W2-002,
+W4-003, W4-004 — were each re-read on `origin/main` and are unchanged. Per-row evidence:
+`FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §"Merge verification".
+
 Closure state for the audit as a whole: `FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md`.
 
 ---

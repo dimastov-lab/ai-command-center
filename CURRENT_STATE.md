@@ -23,11 +23,12 @@ Current position:
   finalization so slow persistence cannot cause a false timeout or late signal.
 - Normal task-v2 launches require explicit confirmation before any provisioning, may create an
   isolated worktree offline, and fail closed unless source repository, expected branch, worktree
-  isolation and configured status policy verify before process launch. When the workspace comes
-  from the task rather than the project, the worktree-isolation check uses the task's own
-  `repository_path` as the source repository (`launch_service.prepare_task_launch`, `744a09c`), so
-  a project spanning more than one repository no longer produces a false
-  `workspace_belongs_to_repository` failure.
+  isolation and configured status policy verify before process launch. On `origin/main` the
+  worktree-isolation check still takes its source repository from the *project* config, so a
+  project spanning more than one repository can still produce a false
+  `workspace_belongs_to_repository` failure. The fix that uses the task's own `repository_path`
+  when the workspace comes from the task (`launch_service.prepare_task_launch`, `744a09c`) exists
+  only on the unpushed local branch — see the divergence note under Current boundaries.
 - Application-owned execution-queue mutations hold a same-host cooperative OS advisory lock across
   the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
 - `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
@@ -48,14 +49,21 @@ Current position:
   `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
-- Founder Functional Audit `9761459` is **closed** (2026-08-07, re-verified against `main`
-  @ `744a09c`). Of its 14 Still Open rows, 7 are remediated and verified on `main` (report-path
-  containment, per-warning launch acknowledgement, Portfolio protected-branch guard,
-  task-delete confirmation, `claude` pre-flight, Workspace Home intelligence, git ahead/behind +
-  fetch), 1 is partial (Portfolio stale-claim recovery: service half only), 1 is folded into the
-  desktop D2 stage tasks, and 5 remain open as `AICC-AUDIT-W*` rows in
-  `docs/roadmap/MASTER_ROADMAP_TASKS.json`. See
-  `docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §Closure.
+- Founder Functional Audit `9761459` is **closed** (2026-08-07), merge-verified against
+  `origin/main` @ `fb3da7f`. Of its 14 Still Open rows, 7 are **merged** and each was re-read in
+  the code on `origin/main` (report-path containment, per-warning launch acknowledgement,
+  Portfolio protected-branch guard, task-delete confirmation, `claude` pre-flight, Workspace Home
+  intelligence, git ahead/behind + fetch); 1 is merged but still partial (Portfolio stale-claim
+  recovery: service half only, no production call site); 1 is folded into the desktop D2 stage
+  tasks; and 5 remain open. The seven merged rows are now `Done` in
+  `docs/roadmap/MASTER_ROADMAP_TASKS.json` — until this pass all 13 `AICC-AUDIT-W*` rows read
+  `Backlog` regardless of what had shipped. See
+  `docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §"Merge verification".
+- Audit evidence set on `origin/main` @ `fb3da7f`: `tests/test_launch.py`,
+  `tests/test_git_info.py`, `tests/test_runtime_report_path_containment.py`,
+  `tests/test_report_path_containment.py`, `tests/test_workspace_home_ui.py`,
+  `tests/test_portfolio_launch.py` — **170 passed, 0 failed** (ambient `AICC_*` stripped,
+  `AICC_DATA_DIR`/`AICC_REPORTS_ROOT` redirected).
 
 Current boundaries:
 - Five audit remediations remain outstanding and are the known functional gaps: `scripts/start-task.sh`
@@ -72,15 +80,24 @@ Current boundaries:
   cleared by deleting `data/portfolio_locks/<task_id>.lock` by hand.
 - `data/tasks.json` is out of sync with the roadmap for the audit-remediation track: it holds 7 of
   13 `AICC-AUDIT-W*` rows, and only 2 of those 7 both are correct and read correctly. Three carry a
-  status contradicting `main` (`W0-006` and `W1-004` sit in `Backlog` though shipped; `W1-005` is
-  still `In Progress` against a closed PR though the fix has shipped) and two more (`W1-007`,
-  `W2-004`) are `Done` and correct but read as failed in the UI. `launch_status` is
-  `"Requires Attention"` on 6 of the 7 and carries no signal on this track. Reconciliation is
-  tracked as `AICC-GOV-F2`; a refreshed audit against current `main` is tracked as `AICC-GOV-F4B`.
-- **Known regression on `main`:** `app.py:3339` calls the removed
-  `execution_queue.reconcile_missing_run_links`, so rendering the Live Execution Center raises
-  `AttributeError`. Introduced by `81833da`; confirmed still present at `744a09c` and untracked as
-  of this update.
+  status contradicting `origin/main` (`W0-006` and `W1-004` sit in `Backlog` though shipped;
+  `W1-005` is still `In Progress` against a closed PR though the fix has shipped) and two more
+  (`W1-007`, `W2-004`) are `Done` and correct but read as failed in the UI. `launch_status` is
+  `"Requires Attention"` on 6 of the 7 and carries no signal on this track. The roadmap JSON side
+  of this gap is now closed (the seven merged rows are `Done`); the `data/tasks.json` side is not.
+  Reconciliation is tracked as `AICC-GOV-F2`; a refreshed audit against current `main` is tracked
+  as `AICC-GOV-F4B`.
+- **Local `main` has diverged from `origin/main`** (observed 2026-08-07): local `c41e9bd` holds 2
+  unpushed commits, `origin/main` `fb3da7f` holds 8 the local branch lacks. Two consequences:
+  - The previously recorded "known regression" — `app.py:3339` calling the removed
+    `execution_queue.reconcile_missing_run_links` — is **fixed on `origin/main`** by `b2134c4`,
+    which restores the function (`execution_queue.py:907`). It still reproduces on the local
+    branch, which predates the fix, and clears when that branch is brought up to date. No task
+    needed.
+  - The local-only fix `744a09c` (task-level `repository_path` for workspace isolation) is **not
+    on `origin/main`**: `prepare_task_launch` there still takes `source_repository_path` from the
+    project config only. It needs to be pushed or re-landed before it can be described as
+    delivered.
 - Normal task launches require explicit user action. Scheduler `ASSIGN` results are point-in-time
   advice, not persisted claims; task-id/capacity decisions may race before the separate launch, and
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
