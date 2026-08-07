@@ -81,6 +81,12 @@ class WorkspaceSpec:
     status_policy: str = STATUS_POLICY_ALLOW_DIRTY
     allow_provision: bool = True
     provision_outcome: str = "skipped"
+    # When False, the step-6 isolation check (primary-worktree guard) is
+    # skipped. Use only for tasks whose workspace IS the primary worktree
+    # intentionally checked out to the expected feature branch — i.e. the
+    # project does not follow the main-in-primary / feature-in-linked-worktree
+    # convention. Set via task["workspace_allow_primary"] = true.
+    enforce_worktree_isolation: bool = True
 
 
 class WorkspaceVerificationError(Exception):
@@ -512,7 +518,7 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     feature = is_feature_task(spec.expected_branch, spec.base_branch, spec.task_type)
     is_primary = _is_primary_worktree(workspace_resolved)
     evidence.is_isolated_worktree = not is_primary
-    if feature and is_primary:
+    if feature and is_primary and spec.enforce_worktree_isolation:
         fail(
             "isolated_worktree_required",
             (
