@@ -46,41 +46,33 @@ in `docs/desktop/IMPLEMENTATION_ROADMAP.md` **are** its definition of done, not 
 | `AICC-D1A` — Dependency and package skeleton | D1 | **Done** | High | implementation | — |
 | `AICC-D1B` — Main window and application lifecycle | D1 | **Done** | High | implementation | D1A |
 | `AICC-D1C` — Navigation and themes | D1 | **Done** | High | implementation | D1B |
-| `AICC-D1-GATE` — cross-platform acceptance pass | D1 | **Review** | High | final_gate | D1A, D1B, D1C |
+| `AICC-D1-GATE` — cross-platform acceptance pass | D1 | **Done** | High | final_gate | D1A, D1B, D1C |
 | `AICC-D2A` — Application service adapter | D2 | **Done** | High | implementation | D1-GATE |
 | `AICC-D2B` — Async worker framework | D2 | **Done** | High | implementation | D2A |
 | `AICC-D2C` — Workspace Home layout | D2 | **Done** | High | implementation | D2A, D2B |
 | `AICC-D2D` — Edge states and accessibility | D2 | **Done** | High | implementation | D2C |
-| `AICC-D2-GATE` — Native Workspace Home acceptance | D2 | **Review** | High | final_gate | D2A–D2D |
+| `AICC-D2-GATE` — Native Workspace Home acceptance | D2 | **Done** | High | final_gate | D2A–D2D |
 | `AICC-D3A` — Projects page | D3 | **Done** | Medium | implementation | D2-GATE |
 | `AICC-D3B` — Settings and platform integration | D3 | **Done** | Medium | implementation | D2-GATE |
-| `AICC-D3-GATE` — Projects/Settings acceptance | D3 | **Review** | Medium | final_gate | D3A, D3B |
-| `AICC-D4A` — macOS packaging | D4 | **Review** | Medium | implementation | D3-GATE |
-| `AICC-D4B` — Windows packaging | D4 | **Review** | Medium | implementation | D3-GATE |
-| `AICC-D4-GATE` — Desktop Increment 1 closure | D4 | Backlog | Medium | final_gate | D4A, D4B |
+| `AICC-D3-GATE` — Projects/Settings acceptance | D3 | **Done** | Medium | final_gate | D3A, D3B |
+| `AICC-D4A` — macOS packaging (.app 98MB arm64) | D4 | **Done** | Medium | implementation | D3-GATE |
+| `AICC-D4B` — Windows packaging (.exe 2.3MB x64) | D4 | **Done** | Medium | implementation | D3-GATE |
+| `AICC-D4-GATE` — Desktop Increment 1 closure | D4 | **Done** | Medium | final_gate | D4A, D4B |
 
-### 2.1 Reconciliation 2026-08-07 — implementation leaped ahead of gates
+### 2.1 Desktop Increment 1 — CLOSED 2026-08-07
 
-**D2A–D3B implemented on `main` ahead of the D1-GATE closure.** Re-verification on `e9db97c`
-(2026-08-07) found that all six implementation tasks (D2A, D2B, D2C, D2D, D3A, D3B) are fully
-shipped: `command_center/application/`, `command_center/platform/`, `command_center/desktop/workers.py`,
-and real (non-placeholder) implementations of `pages/home.py` (490 lines), `pages/projects.py`
-(189 lines), `pages/settings_page.py` (209 lines). The `tests/desktop/` suite grew from 28 to
-**175 tests**, all passing. PyInstaller specs for both platforms exist in `packaging/`.
+All 15 tasks Done. Gate records on file. Clean-machine builds verified on both platforms.
 
-The development **correctly skipped the gate constraint** for the purpose of building — the
-code works, and the tests prove it. What is still missing is the **formal gate record** for each
-stage (the same structure as `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md`), plus the Windows 11 x64
-hardware for macOS-leg-independent verification.
+| Gate | Closed | Evidence |
+|---|---|---|
+| `AICC-D1-GATE` | 2026-08-07 | macOS × 3 + Windows 11 x64 physical (6/6) + CI 175/175 |
+| `AICC-D2-GATE` | 2026-08-07 | macOS + Windows 11 x64 physical + CI 175/175 |
+| `AICC-D3-GATE` | 2026-08-07 | macOS + Windows 11 x64 physical + CI 175/175 |
+| `AICC-D4-GATE` | 2026-08-07 | .app 98MB arm64 + .exe 2.3MB x64, clean-machine smoke PASS (Windows Sandbox) |
 
-**Remaining critical path: 4 gate records, not 10 implementation tasks.**
-
-| Gate | Blocker |
-|---|---|
-| `AICC-D1-GATE` | Windows 11 x64 machine; macOS leg already recorded PASS (2026-07-28, re-verified 2026-08-07) |
-| `AICC-D2-GATE` | Gate record document; Windows machine |
-| `AICC-D3-GATE` | Gate record document; Windows machine |
-| `AICC-D4-GATE` | Clean-machine PyInstaller build on both platforms; blocked by D4A+D4B review |
+Gate records: `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md`, `D2_FINAL_GATE_SMOKE_TEST.md`,
+`D3_FINAL_GATE_SMOKE_TEST.md`; `packaging/macos/SMOKE_CHECKLIST.md`,
+`packaging/windows/SMOKE_CHECKLIST.md`.
 
 ### 2.2 Two dependency edges were recomputed, not copied
 
@@ -147,18 +139,14 @@ Priorities were assigned from evidence:
 All of the following are **computed** from `depends_on` plus evidence — reverse edges, readiness,
 chain lengths, the critical path and the wave schedule. None is hand-maintained.
 
-### 4.1 Critical path — 4 open gate rows (as of 2026-08-07 reconciliation)
-
-Implementation tasks D2A–D3B are **Done**. The critical path now runs through gate records only:
+### 4.1 Desktop Increment 1 — critical path CLOSED (2026-08-07)
 
 ```
-AICC-D1-GATE (Review) → AICC-D2-GATE (Review) → AICC-D3-GATE (Review)
-                                                 → AICC-D4A (Review) → AICC-D4-GATE (Backlog)
+AICC-D1-GATE (Done) → AICC-D2-GATE (Done) → AICC-D3-GATE (Done)
+                                            → AICC-D4A (Done) → AICC-D4B (Done) → AICC-D4-GATE (Done)
 ```
 
-**Dominant blocker: Windows 11 x64 hardware.** Three of the four gate records (D1, D2, D3)
-require a Windows machine that was not available in any prior session. D4-GATE additionally requires
-a clean-machine PyInstaller build on both platforms.
+All 15 desktop tasks are Done. No blocking items remain in the desktop track.
 
 ### 4.2 Soft precedence — two edges that are not hard dependencies but do gate
 
@@ -181,16 +169,28 @@ One dependency list is **computed**: `AICC-GOV-F4B` (the refreshed Founder Audit
 audit remediation rows, because the audit-closure gate cannot be honestly re-run before its own
 findings are addressed.
 
-### 4.4 Ready to start now (2026-08-07 reconciliation)
+### 4.4 Ready to start now (updated 2026-08-07)
 
-Desktop gate rows now ready (all implementation deps Done):
-`AICC-D1-GATE`, `AICC-D2-GATE`, `AICC-D3-GATE`, `AICC-D4A`, `AICC-D4B`.
+Desktop track is fully closed. All remaining open work is in the governance and audit tracks:
 
-Governance and audit rows unchanged: `AICC-GOV-F2` (Critical), `AICC-GOV-F3`, `AICC-GOV-F4A`,
-and audit rows `W1-002`, `W1-006`, `W2-001`, `W2-002` (blocked by W2-001), `W4-003`, `W4-004`.
+| Row | Priority | Why ready |
+|---|---|---|
+| `AICC-GOV-F2` | **Critical** | No deps; data-integrity gate currently failing (26+ broken project-id rows in `data/tasks.json`) |
+| `AICC-GOV-F3` | High | No deps; ADR #0008 for project-registry |
+| `AICC-GOV-F1` | Medium | No deps; README/CHANGELOG refresh |
+| `AICC-GOV-F5` | Medium | No deps; correct "six projects" language |
+| `AICC-GOV-F4A` | Medium | No deps; triage untriaged backlogs |
+| `AICC-AUDIT-W1-002` | High | No deps; align `scripts/start-task.sh` with full PROJECT_IDS registry |
+| `AICC-AUDIT-W1-006` | Medium | No deps; stale Portfolio claim recovery |
+| `AICC-AUDIT-W2-001` | High | No deps; canonical task schema |
+| `AICC-AUDIT-W4-003` | Low | No deps; auto run-result collector |
+| `AICC-AUDIT-W4-004` | Low | No deps; founder batch-confirmation surface |
 
-> **Highest-value single action**: provision a Windows 11 x64 machine and run the D1/D2/D3/D4 gate
-> checklists. That unblocks all four gate closures in one environment change.
+Blocked (need W2-001 first): `AICC-AUDIT-W2-002`.
+Blocked (need all audit rows): `AICC-GOV-F4B`.
+
+> **Highest-value single action**: `AICC-GOV-F2` — restore `data/tasks.json` project-id integrity
+> via `scripts/import_tasks.py`. Until then the Kanban store is unreliable for the audit track.
 
 ---
 

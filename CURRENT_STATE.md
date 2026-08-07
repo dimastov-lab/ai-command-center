@@ -1,26 +1,23 @@
 # AI Command Center — Current State
 
-Updated: 2026-08-07 (roadmap reconciliation)
+Updated: 2026-08-07 (Desktop Increment 1 closed)
 
 ## 0. AI Command Center platform
 
-Status: Active — Streamlit app running; Native Desktop D1–D3 implemented on `main`
+Status: Active — Streamlit app running; **Native Desktop Increment 1 FULLY CLOSED (2026-08-07)**
 
 Current position:
 - `app.py` hosts the implemented Streamlit control application: 20 page handlers, 16 shown in the
   sidebar (chat, generated files, reports, and context open inside the project view).
-- **Native Desktop (PySide6) status as of 2026-08-07:**
-  - D1 (shell, nav, themes): ✅ Done — shipped earlier, re-verified
-  - D2A (application adapter): ✅ Done — `command_center/application/workspace_home_adapter.py`
-  - D2B (async workers): ✅ Done — `command_center/desktop/workers.py`
-  - D2C (Workspace Home layout): ✅ Done — `pages/home.py` 490 lines, fully wired
-  - D2D (edge states, accessibility, BANK/LEGAL redaction): ✅ Done
-  - D3A (Projects page + adapter): ✅ Done
-  - D3B (Settings + platform layer): ✅ Done — `command_center/platform/` complete
-  - D4A (macOS PyInstaller spec): ⚠️ Review — spec ready, clean-machine build pending
-  - D4B (Windows PyInstaller spec): ⚠️ Review — spec ready, Windows machine required
-  - **D1/D2/D3/D4-GATE**: ⚠️ Review/Backlog — gate records pending; Windows 11 x64 machine is sole blocker for D1/D2/D3 gates
-  - Desktop pytest-qt suite: **175 tests pass** (`QT_QPA_PLATFORM=offscreen`)
+- **Native Desktop (PySide6) — Desktop Increment 1: CLOSED 2026-08-07**
+  All 15 tasks Done (D1A → D4-GATE). Gate records on file. Clean-machine builds verified.
+  - D1 (shell, nav, themes): ✅ Done + ✅ Gate closed (macOS × 3 + Windows 11 x64 physical + CI)
+  - D2A–D2D (Workspace Home): ✅ Done + ✅ Gate closed
+  - D3A–D3B (Projects + Settings): ✅ Done + ✅ Gate closed
+  - D4A (macOS .app): ✅ Done — 98MB arm64, PyInstaller 6.21.0 / Python 3.14.6 / PySide6 6.11.1
+  - D4B (Windows .exe): ✅ Done — 2.3MB x64 onedir, verified on Windows 11 x64 physical
+  - **D4-GATE**: ✅ Done — clean-machine smoke PASS on both platforms (Windows Sandbox)
+  - Desktop pytest-qt suite: **175 tests pass** (CI: Python 3.14, Windows Server 2025 + Linux)
 - `python -m command_center.desktop` launches the native shell cleanly.
 - `data/tasks.json` is the default planning and Kanban store. `AICC_TASKS_BACKEND=aios` routes
   all task reads/writes through the AIOS Tasks API instead (requires `AICC_AIOS_URL` + `AICC_AIOS_TOKEN`).
