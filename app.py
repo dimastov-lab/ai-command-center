@@ -64,6 +64,7 @@ from command_center.ui import (
     project_intelligence_panel,
     proposals_panel,
     project_selector,
+    awaiting_pr_panel,
     queue_panel,
     recommendations_panel,
     shell,
@@ -2874,6 +2875,13 @@ def _render_board_sections(
         tasks_by_id,
         queue_entries,
         now=now,
+    )
+
+    awaiting_pr_panel.render_awaiting_pr_panel(
+        tasks,
+        ROOT,
+        upsert_tasks,
+        db_path=DATA_DIR / "runtime.db",
     )
 
     done = board[live_board.BUCKET_DONE]
