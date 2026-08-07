@@ -269,6 +269,11 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     # agent in the chain (see `execution_queue.select_available_executor`). The
     # task only stays stranded when *every* allowed executor has failed (the
     # launch layer then reports `LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`).
+    #
+    # Special case: INTERRUPTED *after* the agent produced output (e.g. laptop
+    # battery died mid-run, OS killed the process). The agent may have made
+    # real progress; store `resume_session_id` so the next launch can pass
+    # `--resume` to continue the conversation rather than starting from scratch.
     if not already_finalized_for_this_run:
         reason = run.get("failure_reason")
         died_on_startup = (
@@ -276,8 +281,32 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
             and not run.get("first_output_at")
             and _died_before_producing_output(run)
         )
+        transient_interruption = (
+            run.get("state") == "INTERRUPTED"
+            and run.get("first_output_at")
+            and not _died_before_producing_output(run)
+        )
         provider_unavailable = reason in providers.PROVIDER_UNAVAILABLE_REASONS
-        if died_on_startup or provider_unavailable:
+
+        if transient_interruption:
+            # Laptop died / OS killed the process mid-run: the executor is fine,
+            # only the OS/power failed. Store the session_id so the next launch
+            # can use --resume to continue from where the agent left off.
+            session_id = run.get("session_id")
+            if session_id:
+                task["resume_session_id"] = session_id
+                mutated = True
+            if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                target_launch_status = "Ready"
+                models.append_timeline_event(
+                    task,
+                    "executor_retry",
+                    "Прогон прерван (питание потеряно / процесс завершён ОС). "
+                    "Возобновление сессии при следующем запуске.",
+                )
+                mutated = True
+
+        elif died_on_startup or provider_unavailable:
             failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
             failed_list = list(task.get("failed_executors") or [])
             if failed_executor not in failed_list:

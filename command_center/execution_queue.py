@@ -744,6 +744,12 @@ def launch_ready(
                 base_branch=base_branch,
                 source_repository_path=source_repository_path,
                 max_global_concurrency=max_global,
+                # Resume support: if task_sync detected an interrupted run that
+                # had already produced output (battery died, connection dropped),
+                # it stores the previous session_id so the agent can pick up its
+                # conversation instead of starting from scratch.
+                session_id=task.get("resume_session_id") or None,
+                is_resume=bool(task.get("resume_session_id")),
             )
         except launch_service.DuplicateActiveLaunchError as exc:
             results.append(

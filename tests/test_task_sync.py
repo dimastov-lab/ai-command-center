@@ -162,7 +162,13 @@ def test_sync_task_from_run_interrupted_with_no_output_auto_retries(tmp_path):
 def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp_path):
     """An INTERRUPTED run that *did* produce output before dying is a genuine
     mid-execution failure — not a startup failure — so it stays "Requires
-    Attention" and does not record a failed executor."""
+    Attention" and does not record a failed executor.
+
+    NOTE: this test uses dates where completed_at < started_at (old fixed date
+    vs. now), so _died_before_producing_output returns True for the duration
+    check, keeping the old behaviour. The new transient-interruption path only
+    fires when the run genuinely ran for >= 60s — see the companion test below.
+    """
     db_path = tmp_path / "runtime-INTERRUPTED-output.db"
     db.migrate(db_path)
     run = _make_run(db_path, state="INTERRUPTED", completed_at="2026-01-01T00:01:00")
@@ -173,6 +179,34 @@ def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp
 
     assert task["launch_status"] == "Requires Attention"
     assert not task.get("failed_executors")
+
+
+def test_sync_task_from_run_interrupted_long_run_schedules_resume(tmp_path):
+    """An INTERRUPTED run that produced output AND ran for >= 60s (e.g. laptop
+    battery died mid-task) is a transient OS interruption, not a provider
+    failure. The executor is not penalised; resume_session_id is stored so the
+    next launch can continue the conversation via --resume."""
+    from datetime import datetime, timedelta, timezone
+    db_path = tmp_path / "runtime-INTERRUPTED-long.db"
+    db.migrate(db_path)
+    now = datetime.now(timezone.utc)
+    started = (now - timedelta(minutes=5)).isoformat()
+    completed = now.isoformat()
+    first_output = (now - timedelta(minutes=4, seconds=30)).isoformat()
+
+    run = _make_run(db_path, state="INTERRUPTED", completed_at=completed)
+    run = db.update_run_fields(
+        db_path, run["id"], expected_version=run["version"],
+        fields={"first_output_at": first_output, "started_at": started},
+    )
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Ready"
+    assert not task.get("failed_executors"), "executor must not be penalised for OS interruption"
+    assert task.get("resume_session_id") == run.get("session_id"), "session_id must be stored for --resume"
+    assert any(e["type"] == "executor_retry" for e in task.get("timeline", []))
 
 
 def test_sync_task_from_run_session_expired_triggers_executor_failover(tmp_path):
