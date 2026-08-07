@@ -118,25 +118,41 @@ ISSUE_BRANCH_MISMATCH = "branch_mismatch"
 SEVERITY_ERROR = "error"
 SEVERITY_WARNING = "warning"
 
+# The two repository states that *reject* a launch outright rather than asking
+# the operator to accept them. Neither is acknowledgeable: there is no
+# checkbox, in any surface, that lets an agent start against them.
+#
+# - `ISSUE_DIRTY_TREE`: an agent starting on top of uncommitted changes
+#   entangles someone else's work with its own diff, and every downstream
+#   check that reads the working tree to decide what the agent did (the
+#   completion gate's pre/post `git status` comparison, the review gate's
+#   diff) is reading a tree it cannot attribute. Commit or stash first.
+# - `ISSUE_DETACHED_HEAD`: commits made on a detached HEAD belong to no
+#   branch, so the run's output is unreachable by name and is lost to the
+#   next `git checkout` — the agent's work is silently discarded.
+#
+# Both were previously acknowledgeable warnings. They are errors now, so they
+# flow through the *existing* blocking path in every consumer:
+# `can_launch` -> `LAUNCH_DECISION_BLOCKED` -> the disabled launch button and
+# the queue's `LAUNCH_SKIP_BLOCKED`. Callers that need to know *which* state
+# blocked a launch must read `error_codes` / `has_issue`, never the message.
+BLOCKING_REPOSITORY_STATE_CODES: frozenset[str] = frozenset(
+    {ISSUE_DIRTY_TREE, ISSUE_DETACHED_HEAD}
+)
+
 # One acknowledgement prompt per *warning* code, deliberately naming the
 # specific hazard being accepted. Every warning is confirmed separately in the
-# Launch confirmation UI (`app.py`'s `render_agent_launcher`): a branch
-# mismatch and a dirty working tree are independent risks with different
-# consequences (running on the wrong branch vs. an agent editing on top of
-# uncommitted work), and a single shared "подтверждаю несмотря на
-# предупреждения" checkbox let an operator who had only registered one of them
-# clear both at once. Keyed by the stable `code`, never by message text.
+# Launch confirmation UI (`app.py`'s `render_agent_launcher`) — never a single
+# shared "подтверждаю несмотря на предупреждения" checkbox, which let an
+# operator who had noticed only one hazard clear them all in a single click.
+#
+# A dirty tree and a detached HEAD deliberately have no entry here: they are
+# `BLOCKING_REPOSITORY_STATE_CODES` and can never appear as a warning, so an
+# ack label for either would be dead config that quietly reappears as a
+# "just tick the box" escape hatch the next time someone adds a checkbox loop.
 WARNING_ACK_LABELS: dict[str, str] = {
-    ISSUE_DIRTY_TREE: (
-        "Подтверждаю: агент будет работать поверх незакоммиченных изменений "
-        "(рабочее дерево не чистое)."
-    ),
     ISSUE_BRANCH_MISMATCH: (
         "Подтверждаю: агент будет работать на текущей ветке, а не на ожидаемой."
-    ),
-    ISSUE_DETACHED_HEAD: (
-        "Подтверждаю: агент будет работать в состоянии detached HEAD (коммиты "
-        "не попадут ни в одну ветку)."
     ),
 }
 
@@ -176,8 +192,26 @@ class LaunchValidation:
         self.issues.append(LaunchIssue(code=code, message=message, severity=SEVERITY_WARNING))
 
     @property
+    def error_issues(self) -> list[LaunchIssue]:
+        """Every blocking issue as a structured issue, in detection order —
+        the symmetric counterpart to `warning_issues`, so a UI can itemize the
+        reasons a launch was *rejected* one per line (each with its stable
+        code) instead of collapsing them into one generic sentence."""
+        return [i for i in self.issues if i.severity == SEVERITY_ERROR]
+
+    @property
     def error_codes(self) -> list[str]:
-        return [i.code for i in self.issues if i.severity == SEVERITY_ERROR]
+        return [i.code for i in self.error_issues]
+
+    def has_issue(self, code: str) -> bool:
+        """Whether `code` was observed at all, at any severity.
+
+        The severity-independent probe. A caller that cares about the
+        *condition* ("is this tree dirty?") must ask this rather than infer it
+        from the launch decision — `LAUNCH_DECISION_NEEDS_CONFIRMATION` used
+        to imply dirtiness, and a caller keyed to that decision silently
+        stopped firing the moment a dirty tree became a blocking error."""
+        return any(i.code == code for i in self.issues)
 
     @property
     def warning_issues(self) -> list[LaunchIssue]:
@@ -211,7 +245,16 @@ class LaunchValidation:
 
 
 def validate_launch(*, workspace_path: str | None, expected_branch: str | None = None) -> LaunchValidation:
-    """Read-only pre-flight check. Never mutates the repository or filesystem."""
+    """Read-only pre-flight gate. Never mutates the repository or filesystem.
+
+    Rejects (blocking errors): no workspace configured, a workspace that is
+    missing / not a directory / not a git repository, an unclean working tree,
+    and a detached HEAD. The last two are the repository-state gate — see
+    `BLOCKING_REPOSITORY_STATE_CODES` for why neither is acknowledgeable.
+
+    Warns (confirmable): a branch mismatch, which is a configuration question
+    an operator can legitimately answer "yes, run here anyway" to.
+    """
     result = LaunchValidation(workspace_path=workspace_path)
 
     if not workspace_path:
@@ -237,16 +280,29 @@ def validate_launch(*, workspace_path: str | None, expected_branch: str | None =
         result._add_error(ISSUE_WORKSPACE_NOT_GIT_REPO, f"{workspace_path} не является git-репозиторием.")
         return result
 
+    # Both repository-state gates below are *rejections*, not confirmable
+    # warnings (see `BLOCKING_REPOSITORY_STATE_CODES`). Each message names the
+    # concrete remedy, because this text is what the operator sees in the
+    # launcher and in the queue's skip report — "не чистое" alone leaves them
+    # guessing whether to commit, stash, or reset.
     branch = status.get("branch")
     if branch == "(detached HEAD)":
-        result._add_warning(ISSUE_DETACHED_HEAD, "Репозиторий в состоянии detached HEAD.")
+        result._add_error(
+            ISSUE_DETACHED_HEAD,
+            "Репозиторий в состоянии detached HEAD — запуск отклонён: коммиты агента "
+            "не попадут ни в одну ветку. Переключитесь на ветку (git switch <branch>) "
+            "и повторите запуск.",
+        )
 
     if status.get("dirty"):
         modified = status.get("modified_count", 0)
         untracked = status.get("untracked_count", 0)
-        result._add_warning(
+        result._add_error(
             ISSUE_DIRTY_TREE,
-            f"Рабочее дерево не чистое: {modified} изменённых, {untracked} неотслеживаемых файлов.",
+            f"Рабочее дерево не чистое ({modified} изменённых, {untracked} неотслеживаемых "
+            "файлов) — запуск отклонён: агент работал бы поверх незакоммиченных изменений. "
+            "Закоммитьте их или уберите в stash (git stash push --include-untracked) "
+            "и повторите запуск.",
         )
 
     if expected_branch and branch and branch != "(detached HEAD)" and branch != expected_branch:
