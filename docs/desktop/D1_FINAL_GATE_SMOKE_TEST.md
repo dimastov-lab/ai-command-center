@@ -7,7 +7,7 @@
   the `bd9f05b` finding)
 - **Date**: 2026-07-28 (macOS leg re-verified same day; see re-verification note below)
 
-## Result: PARTIAL — macOS leg passes; Windows leg not performed (no hardware available)
+## Result: PARTIAL — macOS leg passes; Windows leg performed 2026-08-07: interactive 6/6 PASS, automated suite 1 failed/125 passed
 
 This gate requires the D1 acceptance-criteria list to pass on **both** a real macOS Apple Silicon
 machine and a real Windows 11 x64 machine, plus a green `pytest-qt` suite. Only the macOS leg
@@ -74,16 +74,36 @@ the fresh environment did not have it pre-installed):
 This confirms the macOS PASS result is stable and reproducible. The Windows leg below remains the
 sole blocker; this follow-up session also had no access to a real Windows 11 x64 machine.
 
-## Windows 11 x64 — NOT PERFORMED
+## Windows 11 x64 — PERFORMED 2026-08-07, interactive PASS 6/6; automated suite 1 red
 
-No Windows 11 x64 machine (real or otherwise) was accessible from this automation session. None of
-the acceptance criteria could be exercised there. This is the only remaining blocker to closing
-this gate.
+Real hardware, run via `scripts/run-windows-d1.ps1` from `main` (report `WINDOWS_D1_RESULT.md`
+generated 2026-08-07 03:55 +03:00):
+
+- **Environment**: Windows 11 x64 (NT 10.0.26200.0), AMD64, Python 3.12.10, PySide6 6.11.1.
+- **`pytest tests/desktop -q`** → **1 failed, 125 passed in 25.09s.** The failing test's name was
+  not captured in the result file; it is recorded in `windows-d1-run.log` on the Windows machine.
+  Until that test is identified and green, the automated half of the Windows leg is NOT closed.
+- **`ruff check .`** → PASS.
+- **Interactive checklist — all six items PASS**, including item 5 (move/resize, quit, relaunch —
+  geometry restored exactly, *including width*). This closes, on Windows, the width-restore item
+  that no platform had verified on a live display before.
+- **D4B build** → PASS: `dist\windows\AI Command Center\AI Command Center.exe` produced
+  (2.3 MB bootstrapper, onedir layout). Clean-machine smoke (Step 5,
+  `packaging/windows/SMOKE_CHECKLIST.md`) **NOT PERFORMED** — both checklist copies returned
+  blank; it still requires Windows Sandbox or a second no-Python account.
 
 ## Outstanding work to close this gate
 
-A human (or an automation session with access to real hardware) must still perform, on both a real
-macOS Apple Silicon machine *with an attached display* and a real Windows 11 x64 machine:
+Windows leg (updated 2026-08-07):
+
+1. Identify the one failing test from `windows-d1-run.log` on the Windows machine and get
+   `pytest tests/desktop` fully green there (125/126 is not a pass).
+2. Clean-machine smoke: Windows Sandbox or a second account without Python in PATH, walk
+   `packaging/windows/SMOKE_CHECKLIST.md` against the built `dist\windows\AI Command Center`.
+
+macOS leg — the interactive checklist below must still be performed on a real display (the
+recorded macOS PASS covers the automated suite; live-display items, notably exact width restore,
+were verified only on Windows):
 
 1. Launch `python -m command_center.desktop` interactively (native window, not offscreen).
 2. Confirm `AppShell`, `Sidebar` (all nine sections, Sessions/Execution/Git/Artifacts/Reports/
