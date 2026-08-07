@@ -80,7 +80,7 @@ def _validate_task_ids(task_ids: list[str]) -> None:
 
     missing = [tid for tid in task_ids if tid not in task_id_set]
     if missing:
-        print(f"Error: The following task IDs do not exist:", file=sys.stderr)
+        print("Error: The following task IDs do not exist:", file=sys.stderr)
         for tid in missing:
             print(f"  - {tid}", file=sys.stderr)
         raise SystemExit(1)
