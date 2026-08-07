@@ -4,6 +4,11 @@
 # validated against (was >=8.0,<9.0, which excluded the real pytest 9.x it runs
 # on). Major-band cap matches the house style of requirements.txt.
 pytest>=9.0,<10.0
+# Parallel test execution. pyproject.toml addopts runs every pytest invocation
+# with `-n 6 --dist=loadscope` (commit 7e4af7f), which only pytest-xdist
+# provides — without it pytest (locally and in CI) aborts on the unrecognized
+# `-n` flag before collecting a single test.
+pytest-xdist>=3.6,<4.0
 # Linter enforced by CI (`ruff check .`). 0.x minor releases can change the rule
 # set, so the band is held to the validated 0.15 line for deterministic gates.
 ruff>=0.15,<0.16
