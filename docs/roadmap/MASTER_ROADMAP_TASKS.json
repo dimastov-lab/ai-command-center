@@ -192,7 +192,7 @@
       "AICC-D4A",
       "AICC-D4-GATE"
     ],
-    "note": "As of 2026-08-07 reconciliation: D2A-D2D, D3A-D3B implemented on main ahead of gates. Critical path now runs through the GATE records, not implementation tasks. D1-GATE (Windows leg), D2-GATE, D3-GATE, D4-GATE are the remaining blockers to closing Desktop Increment 1."
+    "note": "Updated 2026-08-07: D1-GATE, D2-GATE, D3-GATE are now Done (Windows 11 x64 physical interactive + CI automated both PASS). Remaining: D4A (macOS packaging), D4B (Windows packaging), D4-GATE (clean-machine launch verification). D4 gates are the sole blocker to closing Desktop Increment 1."
   },
   "folded": [
     {
@@ -355,7 +355,7 @@
       "title": "D1 final gate — record the cross-platform acceptance pass",
       "goal": "Verify DESKTOP_INCREMENT_1.md §2's full D1 acceptance-criteria list on a real macOS (Apple Silicon) and a real Windows 11 x64 machine, and record the result.",
       "prompt": "Verify DESKTOP_INCREMENT_1.md §2's full D1 acceptance-criteria list on a real macOS (Apple Silicon) and a real Windows 11 x64 machine, and record the result.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §2's acceptance-criteria list passes on both target platforms; the full pytest-qt suite is green; the manual smoke pass on both platforms is recorded in-repo.\n\nForbidden scope: No scope creep into D2 content while closing this gate.\n\nEvidence / current state at main bd9f05b: OPEN at bd9f05b — new finding of this roadmap, not carried from the audit. D1A-D1C ship the code and docs/desktop/DESKTOP_INCREMENT_1.md:5 states \"D1 ... has shipped\", but IMPLEMENTATION_ROADMAP.md §'D1 final gate' also requires a \"manual smoke pass on both platforms, recorded\". No such record exists: a repository-wide search of docs/, reports/ and CHANGELOG.md finds no macOS/Windows D1 smoke record. This gate is therefore the true head of the desktop critical path, and D2A must not start before it closes.",
-      "status": "Review",
+      "status": "Done",
       "priority": "High",
       "task_type": "final_gate",
       "project": "AICC",
@@ -375,7 +375,7 @@
       "components": [],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §2's acceptance-criteria list passes on both target platforms; the full pytest-qt suite is green; the manual smoke pass on both platforms is recorded in-repo.",
       "forbidden_scope": "No scope creep into D2 content while closing this gate.",
-      "evidence": "OPEN at bd9f05b — new finding of this roadmap, not carried from the audit. D1A-D1C ship the code and docs/desktop/DESKTOP_INCREMENT_1.md:5 states \"D1 ... has shipped\", but IMPLEMENTATION_ROADMAP.md §'D1 final gate' also requires a \"manual smoke pass on both platforms, recorded\". No such record exists: a repository-wide search of docs/, reports/ and CHANGELOG.md finds no macOS/Windows D1 smoke record. This gate is therefore the true head of the desktop critical path, and D2A must not start before it closes.",
+      "evidence": "Done 2026-08-07. macOS Apple Silicon: 175 pytest-qt passed, ruff clean, live offscreen process PASS, QSettings round-trip PASS (3 verifications). Windows automated CI: GitHub Actions Run 31150374277, Windows Server 2025, 175 passed, ruff clean. Windows 11 x64 physical interactive: AppShell/Sidebar/TopBar rendered, navigation PASS, theme switching PASS, geometry persistence PASS, clean quit PASS. Gate record: docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
@@ -618,7 +618,7 @@
       "title": "D2 final gate — Native Workspace Home acceptance",
       "goal": "Verify DESKTOP_INCREMENT_1.md §3's D2 acceptance criteria as a whole.",
       "prompt": "Verify DESKTOP_INCREMENT_1.md §3's D2 acceptance criteria as a whole.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §3's full list passes; full pytest/pytest-qt suite green.\n\nForbidden scope: No scope creep into D3 content while closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D2A-D2D, none of which has started.",
-      "status": "Review",
+      "status": "Done",
       "priority": "High",
       "task_type": "final_gate",
       "project": "AICC",
@@ -639,7 +639,7 @@
       "components": [],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §3's full list passes; full pytest/pytest-qt suite green.",
       "forbidden_scope": "No scope creep into D3 content while closing this gate.",
-      "evidence": "Review as of e9db97c (2026-08-07): D2A-D2D all implemented and on main. 175 desktop pytest-qt tests pass (2026-08-07 verification). Missing: gate record document in docs/desktop/ recording DESKTOP_INCREMENT_1.md §3 acceptance-criteria pass on both platforms. Windows leg requires hardware.",
+      "evidence": "Done 2026-08-07. D2A-D2D implemented on main. macOS Apple Silicon: 175 pytest-qt passed. Windows automated CI: Run 31150374277, 175 passed. Windows 11 x64 physical interactive: Workspace Home renders, offline stub PASS, redaction PASS, async data load non-blocking PASS, clean quit PASS. Gate record: docs/desktop/D2_FINAL_GATE_SMOKE_TEST.md.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
@@ -763,7 +763,7 @@
       "title": "D3 final gate — Projects and Settings acceptance",
       "goal": "Verify DESKTOP_INCREMENT_1.md §4's D3 acceptance criteria as a whole, on both target platforms.",
       "prompt": "Verify DESKTOP_INCREMENT_1.md §4's D3 acceptance criteria as a whole, on both target platforms.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §4's full list passes on both platforms; full suite green; a manual cross-platform smoke pass for Projects/Settings is recorded.\n\nForbidden scope: No scope creep into D4 packaging concerns while closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D3A and D3B.",
-      "status": "Review",
+      "status": "Done",
       "priority": "Medium",
       "task_type": "final_gate",
       "project": "AICC",
@@ -782,7 +782,7 @@
       "components": [],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §4's full list passes on both platforms; full suite green; a manual cross-platform smoke pass for Projects/Settings is recorded.",
       "forbidden_scope": "No scope creep into D4 packaging concerns while closing this gate.",
-      "evidence": "Review as of e9db97c (2026-08-07): D3A and D3B implemented on main. tests/desktop/test_integrated_pages_smoke.py passes. Missing: gate record for DESKTOP_INCREMENT_1.md §4 acceptance-criteria on both platforms. Windows leg requires hardware.",
+      "evidence": "Done 2026-08-07. D3A and D3B implemented on main. macOS Apple Silicon: 175 pytest-qt passed, QSettings theme round-trip PASS. Windows automated CI: Run 31150374277, 175 passed. Windows 11 x64 physical interactive: Projects page renders, project click PASS, Settings renders, theme change PASS, theme persists after relaunch PASS, clean quit PASS. Gate record: docs/desktop/D3_FINAL_GATE_SMOKE_TEST.md.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",

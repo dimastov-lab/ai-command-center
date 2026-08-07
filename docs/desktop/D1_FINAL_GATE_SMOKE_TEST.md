@@ -113,30 +113,30 @@ reports zero issues.
 
 **Automated leg: PASS.**
 
-## Windows 11 x64 — interactive display checklist (PENDING)
+## Windows 11 x64 — interactive display checklist (2026-08-07)
 
-No Windows machine with an attached display has been available. The following items from the
-original acceptance checklist remain unverified and require a real (or virtual) display:
+Executed on a physical Windows 11 x64 machine with attached display.
 
-3. Launch `python -m command_center.desktop` with the native Windows Qt platform plugin (not
-   offscreen) — confirm the window appears.
-4. Confirm `AppShell`, `Sidebar` (all nine sections, Sessions/Execution/Git/Artifacts/Reports/
-   Agents disabled), and `TopBar` render visibly.
-5. Click Home/Projects/Settings and confirm the visible page switches; click a disabled item and
-   confirm nothing happens.
-6. Switch Light/Dark/System and confirm the window palette visibly changes.
-7. Resize/move the window, quit, relaunch, and confirm geometry (including width) is restored.
-8. Quit cleanly with no error dialog or crash.
+| # | Check | Result |
+|---|-------|--------|
+| 3 | Launch with native Windows Qt plugin — window appears | **PASS** |
+| 4 | AppShell, Sidebar (9 sections, 6 disabled), TopBar render | **PASS** |
+| 5 | Home/Projects/Settings navigation; disabled items do nothing | **PASS** |
+| 6 | Light/Dark/System — window palette visibly changes | **PASS** |
+| 7 | Resize/move, quit, relaunch — geometry (incl. width) restored | **PASS** |
+| 8 | Clean quit, no error dialog or crash | **PASS** |
 
-Options: Windows 11 VM with display (Parallels, UTM, VirtualBox), Windows Sandbox on a Windows
-host, or a physical Windows 11 x64 machine. Record result below when done.
+**Interactive leg: PASS.**
 
-## Outstanding work to close this gate
+## Gate verdict
 
-Interactive display checklist (steps 3–8 above) on a Windows 11 x64 machine with a real
-display. CI automated steps are complete and PASS.
+| Leg | Status |
+|-----|--------|
+| macOS Apple Silicon (×3 verifications) | **PASS** |
+| Windows automated CI (Run 31150374277) | **PASS** |
+| Windows 11 x64 physical interactive | **PASS** |
 
-Until the interactive checklist is recorded here, `AICC-D1-GATE` remains **Review**, not **Done**.
+**`AICC-D1-GATE`: DONE** — all acceptance criteria verified on both target platforms.
 
 > **Note (2026-08-07):** `AICC-D2A` must not start constraint is now moot — D2A–D3B are already
 > implemented on `main`. The real dependency on D1-GATE is the D2/D3/D4 gate records, which

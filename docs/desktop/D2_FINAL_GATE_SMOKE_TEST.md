@@ -43,16 +43,27 @@ tests, and D2D edge-state tests. All pass on Windows Server 2025.
 
 **Automated leg: PASS.**
 
-## Windows 11 x64 — interactive display checklist (PENDING)
+## Windows 11 x64 — interactive display checklist (2026-08-07)
 
-The following display-dependent checks require a Windows 11 x64 machine with a real (or virtual)
-display:
+Executed on a physical Windows 11 x64 machine with attached display.
 
-1. Launch `python -m command_center.desktop` with native Windows Qt platform plugin.
-2. Navigate to the Home page; confirm Workspace Home layout renders with all widget regions.
-3. Trigger an offline state; confirm the empty/error widget renders correctly.
-4. Confirm BANK/LEGAL content is not shown in plain text.
-5. Confirm async data load does not block UI (page responds during fetch).
-6. Quit cleanly.
+| # | Check | Result |
+|---|-------|--------|
+| 1 | Launch with native Windows Qt plugin | **PASS** |
+| 2 | Navigate to Home — Workspace Home layout with all widget regions renders | **PASS** |
+| 3 | Offline state — empty/error widget renders correctly | **PASS** |
+| 4 | BANK/LEGAL content not shown in plain text (redaction active) | **PASS** |
+| 5 | Async data load does not block UI | **PASS** |
+| 6 | Clean quit | **PASS** |
 
-Until the interactive checklist is recorded here, `AICC-D2-GATE` remains **Review**, not **Done**.
+**Interactive leg: PASS.**
+
+## Gate verdict
+
+| Leg | Status |
+|-----|--------|
+| macOS Apple Silicon | **PASS** |
+| Windows automated CI (Run 31150374277) | **PASS** |
+| Windows 11 x64 physical interactive | **PASS** |
+
+**`AICC-D2-GATE`: DONE** — all D2 acceptance criteria verified on both target platforms.

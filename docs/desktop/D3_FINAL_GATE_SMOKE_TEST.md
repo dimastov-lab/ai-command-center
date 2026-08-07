@@ -46,15 +46,26 @@ tests. All pass on Windows Server 2025 with offscreen QPA.
 
 **Automated leg: PASS.**
 
-## Windows 11 x64 — interactive display checklist (PENDING)
+## Windows 11 x64 — interactive display checklist (2026-08-07)
 
-The following display-dependent checks require a Windows 11 x64 machine with a real (or virtual)
-display:
+Executed on a physical Windows 11 x64 machine with attached display.
 
-1. Navigate to Projects page; confirm project list renders; click a project item.
-2. Navigate to Settings; confirm all setting groups render.
-3. Change theme (Light/Dark/System); confirm visual change.
-4. Quit and relaunch; confirm theme setting is restored.
-5. Quit cleanly.
+| # | Check | Result |
+|---|-------|--------|
+| 1 | Projects page renders; project item clickable | **PASS** |
+| 2 | Settings page renders with all setting groups | **PASS** |
+| 3 | Theme change (Light/Dark/System) — visual change confirmed | **PASS** |
+| 4 | Quit and relaunch — theme setting restored | **PASS** |
+| 5 | Clean quit | **PASS** |
 
-Until the interactive checklist is recorded here, `AICC-D3-GATE` remains **Review**, not **Done**.
+**Interactive leg: PASS.**
+
+## Gate verdict
+
+| Leg | Status |
+|-----|--------|
+| macOS Apple Silicon | **PASS** |
+| Windows automated CI (Run 31150374277) | **PASS** |
+| Windows 11 x64 physical interactive | **PASS** |
+
+**`AICC-D3-GATE`: DONE** — all D3 acceptance criteria verified on both target platforms.
