@@ -20,7 +20,7 @@ from typing import Callable
 
 import streamlit as st
 
-from command_center import models, project_config, tasks_repository
+from command_center import project_config, tasks_repository
 from command_center.runtime import db as runtime_db, validation
 
 
@@ -125,7 +125,6 @@ def _create_autofix_task(
     save_tasks_fn: Callable[[list[dict]], None],
 ) -> str:
     """Create a new implementation task to fix failing tests and return its id."""
-    import uuid
     parent_id = task["id"]
     attempt = _get_autofix_count(parent_id) + 1
     new_id = f"{parent_id}-FIX-{attempt:02d}"
@@ -343,7 +342,7 @@ def _action_merge(
     )
     st.session_state.pop(_sk(task_id, "pr_url"), None)
     st.session_state.pop(_sk(task_id, "test_result"), None)
-    st.success(f"Смержено! Задача переведена в Done.")
+    st.success("Смержено! Задача переведена в Done.")
     save_fn(tasks_repository.load_tasks(root))
     st.rerun()
 
@@ -455,7 +454,6 @@ def render_awaiting_pr_panel(
 
     for task in pending:
         tid = task["id"]
-        repo = task.get("repository_path") or ""
 
         # Fetch completion record if we have a db_path.
         completion: dict | None = None

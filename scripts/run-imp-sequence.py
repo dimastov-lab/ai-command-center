@@ -14,7 +14,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from command_center import tasks_repository  # noqa: E402
-from command_center.runtime import db as run_db  # noqa: E402
 
 RUN_DB = ROOT / "data" / "runtime.db"
 POLL_INTERVAL = 20  # seconds
