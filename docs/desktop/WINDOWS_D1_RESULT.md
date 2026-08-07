@@ -31,4 +31,3 @@ Script: run-windows-d1.ps1
 Paste this section into docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md next to the macOS leg.
 D4B - mark packaging/windows/SMOKE_CHECKLIST.md.
 Step 5 (clean-machine smoke) is run SEPARATELY in Windows Sandbox.
-
