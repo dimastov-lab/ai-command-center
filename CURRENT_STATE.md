@@ -23,6 +23,10 @@ Current position:
   all task reads/writes through the AIOS Tasks API instead (requires `AICC_AIOS_URL` + `AICC_AIOS_TOKEN`).
   `tasks_repository.get_repository()` is the factory; `scripts/migrate_tasks_to_aios.py` provides
   one-shot migration. See CHANGELOG [Unreleased] §"AIOS Tasks backend (Sprint 4)" for limitations.
+  `aios_sdk` installs from a wheel vendored in-repo (`vendor/`, built from a pinned aios commit
+  by `scripts/build_aios_sdk_wheel.py`; provenance in `vendor/README.md`) and referenced by
+  `requirements.txt`, so the AIOS repository/adapter tests run in CI instead of skipping
+  (Sprint 4 limitation I5 — closed 2026-08-07).
 - `data/runtime.db` schema 11 is authoritative for asynchronous execution, completion, the
   persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
   verdict, and the `queue_entry` mirror (ADR 0007 dual-write).

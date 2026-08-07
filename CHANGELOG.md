@@ -47,6 +47,7 @@ Work that ran alongside H1 but is not one of its three tracks is listed separate
 | 2026-08-04 | Report-derived child tasks stamped `untrusted_import` (`SEC-D-02`); PID-reuse recovery covered and single-host lock scope documented | Audit remediation |
 | 2026-08-06 | **Sprint 4** AIOS Tasks backend behind `AICC_TASKS_BACKEND`; ESF/AML project registry; D2 Native Workspace Home tests + `ErrorState` widget | Platform / Desktop |
 | 2026-08-07 | Task-aware executor preflight; load-aware executor selection; `TasksStoreUnreadable` instead of a silent empty read; audit-closure verdict turned into an executable gate with W1/W2 remediation confirmed merged | Audit remediation / Governance |
+| 2026-08-07 | **Sprint 4 acceptance** — `aios_sdk` vendored as a standalone wheel (limitation I5 closed): AIOS backend tests now run in CI; missing `pytest-xdist` dependency restored | Platform |
 
 #### Track 1 — Desktop Increment 1
 
@@ -109,6 +110,47 @@ still describe the desktop client as a pure shell with no data wiring, or as doc
 work only. The code, its tests, and this changelog are the current authority; those three documents
 need reconciliation.
 
+### AIOS Tasks backend accepted — SDK vendored, AIOS tests in CI — 2026-08-07
+
+Closes Sprint 4 limitation I5. `aios_sdk` is no longer a local path dependency that only
+development machines have: it now installs everywhere the suite runs, so the AIOS backend
+tests execute in CI instead of silently skipping.
+
+#### Added
+- **`scripts/build_aios_sdk_wheel.py`**: builds a standalone `aios-sdk` wheel from a pinned
+  commit of the private aios repository. Content is taken via `git archive` (committed state
+  only — never a working tree) and covers only `src/aios_sdk`, which imports nothing from
+  `aios.*` core; the closed core itself is not vendored. The build is deterministic (fixed
+  zip timestamps, sorted entries — mirrors aios `tools/build_distributions.py`), and the
+  pinned commit is embedded as a PEP 440 local segment (`0.1.0+gd3c69e4`). Dependency bands,
+  `requires-python`, author and license metadata are read from the aios `pyproject.toml` at
+  the same ref.
+- **`vendor/aios_sdk-0.1.0+gd3c69e4-py3-none-any.whl`** (25 KB; deps `httpx`, `pydantic`)
+  plus `vendor/README.md` with provenance (source sha, wheel sha256) and refresh
+  instructions. A committed wheel keeps `ci.yml`'s design constraint intact: the workflow
+  still references no secrets even though the SDK's home repository is private.
+- **`requirements.txt`** now installs the vendored wheel (path is resolved by pip against
+  the current directory — install from the repository root, as CI and the Dockerfile do).
+  The `Dockerfile` copies `vendor/` before `pip install`.
+
+#### Fixed
+- **`pytest-xdist` was missing from every requirements file** while `pyproject.toml`
+  addopts run every pytest invocation with `-n 6 --dist=loadscope` (commit `7e4af7f`) —
+  pytest, including CI's required `pytest -q` gate, aborted on the unrecognized `-n` flag
+  before collecting a single test. Added `pytest-xdist>=3.6,<4.0` to `requirements-dev.txt`
+  and to the arch-fitness workflow's minimal install (it runs `pytest tests/architecture`
+  under the same addopts).
+- Five pre-existing Ruff findings in `command_center/ui/awaiting_pr_panel.py` and
+  `scripts/run-imp-sequence.py` (unused imports/variable, extraneous f-string prefix) that
+  failed the `ruff check .` CI gate ahead of the pytest step.
+
+#### Clarified
+- Of the three Sprint 4 test files, only `tests/test_aios_tasks_repository.py` and
+  `tests/test_aios_tasks_adapter.py` were skipped (`pytest.importorskip("aios_sdk")`);
+  `tests/test_tasks_backend_routing.py` always ran — `get_repository()` validates
+  `AICC_AIOS_URL`/`AICC_AIOS_TOKEN` before the lazy SDK import. All 44 tests across the
+  three files now run everywhere.
+
 ### AIOS Tasks backend (Sprint 4) — 2026-08-06
 
 Feature flag `AICC_TASKS_BACKEND=json|aios` selects the tasks persistence layer at runtime.
@@ -136,7 +178,8 @@ to route all task reads/writes through the AIOS Tasks API.
 - C3: `AIOSIdMap` is per-process; multi-worker Streamlit deployments need a shared store.
 - I3: AIOS auth token is not refreshed mid-session (assumed long-lived).
 - I4: `list_tasks()` fetches only the first page (AIOS v1 has no cursor pagination).
-- I5: `aios_sdk` is a local path dep; not in `requirements.txt` — CI skips AIOS tests.
+- I5 (closed 2026-08-07): `aios_sdk` was a local path dep, so CI skipped the AIOS tests.
+  Resolved by the vendored SDK wheel — see "AIOS Tasks backend accepted" above.
 
 ### D1 final gate — cross-platform smoke pass (partial)
 

@@ -50,9 +50,10 @@ python3.14 -m venv .venv-desktop
 ```
 
 A healthy start is a native window titled "AI Command Center" with an empty log and no traceback.
-`requirements-desktop.txt` is deliberately kept separate from `requirements.txt` (which stays
-Streamlit-only); to run the desktop client and the test suite from one environment, install
-`requirements-dev.txt` instead.
+`requirements-desktop.txt` is deliberately kept separate from `requirements.txt` (which holds
+only the Streamlit runtime and the vendored `aios_sdk` wheel — see `vendor/README.md`); to run
+the desktop client and the test suite from one environment, install `requirements-dev.txt`
+instead.
 
 Entry point: [`command_center/desktop/__main__.py`](command_center/desktop/__main__.py) →
 `app.run()`, which constructs the one `QApplication`, the settings store, the theme controller,

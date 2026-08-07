@@ -1,2 +1,10 @@
 streamlit>=1.50,<2.0
 PyYAML>=6.0,<7.0
+# AIOS SDK — closed-core client for the AIOS Tasks backend
+# (AICC_TASKS_BACKEND=aios) and its test suite. The aios repository is private
+# and CI references no secrets, so the SDK ships as a wheel vendored in-repo.
+# Provenance, sha256 and refresh instructions: vendor/README.md.
+# NB: pip resolves this path against the CURRENT directory, not this file —
+# run `pip install -r requirements*.txt` from the repository root (CI and the
+# Dockerfile already do).
+./vendor/aios_sdk-0.1.0+gd3c69e4-py3-none-any.whl
