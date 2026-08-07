@@ -274,6 +274,23 @@ def main(task_ids: list[str], dry_run: bool = False, show_status: bool = False) 
         final = _wait_for_terminal(task_id, dry_run=dry_run)
         print(f"{prefix}   {task_id} DONE → {final}", flush=True)
 
+        # Auto-complete PR lifecycle if task is awaiting a pull request
+        if final == "Awaiting PR" and not dry_run:
+            print(f"[SEQ]   {task_id}: launching auto-complete-task (PR → tests → merge)…", flush=True)
+            ac = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "auto-complete-task.py"), task_id],
+                cwd=str(ROOT),
+            )
+            if ac.returncode == 0:
+                final = "Done"
+                print(f"[SEQ]   {task_id} → Done (auto-merged)", flush=True)
+            else:
+                print(
+                    f"[SEQ]   auto-complete-task failed (rc={ac.returncode}) — "
+                    "task left in Awaiting PR; check autofix tasks.",
+                    flush=True,
+                )
+
         state["steps"][task_id] = {"status": final}
         state["current_index"] = idx + 1
         _save_state(state, dry_run=dry_run)
