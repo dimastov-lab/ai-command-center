@@ -59,6 +59,18 @@ Current position:
   `docs/roadmap/MASTER_ROADMAP_TASKS.json` — until this pass all 13 `AICC-AUDIT-W*` rows read
   `Backlog` regardless of what had shipped. See
   `docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §"Merge verification".
+- **The audit closure is enforced, not just written down.**
+  `tests/architecture/test_audit_closure_fitness.py` (parsers and git probes in
+  `tests/architecture/audit_closure.py`) parses the status document's merge-verification table and
+  checks it against `MASTER_ROADMAP_TASKS.json` and against the code on the pinned commit
+  `fb3da7f`: statuses must agree row for row, every `Done` row must cite one of the nine evidence
+  commits, each evidence commit must be an ancestor of the pinned commit, each merged row's symbol
+  must be readable there, the two probeable still-open rows must still be open, `W1-006` must keep
+  no production call site for `recover_stale_claim`, and `W3-002`'s `AICC-D2*` fold targets must
+  exist. The gate is mutation-tested — verified red under five mutations of the real artifacts and
+  green when restored. This closes the reporting gap that let a documentation task pass validation
+  as "1/1 commands passed" (the default `compileall`) while asserting anything at all about the
+  repository. `tests/architecture/` — **17 passed**.
 - Audit evidence set on `origin/main` @ `fb3da7f`: `tests/test_launch.py`,
   `tests/test_git_info.py`, `tests/test_runtime_report_path_containment.py`,
   `tests/test_report_path_containment.py`, `tests/test_workspace_home_ui.py`,
@@ -87,8 +99,12 @@ Current boundaries:
   of this gap is now closed (the seven merged rows are `Done`); the `data/tasks.json` side is not.
   Reconciliation is tracked as `AICC-GOV-F2`; a refreshed audit against current `main` is tracked
   as `AICC-GOV-F4B`.
-- **Local `main` has diverged from `origin/main`** (observed 2026-08-07): local `c41e9bd` holds 2
-  unpushed commits, `origin/main` `fb3da7f` holds 8 the local branch lacks. Two consequences:
+- **Local `main` has diverged from `origin/main`** (re-checked after `git fetch`, 2026-08-07):
+  local `main` holds 3 unpushed commits (`744a09c`, `c41e9bd`, `9553fd6`) and `origin/main`
+  `fb3da7f` holds 8 the local branch lacks; neither is an ancestor of the other. Nothing on the
+  audit-remediation track depends on this — every closure claim is verified against `fb3da7f`, not
+  against the local branch — but the divergence itself is unresolved and grows with each local
+  commit. Two consequences:
   - The previously recorded "known regression" — `app.py:3339` calling the removed
     `execution_queue.reconcile_missing_run_links` — is **fixed on `origin/main`** by `b2134c4`,
     which restores the function (`execution_queue.py:907`). It still reproduces on the local

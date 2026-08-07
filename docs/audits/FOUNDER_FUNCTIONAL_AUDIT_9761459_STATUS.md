@@ -12,6 +12,11 @@ Final disposition of the 14 rows the reconciliation left Still Open, all read on
 partial** (W1-006), **1 folded** into the desktop D2 tasks (W3-002), **5 still open**. The seven
 merged rows are now `Done` in the roadmap JSON. Detail: §"Merge verification".
 
+That verdict is not only prose: `tests/architecture/test_audit_closure_fitness.py` parses the
+merge-verification table and checks it against the roadmap JSON and against the code on the pinned
+commit, so this closure goes red if the document, the tracker, and the repository drift apart. See
+§"Closure gate".
+
 ## Audit baseline
 
 - Audited HEAD: `9761459`
@@ -191,6 +196,35 @@ this document hands residual work to — carried no signal on this track either.
 `launch_service.py`) is **not on `origin/main`** — `prepare_task_launch` there still reads
 `source_repository_path` from the project config only. Anything describing that fix as delivered
 is describing the local checkout. It needs to be pushed or re-landed.
+
+### Closure gate — this section is executable
+
+Every table above is prose, and a documentation-only task validates as "1/1 commands passed" (a
+bare `compileall`), which is true of an empty diff. So the closure verdict is also expressed as a
+fitness gate: **`tests/architecture/test_audit_closure_fitness.py`** (parsers and git probes in
+`tests/architecture/audit_closure.py`). It parses *this* section and checks it against the roadmap
+JSON and against the code on the pinned commit:
+
+| Check | Goes red when |
+| --- | --- |
+| Row set and status agree | a row reads `Merged` here and `Backlog` in the roadmap, or the reverse — the exact drift that left all 13 rows `Backlog` for months |
+| `Done` rows cite evidence | a roadmap row is `Done` with a `ready_reason` naming none of the nine evidence commits |
+| Evidence is merged | any evidence commit is not an ancestor of the pinned commit |
+| Merged rows read as merged | the symbol each row was closed on is absent from its file on the pinned commit |
+| Still-open rows are still open | `W1-002` or `W4-003` was quietly remediated, making this closure a false all-clear |
+| W1-006 stays partial | `recover_stale_claim` gains a production call site — the sole ground for "merged, still partial" |
+| Fold is honoured | `W3-002` regrows an `AICC-AUDIT-W*` row, or an `AICC-D2*` fold target disappears |
+| Carry-over holds | `744a09c` turns out to be an ancestor of the pinned commit after all |
+
+The probed ref is *pinned* (`fb3da7f`, parsed out of the heading above), not `origin/main`, so the
+checks stay deterministic as the branch advances and a later merge cannot rewrite what this audit
+certified. Three further tests keep the gate itself honest: the parsers must find 14 dispositions,
+13 roadmap rows and 9 evidence commits; the consistency checkers are mutation-tested against
+flipped rows; and the git probes must find a caller for a symbol that has one. Verified red under
+five mutations of the real artifacts (a `Done` row flipped to `Backlog`, a `ready_reason` stripped
+of its commit, a still-open row promoted to `Merged`, the pinned ref moved to `9761459`, an
+`AICC-D2*` fold target deleted) and green when restored: **17 passed** for
+`tests/architecture/`.
 
 ### Warning 1 — a merged PR is not proof, and a closed PR is not disproof
 
