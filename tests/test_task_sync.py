@@ -267,7 +267,12 @@ def test_provider_failure_projection_is_idempotent_across_refresh_and_restart(tm
     assert [event["type"] for event in task["timeline"]].count(
         "launch_requires_attention"
     ) == 1
-    assert [event["type"] for event in task["timeline"]].count("executor_failed") == 1
+    # provider_api_error now uses retry logic: first attempt generates executor_retry
+    # (not executor_failed) and does NOT add to failed_executors.
+    assert [event["type"] for event in task["timeline"]].count("executor_retry") == 1
+    assert [event["type"] for event in task["timeline"]].count("executor_failed") == 0
+    assert task.get("provider_error_retry_count") == 1
+    assert not task.get("failed_executors")
 
 
 def test_sync_task_from_run_quota_limit_triggers_executor_failover(tmp_path):
@@ -363,7 +368,10 @@ def test_sync_task_from_run_failed_executors_accumulate_across_providers(tmp_pat
     )
     task_sync.sync_task_from_run(task, run2, db_path=db_path)
 
-    assert task.get("failed_executors") == ["claude_code", "copilot_cli"]
+    # provider_api_error uses retry logic: copilot_cli is NOT yet in failed_executors
+    # (retry count = 1, threshold = 3). Only session_expired (claude_code) is failed.
+    assert task.get("failed_executors") == ["claude_code"]
+    assert task.get("provider_error_retry_count") == 1
 
 
 def test_sync_task_from_run_completed_clears_failed_executors(tmp_path):
@@ -694,3 +702,83 @@ def test_reconcile_and_sync_recovers_stale_current_run_id_pointer(tmp_path):
     assert task["current_run_id"] == new_run["id"]
     assert task["launch_status"] == "Ready"
     assert task.get("failed_executors") == ["claude_code"]
+
+
+# ---------------------------------------------------------------------------
+# provider_error_retry_count — AICC-IMP-004
+# ---------------------------------------------------------------------------
+
+
+def test_provider_api_error_retries_same_executor_up_to_3_times(tmp_path):
+    """provider_api_error increments provider_error_retry_count and keeps the
+    same executor in play (no failed_executors entry) until the 3rd failure."""
+    db_path = tmp_path / "retry.db"
+    db.migrate(db_path)
+    task = _make_task(executor="claude_code")
+
+    def _api_error_run(i):
+        r = _make_run(
+            db_path, state="FAILED",
+            completed_at=f"2026-01-01T00:0{i}:00",
+            failure_reason="provider_api_error",
+            provider_id="claude_code",
+            task_id="task-1",
+        )
+        return r
+
+    # Runs 1 and 2: retry (count < 3)
+    run1 = _api_error_run(1)
+    task_sync.sync_task_from_run(task, run1, db_path=db_path)
+    assert task["launch_status"] == "Ready"
+    assert task.get("provider_error_retry_count") == 1
+    assert not task.get("failed_executors")
+    assert any(e["type"] == "executor_retry" for e in task["timeline"])
+
+    session = db.list_sessions(db_path, task_id="task-1")[0]
+    run2 = db.create_run(
+        db_path, session_id=session["id"], task_id="task-1", project="AICC",
+        task_type="implementation", repository_path="/tmp/x", prompt="p",
+        is_resume=False, provider_id="claude_code",
+    )
+    for state in ("QUEUED", "RUNNING"):
+        run2 = db.update_run_state(db_path, run2["id"], expected_version=run2["version"], new_state=state)
+    run2 = db.update_run_state(
+        db_path, run2["id"], expected_version=run2["version"], new_state="FAILED",
+        fields={"failure_reason": "provider_api_error", "completed_at": "2026-01-01T00:02:00"},
+    )
+    task_sync.sync_task_from_run(task, run2, db_path=db_path)
+    assert task.get("provider_error_retry_count") == 2
+    assert not task.get("failed_executors")
+
+    # Run 3: exhausted → failover
+    run3 = db.create_run(
+        db_path, session_id=session["id"], task_id="task-1", project="AICC",
+        task_type="implementation", repository_path="/tmp/x", prompt="p",
+        is_resume=False, provider_id="claude_code",
+    )
+    for state in ("QUEUED", "RUNNING"):
+        run3 = db.update_run_state(db_path, run3["id"], expected_version=run3["version"], new_state=state)
+    run3 = db.update_run_state(
+        db_path, run3["id"], expected_version=run3["version"], new_state="FAILED",
+        fields={"failure_reason": "provider_api_error", "completed_at": "2026-01-01T00:03:00"},
+    )
+    task_sync.sync_task_from_run(task, run3, db_path=db_path)
+    assert task.get("provider_error_retry_count") is None  # reset
+    assert task.get("failed_executors") == ["claude_code"]
+    assert task["launch_status"] == "Ready"
+    assert any(e["type"] == "executor_failed" for e in task["timeline"])
+
+
+def test_provider_error_retry_count_cleared_on_success(tmp_path):
+    """A clean completion resets both failed_executors and provider_error_retry_count."""
+    db_path = tmp_path / "retry-clear.db"
+    db.migrate(db_path)
+    task = _make_task(executor="claude_code", failed_executors=["claude_code"])
+    task["provider_error_retry_count"] = 2
+
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00")
+    db.append_run_event(db_path, run["id"], "result", {"result": "Verdict: APPROVED FOR COMMIT"})
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert not task.get("failed_executors")
+    assert not task.get("provider_error_retry_count")

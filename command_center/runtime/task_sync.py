@@ -310,40 +310,79 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
 
         elif died_on_startup or provider_unavailable:
             failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
-            failed_list = list(task.get("failed_executors") or [])
-            if failed_executor not in failed_list:
-                failed_list.append(failed_executor)
-                task["failed_executors"] = failed_list
-                mutated = True
-            # Flip any "stranded, won't auto-relaunch" status back to "Ready" so
-            # the next `launch_ready` picks up the next executor in the chain.
-            # `died_on_startup` (INTERRUPTED, no output) resolves to "Requires
-            # Attention"; a classified provider failure (state=FAILED) resolves to
-            # "Failed" — both are stranded statuses, so both are re-queued. A
-            # non-provider failure (`incomplete:working_tree_unchanged`,
-            # `blocked:permission_denied:*`) never reaches here, so its
-            # "Incomplete"/"Blocked" status is preserved.
-            if target_launch_status in _STRANDED_LAUNCH_STATUSES:
-                target_launch_status = "Ready"
-                detail = (
-                    f"Исполнитель «{failed_executor}» недоступен ({reason or 'нет вывода'})."
-                    if provider_unavailable
-                    else f"Исполнитель «{failed_executor}» не запустился (нет вывода)."
-                )
-                models.append_timeline_event(
-                    task,
-                    "executor_failed",
-                    detail
-                    + " Задача возвращена в очередь для повтора другим агентом.",
-                )
-                mutated = True
+
+            # For transient API errors, retry the *same* executor up to 3 times
+            # before declaring it failed and moving on. A 5xx outage usually
+            # resolves in seconds; switching executor after the first glitch would
+            # waste the user's budget on a more expensive fallback unnecessarily.
+            if reason == "provider_api_error" and not died_on_startup:
+                retry_count = int(task.get("provider_error_retry_count") or 0) + 1
+                if retry_count < 3:
+                    task["provider_error_retry_count"] = retry_count
+                    if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                        target_launch_status = "Ready"
+                        models.append_timeline_event(
+                            task,
+                            "executor_retry",
+                            f"API-ошибка от «{failed_executor}» (попытка {retry_count}/3). "
+                            "Повтор того же исполнителя.",
+                        )
+                    mutated = True
+                else:
+                    # Exhausted retries — fall through to the normal failover path.
+                    task.pop("provider_error_retry_count", None)
+                    failed_list = list(task.get("failed_executors") or [])
+                    if failed_executor not in failed_list:
+                        failed_list.append(failed_executor)
+                        task["failed_executors"] = failed_list
+                    if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                        target_launch_status = "Ready"
+                        models.append_timeline_event(
+                            task,
+                            "executor_failed",
+                            f"Исполнитель «{failed_executor}» недоступен после 3 попыток ({reason}). "
+                            "Задача возвращена в очередь для повтора другим агентом.",
+                        )
+                    mutated = True
+            else:
+                failed_list = list(task.get("failed_executors") or [])
+                if failed_executor not in failed_list:
+                    failed_list.append(failed_executor)
+                    task["failed_executors"] = failed_list
+                    mutated = True
+                # Flip any "stranded, won't auto-relaunch" status back to "Ready" so
+                # the next `launch_ready` picks up the next executor in the chain.
+                # `died_on_startup` (INTERRUPTED, no output) resolves to "Requires
+                # Attention"; a classified provider failure (state=FAILED) resolves to
+                # "Failed" — both are stranded statuses, so both are re-queued. A
+                # non-provider failure (`incomplete:working_tree_unchanged`,
+                # `blocked:permission_denied:*`) never reaches here, so its
+                # "Incomplete"/"Blocked" status is preserved.
+                if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                    target_launch_status = "Ready"
+                    detail = (
+                        f"Исполнитель «{failed_executor}» недоступен ({reason or 'нет вывода'})."
+                        if provider_unavailable
+                        else f"Исполнитель «{failed_executor}» не запустился (нет вывода)."
+                    )
+                    models.append_timeline_event(
+                        task,
+                        "executor_failed",
+                        detail
+                        + " Задача возвращена в очередь для повтора другим агентом.",
+                    )
+                    mutated = True
 
     # On a clean completion, clear any accumulated executor failures — the
     # chain is healthy again and a future re-launch should try the configured
     # executor from scratch.
-    if status == session_view.STATUS_COMPLETED and task.get("failed_executors"):
-        task.pop("failed_executors", None)
-        mutated = True
+    if status == session_view.STATUS_COMPLETED:
+        if task.get("failed_executors"):
+            task.pop("failed_executors", None)
+            mutated = True
+        if task.get("provider_error_retry_count"):
+            task.pop("provider_error_retry_count", None)
+            mutated = True
 
     if task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
