@@ -1,4 +1,4 @@
-﻿# Windows 11 x64 - D1-GATE + D4B run result
+# Windows 11 x64 - D1-GATE + D4B run result
 
 Generated: 2026-08-07 03:55:29 +03:00
 Script: run-windows-d1.ps1
@@ -11,7 +11,7 @@ Script: run-windows-d1.ps1
 
 ## Step 2 - automated tests
 - \pytest tests/desktop -q\: 1 failed, 125 passed in 25.09s
-- \uff check .\: PASS
+- \uff check .\: PASS
 
 ## Step 3 - interactive D1 checklist
 - Item 1: PASS
