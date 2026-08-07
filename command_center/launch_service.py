@@ -397,6 +397,7 @@ def execute_agent_launch_v2(
             repository_path=source_repository_path,
             task_type=task_type,
             status_policy=status_policy,
+            enforce_worktree_isolation=not bool((task or {}).get("workspace_allow_primary")),
         )
         verification_evidence = workspace_provisioning.provision_and_verify(workspace_verification)
         workspace_verification = replace(
