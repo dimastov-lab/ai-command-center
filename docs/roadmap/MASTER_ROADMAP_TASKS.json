@@ -192,7 +192,7 @@
       "AICC-D4A",
       "AICC-D4-GATE"
     ],
-    "note": "Updated 2026-08-07: D1-GATE through D4B are now Done. D4A (macOS .app 98MB, all smoke PASS), D4B (Windows .exe 2.3MB, interactive smoke PASS; rebuild with Python 3.14 recommended). Remaining: D4-GATE — clean-machine smoke on both platforms (Windows Sandbox + macOS clean account). This is the last task before Desktop Increment 1 is fully closed."
+    "note": "CLOSED 2026-08-07. All 10 tasks Done: D1A/B/C, D1-GATE, D2A/B/C/D, D2-GATE, D3A/B, D3-GATE, D4A, D4B, D4-GATE. Desktop Increment 1 is fully closed. macOS .app (98MB arm64) and Windows .exe (2.3MB x64) both verified on clean machines. 175 tests pass on CI (Python 3.14, Windows Server 2025 + Linux)."
   },
   "folded": [
     {
@@ -904,7 +904,7 @@
       "title": "D4 final gate — Desktop Increment 1 closure",
       "goal": "Verify DESKTOP_INCREMENT_1.md §6's final Desktop Increment 1 acceptance criteria in full, across both platforms. This gate closes Desktop Increment 1 and satisfies the final goal's Desktop parity gate.",
       "prompt": "Verify DESKTOP_INCREMENT_1.md §6's final Desktop Increment 1 acceptance criteria in full, across both platforms. This gate closes Desktop Increment 1 and satisfies the final goal's Desktop parity gate.\n\nDefinition of Done: DESKTOP_INCREMENT_1.md §6's complete list passes; full suite green; both platforms' clean-machine smoke checklists recorded as passing.\n\nForbidden scope: No work toward any post-Increment-1 feature (run start/cancel, streaming, embedded terminal, signing, server mode, SSO, AICOS interfaces) begins as part of closing this gate.\n\nEvidence / current state at main bd9f05b: Blocked at bd9f05b by D4A and D4B.",
-      "status": "Backlog",
+      "status": "Done",
       "priority": "Medium",
       "task_type": "final_gate",
       "project": "AICC",
@@ -923,7 +923,7 @@
       "components": [],
       "definition_of_done": "DESKTOP_INCREMENT_1.md §6's complete list passes; full suite green; both platforms' clean-machine smoke checklists recorded as passing.",
       "forbidden_scope": "No work toward any post-Increment-1 feature (run start/cancel, streaming, embedded terminal, signing, server mode, SSO, AICOS interfaces) begins as part of closing this gate.",
-      "evidence": "Blocked at bd9f05b by D4A and D4B.",
+      "evidence": "Done 2026-08-07. macOS clean-machine smoke: PASS. Windows clean-machine smoke (Windows Sandbox, Windows 11 x64): PASS. D4A (.app 98MB arm64) + D4B (.exe 2.3MB x64) both launched on machines without external Python, all checklist items passed. Desktop Increment 1 is fully closed.",
       "folds_in": [],
       "source": "docs/desktop/IMPLEMENTATION_ROADMAP.md + DESKTOP_INCREMENT_1.md",
       "authority": "DR-ROADMAP-AUTHORITY-001",
@@ -935,8 +935,8 @@
       "soft_blocks": [],
       "conflicts_with": [],
       "conflict_files": {},
-      "ready_to_start": false,
-      "ready_reason": "Blocked by unfinished dependencies: AICC-D4A, AICC-D4B.",
+      "ready_to_start": true,
+      "ready_reason": "Done 2026-08-07 — Desktop Increment 1 fully closed.",
       "on_critical_path": true,
       "critical_path_position": 10,
       "downstream_chain_length": 1,
