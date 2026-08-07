@@ -284,6 +284,13 @@ TIMELINE_EVENT_TYPES: list[str] = [
 ]
 
 
+def truncate_text(text: str, max_len: int) -> str:
+    """Truncate text to at most max_len characters, appending '…' if truncated."""
+    if len(text) <= max_len:
+        return text
+    return text[: max(0, max_len - 1)] + "…"
+
+
 def derive_short_title(text: str, limit: int = 80) -> str:
     collapsed = " ".join(text.split())
     if len(collapsed) <= limit:

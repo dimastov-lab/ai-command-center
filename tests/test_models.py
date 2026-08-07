@@ -127,6 +127,31 @@ def test_normalize_task_execution_derives_workspace_path_and_executor():
     assert task["executor"] == "claude_code"
 
 
+def test_truncate_text_keeps_short_text():
+    assert models.truncate_text("hello", 10) == "hello"
+    assert models.truncate_text("", 5) == ""
+
+
+def test_truncate_text_truncates_long_text():
+    result = models.truncate_text("hello world", 8)
+    assert len(result) <= 8
+    assert result.endswith("…")
+    assert result == "hello w…"
+
+
+def test_truncate_text_respects_max_len():
+    text = "x" * 1000
+    result = models.truncate_text(text, 50)
+    assert len(result) == 50
+    assert result.endswith("…")
+
+
+def test_truncate_text_handles_edge_cases():
+    assert models.truncate_text("a", 1) == "a"
+    assert len(models.truncate_text("abc", 2)) == 2
+    assert models.truncate_text("abc", 0) == "…"
+
+
 def test_derive_short_title_truncates_on_word_boundary():
     long_text = "word " * 40
     short = models.derive_short_title(long_text.strip())
