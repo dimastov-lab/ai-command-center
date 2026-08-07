@@ -73,3 +73,6 @@ runtime.db-wal
 .aider.chat.history.md
 .aider.input.history
 .aider.tags.cache.v4/
+
+# Sequencer runtime state (not versioned)
+data/sequence_state.json
