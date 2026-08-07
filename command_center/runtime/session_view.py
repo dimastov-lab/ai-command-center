@@ -220,6 +220,10 @@ def elapsed_seconds(started_at: str | None, finished_at: str | None, now: dateti
     started = _parse_iso(started_at)
     if started is None:
         return None
+    # _parse_iso always produces UTC-aware datetimes; normalise `now` to match
+    # so the subtraction never raises TypeError when the caller passes naive now.
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     end = _parse_iso(finished_at) or now
     return max(0.0, (end - started).total_seconds())
 
