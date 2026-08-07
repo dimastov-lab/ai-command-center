@@ -136,7 +136,8 @@ Current boundaries:
   automatic but required-check enforcement remains an operator merge discipline.
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
-- The native PySide6 desktop client remains documentation and design work only.
+- Native PySide6 desktop D1–D3 are implemented on `main` (see §0 Desktop status). D4 packaging
+  specs exist; clean-machine build and interactive Windows gate remain pending.
 - The runtime is local and process-hosted, not a distributed or production-ready worker platform.
 
 ## 1. AIOS

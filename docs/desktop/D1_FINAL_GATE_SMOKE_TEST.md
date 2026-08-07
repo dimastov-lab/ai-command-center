@@ -93,30 +93,50 @@ Automated re-verification on `e9db97c` (2026-08-07), same physical Apple Silicon
 
 macOS leg: **PASS** (third confirmation). Gate status remains **Review** — Windows leg only.
 
-## Windows 11 x64 — NOT PERFORMED
+## Windows — automated CI leg (2026-08-07)
 
-No Windows 11 x64 machine (real or otherwise) was accessible from any session to date. None of
-the acceptance criteria could be exercised there. This is the only remaining blocker to closing
-this gate.
+Executed via GitHub Actions `windows-quality-gates` job (workflow dispatch on `origin/main`,
+Run ID `31150374277`). Runner: `windows-latest` = Microsoft Windows Server 2025 (10.0.26100).
 
-## Outstanding work to close this gate
+| Step | Command | Result |
+|------|---------|--------|
+| Ruff | `ruff check .` | **All checks passed!** |
+| Byte compile | `python -m compileall -q .` | exit 0 |
+| pytest-qt suite | `pytest tests/desktop -q` (offscreen QPA) | **175 passed in 20.50s** |
+| E2E smoke | real-browser driver | **1 passed in 6.84s** |
 
-A human (or an automation session with access to real hardware) must perform, on a real Windows
-11 x64 machine with an attached display:
+CI job duration: **2m 21s**. No failures, no warnings.
 
-1. Install Python 3.12+ and `pip install -r requirements-desktop.txt -r requirements-dev.txt`.
-2. `pytest tests/desktop/ -q` → all pass.
-3. Launch `python -m command_center.desktop` with the native Windows Qt platform plugin.
+This confirms: dependency installation succeeds on Windows, all 175 desktop tests compile and
+run under offscreen Qt on Windows Server 2025, no platform-specific import failures, ruff
+reports zero issues.
+
+**Automated leg: PASS.**
+
+## Windows 11 x64 — interactive display checklist (PENDING)
+
+No Windows machine with an attached display has been available. The following items from the
+original acceptance checklist remain unverified and require a real (or virtual) display:
+
+3. Launch `python -m command_center.desktop` with the native Windows Qt platform plugin (not
+   offscreen) — confirm the window appears.
 4. Confirm `AppShell`, `Sidebar` (all nine sections, Sessions/Execution/Git/Artifacts/Reports/
-   Agents disabled), and `TopBar` render.
+   Agents disabled), and `TopBar` render visibly.
 5. Click Home/Projects/Settings and confirm the visible page switches; click a disabled item and
    confirm nothing happens.
 6. Switch Light/Dark/System and confirm the window palette visibly changes.
 7. Resize/move the window, quit, relaunch, and confirm geometry (including width) is restored.
 8. Quit cleanly with no error dialog or crash.
-9. Record result in this file.
 
-Until the Windows checklist is recorded here, `AICC-D1-GATE` remains **Review**, not **Done**.
+Options: Windows 11 VM with display (Parallels, UTM, VirtualBox), Windows Sandbox on a Windows
+host, or a physical Windows 11 x64 machine. Record result below when done.
+
+## Outstanding work to close this gate
+
+Interactive display checklist (steps 3–8 above) on a Windows 11 x64 machine with a real
+display. CI automated steps are complete and PASS.
+
+Until the interactive checklist is recorded here, `AICC-D1-GATE` remains **Review**, not **Done**.
 
 > **Note (2026-08-07):** `AICC-D2A` must not start constraint is now moot — D2A–D3B are already
 > implemented on `main`. The real dependency on D1-GATE is the D2/D3/D4 gate records, which
