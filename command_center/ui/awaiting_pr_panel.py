@@ -107,6 +107,63 @@ def _set_test_detail(task_id: str, detail: str) -> None:
     st.session_state[_sk(task_id, "test_detail")] = detail
 
 
+def _get_autofix_count(task_id: str) -> int:
+    return int(st.session_state.get(_sk(task_id, "autofix_count"), 0))
+
+
+def _set_autofix_count(task_id: str, n: int) -> None:
+    st.session_state[_sk(task_id, "autofix_count")] = n
+
+
+MAX_AUTOFIX_ATTEMPTS = 3
+
+
+def _create_autofix_task(
+    task: dict,
+    root: Path,
+    failure_summary: str,
+    save_tasks_fn: Callable[[list[dict]], None],
+) -> str:
+    """Create a new implementation task to fix failing tests and return its id."""
+    import uuid
+    parent_id = task["id"]
+    attempt = _get_autofix_count(parent_id) + 1
+    new_id = f"{parent_id}-FIX-{attempt:02d}"
+    parent_title = task.get("title") or parent_id
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    fix_task: dict = {
+        "id": new_id,
+        "title": f"Auto-fix: {parent_title[:60]} — fix failing tests (attempt {attempt})",
+        "description": (
+            f"Auto-generated fix task for {parent_id} (attempt {attempt}/{MAX_AUTOFIX_ATTEMPTS}).\n\n"
+            "The following tests failed — fix them without breaking passing tests:\n\n"
+            f"```\n{failure_summary[:2000]}\n```\n\n"
+            f"Repository: {task.get('repository_path') or 'see parent task'}"
+        ),
+        "task_type": "implementation",
+        "status": "Next",
+        "launch_status": "Ready",
+        "project": task.get("project"),
+        "branch": task.get("branch"),
+        "repository_path": task.get("repository_path"),
+        "executor": task.get("executor"),
+        "model": task.get("model"),
+        "parent_task_id": parent_id,
+        "created_at": now,
+        "updated_at": now,
+        "timeline": [],
+        "tags": ["auto-fix"],
+    }
+
+    def _add(tasks: list[dict]) -> list[dict]:
+        if not any(t["id"] == new_id for t in tasks):
+            tasks.append(fix_task)
+        return tasks
+
+    tasks_repository.mutate_tasks(root, _add)
+    return new_id
+
+
 # ---------------------------------------------------------------------------
 # Action: Create PR
 # ---------------------------------------------------------------------------
@@ -191,6 +248,7 @@ def _action_run_tests(
     task: dict,
     root: Path,
     project_configs: dict,
+    save_tasks_fn: Callable[[list[dict]], None] | None = None,
 ) -> None:
     task_id = task["id"]
     repo = task.get("repository_path") or ""
@@ -211,19 +269,30 @@ def _action_run_tests(
     if outcome.passed:
         _set_test_result(task_id, "green")
         _set_test_detail(task_id, outcome.summary())
+        _set_autofix_count(task_id, 0)  # reset counter on success
     else:
         _set_test_result(task_id, "red")
         _set_test_detail(task_id, outcome.summary())
-        st.warning(
-            "Тесты красные. Запускаю агента для исправления…\n\n"
-            "После завершения нажмите **Run Tests** ещё раз."
-        )
-        # Queue a remediation run via session state so app.py can pick it up.
-        st.session_state[f"awaiting_pr_autofix_{task_id}"] = {
-            "task_id": task_id,
-            "root": str(root),
-            "failure_summary": outcome.summary(),
-        }
+
+        attempt = _get_autofix_count(task_id)
+        if attempt >= MAX_AUTOFIX_ATTEMPTS:
+            st.error(
+                f"🔴 Тесты красные — автоисправление исчерпано ({MAX_AUTOFIX_ATTEMPTS}/{MAX_AUTOFIX_ATTEMPTS} попыток). "
+                "Проверьте задачи вручную."
+            )
+        elif save_tasks_fn is not None:
+            fix_id = _create_autofix_task(task, root, outcome.summary(), save_tasks_fn)
+            _set_autofix_count(task_id, attempt + 1)
+            st.warning(
+                f"🔴 Тесты красные — создана задача **{fix_id}** для автоисправления "
+                f"(попытка {attempt + 1}/{MAX_AUTOFIX_ATTEMPTS}). "
+                "После её завершения нажмите **Тесты** ещё раз."
+            )
+        else:
+            st.warning(
+                "🔴 Тесты красные. Исправьте ошибки и нажмите **Тесты** ещё раз.\n\n"
+                f"```\n{outcome.summary()[:800]}\n```"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +507,7 @@ def render_awaiting_pr_panel(
                 help="Запустить тесты и показать результат" if not tests_disabled
                      else "Сначала создайте ПР",
             ):
-                _action_run_tests(task, root, project_configs)
+                _action_run_tests(task, root, project_configs, save_tasks_fn=save_tasks_fn)
                 st.rerun()
 
         # Кнопка 3: Влить (доступна только при зелёных тестах)
