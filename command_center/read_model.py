@@ -23,7 +23,7 @@ from dataclasses import dataclass
 # legacy/live data already contains it and those tasks must be visible rather
 # than silently dropped (audit D2). Any status outside this set is counted in
 # `other`.
-CANONICAL_LANES: tuple[str, ...] = ("Backlog", "Next", "In Progress", "Review", "Blocked", "Done")
+CANONICAL_LANES: tuple[str, ...] = ("Backlog", "Next", "In Progress", "Review", "Blocked", "Done", "Closed")
 
 # Lanes that represent in-flight or ready-to-start work — neither resolved
 # (`Done`) nor stuck (`Blocked`).

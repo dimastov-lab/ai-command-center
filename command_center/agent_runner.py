@@ -219,12 +219,11 @@ GIT_WRITE_DISALLOWED_TOOLS: list[str] = [
     "Bash(git clean:*)",
     "Bash(git branch -d:*)",
     "Bash(git branch -D:*)",
-    # `gh` (GitHub CLI): PR/issue/release write operations are the completion
-    # pipeline's job, never the agent's. Block specific write subcommands rather
-    # than all of `gh` wholesale: this lets implementation agents use read-only
-    # commands (gh pr list, gh pr view, gh pr diff) for context while keeping
-    # mutations off-limits. `scrub_vcs_credentials` is the complementary control
-    # that prevents authenticated pushes via nested shells.
+    # `gh` (GitHub CLI): all `gh` commands are denied for implementation/
+    # remediation agents. `scrub_vcs_credentials` strips auth tokens so even
+    # a nested shell cannot push or merge; this blanket denial is the defence-
+    # in-depth layer at the tool level.
+    "Bash(gh:*)",
     "Bash(gh pr create:*)",
     "Bash(gh pr merge:*)",
     "Bash(gh pr edit:*)",

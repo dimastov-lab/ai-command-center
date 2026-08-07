@@ -676,6 +676,8 @@ def launch_ready(
         validation = prep.validation
 
         if prep.decision == launch_service.LAUNCH_DECISION_BLOCKED:
+            _block_warnings = list(validation.errors) if validation else list(prep.fatal_messages)
+            _block_report = _validation_report(validation, expected_branch=expected_branch) if validation else None
             results.append(
                 LaunchAttemptResult(
                     entry["id"],
@@ -683,6 +685,8 @@ def launch_ready(
                     False,
                     message="; ".join(prep.fatal_messages) or "запуск заблокирован",
                     reason_code=LAUNCH_SKIP_BLOCKED,
+                    warnings=_block_warnings,
+                    validation_report=_block_report,
                 )
             )
             continue

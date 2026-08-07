@@ -1,0 +1,6 @@
+
+# 2026-08-07 11:52:00.687650
++In command_center/runtime/task_sync.py, modify the executor fallback section (AICC-DESKTOP-017). For provider_api_error specifically, use a retry counter approach: add task field provider_error_retry_count (defaults 0). When provider_api_error occurs: increment the counter. If count < 3: set launch_status=Ready WITHOUT adding to failed_executors (just retry same executor). If count >= 3: add to failed_executors as before and reset counter. Reset the counter when run completes successfully. Add tests for this behavior in tests/test_task_sync.py.
+
+# 2026-08-07 11:52:00.687773
++In command_center/runtime/task_sync.py, modify the executor fallback section (AICC-DESKTOP-017). For provider_api_error specifically, use a retry counter approach: add task field provider_error_retry_count (defaults 0). When provider_api_error occurs: increment the counter. If count < 3: set launch_status=Ready WITHOUT adding to failed_executors (just retry same executor). If count >= 3: add to failed_executors as before and reset counter. Reset the counter when run completes successfully. Add tests for this behavior in tests/test_task_sync.py.
