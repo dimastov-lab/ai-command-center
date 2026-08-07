@@ -1,14 +1,27 @@
 # AI Command Center — Current State
 
-Updated: 2026-08-07
+Updated: 2026-08-07 (roadmap reconciliation)
 
 ## 0. AI Command Center platform
 
-Status: Active, local Streamlit implementation
+Status: Active — Streamlit app running; Native Desktop D1–D3 implemented on `main`
 
 Current position:
 - `app.py` hosts the implemented Streamlit control application: 20 page handlers, 16 shown in the
   sidebar (chat, generated files, reports, and context open inside the project view).
+- **Native Desktop (PySide6) status as of 2026-08-07:**
+  - D1 (shell, nav, themes): ✅ Done — shipped earlier, re-verified
+  - D2A (application adapter): ✅ Done — `command_center/application/workspace_home_adapter.py`
+  - D2B (async workers): ✅ Done — `command_center/desktop/workers.py`
+  - D2C (Workspace Home layout): ✅ Done — `pages/home.py` 490 lines, fully wired
+  - D2D (edge states, accessibility, BANK/LEGAL redaction): ✅ Done
+  - D3A (Projects page + adapter): ✅ Done
+  - D3B (Settings + platform layer): ✅ Done — `command_center/platform/` complete
+  - D4A (macOS PyInstaller spec): ⚠️ Review — spec ready, clean-machine build pending
+  - D4B (Windows PyInstaller spec): ⚠️ Review — spec ready, Windows machine required
+  - **D1/D2/D3/D4-GATE**: ⚠️ Review/Backlog — gate records pending; Windows 11 x64 machine is sole blocker for D1/D2/D3 gates
+  - Desktop pytest-qt suite: **175 tests pass** (`QT_QPA_PLATFORM=offscreen`)
+- `python -m command_center.desktop` launches the native shell cleanly.
 - `data/tasks.json` is the default planning and Kanban store. `AICC_TASKS_BACKEND=aios` routes
   all task reads/writes through the AIOS Tasks API instead (requires `AICC_AIOS_URL` + `AICC_AIOS_TOKEN`).
   `tasks_repository.get_repository()` is the factory; `scripts/migrate_tasks_to_aios.py` provides
