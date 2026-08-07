@@ -149,6 +149,44 @@ def iso_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def format_age(iso_str: str | None) -> str:
+    """ISO timestamp → human-readable relative time (e.g. '2 hours ago', '1 day ago').
+    Returns empty string if input is None, empty, or unparseable."""
+    if not iso_str:
+        return ""
+    text = str(iso_str).strip()
+    if not text:
+        return ""
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+
+    if dt.tzinfo is not None:
+        now = datetime.now(dt.tzinfo)
+    else:
+        now = datetime.now()
+    delta = now - dt
+    seconds = delta.total_seconds()
+
+    if seconds < 0:
+        return ""
+    elif seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    elif seconds < 86400:
+        hours = int(seconds // 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    elif seconds < 604800:
+        days = int(seconds // 86400)
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    else:
+        weeks = int(seconds // 604800)
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+
+
 def new_id() -> str:
     return uuid.uuid4().hex
 
