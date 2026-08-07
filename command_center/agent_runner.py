@@ -105,7 +105,18 @@ PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
 READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
-MUTATING_TASK_TYPES = {"implementation", "remediation"}
+# Any task type that is expected to produce file changes needs trusted_development.
+# Unknown/future types still fail closed as read-only (not listed here).
+MUTATING_TASK_TYPES = {
+    "implementation",
+    "remediation",
+    "bug",
+    "documentation",
+    "security",
+    "governance",
+    "refactoring",
+    "testing",
+}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
 # empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
@@ -208,14 +219,29 @@ GIT_WRITE_DISALLOWED_TOOLS: list[str] = [
     "Bash(git clean:*)",
     "Bash(git branch -d:*)",
     "Bash(git branch -D:*)",
-    # `gh` (GitHub CLI): opening and merging pull requests is the completion
-    # pipeline's job, never the agent's, so gh is denied wholesale — this blocks
-    # the `gh pr create`/`gh pr merge`/`gh api` writes an agent could otherwise
-    # run freely (gh was previously unrestricted here). Pattern-based denial,
-    # like the git entries above: it does not stop gh re-invoked through a nested
-    # shell — `scrub_vcs_credentials` is the complementary control that removes
-    # the tokens gh would need to authenticate.
-    "Bash(gh:*)",
+    # `gh` (GitHub CLI): PR/issue/release write operations are the completion
+    # pipeline's job, never the agent's. Block specific write subcommands rather
+    # than all of `gh` wholesale: this lets implementation agents use read-only
+    # commands (gh pr list, gh pr view, gh pr diff) for context while keeping
+    # mutations off-limits. `scrub_vcs_credentials` is the complementary control
+    # that prevents authenticated pushes via nested shells.
+    "Bash(gh pr create:*)",
+    "Bash(gh pr merge:*)",
+    "Bash(gh pr edit:*)",
+    "Bash(gh pr close:*)",
+    "Bash(gh pr reopen:*)",
+    "Bash(gh pr review:*)",
+    "Bash(gh issue create:*)",
+    "Bash(gh issue edit:*)",
+    "Bash(gh issue close:*)",
+    "Bash(gh issue reopen:*)",
+    "Bash(gh release create:*)",
+    "Bash(gh release delete:*)",
+    "Bash(gh release edit:*)",
+    "Bash(gh repo create:*)",
+    "Bash(gh repo delete:*)",
+    "Bash(gh repo rename:*)",
+    "Bash(gh api:*)",
 ]
 
 # Environment variables that carry Git/GitHub push/merge credentials, stripped
