@@ -33,6 +33,7 @@ from command_center import (
     agent_runner,
     git_info,
     launch,
+    model_selector,
     models,
     project_config,
     workspace_provisioning,
@@ -321,6 +322,7 @@ def execute_agent_launch_v2(
     max_global_concurrency: int | None = None,
     session_id: str | None = None,
     is_resume: bool = False,
+    model: str | None = None,
 ) -> dict:
     """Async counterpart to `execute_agent_launch` above — same pre-launch
     bookkeeping (`push_prompt_history`, `launch.begin_launch`), but instead
@@ -438,6 +440,13 @@ def execute_agent_launch_v2(
         if on_task_state_changed is not None:
             on_task_state_changed()
 
+    # Auto-select model and executor when not explicitly set by the caller.
+    # Explicit model/executor from the task or caller always win.
+    if task is not None and executor_id == "claude_code" and model is None:
+        auto_model, auto_executor = model_selector.select_model(task)
+        model = auto_model
+        executor_id = auto_executor
+
     title = (task or {}).get("title") or ("Codex CLI run" if executor_id == "codex" else prompt[:120])
 
     run = execution_center_api.start_run(
@@ -491,6 +500,7 @@ def execute_agent_launch_v2(
         executor_id=executor_id,
         session_id=session_id,
         is_resume=is_resume,
+        model=model,
     )
 
     if task is not None:

@@ -823,7 +823,11 @@ class CodexProvider:
             str(repository_path),
         ]
         if model:
-            argv.extend(["--model", model])
+            # "ollama/<name>" → codex exec --oss --local-provider ollama --model <name>
+            if model.startswith("ollama/"):
+                argv.extend(["--oss", "--local-provider", "ollama", "--model", model[len("ollama/"):]])
+            else:
+                argv.extend(["--model", model])
         argv.append("-")
         audit = {
             "provider_id": self.id,
