@@ -785,3 +785,35 @@ def test_provider_error_retry_count_cleared_on_success(tmp_path):
 
     assert not task.get("failed_executors")
     assert not task.get("provider_error_retry_count")
+
+
+# ---------------------------------------------------------------------------
+# last_provider_id — task_sync (IMP-NNN)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_task_from_run_completed_records_last_provider_id(tmp_path):
+    """A completed run records the provider_id that executed it as last_provider_id
+    on the task."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00", provider_id="copilot_cli")
+    db.append_run_event(db_path, run["id"], "result", {"result": "Verdict: APPROVED FOR COMMIT"})
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["last_provider_id"] == "copilot_cli"
+
+
+def test_sync_task_from_run_failed_records_last_provider_id(tmp_path):
+    """A failed run records the provider_id that executed it as last_provider_id
+    on the task."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="FAILED", completed_at="2026-01-01T00:01:00", provider_id="claude_code")
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["last_provider_id"] == "claude_code"

@@ -170,6 +170,7 @@ def default_task_workflow_fields() -> dict:
         "branch": None,
         "agent": None,
         "last_run_at": None,
+        "last_provider_id": None,
     }
 
 
