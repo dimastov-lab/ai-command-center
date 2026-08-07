@@ -7,7 +7,10 @@
   the `bd9f05b` finding)
 - **Date**: 2026-07-28 (macOS leg re-verified same day; see re-verification note below)
 
-## Result: PARTIAL — macOS leg passes; Windows leg performed 2026-08-07: interactive 6/6 PASS, automated suite 1 failed/125 passed
+## Result: DONE per Gate verdict below (2026-08-07) — macOS ×3 PASS; Windows automated CI PASS; Windows 11 physical interactive 6/6 PASS
+
+Chronological records below include intermediate PARTIAL states from earlier the same day
+(physical-machine automated suite 1 failed/125 passed — see the morning Windows run section).
 
 This gate requires the D1 acceptance-criteria list to pass on **both** a real macOS Apple Silicon
 machine and a real Windows 11 x64 machine, plus a green `pytest-qt` suite. Only the macOS leg
@@ -74,21 +77,8 @@ the fresh environment did not have it pre-installed):
 This confirms the macOS PASS result is stable and reproducible. The Windows leg below remains the
 sole blocker; this follow-up session also had no access to a real Windows 11 x64 machine.
 
-<<<<<<< HEAD
-## macOS Apple Silicon — третья перепроверка (2026-08-07)
-||||||| be6328e
-## Windows 11 x64 — NOT PERFORMED
-=======
 ## Windows 11 x64 — PERFORMED 2026-08-07, interactive PASS 6/6; automated suite 1 red
->>>>>>> origin/main
 
-<<<<<<< HEAD
-Automated re-verification on `e9db97c` (2026-08-07), same physical Apple Silicon Mac:
-||||||| be6328e
-No Windows 11 x64 machine (real or otherwise) was accessible from this automation session. None of
-the acceptance criteria could be exercised there. This is the only remaining blocker to closing
-this gate.
-=======
 Real hardware, run via `scripts/run-windows-d1.ps1` from `main` (report `WINDOWS_D1_RESULT.md`
 generated 2026-08-07 03:55 +03:00):
 
@@ -104,7 +94,44 @@ generated 2026-08-07 03:55 +03:00):
   (2.3 MB bootstrapper, onedir layout). Clean-machine smoke (Step 5,
   `packaging/windows/SMOKE_CHECKLIST.md`) **NOT PERFORMED** — both checklist copies returned
   blank; it still requires Windows Sandbox or a second no-Python account.
->>>>>>> origin/main
+
+## Outstanding work recorded after the morning Windows run (2026-08-07)
+
+> Historical note (merge reconciliation, 2026-08-07): the items below were written immediately
+> after the physical-machine run above. The later same-day sections (macOS third re-verification,
+> Windows automated CI leg, Windows interactive display checklist) address most of them — see the
+> Gate verdict at the end of this document. Still genuinely open afterwards: identifying the one
+> red test from `windows-d1-run.log` on the physical machine, and the clean-machine smoke of the
+> D4B build.
+
+Windows leg (updated 2026-08-07):
+
+1. Identify the one failing test from `windows-d1-run.log` on the Windows machine and get
+   `pytest tests/desktop` fully green there (125/126 is not a pass).
+2. Clean-machine smoke: Windows Sandbox or a second account without Python in PATH, walk
+   `packaging/windows/SMOKE_CHECKLIST.md` against the built `dist\windows\AI Command Center`.
+
+macOS leg — the interactive checklist below must still be performed on a real display (the
+recorded macOS PASS covers the automated suite; live-display items, notably exact width restore,
+were verified only on Windows):
+
+1. Launch `python -m command_center.desktop` interactively (native window, not offscreen).
+2. Confirm `AppShell`, `Sidebar` (all nine sections, Sessions/Execution/Git/Artifacts/Reports/
+   Agents disabled), and `TopBar` render.
+3. Click Home/Projects/Settings and confirm the visible page switches; click a disabled item and
+   confirm nothing happens.
+4. Switch Light/Dark/System and confirm the window palette visibly changes.
+5. Resize/move the window, quit, relaunch, and confirm geometry (including width) is restored
+   exactly.
+6. Quit cleanly with no error dialog or crash.
+
+Until both platforms' checklists are recorded here, `AICC-D1-GATE` remains **Review**, not **Done**,
+and `AICC-D2A` must not start (per this gate's forbidden-scope note and
+`docs/roadmap/MASTER_PRODUCT_ROADMAP.md` §2.1).
+
+## macOS Apple Silicon — третья перепроверка (2026-08-07)
+
+Automated re-verification on `e9db97c` (2026-08-07), same physical Apple Silicon Mac:
 
 - **`pytest tests/desktop/ -q`** → **175 passed** in 8.95s (0 failed, 0 errors). Suite grew from
   28 tests (prior record) to 175: D2A–D3B implementation plus packaging tests now included and
@@ -119,23 +146,7 @@ generated 2026-08-07 03:55 +03:00):
 - **Context note**: D2A–D3B were implemented on `main` between the prior record and this
   re-verification. The D1 shell itself is unchanged and all D1 acceptance criteria still hold.
 
-<<<<<<< HEAD
 macOS leg: **PASS** (third confirmation). Gate status remains **Review** — Windows leg only.
-||||||| be6328e
-A human (or an automation session with access to real hardware) must still perform, on both a real
-macOS Apple Silicon machine *with an attached display* and a real Windows 11 x64 machine:
-=======
-Windows leg (updated 2026-08-07):
-
-1. Identify the one failing test from `windows-d1-run.log` on the Windows machine and get
-   `pytest tests/desktop` fully green there (125/126 is not a pass).
-2. Clean-machine smoke: Windows Sandbox or a second account without Python in PATH, walk
-   `packaging/windows/SMOKE_CHECKLIST.md` against the built `dist\windows\AI Command Center`.
-
-macOS leg — the interactive checklist below must still be performed on a real display (the
-recorded macOS PASS covers the automated suite; live-display items, notably exact width restore,
-were verified only on Windows):
->>>>>>> origin/main
 
 ## Windows — automated CI leg (2026-08-07)
 

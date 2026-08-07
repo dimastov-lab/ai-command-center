@@ -4,6 +4,7 @@
 Usage:
     python scripts/run-sequence.py TASK-ID-1 TASK-ID-2 TASK-ID-3 ...
     python scripts/run-sequence.py --dry-run TASK-ID-1 TASK-ID-2 TASK-ID-3 ...
+    python scripts/run-sequence.py --status
 
 State is saved to data/sequence_state.json after each step. If the process
 dies, re-run with the same task list — it resumes from the last non-terminal
@@ -11,7 +12,11 @@ step automatically.  The state file is removed on successful completion.
 
 With --dry-run, shows what would happen without actually launching tasks or
 modifying state.
+
+With --status, shows the progress of the current sequence without modifying
+any state or launching tasks.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,13 +29,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from command_center import tasks_repository  # noqa: E402
+from command_center import storage, tasks_repository  # noqa: E402
 
-STATE_FILE = ROOT / "data" / "sequence_state.json"
+
+def _get_state_file() -> Path:
+    """Get state file path, respecting AICC_DATA_DIR environment variable."""
+    data_dir = storage.resolve_data_dir(ROOT)
+    return data_dir / "sequence_state.json"
+
+
 POLL_INTERVAL = 20  # seconds
 
 TERMINAL_STATUSES = frozenset(
-    {"Completed", "Awaiting PR", "Needs Review", "Cancelled", "Failed", "Closed", "Done"}
+    {
+        "Completed",
+        "Awaiting PR",
+        "Needs Review",
+        "Cancelled",
+        "Failed",
+        "Closed",
+        "Done",
+    }
 )
 RUNNING_STATUSES = frozenset({"Running", "Launching"})
 
@@ -39,17 +58,20 @@ RUNNING_STATUSES = frozenset({"Running", "Launching"})
 # State persistence
 # ---------------------------------------------------------------------------
 
+
 def _load_state(task_ids: list[str], dry_run: bool = False) -> dict:
     """Load existing state or create fresh state for this sequence.
 
     If a saved sequence exists for the same ordered task list, resume it.
     Otherwise start fresh (the old state file is overwritten).
     """
-    if STATE_FILE.exists():
+    if _get_state_file().exists():
         try:
-            saved = json.loads(STATE_FILE.read_text())
+            saved = json.loads(_get_state_file().read_text())
             if saved.get("task_ids") == task_ids:
-                print(f"[SEQ] Resuming from step {saved['current_index']} / {len(task_ids)}")
+                print(
+                    f"[SEQ] Resuming from step {saved['current_index']} / {len(task_ids)}"
+                )
                 return saved
         except (json.JSONDecodeError, KeyError):
             pass
@@ -60,15 +82,19 @@ def _load_state(task_ids: list[str], dry_run: bool = False) -> dict:
 
 def _save_state(state: dict, dry_run: bool = False) -> None:
     if dry_run:
-        print(f"[DRY-RUN] Would save state: {json.dumps(state, indent=2, ensure_ascii=False)[:100]}...", flush=True)
+        print(
+            f"[DRY-RUN] Would save state: {json.dumps(state, indent=2, ensure_ascii=False)[:100]}...",
+            flush=True,
+        )
         return
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+    _get_state_file().parent.mkdir(parents=True, exist_ok=True)
+    _get_state_file().write_text(json.dumps(state, indent=2, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
 # Task helpers
 # ---------------------------------------------------------------------------
+
 
 def _validate_task_ids(task_ids: list[str]) -> None:
     """Validate that all task IDs exist in the repository.
@@ -111,7 +137,10 @@ def _wait_for_terminal(task_id: str, dry_run: bool = False) -> str:
         if status in TERMINAL_STATUSES:
             print("[DRY-RUN]   Would skip polling (already terminal)", flush=True)
         else:
-            print(f"[DRY-RUN]   Would poll every {POLL_INTERVAL}s until terminal", flush=True)
+            print(
+                f"[DRY-RUN]   Would poll every {POLL_INTERVAL}s until terminal",
+                flush=True,
+            )
         return status
     while True:
         status = _task_launch_status(task_id)
@@ -122,18 +151,84 @@ def _wait_for_terminal(task_id: str, dry_run: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Status display
+# ---------------------------------------------------------------------------
+
+
+def _show_status() -> int:
+    """Display the current sequence status. Returns 0 if status shown, 1 if no sequence running."""
+    state_file = _get_state_file()
+    if not state_file.exists():
+        print("No sequence in progress.", flush=True)
+        return 0
+
+    try:
+        state = json.loads(state_file.read_text())
+    except (json.JSONDecodeError, KeyError):
+        print("No sequence in progress (state file corrupted).", flush=True)
+        return 0
+
+    task_ids = state.get("task_ids", [])
+    current_idx = state.get("current_index", 0)
+    steps = state.get("steps", {})
+
+    if not task_ids:
+        print("No sequence in progress.", flush=True)
+        return 0
+
+    print(f"Sequence Progress: {current_idx}/{len(task_ids)} completed", flush=True)
+    print("", flush=True)
+
+    for idx, task_id in enumerate(task_ids):
+        step_info = steps.get(task_id, {})
+        status = step_info.get("status", "?")
+        skipped = step_info.get("skipped", False)
+
+        if idx < current_idx:
+            # Completed
+            marker = "✓"
+            status_label = f"{status} (completed)"
+        elif idx == current_idx:
+            # Currently running
+            marker = "→"
+            status_label = f"{status} (in progress)"
+        else:
+            # Pending
+            marker = "•"
+            status_label = "pending"
+
+        if skipped:
+            status_label += " (skipped)"
+
+        print(f"  {marker} {idx + 1}. {task_id}: {status_label}", flush=True)
+
+    print("", flush=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main(task_ids: list[str], dry_run: bool = False) -> int:
+
+def main(task_ids: list[str], dry_run: bool = False, show_status: bool = False) -> int:
+    if show_status:
+        return _show_status()
+
     if not task_ids:
-        print("Usage: run-sequence.py [--dry-run] TASK-ID [TASK-ID ...]", file=sys.stderr)
+        print(
+            "Usage: run-sequence.py [--dry-run] TASK-ID [TASK-ID ...] | [--status]",
+            file=sys.stderr,
+        )
         return 1
 
     _validate_task_ids(task_ids)
 
     if dry_run:
-        print("[DRY-RUN] Running in dry-run mode — no tasks will be launched or state modified.", flush=True)
+        print(
+            "[DRY-RUN] Running in dry-run mode — no tasks will be launched or state modified.",
+            flush=True,
+        )
 
     state = _load_state(task_ids, dry_run=dry_run)
 
@@ -143,7 +238,10 @@ def main(task_ids: list[str], dry_run: bool = False) -> int:
 
         status = _task_launch_status(task_id)
         prefix = "[DRY-RUN]" if dry_run else "[SEQ]"
-        print(f"\n{prefix} Step {idx + 1}/{len(task_ids)}: {task_id}  [{status}]", flush=True)
+        print(
+            f"\n{prefix} Step {idx + 1}/{len(task_ids)}: {task_id}  [{status}]",
+            flush=True,
+        )
 
         if status in TERMINAL_STATUSES:
             print(f"{prefix}   Already terminal ({status}), skipping.", flush=True)
@@ -158,8 +256,14 @@ def main(task_ids: list[str], dry_run: bool = False) -> int:
                 time.sleep(8)  # give supervisor time to pick up
                 # If launch was rejected (dirty tree, locked, etc.) retry until accepted
                 post_status = _task_launch_status(task_id)
-                while post_status not in RUNNING_STATUSES and post_status not in TERMINAL_STATUSES:
-                    print(f"[SEQ]   launch rejected ({post_status}), retrying in {POLL_INTERVAL}s…", flush=True)
+                while (
+                    post_status not in RUNNING_STATUSES
+                    and post_status not in TERMINAL_STATUSES
+                ):
+                    print(
+                        f"[SEQ]   launch rejected ({post_status}), retrying in {POLL_INTERVAL}s…",
+                        flush=True,
+                    )
                     time.sleep(POLL_INTERVAL)
                     _launch(task_id)
                     time.sleep(8)
@@ -180,9 +284,9 @@ def main(task_ids: list[str], dry_run: bool = False) -> int:
         print(f"  {tid}: {info['status']}", flush=True)
 
     if not dry_run:
-        STATE_FILE.unlink(missing_ok=True)
+        _get_state_file().unlink(missing_ok=True)
     else:
-        print(f"[DRY-RUN] Would delete state file: {STATE_FILE}", flush=True)
+        print(f"[DRY-RUN] Would delete state file: {_get_state_file()}", flush=True)
     return 0
 
 
@@ -190,8 +294,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run a sequence of tasks with crash-resilient state tracking."
     )
-    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without modifying state or launching tasks")
-    parser.add_argument("task_ids", nargs="+", help="Task IDs to run in sequence")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would happen without modifying state or launching tasks",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show the progress of the current sequence",
+    )
+    parser.add_argument("task_ids", nargs="*", help="Task IDs to run in sequence")
     args = parser.parse_args()
 
-    raise SystemExit(main(args.task_ids, dry_run=args.dry_run))
+    raise SystemExit(main(args.task_ids, dry_run=args.dry_run, show_status=args.status))
