@@ -413,6 +413,16 @@ def sync_task_from_completion(task: dict, completion: dict) -> bool:
             mutated = True
 
     target = _LAUNCH_STATUS_BY_COMPLETION_STATE.get(state)
+    # REQUIRES_ATTENTION with NO_PR_NOT_IN_TARGET means the agent finished
+    # successfully but couldn't open a PR (it ran on the base branch directly).
+    # This is not an error — it's a task waiting for a PR to be created.
+    # Map to "Awaiting PR" instead of "Requires Attention" so the board clearly
+    # distinguishes "needs human intervention to fix" from "ready to ship via PR".
+    if (
+        state == completion_states.CompletionState.REQUIRES_ATTENTION
+        and completion.get("last_reason_code") == "NO_PR_NOT_IN_TARGET"
+    ):
+        target = "Awaiting PR"
     if target and task.get("launch_status") != target:
         task["launch_status"] = target
         mutated = True

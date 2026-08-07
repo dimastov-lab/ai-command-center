@@ -223,6 +223,7 @@ LAUNCH_STATUSES: list[str] = [
     "Blocked",
     "Incomplete",
     "Needs Review",
+    "Awaiting PR",
     "Completed",
     "Failed",
     "Requires Attention",
