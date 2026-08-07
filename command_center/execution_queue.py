@@ -475,38 +475,6 @@ def select_available_executor(
     return candidates[0][0]
 
 
-def select_remediation_executor(task: dict, cfg: dict) -> str | None:
-    """Pick the executor to use for a «Исправить» (fix) re-launch.
-
-    Simpler than ``select_available_executor``:
-    - Does NOT probe ``provider.availability()`` — transient probe failures
-      must not block an operator-initiated retry (see comment in app.py).
-    - Does NOT apply load-awareness — this is a one-off human action.
-    - Skips only executors already in ``task["failed_executors"]`` (those
-      recorded as startup failures, not permission-denied blocks mid-run).
-
-    Returns the first viable candidate in configured order, or ``None`` when
-    every candidate is in ``failed_executors``.
-    """
-    configured = task.get("executor") or "claude_code"
-    failed = set(task.get("failed_executors") or [])
-    allowed = list(cfg.get("allowed_agents") or [])
-
-    candidates: list[str] = []
-    seen: set[str] = set()
-    for eid in [configured, *allowed]:
-        if eid not in seen:
-            candidates.append(eid)
-            seen.add(eid)
-    if not candidates:
-        candidates = ["claude_code"]
-
-    for eid in candidates:
-        if eid not in failed:
-            return eid
-    return None
-
-
 @dataclass
 class LaunchAttemptResult:
     entry_id: str
@@ -776,6 +744,12 @@ def launch_ready(
                 base_branch=base_branch,
                 source_repository_path=source_repository_path,
                 max_global_concurrency=max_global,
+                # Resume support: if task_sync detected an interrupted run that
+                # had already produced output (battery died, connection dropped),
+                # it stores the previous session_id so the agent can pick up its
+                # conversation instead of starting from scratch.
+                session_id=task.get("resume_session_id") or None,
+                is_resume=bool(task.get("resume_session_id")),
             )
         except launch_service.DuplicateActiveLaunchError as exc:
             results.append(
@@ -902,36 +876,3 @@ def _commit_launch_results(
 
         save_queue(root, merged)
     return merged
-
-
-def reconcile_missing_run_links(root: Path, entries: list[dict]) -> list[dict]:
-    """Backfill `run_id` on LAUNCHED entries that lost their run link.
-
-    A queue entry transitions to STATE_LAUNCHED and receives a `run_id` in
-    `_commit_launch_results`. If that commit was interrupted (crash, SIGKILL,
-    lost write) the entry stays LAUNCHED but with `run_id=None`, making it
-    invisible to live-board and attention tracking.
-
-    For each such orphaned entry, look up the latest run for that `task_id` in
-    runtime.db and fill in its id. Returns the (possibly modified) list; the
-    caller decides whether to persist it.
-    """
-    db_path = runtime_db.resolve_db_path(root)
-    repaired: list[dict] = []
-    changed = False
-    for entry in entries:
-        if entry.get("state") == STATE_LAUNCHED and not entry.get("run_id"):
-            task_id = entry.get("task_id")
-            run = runtime_db.get_latest_run_for_task(db_path, task_id) if task_id else None
-            if run and run.get("id"):
-                entry = dict(entry)
-                entry["run_id"] = run["id"]
-                logger.info(
-                    "reconcile_missing_run_links: backfilled run_id=%s for queue entry %s (task %s)",
-                    run["id"],
-                    entry.get("id"),
-                    task_id,
-                )
-                changed = True
-        repaired.append(entry)
-    return repaired if changed else entries

@@ -44,7 +44,13 @@ from command_center.runtime import context_service, db as runtime_db
 # Kanban launcher and the execution queue branch on, so neither reimplements
 # the "is this launchable / provisionable / fatal?" logic.
 LAUNCH_DECISION_READY = "ready"                      # workspace valid, launch now
-LAUNCH_DECISION_NEEDS_CONFIRMATION = "needs_confirmation"  # valid but has warnings
+# Valid but has confirmable warnings. Since the repository-state gate
+# (`launch.BLOCKING_REPOSITORY_STATE_CODES`) made a dirty tree and a detached
+# HEAD blocking errors, the only condition that reaches this decision is a
+# branch mismatch — a dirty workspace now lands in BLOCKED. Anything that used
+# this decision as a proxy for "the tree is dirty" must ask
+# `validation.has_issue(launch.ISSUE_DIRTY_TREE)` instead.
+LAUNCH_DECISION_NEEDS_CONFIRMATION = "needs_confirmation"
 LAUNCH_DECISION_PROVISIONABLE = "provisionable"      # workspace absent, can be created
 LAUNCH_DECISION_BLOCKED = "blocked"                  # fatal — never launch
 
@@ -313,6 +319,8 @@ def execute_agent_launch_v2(
     provision_workspace: bool = True,
     on_task_state_changed: Callable[[], None] | None = None,
     max_global_concurrency: int | None = None,
+    session_id: str | None = None,
+    is_resume: bool = False,
 ) -> dict:
     """Async counterpart to `execute_agent_launch` above — same pre-launch
     bookkeeping (`push_prompt_history`, `launch.begin_launch`), but instead
@@ -481,10 +489,16 @@ def execute_agent_launch_v2(
         # path, present or future, can spawn the process without passing this.
         workspace_verification=workspace_verification,
         executor_id=executor_id,
+        session_id=session_id,
+        is_resume=is_resume,
     )
 
     if task is not None:
         task["current_run_id"] = run["id"]
+        # Once a resume has been dispatched, clear the hint — the new run_id
+        # is now the source of truth; stale session_id would confuse the next
+        # failure handler into resuming a session that has already been resumed.
+        task.pop("resume_session_id", None)
         if on_task_state_changed is not None:
             on_task_state_changed()
 
