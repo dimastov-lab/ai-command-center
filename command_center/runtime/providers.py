@@ -1413,9 +1413,15 @@ class AiderProvider:
 
     id = AIDER_ID
     label = "Aider (local)"
+    supports_resume = False
+    requires_dedicated_worktree = False
 
     # Default model when none specified — good balance of speed and quality.
     DEFAULT_MODEL = "ollama/qwen2.5-coder:7b-instruct-q4_K_M"
+
+    @staticmethod
+    def validate_prompt(prompt: str) -> None:
+        return None
 
     def availability(self) -> "ProviderAvailability":
         exe = shutil.which("aider")
