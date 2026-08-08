@@ -14,6 +14,7 @@ from command_center import (
     agent_runner,
     artifacts,
     chat_service,
+    dashboard_truth,
     execution_queue,
     executors,
     git_info,
@@ -3974,6 +3975,18 @@ def render_home_dashboard(
     sessions, tasks_by_id = _build_execution_center_sessions(api, tasks, now=now)
     for s in sessions:
         s["display_status"] = _execution_center_display_status(s)
+    stale_run_ids = frozenset(
+        session["run_id"]
+        for session in sessions
+        if session["display_status"] == session_view.STATUS_STALE
+    )
+    truth = dashboard_truth.build_dashboard_truth(
+        counts,
+        runs=runs,
+        total_run_count=api.count_runs(),
+        stale_run_ids=stale_run_ids,
+        run_window_limit=200,
+    )
     board = live_board.split_board(sessions, display_status="display_status")
 
     running = board[live_board.BUCKET_LIVE]
@@ -3984,7 +3997,10 @@ def render_home_dashboard(
     }
 
     greeting = f"{_home_greeting()} {owner}" if owner else _home_greeting()
-    st.markdown(f"### {greeting}")
+    st.markdown(
+        f"<h2 class='hx-page-title'>{html.escape(greeting)}</h2>",
+        unsafe_allow_html=True,
+    )
     st.caption("Вот что происходит с вашими проектами сегодня.")
 
     # Next-action hero (UX-2b): the one thing an operator opens the dashboard
@@ -4026,9 +4042,9 @@ def render_home_dashboard(
     )
     if runs_yesterday:
         delta = runs_today - runs_yesterday
-        runs_delta_txt = f"сегодня {runs_today} ({'+' if delta >= 0 else ''}{delta} к вчера)"
+        runs_delta_txt = f"в окне {len(runs)}/200: сегодня {runs_today} ({'+' if delta >= 0 else ''}{delta} к вчера)"
     else:
-        runs_delta_txt = f"сегодня {runs_today}"
+        runs_delta_txt = f"в окне {len(runs)}/200: сегодня {runs_today}"
 
     # KPI sparklines removed: the four KPIs (Проекты/Агенты/Задачи/Ревью) measure
     # different things, but the old code fed the *same* `_runs_per_day` series to
@@ -4039,16 +4055,16 @@ def render_home_dashboard(
     home_dashboard.kpi_tiles([
         home_dashboard.Kpi("Проекты", len(projects_with_tasks),
                            (
-                               f"{counts.attention} задач требуют внимания"
+                               f"TaskSnapshot: {counts.attention} задач требуют внимания"
                                if counts.attention
-                               else "нет задач, требующих внимания"
+                               else "TaskSnapshot: нет задач, требующих внимания"
                            ),
                            "📁", "violet", ()),
-        home_dashboard.Kpi("Агенты", len(running), runs_delta_txt, "🤖", "blue", ()),
+        home_dashboard.Kpi("Живые прогоны", len(running), runs_delta_txt, "🤖", "blue", ()),
         home_dashboard.Kpi(
             "Задачи",
             counts.total,
-            f"{counts.active} активных · {counts.done} завершено",
+            f"TaskSnapshot: {counts.active} активных · {counts.done} завершено",
             "✓",
             "green",
             (),
@@ -4056,7 +4072,7 @@ def render_home_dashboard(
         home_dashboard.Kpi(
             "Ревью",
             counts.by_lane["Review"],
-            f"{counts.by_lane['Review']} в колонке Review",
+            f"TaskSnapshot: {counts.by_lane['Review']} в колонке Review",
             "★",
             "amber",
             (),
@@ -4116,7 +4132,12 @@ def render_home_dashboard(
             else:
                 st.caption("Сейчас ничего не выполняется — запустите агента из Execution Center.")
             home_dashboard.queue_footer(
-                api.count_runs(), len(running), len(board[live_board.BUCKET_DONE]), len(board[live_board.BUCKET_ATTENTION])
+                truth.run_metric.value,
+                len(running),
+                len(board[live_board.BUCKET_DONE]),
+                len(board[live_board.BUCKET_ATTENTION]),
+                loaded=len(runs),
+                window_limit=200,
             )
             home_dashboard.card_close()
             if st.button("Открыть Execution Center", key="home_open_exec", type="primary", width="stretch"):
@@ -4132,14 +4153,14 @@ def render_home_dashboard(
             window_success = _window_success_rate(runs)
             task_ratio = int(100 * counts.done / counts.total) if counts.total else 0
             if window_success is None:
-                home_dashboard.health_gauge(0, "Нет данных за неделю", accent="slate")
+                home_dashboard.health_gauge(0, "7д, окно ≤200: нет данных", accent="slate")
             else:
                 grade = "Отлично" if window_success >= 85 else "Хорошо" if window_success >= 60 else "Требует внимания"
                 accent = "green" if window_success >= 85 else "blue" if window_success >= 60 else "amber"
-                home_dashboard.health_gauge(window_success, grade, accent=accent)
+                home_dashboard.health_gauge(window_success, f"7д, окно ≤200: {grade}", accent=accent)
             home_dashboard.metric_list([
                 ("Задачи завершены", task_ratio, "green"),
-                ("Прогоны успешны (7д)", window_success if window_success is not None else 0, "blue"),
+                ("Прогоны успешны (7д, окно ≤200)", window_success if window_success is not None else 0, "blue"),
             ])
             home_dashboard.card_close()
 
@@ -4169,7 +4190,7 @@ def render_home_dashboard(
             home_dashboard.card_close()
 
         with col_k:
-            home_dashboard.card_open("Обзор Kanban", "Доска")
+            home_dashboard.card_open("Обзор Kanban · TaskSnapshot", "Доска")
             accents = ["slate", "blue", "green", "amber", "red", "violet"]
             overview_lanes = list(read_model.CANONICAL_LANES)
             cols = [
@@ -4198,14 +4219,29 @@ def render_home_dashboard(
         home_dashboard.card_open("Быстрые действия")
         qa = st.columns(5)
         actions = [
-            ("Новая задача", "create"), ("Запустить агента", "execution_center"),
-            ("Workspace", "workspace_home"), ("Git Center", "git_center"), ("Отчёты", "reports"),
+            ("Быстро: новая задача", "create"), ("Быстро: запустить агента", "execution_center"),
+            ("Быстро: Workspace", "workspace_home"), ("Быстро: Git Center", "git_center"),
+            ("Быстро: отчёты", "reports"),
         ]
         for i, (label, nav) in enumerate(actions):
             with qa[i]:
                 if st.button(label, key=f"home_qa_{nav}", width="stretch"):
                     st.session_state.pending_nav = nav
                     st.rerun()
+        home_dashboard.card_close()
+
+        home_dashboard.card_open("Доставка и runtime", "Canonical provenance")
+        if truth.deliveries:
+            home_dashboard.delivery_rows(
+                [item.__dict__ for item in truth.deliveries[:6]],
+                window_label=truth.run_window_label,
+            )
+        else:
+            st.markdown(
+                "<div role='status' aria-live='polite'>Доказательства запусков отсутствуют.</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(truth.run_window_label)
         home_dashboard.card_close()
 
     with side:

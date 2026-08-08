@@ -140,3 +140,49 @@ def test_board_shows_blocked_lane_and_accounts_for_every_task(live_app):
     # Sanity: the other canonical lanes render too, so the board is really up.
     assert "Backlog" in body
     assert "Done" in body
+
+
+def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
+    with sync_api.sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 320, "height": 800})
+        page.goto(live_app, wait_until="load")
+        page.wait_for_selector("text=Очередь выполнения", timeout=90000)
+
+        surface = page.locator("[data-testid='stMain']")
+        assert surface.locator("h1").count() >= 1
+        assert surface.locator("h2").count() >= 1
+        assert surface.locator("[role='status']").count() >= 1
+        assert surface.locator("[role='progressbar']").count() >= 1
+        assert surface.locator("svg[role='img'][aria-label]").count() >= 1
+        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+        action_names = surface.locator("button").evaluate_all(
+            "els => els.map(el => el.getAttribute('aria-label') || el.innerText).filter(Boolean)"
+        )
+        assert action_names
+        dashboard_action_names = [
+            name
+            for name in action_names
+            if any(
+                marker in name
+                for marker in ("Быстро:", "arrow_forward", "Открыть Execution Center", "Открыть задачу")
+            )
+        ]
+        assert dashboard_action_names
+        assert len(dashboard_action_names) == len(set(dashboard_action_names))
+
+        surface.locator("button").first.focus()
+        first_focused = page.evaluate("document.activeElement.outerHTML")
+        focus_style = surface.locator("button").first.evaluate(
+            "el => getComputedStyle(el).outlineStyle + ':' + getComputedStyle(el).outlineWidth"
+        )
+        assert focus_style != "none:0px"
+        page.keyboard.press("Tab")
+        assert page.evaluate("document.activeElement !== document.body")
+        assert page.evaluate("document.activeElement.outerHTML") != first_focused
+
+        page.set_viewport_size({"width": 640, "height": 800})
+        page.evaluate("document.documentElement.style.fontSize = '200%'")
+        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        browser.close()

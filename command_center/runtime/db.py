@@ -1857,6 +1857,33 @@ def create_provenance_evidence(
             return record
 
 
+def get_provenance_evidence_for_runs(
+    db_path: Path, run_ids: list[str]
+) -> dict[str, list[dict]]:
+    """Return safe evidence envelopes for the canonical read model.
+
+    Native and normalized JSON payloads deliberately stay inside persistence:
+    the Dashboard needs adapter/status/SHA identity, never prompts or provider
+    payload fields.
+    """
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT integrity_id, run_id, adapter, status, candidate_sha,
+                       reported_sha, observed_at
+                FROM provenance_evidence
+                WHERE run_id IN ({placeholders})
+                ORDER BY run_id, observed_at, integrity_id""",
+            tuple(run_ids),
+        ).fetchall()
+    result: dict[str, list[dict]] = {run_id: [] for run_id in run_ids}
+    for row in rows:
+        result[row["run_id"]].append(dict(row))
+    return result
+
+
 # --------------------------------------------------------------------------
 # Explicit provider route and immutable attempt evidence (schema 14)
 # --------------------------------------------------------------------------
