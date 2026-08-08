@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from command_center import storage
 from command_center.application import tasks_gateway
 
 _AICC_PRIORITY_TO_INT = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
@@ -43,7 +44,6 @@ _LANE_TO_TARGET_STATE = {
     "Backlog": "open",
     "Next": "assigned",
     "In Progress": "in_progress",
-    "Review": "in_progress",
     "Done": "completed",
 }
 
@@ -160,8 +160,10 @@ class AIOSIdMap:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._lock_path = path.with_name(f".{path.name}.lock")
         self._lock = threading.Lock()
-        self._data = self._load()
+        with storage.file_lock(self._lock_path):
+            self._data = self._load()
 
     def _load(self) -> dict[str, str]:
         if not self._path.exists():
@@ -221,41 +223,51 @@ class AIOSIdMap:
 
     def get(self, aicc_id: str) -> str | None:
         with self._lock:
-            return self._data.get(aicc_id)
+            with storage.file_lock(self._lock_path):
+                self._data = self._load()
+                return self._data.get(aicc_id)
 
     def put(self, aicc_id: str, aios_id: str) -> None:
         if not aicc_id or not aios_id:
             raise tasks_gateway.TaskMapWriteError("task map identities must be non-empty")
         with self._lock:
-            existing_owner = next(
-                (key for key, value in self._data.items() if value == aios_id and key != aicc_id),
-                None,
-            )
-            if existing_owner is not None:
-                raise tasks_gateway.CorruptTaskMapError(
-                    "one AIOS task cannot map to multiple AICC task identities"
+            with storage.file_lock(self._lock_path):
+                self._data = self._load()
+                existing_owner = next(
+                    (
+                        key
+                        for key, value in self._data.items()
+                        if value == aios_id and key != aicc_id
+                    ),
+                    None,
                 )
-            previous = self._data.get(aicc_id)
-            self._data[aicc_id] = aios_id
-            try:
-                self._save()
-            except Exception:
-                if previous is None:
-                    self._data.pop(aicc_id, None)
-                else:
-                    self._data[aicc_id] = previous
-                raise
+                if existing_owner is not None:
+                    raise tasks_gateway.CorruptTaskMapError(
+                        "one AIOS task cannot map to multiple AICC task identities"
+                    )
+                previous = self._data.get(aicc_id)
+                self._data[aicc_id] = aios_id
+                try:
+                    self._save()
+                except Exception:
+                    if previous is None:
+                        self._data.pop(aicc_id, None)
+                    else:
+                        self._data[aicc_id] = previous
+                    raise
 
     def remove(self, aicc_id: str) -> None:
         with self._lock:
-            if aicc_id not in self._data:
-                return
-            previous = self._data.pop(aicc_id)
-            try:
-                self._save()
-            except Exception:
-                self._data[aicc_id] = previous
-                raise
+            with storage.file_lock(self._lock_path):
+                self._data = self._load()
+                if aicc_id not in self._data:
+                    return
+                previous = self._data.pop(aicc_id)
+                try:
+                    self._save()
+                except Exception:
+                    self._data[aicc_id] = previous
+                    raise
 
 
 def _task_dto(task: Any) -> tasks_gateway.TaskDTO:
@@ -348,6 +360,11 @@ class AIOSSDKTasksGateway:
     def cancel_task(self, task_id: str) -> tasks_gateway.TaskResult:
         return self._call("task.cancel", lambda: self._client.tasks.cancel(task_id))
 
+    def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
+
 
 class AIOSTasksRepository:
     """AICC repository facade over the product-owned ``TasksGateway``."""
@@ -362,7 +379,24 @@ class AIOSTasksRepository:
 
     def load_all(self) -> list[dict[str, Any]]:
         result = self._gateway.list_tasks()
-        return [aios_task_to_aicc_dict(task, evidence=result.evidence) for task in result.tasks]
+        # Cancelled tasks are explicit remote tombstones, not live AICC board
+        # tasks. Other unknown states still fail closed in the projection.
+        return [
+            aios_task_to_aicc_dict(task, evidence=result.evidence)
+            for task in result.tasks
+            if task.state != "cancelled"
+        ]
+
+    def close(self) -> None:
+        close = getattr(self._gateway, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> AIOSTasksRepository:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def _reconcile(self, aicc_id: str) -> tasks_gateway.TaskResult | None:
         listed = self._gateway.list_tasks()

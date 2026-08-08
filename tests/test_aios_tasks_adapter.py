@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from command_center.application import tasks_gateway
+
 from command_center.application.aios_tasks import (  # noqa: E402
     aicc_dict_to_create_request,
     aios_task_to_aicc_dict,
@@ -65,9 +69,9 @@ def test_done_maps_to_completed_state():
     req, target = aicc_dict_to_create_request(_make_aicc_task(status="Done"))
     assert target == "completed"
 
-def test_review_maps_to_in_progress_state():
-    req, target = aicc_dict_to_create_request(_make_aicc_task(status="Review"))
-    assert target == "in_progress"
+def test_review_fails_closed_without_a_lossless_remote_state():
+    with pytest.raises(tasks_gateway.UnsupportedTaskTransitionError, match="Review"):
+        aicc_dict_to_create_request(_make_aicc_task(status="Review"))
 
 def test_next_maps_to_assigned_state():
     req, target = aicc_dict_to_create_request(_make_aicc_task(status="Next"))
@@ -112,7 +116,7 @@ def test_aicc_id_stored_in_payload():
     assert req.payload["aicc_id"] == "abc123"
 
 def test_stale_kanban_status_is_not_stored_in_payload():
-    req, _ = aicc_dict_to_create_request(_make_aicc_task(status="Review"))
+    req, _ = aicc_dict_to_create_request(_make_aicc_task(status="In Progress"))
     assert "kanban_status" not in req.payload
 
 def test_created_by_uses_owner():
@@ -122,7 +126,7 @@ def test_created_by_uses_owner():
 # --- aios_task_to_aicc_dict ---
 
 def test_round_trip_uses_authoritative_remote_state_not_payload_status():
-    aicc = _make_aicc_task(status="Review")
+    aicc = _make_aicc_task(status="In Progress")
     req, _ = aicc_dict_to_create_request(aicc)
     # Build a fake AIOS task as the server would return it
     aios = _make_aios_task(payload=req.payload | {"kanban_status": "Review"})

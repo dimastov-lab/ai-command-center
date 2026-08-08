@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -118,6 +120,20 @@ class FakeGateway:
         )
 
 
+def _concurrent_map_put(
+    path: str,
+    aicc_id: str,
+    aios_id: str,
+    ready: multiprocessing.Queue,
+    start: multiprocessing.Event,
+) -> None:
+    id_map = AIOSIdMap(Path(path))
+    ready.put(True)
+    if not start.wait(timeout=10):
+        raise RuntimeError("concurrent map test start timed out")
+    id_map.put(aicc_id, aios_id)
+
+
 def test_gateway_contract_imports_without_aios_sdk_and_is_runtime_checkable():
     assert tasks_gateway.TasksGateway is not None
     assert tasks_gateway.TaskDTO.__module__ == "command_center.application.tasks_gateway"
@@ -179,6 +195,42 @@ def test_corrupt_mapping_file_fails_closed(tmp_path):
         AIOSIdMap(path)
 
 
+def test_separate_map_instances_preserve_each_others_updates(tmp_path):
+    path = tmp_path / "aios_task_map.json"
+    first = AIOSIdMap(path)
+    second = AIOSIdMap(path)
+    first.put("aicc-1", "aios-1")
+    second.put("aicc-2", "aios-2")
+    assert AIOSIdMap(path).get("aicc-1") == "aios-1"
+    assert AIOSIdMap(path).get("aicc-2") == "aios-2"
+
+
+def test_cross_process_mapping_updates_do_not_overwrite_each_other(tmp_path):
+    path = tmp_path / "aios_task_map.json"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    start = context.Event()
+    processes = [
+        context.Process(
+            target=_concurrent_map_put,
+            args=(str(path), f"aicc-{index}", f"aios-{index}", ready, start),
+        )
+        for index in (1, 2)
+    ]
+    for process in processes:
+        process.start()
+    assert ready.get(timeout=10) is True
+    assert ready.get(timeout=10) is True
+    start.set()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "aicc-1": "aios-1",
+        "aicc-2": "aios-2",
+    }
+
+
 def test_create_success_then_map_write_crash_reconciles_without_duplicate(tmp_path, monkeypatch):
     gateway = FakeGateway()
     first_map = AIOSIdMap(tmp_path / "map.json")
@@ -223,6 +275,25 @@ def test_reverse_and_unrepresentable_transitions_are_explicit(tmp_path):
         repo.update_status("aicc-1", "In Progress")
     with pytest.raises(tasks_gateway.UnsupportedTaskTransitionError, match="Blocked"):
         repo.update_status("aicc-1", "Blocked")
+
+
+def test_delete_tombstone_does_not_poison_load_all(tmp_path):
+    gateway = FakeGateway([_gateway_task()])
+    id_map = AIOSIdMap(tmp_path / "map.json")
+    id_map.put("aicc-1", "aios-1")
+    repo = AIOSTasksRepository(gateway, id_map)
+    assert repo.delete("aicc-1") is True
+    assert gateway.tasks[0].state == "cancelled"
+    assert repo.load_all() == []
+
+
+def test_repository_explicitly_closes_owned_sdk_client(tmp_path):
+    client = SimpleNamespace(tasks=SimpleNamespace(), close=lambda: setattr(client, "closed", True))
+    client.closed = False
+    sdk = SimpleNamespace(AIOSSDKError=RuntimeError)
+    repo = AIOSTasksRepository(AIOSSDKTasksGateway(client, sdk), AIOSIdMap(tmp_path / "map.json"))
+    repo.close()
+    assert client.closed is True
 
 
 def test_sdk_error_is_translated_to_safe_product_error_with_request_evidence():

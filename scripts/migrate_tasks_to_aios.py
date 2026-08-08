@@ -61,27 +61,36 @@ def main(root: Path, *, dry_run: bool) -> int:
             id_map=id_map,
         )
 
-    for task in tasks:
-        aicc_id = task.get("id", "")
-        if not aicc_id:
-            logger.warning("Skipping task with no id: %r", task.get("title"))
-            skipped += 1
-            continue
-        if id_map.get(aicc_id):
-            logger.debug("Already migrated: %s", aicc_id)
-            skipped += 1
-            continue
-        if dry_run:
-            logger.info("[DRY-RUN] Would migrate: %s — %s", aicc_id, task.get("title"))
-            migrated += 1
-            continue
-        try:
-            created = repo.create(task)
-            logger.info("Migrated %s → %s (%s)", aicc_id, created.get("aios_id"), task.get("title"))
-            migrated += 1
-        except Exception as exc:
-            logger.error("Failed to migrate %s: %s", aicc_id, exc)
-            failed += 1
+    try:
+        for task in tasks:
+            aicc_id = task.get("id", "")
+            if not aicc_id:
+                logger.warning("Skipping task with no id: %r", task.get("title"))
+                skipped += 1
+                continue
+            if id_map.get(aicc_id):
+                logger.debug("Already migrated: %s", aicc_id)
+                skipped += 1
+                continue
+            if dry_run:
+                logger.info("[DRY-RUN] Would migrate: %s — %s", aicc_id, task.get("title"))
+                migrated += 1
+                continue
+            try:
+                created = repo.create(task)
+                logger.info(
+                    "Migrated %s → %s (%s)",
+                    aicc_id,
+                    created.get("aios_id"),
+                    task.get("title"),
+                )
+                migrated += 1
+            except Exception as exc:
+                logger.error("Failed to migrate %s: %s", aicc_id, exc)
+                failed += 1
+    finally:
+        if repo is not None:
+            repo.close()
 
     logger.info("Done. migrated=%d  skipped=%d  failed=%d", migrated, skipped, failed)
     return 0 if failed == 0 else 2
