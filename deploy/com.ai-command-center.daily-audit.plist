@@ -22,6 +22,14 @@
   <dict>
     <key>AICC_DAILY_AUDIT_ENABLED</key>
     <string>1</string>
+    <key>AICC_DAILY_AUDIT_PROVIDER_ID</key>
+    <string>claude_code</string>
+    <key>AICC_DAILY_AUDIT_TRANSPORT_RETRY_ATTEMPTS</key>
+    <string>3</string>
+    <key>AICC_DAILY_AUDIT_TRANSPORT_RETRY_BASE_SECONDS</key>
+    <string>2</string>
+    <key>AICC_DAILY_AUDIT_MAX_CONSECUTIVE_FAILURES</key>
+    <string>3</string>
     <key>AICC_COMPLETION_AUTOPILOT</key>
     <string>1</string>
     <key>AICC_DATA_DIR</key>

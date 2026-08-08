@@ -122,6 +122,58 @@ def test_wait_run_has_a_bounded_deadline_and_requests_cancellation():
     assert api.cancelled and api.cancelled[0][0] == "run-1"
 
 
+def test_git_retries_only_transient_transport_errors(tmp_path, monkeypatch):
+    results = iter(
+        [
+            subprocess.CompletedProcess([], 1, "", "Could not resolve host: github.com"),
+            subprocess.CompletedProcess([], 1, "", "SSL connection timeout"),
+            subprocess.CompletedProcess([], 0, "ok\n", ""),
+        ]
+    )
+    calls = []
+    sleeps = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return next(results)
+
+    monkeypatch.setattr(daily_audit_backend_module.subprocess, "run", fake_run)
+    backend = ExecutionCenterCampaignBackend(sleep=sleeps.append)
+    assert backend._git(
+        tmp_path, "fetch", "origin", retry_attempts=3, retry_base_seconds=2
+    ) == "ok"
+    assert len(calls) == 3
+    assert sleeps == [2, 4]
+
+
+def test_git_permanent_error_is_not_retried(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess([], 128, "", "fatal: bad refspec")
+
+    monkeypatch.setattr(daily_audit_backend_module.subprocess, "run", fake_run)
+    backend = ExecutionCenterCampaignBackend(sleep=lambda _seconds: None)
+    with pytest.raises(CampaignBackendError, match="bad refspec"):
+        backend._git(tmp_path, "fetch", retry_attempts=3)
+    assert len(calls) == 1
+
+
+def test_git_transport_retry_is_strictly_bounded(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess([], 1, "", "network is unreachable")
+
+    monkeypatch.setattr(daily_audit_backend_module.subprocess, "run", fake_run)
+    backend = ExecutionCenterCampaignBackend(sleep=lambda _seconds: None)
+    with pytest.raises(CampaignBackendError, match="exhausted after 3 attempt"):
+        backend._git(tmp_path, "fetch", retry_attempts=3)
+    assert len(calls) == 3
+
+
 def test_wait_run_aborts_and_cancels_immediately_after_lease_loss(tmp_path):
     abort_event = threading.Event()
     abort_event.set()
@@ -366,6 +418,9 @@ class ScenarioBackend(ExecutionCenterCampaignBackend):
     def _prepare_worktree(self, request):
         return self.root, "codex/test"
 
+    def preflight(self, request):
+        return {"provider_id": request.provider_id, "remote_main": "base-head"}
+
     def _head(self, worktree, *, timeout_seconds):
         return "base-head"
 
@@ -465,8 +520,10 @@ class IntegrationAPI:
         self.counter = 0
         self.completion = None
         self.task_types = []
+        self.start_kwargs = []
 
     def start_run(self, **kwargs):
+        self.start_kwargs.append(kwargs)
         self.counter += 1
         run_id = f"run-{self.counter}"
         task_type = kwargs["task_type"]
@@ -556,6 +613,11 @@ def test_backend_preserves_isolated_worktree_commit_and_verified_completion_cove
         FakeOrchestrator,
     )
     backend = ExecutionCenterCampaignBackend(api, poll_seconds=0)
+    monkeypatch.setattr(
+        backend,
+        "preflight",
+        lambda request: {"provider_id": request.provider_id, "remote_main": "a" * 40},
+    )
     campaign_request = request(
         repository,
         max_remediation_rounds=2,
@@ -569,6 +631,7 @@ def test_backend_preserves_isolated_worktree_commit_and_verified_completion_cove
     assert result.target_verified
     assert result.pull_request_url == "https://example.test/pr/1"
     assert api.task_types == ["audit", "final_gate"]
+    assert {item["executor_id"] for item in api.start_kwargs} == {"claude_code"}
     assert seeded[0][1]["merge_mode"] == "auto_after_checks"
     assert seeded[0][2]["validation_required"] is False
     assert "publication_fence_campaign_id" not in seeded[0][1]

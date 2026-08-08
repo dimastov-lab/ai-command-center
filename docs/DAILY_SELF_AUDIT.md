@@ -35,6 +35,12 @@ AICC_DATA_DIR=/absolute/path/to/the/app/data
 Optional bounds are `AICC_DAILY_AUDIT_MAX_REMEDIATION_ROUNDS` (1–10,
 default 5), `AICC_DAILY_AUDIT_RUN_TIMEOUT_SECONDS` (30–3600, default 3600)
 and `AICC_DAILY_AUDIT_COMPLETION_TIMEOUT_SECONDS` (60–43200, default 21600).
+The route is pinned by `AICC_DAILY_AUDIT_PROVIDER_ID` (default `claude_code`).
+Git transport retries only recognized transient failures, at most
+`AICC_DAILY_AUDIT_TRANSPORT_RETRY_ATTEMPTS` times (1–5, default 3), with a
+bounded exponential delay from `AICC_DAILY_AUDIT_TRANSPORT_RETRY_BASE_SECONDS`.
+After `AICC_DAILY_AUDIT_MAX_CONSECUTIVE_FAILURES` failed campaigns (default 3),
+the scheduler opens its circuit and stops dispatching until an explicit reset.
 Git operations and each validation command also have fixed deadlines (120 and
 900 seconds by default). A timed-out agent run is explicitly cancelled and a
 timed-out completion remains recoverable instead of being reported as done.
@@ -49,6 +55,14 @@ Inspect persisted scheduling state:
 
 ```text
 python scripts/daily_audit_daemon.py --status
+```
+
+Run the separate, non-dispatching provider/network acceptance and re-arm an
+idle circuit for the next normal interval:
+
+```text
+python scripts/daily_audit_daemon.py --preflight
+python scripts/daily_audit_daemon.py --reset-circuit
 ```
 
 `deploy/com.ai-command-center.daily-audit.plist` is a launchd template. Replace
@@ -75,9 +89,10 @@ campaign is dispatched per day and that another host cannot duplicate it.
 - Terminal agent state handling includes `INTERRUPTED`, `UNKNOWN` and future
   unknown states. Result events are paginated, so the final result is not lost
   after the first 1000 events.
-- Transient failures retry with bounded exponential backoff from one hour to
-  one day. A provider rate-limit reset timestamp is retained and postpones the
-  next attempt when it is later than the calculated backoff.
+- Transient Git transport failures receive a bounded in-operation retry.
+  Campaign failures back off from one hour to one day, retain provider reset
+  timestamps, and open a persistent circuit after the configured limit. A
+  manual preflight and reset are required before scheduling resumes.
 - Validation runs before the final gate. The gate receives the audit and
   remediation evidence, full review diff, validation evidence and exact SHA-256
   digests. It must return structured findings and evidence; missing evidence,

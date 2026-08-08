@@ -37,6 +37,10 @@ DEFAULT_RUN_TIMEOUT_SECONDS = 3_600
 DEFAULT_GIT_TIMEOUT_SECONDS = 120
 DEFAULT_VALIDATION_TIMEOUT_SECONDS = 900
 DEFAULT_COMPLETION_TIMEOUT_SECONDS = 6 * 3_600
+DEFAULT_PROVIDER_ID = "claude_code"
+DEFAULT_TRANSPORT_RETRY_ATTEMPTS = 3
+DEFAULT_TRANSPORT_RETRY_BASE_SECONDS = 2.0
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 PROJECT = "AICC"
 
 
@@ -77,6 +81,10 @@ class DailyAuditConfig:
     validation_timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS
     completion_timeout_seconds: int = DEFAULT_COMPLETION_TIMEOUT_SECONDS
     lease_heartbeat_seconds: float | None = None
+    provider_id: str = DEFAULT_PROVIDER_ID
+    transport_retry_attempts: int = DEFAULT_TRANSPORT_RETRY_ATTEMPTS
+    transport_retry_base_seconds: float = DEFAULT_TRANSPORT_RETRY_BASE_SECONDS
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
 
     @classmethod
     def from_environment(cls, repository_path: Path) -> "DailyAuditConfig":
@@ -89,6 +97,25 @@ class DailyAuditConfig:
             os.environ.get(
                 "AICC_DAILY_AUDIT_COMPLETION_TIMEOUT_SECONDS",
                 str(DEFAULT_COMPLETION_TIMEOUT_SECONDS),
+            )
+        )
+        provider_id = os.environ.get("AICC_DAILY_AUDIT_PROVIDER_ID", DEFAULT_PROVIDER_ID).strip()
+        transport_attempts = int(
+            os.environ.get(
+                "AICC_DAILY_AUDIT_TRANSPORT_RETRY_ATTEMPTS",
+                str(DEFAULT_TRANSPORT_RETRY_ATTEMPTS),
+            )
+        )
+        transport_base = float(
+            os.environ.get(
+                "AICC_DAILY_AUDIT_TRANSPORT_RETRY_BASE_SECONDS",
+                str(DEFAULT_TRANSPORT_RETRY_BASE_SECONDS),
+            )
+        )
+        max_failures = int(
+            os.environ.get(
+                "AICC_DAILY_AUDIT_MAX_CONSECUTIVE_FAILURES",
+                str(DEFAULT_MAX_CONSECUTIVE_FAILURES),
             )
         )
         return cls(
@@ -109,6 +136,10 @@ class DailyAuditConfig:
             ),
             run_timeout_seconds=max(30, min(run_timeout, 3_600)),
             completion_timeout_seconds=max(60, min(completion_timeout, 12 * 3_600)),
+            provider_id=provider_id or DEFAULT_PROVIDER_ID,
+            transport_retry_attempts=max(1, min(transport_attempts, 5)),
+            transport_retry_base_seconds=max(0.0, min(transport_base, 30.0)),
+            max_consecutive_failures=max(1, min(max_failures, 10)),
         )
 
 
@@ -123,6 +154,9 @@ class CampaignRequest:
     git_timeout_seconds: int = DEFAULT_GIT_TIMEOUT_SECONDS
     validation_timeout_seconds: int = DEFAULT_VALIDATION_TIMEOUT_SECONDS
     completion_timeout_seconds: int = DEFAULT_COMPLETION_TIMEOUT_SECONDS
+    provider_id: str = DEFAULT_PROVIDER_ID
+    transport_retry_attempts: int = DEFAULT_TRANSPORT_RETRY_ATTEMPTS
+    transport_retry_base_seconds: float = DEFAULT_TRANSPORT_RETRY_BASE_SECONDS
     lease_owner: str | None = None
     abort_event: threading.Event | None = field(default=None, repr=False, compare=False)
     lease_check: Callable[[], bool] | None = field(default=None, repr=False, compare=False)
@@ -186,6 +220,8 @@ class DailyAuditStore:
                     lease_until TEXT,
                     active_campaign_id TEXT,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    circuit_open INTEGER NOT NULL DEFAULT 0,
+                    circuit_reason TEXT,
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS daily_audit_campaign (
@@ -207,6 +243,15 @@ class DailyAuditStore:
                 connection.execute(
                     """ALTER TABLE daily_audit_schedule
                        ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"""
+                )
+            if "circuit_open" not in columns:
+                connection.execute(
+                    """ALTER TABLE daily_audit_schedule
+                       ADD COLUMN circuit_open INTEGER NOT NULL DEFAULT 0"""
+                )
+            if "circuit_reason" not in columns:
+                connection.execute(
+                    "ALTER TABLE daily_audit_schedule ADD COLUMN circuit_reason TEXT"
                 )
 
     def ensure_schedule(self, now: datetime) -> None:
@@ -230,7 +275,7 @@ class DailyAuditStore:
             ).fetchone()
             due = parse_time(row["next_run_at"]) <= now
             lease_expired = not row["lease_until"] or parse_time(row["lease_until"]) <= now
-            if not due or not lease_expired:
+            if bool(row["circuit_open"]) or not due or not lease_expired:
                 connection.rollback()
                 return None
             abandoned = row["active_campaign_id"]
@@ -380,7 +425,8 @@ class DailyAuditStore:
             connection.execute(
                 """UPDATE daily_audit_schedule
                    SET next_run_at = ?, lease_owner = NULL, lease_until = NULL,
-                       active_campaign_id = NULL, consecutive_failures = 0, updated_at = ?
+                       active_campaign_id = NULL, consecutive_failures = 0,
+                       circuit_open = 0, circuit_reason = NULL, updated_at = ?
                    WHERE singleton = 1 AND active_campaign_id = ?""",
                 (iso(now + interval), iso(now), campaign_id),
             )
@@ -397,6 +443,7 @@ class DailyAuditStore:
         retry_after: timedelta = DEFAULT_FAILURE_RETRY,
         max_retry_after: timedelta = MAX_FAILURE_RETRY,
         retry_at: datetime | None = None,
+        max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     ) -> datetime | None:
         """Persist failure and atomically schedule bounded exponential backoff."""
         with self._connect() as connection:
@@ -431,6 +478,7 @@ class DailyAuditStore:
                 (iso(now), message, campaign_id),
             )
             failures = int(schedule["consecutive_failures"] or 0) + 1
+            circuit_open = failures >= max(1, max_consecutive_failures)
             multiplier = 2 ** min(failures - 1, 10)
             delay_seconds = min(
                 retry_after.total_seconds() * multiplier,
@@ -447,9 +495,17 @@ class DailyAuditStore:
             connection.execute(
                 """UPDATE daily_audit_schedule
                    SET next_run_at = ?, lease_owner = NULL, lease_until = NULL,
-                       active_campaign_id = NULL, consecutive_failures = ?, updated_at = ?
+                       active_campaign_id = NULL, consecutive_failures = ?,
+                       circuit_open = ?, circuit_reason = ?, updated_at = ?
                    WHERE singleton = 1 AND active_campaign_id = ?""",
-                (iso(next_run), failures, iso(now), campaign_id),
+                (
+                    iso(next_run),
+                    failures,
+                    int(circuit_open),
+                    message[:1_000] if circuit_open else None,
+                    iso(now),
+                    campaign_id,
+                ),
             )
             connection.commit()
             return next_run
@@ -527,9 +583,10 @@ class DailyAuditStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT active_campaign_id FROM daily_audit_schedule WHERE singleton = 1"
+                """SELECT active_campaign_id, circuit_open
+                   FROM daily_audit_schedule WHERE singleton = 1"""
             ).fetchone()
-            if row and row["active_campaign_id"]:
+            if row and (row["active_campaign_id"] or row["circuit_open"]):
                 connection.rollback()
                 return False
             connection.execute(
@@ -540,6 +597,43 @@ class DailyAuditStore:
             )
             connection.commit()
             return True
+
+    def reset_circuit(self, *, now: datetime, interval: timedelta) -> bool:
+        """Explicitly re-arm an idle scheduler for its next normal interval."""
+        self.ensure_schedule(now)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT active_campaign_id FROM daily_audit_schedule WHERE singleton = 1"
+            ).fetchone()
+            if row and row["active_campaign_id"]:
+                connection.rollback()
+                return False
+            connection.execute(
+                """UPDATE daily_audit_schedule
+                   SET next_run_at = ?, consecutive_failures = 0,
+                       circuit_open = 0, circuit_reason = NULL, updated_at = ?
+                   WHERE singleton = 1""",
+                (iso(now + interval), iso(now)),
+            )
+            connection.commit()
+            return True
+
+    def enforce_failure_limit(self, *, max_consecutive_failures: int, now: datetime) -> None:
+        """Migrate an already failing schedule into the fail-closed state."""
+        with self._connect() as connection:
+            connection.execute(
+                """UPDATE daily_audit_schedule
+                   SET circuit_open = 1,
+                       circuit_reason = COALESCE(
+                           circuit_reason,
+                           'Consecutive failure limit reached before circuit migration.'
+                       ),
+                       updated_at = ?
+                   WHERE singleton = 1 AND active_campaign_id IS NULL
+                     AND consecutive_failures >= ?""",
+                (iso(now), max(1, max_consecutive_failures)),
+            )
 
     def list_campaigns(self, *, limit: int = 20) -> list[dict]:
         with self._connect() as connection:
@@ -567,6 +661,10 @@ class DailyAuditService:
         self.owner = owner or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         resolved_db = db_path or runtime_db.resolve_db_path()
         self.store = DailyAuditStore(resolved_db)
+        self.store.enforce_failure_limit(
+            max_consecutive_failures=self.config.max_consecutive_failures,
+            now=self.clock(),
+        )
         self._stop_requested = threading.Event()
         # RLock avoids self-deadlock if Python dispatches SIGTERM/SIGINT while
         # the daemon's main thread is inside one of these tiny critical sections.
@@ -626,6 +724,9 @@ class DailyAuditService:
             git_timeout_seconds=self.config.git_timeout_seconds,
             validation_timeout_seconds=self.config.validation_timeout_seconds,
             completion_timeout_seconds=self.config.completion_timeout_seconds,
+            provider_id=self.config.provider_id,
+            transport_retry_attempts=self.config.transport_retry_attempts,
+            transport_retry_base_seconds=self.config.transport_retry_base_seconds,
             lease_owner=self.owner,
             abort_event=campaign_abort,
             lease_check=lease_check,
@@ -695,6 +796,7 @@ class DailyAuditService:
                 owner=self.owner,
                 now=self.clock(),
                 retry_at=getattr(exc, "retry_at", None),
+                max_consecutive_failures=self.config.max_consecutive_failures,
             )
             raise
         finally:
@@ -706,3 +808,6 @@ class DailyAuditService:
 
     def status_json(self) -> str:
         return json.dumps(self.store.status(), ensure_ascii=False, indent=2)
+
+    def reset_circuit(self) -> bool:
+        return self.store.reset_circuit(now=self.clock(), interval=self.config.interval)
