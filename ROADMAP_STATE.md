@@ -1,7 +1,7 @@
 # Program Roadmap State
 
-Updated: 2026-08-08 18:53 MSK  
-Current wave: **Wave 0 — executing; gate not accepted**  
+Updated: 2026-08-08 18:53 MSK
+Current wave: **Wave 0 — executing; gate not accepted**
 Tracking issue: [#163](https://github.com/dimastov-lab/ai-command-center/issues/163)
 
 ## Dependency gate
