@@ -273,7 +273,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -761,6 +761,35 @@ CREATE INDEX IF NOT EXISTS idx_provenance_evidence_run_id
 """
 
 
+_SCHEMA_V14 = """
+CREATE TABLE IF NOT EXISTS run_provider_route (
+    run_id TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+    providers_json TEXT NOT NULL,
+    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+    selection_reason TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_attempt (
+    run_id TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
+    provider_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    classification TEXT,
+    disposition TEXT,
+    error_code TEXT,
+    parent_attempt_number INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    PRIMARY KEY (run_id, attempt_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_attempt_run_id
+    ON provider_attempt(run_id, attempt_number);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -783,6 +812,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (11, _migration_11_add_pre_run_head),
     (12, _migration_12_add_executor_capability_fields),
     (13, _SCHEMA_V13),
+    (14, _SCHEMA_V14),
 ]
 
 
@@ -1188,6 +1218,10 @@ def create_run(
     command_policy: str | None = None,
     provider_id: str = "claude_code",
     provider_metadata_json: str | None = None,
+    provider_route: tuple[str, ...] | None = None,
+    max_provider_attempts: int | None = None,
+    provider_route_reason: str | None = None,
+    provider_policy_version: str | None = None,
     canonical_repository_path: str | None = None,
     worktree_path: str | None = None,
     branch: str | None = None,
@@ -1216,6 +1250,22 @@ def create_run(
     same workspace the way a separate pre-flight query (e.g. `launch_service.
     find_active_run_conflict`) can — raises `WorkspaceLockedError` instead of
     inserting."""
+    if provider_route is not None:
+        if not provider_route or any(not item for item in provider_route):
+            raise ValueError("provider_route must contain non-empty provider ids")
+        if provider_route[0] != provider_id:
+            raise ValueError("provider_id must equal the first provider_route entry")
+        if max_provider_attempts is None:
+            max_provider_attempts = len(provider_route)
+        if not 1 <= max_provider_attempts <= len(provider_route):
+            raise ValueError("max_provider_attempts must fit inside provider_route")
+        if len(set(provider_route)) != len(provider_route):
+            raise ValueError("provider_route may attempt each provider at most once")
+        provider_route_reason = provider_route_reason or "explicit_request"
+        provider_policy_version = provider_policy_version or "project_policy_v1"
+    elif max_provider_attempts is not None:
+        raise ValueError("max_provider_attempts requires provider_route")
+
     with connect(db_path) as conn:
         with transaction(conn):
             if enforce_workspace_lock:
@@ -1336,6 +1386,24 @@ def create_run(
                         base_sha,
                         head_sha,
                         now,
+                        now,
+                    ),
+                )
+            provider_route_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provider_route'"
+            ).fetchone()
+            if provider_route_table is not None and provider_route is not None:
+                conn.execute(
+                    """INSERT INTO run_provider_route (
+                           run_id, providers_json, max_attempts, selection_reason,
+                           policy_version, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        record["id"],
+                        json.dumps(provider_route, ensure_ascii=False),
+                        max_provider_attempts,
+                        provider_route_reason,
+                        provider_policy_version,
                         now,
                     ),
                 )
@@ -1787,6 +1855,178 @@ def create_provenance_evidence(
                 record,
             )
             return record
+
+
+# --------------------------------------------------------------------------
+# Explicit provider route and immutable attempt evidence (schema 14)
+# --------------------------------------------------------------------------
+
+
+def get_provider_route(db_path: Path, run_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM run_provider_route WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["providers"] = json.loads(result.pop("providers_json"))
+    return result
+
+
+def get_provider_routes_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM run_provider_route WHERE run_id IN ({placeholders})",
+            tuple(run_ids),
+        ).fetchall()
+    result: dict[str, dict] = {}
+    for row in rows:
+        item = dict(row)
+        item["providers"] = json.loads(item.pop("providers_json"))
+        result[item["run_id"]] = item
+    return result
+
+
+def start_provider_attempt(
+    db_path: Path,
+    *,
+    run_id: str,
+    attempt_number: int,
+    provider_id: str,
+    started_at: str,
+) -> dict:
+    record = {
+        "run_id": run_id,
+        "attempt_number": attempt_number,
+        "provider_id": provider_id,
+        "outcome": "started",
+        "classification": None,
+        "disposition": None,
+        "error_code": None,
+        "parent_attempt_number": attempt_number - 1 if attempt_number > 1 else None,
+        "started_at": started_at,
+        "completed_at": None,
+    }
+    with connect(db_path) as conn:
+        with transaction(conn):
+            existing = conn.execute(
+                """SELECT * FROM provider_attempt
+                   WHERE run_id = ? AND attempt_number = ?""",
+                (run_id, attempt_number),
+            ).fetchone()
+            if existing is not None:
+                current = dict(existing)
+                if current != record:
+                    raise ValueError(
+                        f"Provider attempt {run_id!r}/{attempt_number} already differs"
+                    )
+                return current
+            conn.execute(
+                """INSERT INTO provider_attempt (
+                       run_id, attempt_number, provider_id, outcome,
+                       classification, disposition, error_code,
+                       parent_attempt_number, started_at, completed_at
+                   ) VALUES (
+                       :run_id, :attempt_number, :provider_id, :outcome,
+                       :classification, :disposition, :error_code,
+                       :parent_attempt_number, :started_at, :completed_at
+                   )""",
+                record,
+            )
+    return record
+
+
+def finish_provider_attempt(
+    db_path: Path,
+    *,
+    run_id: str,
+    attempt_number: int,
+    outcome: str,
+    classification: str,
+    disposition: str,
+    error_code: str | None,
+    completed_at: str,
+) -> dict:
+    if outcome not in {"succeeded", "failed", "cancelled"}:
+        raise ValueError(f"Invalid provider attempt outcome: {outcome!r}")
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                """SELECT * FROM provider_attempt
+                   WHERE run_id = ? AND attempt_number = ?""",
+                (run_id, attempt_number),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No provider attempt {run_id!r}/{attempt_number}")
+            current = dict(row)
+            expected = {
+                **current,
+                "outcome": outcome,
+                "classification": classification,
+                "disposition": disposition,
+                "error_code": error_code,
+                "completed_at": completed_at,
+            }
+            if current["outcome"] != "started":
+                if current != expected:
+                    raise ValueError(
+                        f"Provider attempt {run_id!r}/{attempt_number} is immutable"
+                    )
+                return current
+            conn.execute(
+                """UPDATE provider_attempt
+                   SET outcome = ?, classification = ?, disposition = ?,
+                       error_code = ?, completed_at = ?
+                   WHERE run_id = ? AND attempt_number = ? AND outcome = 'started'""",
+                (
+                    outcome,
+                    classification,
+                    disposition,
+                    error_code,
+                    completed_at,
+                    run_id,
+                    attempt_number,
+                ),
+            )
+            updated = conn.execute(
+                """SELECT * FROM provider_attempt
+                   WHERE run_id = ? AND attempt_number = ?""",
+                (run_id, attempt_number),
+            ).fetchone()
+            return dict(updated)
+
+
+def list_provider_attempts(db_path: Path, run_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT * FROM provider_attempt
+               WHERE run_id = ? ORDER BY attempt_number""",
+            (run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_provider_attempts_for_runs(
+    db_path: Path, run_ids: list[str]
+) -> dict[str, list[dict]]:
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT * FROM provider_attempt
+                WHERE run_id IN ({placeholders})
+                ORDER BY run_id, attempt_number""",
+            tuple(run_ids),
+        ).fetchall()
+    result: dict[str, list[dict]] = {run_id: [] for run_id in run_ids}
+    for row in rows:
+        result[row["run_id"]].append(dict(row))
+    return result
 
 
 # --------------------------------------------------------------------------

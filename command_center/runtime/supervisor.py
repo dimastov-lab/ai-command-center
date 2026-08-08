@@ -50,7 +50,13 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from command_center import agent_runner, capabilities, project_config, workspace_provisioning
+from command_center import (
+    agent_runner,
+    capabilities,
+    project_config,
+    provider_route,
+    workspace_provisioning,
+)
 from command_center.models import iso_now
 from command_center import run_lineage as provenance
 from command_center.runtime import context_service, db, identity, outcome, providers, reports, stream_parser
@@ -518,6 +524,10 @@ class Supervisor:
         repository_already_validated: bool = False,
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
         executor_id: str = providers.CLAUDE_ID,
+        provider_route_ids: tuple[str, ...] | None = None,
+        max_provider_attempts: int | None = None,
+        provider_route_reason: str = "explicit_single_provider",
+        provider_policy_version: str = "project_allowed_agents_v1",
         canonical_repository_path: str | None = None,
         max_global_concurrency: int | None = None,
         untrusted: bool = False,
@@ -592,8 +602,19 @@ class Supervisor:
         # human confirmation, which must precede every mutation; then the
         # provider's own readiness. Nothing here has yet touched the database
         # or the filesystem.
+        route_ids = provider_route_ids or (executor_id,)
+        route = provider_route.ProviderRoute(
+            route_ids,
+            max_attempts=max_provider_attempts or len(route_ids),
+            selection_reason=provider_route_reason,
+            policy_version=provider_policy_version,
+        )
+        if route.providers[0] != executor_id:
+            raise SupervisorError("executor_id must be the first provider route candidate")
+        for candidate in route.providers:
+            providers.get_provider(candidate)
+            project_config.require_execution_provider_allowed(project, candidate)
         provider = providers.get_provider(executor_id)
-        project_config.require_execution_provider_allowed(project, executor_id)
         context_service.require_launch_confirmation(confirmed, what=f"Launching a {provider.label} run")
 
         # Process-group supervision is a hard host requirement, independent of
@@ -776,6 +797,10 @@ class Supervisor:
                     command_policy=decision.command_policy,
                     provider_id=executor_id,
                     provider_metadata_json=providers.audit_json(spec.audit_metadata),
+                    provider_route=route.providers,
+                    max_provider_attempts=route.max_attempts,
+                    provider_route_reason=route.selection_reason,
+                    provider_policy_version=route.policy_version,
                     canonical_repository_path=(
                         str(Path(provenance_repository).expanduser().resolve())
                         if provenance_repository
@@ -936,6 +961,13 @@ class Supervisor:
         provider_runtime: providers.ProviderRuntime,
     ) -> dict:
         run_id = run["id"]
+        db.start_provider_attempt(
+            self.db_path,
+            run_id=run_id,
+            attempt_number=1,
+            provider_id=provider.id,
+            started_at=iso_now(),
+        )
         try:
             process = subprocess.Popen(
                 list(spec.argv),
@@ -954,6 +986,16 @@ class Supervisor:
             )
         except OSError as exc:
             failure_reason = "executable_missing" if isinstance(exc, FileNotFoundError) else "provider_launch_failed"
+            db.finish_provider_attempt(
+                self.db_path,
+                run_id=run_id,
+                attempt_number=1,
+                outcome="failed",
+                classification=provider_route.classify_failure(failure_reason),
+                disposition=provider_route.TERMINAL,
+                error_code=failure_reason,
+                completed_at=iso_now(),
+            )
             run = db.update_run_state(
                 self.db_path,
                 run_id,
@@ -1385,16 +1427,34 @@ class Supervisor:
         All exception classes are retried: a transient SQLite failure must not
         permanently strand an exited run in an active state.
         """
+        def finish_started_attempt(current: dict) -> None:
+            attempts = db.list_provider_attempts(self.db_path, run_id)
+            if not attempts or attempts[-1]["outcome"] != "started":
+                return
+            reason = current.get("failure_reason") or failure_reason
+            db.finish_provider_attempt(
+                self.db_path,
+                run_id=run_id,
+                attempt_number=attempts[-1]["attempt_number"],
+                outcome="failed",
+                classification=provider_route.classify_failure(reason),
+                disposition=provider_route.TERMINAL,
+                error_code=reason,
+                completed_at=current.get("completed_at") or iso_now(),
+            )
+
         for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
             try:
                 current = db.get_run(self.db_path, run_id)
                 if current is None:
                     return True
                 if current["state"] in db.TERMINAL_STATES:
+                    if current["state"] == "FAILED":
+                        finish_started_attempt(current)
                     return True
                 if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
                     return False
-                db.update_run_state(
+                current = db.update_run_state(
                     self.db_path,
                     run_id,
                     expected_version=current["version"],
@@ -1405,6 +1465,7 @@ class Supervisor:
                         "failure_reason": failure_reason,
                     },
                 )
+                finish_started_attempt(current)
                 self._append_lifecycle_event_best_effort(
                     lifecycle,
                     run_id,
@@ -2005,6 +2066,34 @@ class Supervisor:
                         },
                     )
                     terminal_persisted = True
+                    if new_state == "COMPLETED":
+                        attempt_outcome = "succeeded"
+                        attempt_classification = provider_route.SUCCESS
+                        attempt_error = None
+                    elif new_state == "CANCELLED":
+                        attempt_outcome = "cancelled"
+                        attempt_classification = provider_route.CANCELLED
+                        attempt_error = "cancelled"
+                    else:
+                        attempt_outcome = "failed"
+                        attempt_classification = provider_route.classify_failure(
+                            failure_reason
+                        )
+                        attempt_error = failure_reason or "provider_exit_nonzero"
+                    db.finish_provider_attempt(
+                        self.db_path,
+                        run_id=run_id,
+                        attempt_number=1,
+                        outcome=attempt_outcome,
+                        classification=attempt_classification,
+                        disposition=(
+                            provider_route.SUCCEEDED
+                            if new_state == "COMPLETED"
+                            else provider_route.TERMINAL
+                        ),
+                        error_code=attempt_error,
+                        completed_at=run["completed_at"],
+                    )
                     active.terminal_persisted_event.set()
                     provenance.update_identity(
                         self.db_path,

@@ -161,7 +161,12 @@ def _decode_checks(value: str | None) -> list[dict]:
     return decoded if isinstance(decoded, list) else []
 
 
-def build_view(record: dict | None) -> dict | None:
+def build_view(
+    record: dict | None,
+    *,
+    provider_route_record: dict | None = None,
+    provider_attempts: list[dict] | None = None,
+) -> dict | None:
     """Return the one public provenance shape used by API and UI."""
     if record is None:
         return None
@@ -173,6 +178,15 @@ def build_view(record: dict | None) -> dict | None:
             "url": record.get("pull_request_url"),
             "head_sha": record.get("pull_request_head_sha"),
         }
+    route = None
+    if provider_route_record is not None:
+        route = {
+            "providers": provider_route_record.get("providers"),
+            "max_attempts": provider_route_record.get("max_attempts"),
+            "selection_reason": provider_route_record.get("selection_reason"),
+            "policy_version": provider_route_record.get("policy_version"),
+        }
+    attempts = provider_attempts or []
     view = {
         "run_id": record.get("run_id"),
         "task_id": record.get("task_id"),
@@ -191,23 +205,43 @@ def build_view(record: dict | None) -> dict | None:
         "deployment_environment": record.get("deployment_environment"),
         "deployed_at": record.get("deployed_at"),
         "deployment_verified_at": record.get("deployment_verified_at"),
+        "provider_route": route,
+        "provider_attempts": attempts,
     }
     unknown = [name for name in _SCALAR_UNKNOWN_FIELDS if view.get(name) is None]
     if pr is None:
         unknown.append("pr")
     if not checks:
         unknown.append("ci")
+    if route is None:
+        unknown.append("provider_route")
+    if not attempts:
+        unknown.append("provider_attempts")
     view["unknown_fields"] = unknown
     return view
 
 
 def get_view(db_path: Path, run_id: str) -> dict | None:
-    return build_view(db.get_run_provenance(db_path, run_id))
+    return build_view(
+        db.get_run_provenance(db_path, run_id),
+        provider_route_record=db.get_provider_route(db_path, run_id),
+        provider_attempts=db.list_provider_attempts(db_path, run_id),
+    )
 
 
 def views_for_runs(db_path: Path, run_ids: Iterable[str]) -> dict[str, dict]:
-    records = db.get_run_provenance_for_runs(db_path, list(run_ids))
-    return {run_id: build_view(record) for run_id, record in records.items()}
+    ids = list(run_ids)
+    records = db.get_run_provenance_for_runs(db_path, ids)
+    routes = db.get_provider_routes_for_runs(db_path, ids)
+    attempts = db.get_provider_attempts_for_runs(db_path, ids)
+    return {
+        run_id: build_view(
+            record,
+            provider_route_record=routes.get(run_id),
+            provider_attempts=attempts.get(run_id),
+        )
+        for run_id, record in records.items()
+    }
 
 
 def update_identity(

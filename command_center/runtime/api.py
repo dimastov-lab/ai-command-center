@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from command_center import project_config, workspace_provisioning
+from command_center import project_config, provider_route, workspace_provisioning
 from command_center import run_lineage as provenance
 from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
@@ -66,6 +66,8 @@ class ExecutionCenterAPI:
         repository_already_validated: bool = False,
         workspace_verification: workspace_provisioning.WorkspaceSpec | None = None,
         executor_id: str = "claude_code",
+        provider_route_ids: tuple[str, ...] | None = None,
+        max_provider_attempts: int | None = None,
         max_global_concurrency: int | None = None,
         untrusted: bool = False,
         operator_elevated: bool = False,
@@ -83,7 +85,23 @@ class ExecutionCenterAPI:
         `timeout_seconds` defaults to 900s; pass `None` explicitly to disable
         the automatic timeout for this run.
         """
+        allowed_providers = tuple(project_config.allowed_execution_providers(project))
         project_config.require_execution_provider_allowed(project, executor_id)
+        for candidate in provider_route_ids or ():
+            project_config.require_execution_provider_allowed(project, candidate)
+        route = provider_route.ProviderRoute.from_policy(
+            allowed_providers=allowed_providers,
+            preferred_provider=executor_id,
+            explicit_providers=provider_route_ids,
+            policy_version="project_allowed_agents_v1",
+        )
+        if max_provider_attempts is not None:
+            route = provider_route.ProviderRoute(
+                route.providers,
+                max_attempts=max_provider_attempts,
+                selection_reason=route.selection_reason,
+                policy_version=route.policy_version,
+            )
         context = context_service.assemble_context(
             project_id=project,
             metadata=metadata,
@@ -112,6 +130,10 @@ class ExecutionCenterAPI:
             repository_already_validated=repository_already_validated,
             workspace_verification=workspace_verification,
             executor_id=executor_id,
+            provider_route_ids=route.providers,
+            max_provider_attempts=route.max_attempts,
+            provider_route_reason=route.selection_reason,
+            provider_policy_version=route.policy_version,
             canonical_repository_path=project_config.get_project_config(project).get("repository_path"),
             max_global_concurrency=max_global_concurrency,
             untrusted=untrusted,

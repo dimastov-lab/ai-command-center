@@ -1,17 +1,18 @@
 # Program Roadmap State
 
-Updated: 2026-08-08 21:37 MSK
-Current wave: **Wave 2 — AICC PR/worktree reconciliation and safe delivery**
-Tracking issue: [#167](https://github.com/dimastov-lab/ai-command-center/issues/167)
+Updated: 2026-08-08 23:25 MSK
+Current wave: **Wave 3 — AICC provider route, bounded retry, and manual acceptance**
+Tracking issue: [#170](https://github.com/dimastov-lab/ai-command-center/issues/170)
 
 ## Dependency gate
 
-Wave 1 is accepted on AICC main `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c`. Wave 2 may prepare separate atomic delivery and cleanup proposals, but merge, PR closure, production deploy, history rewrite, legacy-volume deletion, and worktree cleanup remain explicit human gates. PR #157 and PR #158 remain separate and unmerged.
+Wave 2 is accepted on AICC main `c07ecaac42f180b0c265e60ea8b7f4ffcc956ad0`. Wave 3 may prepare an explicit provider route and hermetic manual acceptance journey, but merge, production deploy, PR closure, and worktree cleanup remain explicit human gates. PR #157 and PR #158 remain untouched by this task.
 
 ## Required provenance
 
 | task_id | repository | worktree | branch | base_sha | head_sha | tests | pr | ci | accepted_sha | deployed_sha |
 |---|---|---|---|---|---|---|---|---|---|---|
+| W3-AICC-PROVIDER-ROUTE-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave3-provider-route-20260808` | `codex/wave3-provider-route-20260808` | `c07ecaac42f180b0c265e60ea8b7f4ffcc956ad0` | pending commit | RED import failure; focused `132 passed`; Supervisor failure/lifecycle `7 passed`; manual hermetic journey green with zero external calls; full ran once: `2909 passed, 1 failed` (legacy policy exception ordering), remediated focused `36 passed`; exact-head CI authoritative | issue [#170](https://github.com/dimastov-lab/ai-command-center/issues/170); draft PR pending | pending exact-head CI | unknown until exact-head CI + human review | unknown; no deploy |
 | W2-AICC-SAFE-DELIVERY-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave2-safe-delivery-20260808` | `codex/wave2-safe-delivery-20260808` | `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c` | pending commit | RED import failure + inventory fixture failure; focused + boundary `8 passed`; full ran once but terminal summary was lost on transport disconnect, so no local count claimed; Ruff/compile clean | issue [#167](https://github.com/dimastov-lab/ai-command-center/issues/167); draft PR pending | exact-head CI is authoritative full-suite gate | unknown until exact-head CI + human review | unknown; no deploy |
 | W2-AICC-PR158-EXTRACT-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/pr158-truncate-text-20260808` | `codex/pr158-truncate-text-20260808` | `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c` | `605a03c6031d605ac535756bafcb90f7320bfc4b` | RED `2 failed`; focused `27 passed`; full `2890 passed`, 1 warning; Ruff clean | draft [#168](https://github.com/dimastov-lab/ai-command-center/pull/168); #158 untouched | boundary/Windows success; Linux pending | unknown until exact-head CI + human review | unknown; no deploy |
 | W1-AICC-PROVENANCE-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave1-provenance-20260808` | `codex/wave1-provenance-20260808` | `253ab4591498682f6889438380c3a901952c3485` | `4c4d914766ed7644dd9af2c92271f34b4937261f` | RED import failure; focused `18 + 147 + 20 + 85 + 95 passed`; exact-head CI full suite green | issue [#165](https://github.com/dimastov-lab/ai-command-center/issues/165); merged [#166](https://github.com/dimastov-lab/ai-command-center/pull/166) | Linux/Windows/boundary success | main merge `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c` | unknown; no deploy |
@@ -45,6 +46,12 @@ Wave 1 is accepted on AICC main `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c`. Wave
 - #157 is proposed for supersession as a conflicting 64-commit umbrella. Its sole tail test deflake was not reproduced on current main (`2 passed` with the existing 5-second fake run).
 - #158 remains untouched; only its unique two-file intent is extracted to #168 from current main, with `max_len <= 0` explicitly returning empty output.
 
+## Wave 3 provider-route evidence
+
+- Policy filtering precedes provider preference; the selected route is immutable, ordered, distinct, and bounded by its provider count.
+- Only explicitly classified provider-local transient failures with verified unchanged workspace evidence advance to the next provider. Authentication, policy, invalid request, cancel, timeout, incomplete result, changed workspace, and unknown exits terminate immediately.
+- Canonical provenance records the route policy/reason and append-only attempt outcomes without prompts or secrets. The hermetic acceptance fixture proves transient A to successful B in exactly two attempts, distinct-provider exhaustion, and non-retryable fail-fast without external provider calls.
+
 ## Deferred human gates
 
 - Draft PR review/ready/merge requires explicit permission; no accepted delivery head has been merged or deployed.
@@ -54,4 +61,4 @@ Wave 1 is accepted on AICC main `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c`. Wave
 
 ## Next allowed work
 
-Finish the Wave 2 governance suite, open its draft PR, and require exact-head CI on both Wave 2 branches. Do not merge, close PRs, deploy, rewrite history, or delete worktrees without explicit approval.
+Open the Wave 3 draft PR and require exact-head CI plus human review. Do not merge, close PRs, deploy, rewrite history, or delete worktrees without explicit approval.
