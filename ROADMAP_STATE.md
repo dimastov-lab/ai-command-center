@@ -1,17 +1,18 @@
 # Program Roadmap State
 
-Updated: 2026-08-08 23:43 MSK
-Current wave: **Wave 3 — AICC provider route, bounded retry, and manual acceptance**
-Tracking issue: [#170](https://github.com/dimastov-lab/ai-command-center/issues/170)
+Updated: 2026-08-09 00:36 MSK
+Current wave: **Wave 4 — AICC truthful Dashboard, UX, and accessibility**
+Tracking issue: [#172](https://github.com/dimastov-lab/ai-command-center/issues/172)
 
 ## Dependency gate
 
-Wave 2 is accepted on AICC main `c07ecaac42f180b0c265e60ea8b7f4ffcc956ad0`. Wave 3 may prepare an explicit provider route and hermetic manual acceptance journey, but merge, production deploy, PR closure, and worktree cleanup remain explicit human gates. PR #157 and PR #158 remain untouched by this task.
+Wave 3 is accepted on AICC main `857ddcbbffea87f797382300ee93c787ae7b8c07` with successful exact-main CI. Wave 4 may prepare truthful Dashboard and accessibility changes, but merge, production deploy, PR closure, and worktree cleanup remain explicit human gates. PR #157 and PR #158 remain untouched by this task.
 
 ## Required provenance
 
 | task_id | repository | worktree | branch | base_sha | head_sha | tests | pr | ci | accepted_sha | deployed_sha |
 |---|---|---|---|---|---|---|---|---|---|---|
+| W4-AICC-TRUTHFUL-DASHBOARD-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave4-truthful-dashboard-20260809` | `codex/wave4-truthful-dashboard-20260809` | `857ddcbbffea87f797382300ee93c787ae7b8c07` | pending commit | RED import failure; final focused truth/provenance/UI/browser/architecture `64 passed`; broader API/DB/UI/architecture/browser `167 passed`; Chromium keyboard/semantics/320px/200%-text journey `1 passed`; full ran exactly once and produced empty `lastfailed` plus finalized coverage XML, but terminal summary/exit was lost during tool transport, so no local count is claimed; Ruff/compileall/diff-check clean | issue [#172](https://github.com/dimastov-lab/ai-command-center/issues/172); draft PR pending | exact-head Linux/Windows/boundary CI is authoritative full-suite gate | unknown until exact-head CI + human review | unknown; no deploy |
 | W3-AICC-PROVIDER-ROUTE-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave3-provider-route-20260808` | `codex/wave3-provider-route-20260808` | `c07ecaac42f180b0c265e60ea8b7f4ffcc956ad0` | implementation `0539cfdbf7085de5d85d6d752dc893f23eb0039d`; final docs head tracked by PR | RED import failure; focused `132 passed`; Supervisor failure/lifecycle `7 passed`; manual hermetic journey green with zero external calls; full ran once: `2909 passed, 1 failed` (legacy policy exception ordering), remediated focused `36 passed`; final route/idempotency `15 passed`; architecture `17 passed`; exact-head CI authoritative | issue [#170](https://github.com/dimastov-lab/ai-command-center/issues/170); draft [#171](https://github.com/dimastov-lab/ai-command-center/pull/171) | pending exact-head Linux/Windows/boundary CI | unknown until exact-head CI + human review | unknown; no deploy |
 | W2-AICC-SAFE-DELIVERY-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave2-safe-delivery-20260808` | `codex/wave2-safe-delivery-20260808` | `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c` | pending commit | RED import failure + inventory fixture failure; focused + boundary `8 passed`; full ran once but terminal summary was lost on transport disconnect, so no local count claimed; Ruff/compile clean | issue [#167](https://github.com/dimastov-lab/ai-command-center/issues/167); draft PR pending | exact-head CI is authoritative full-suite gate | unknown until exact-head CI + human review | unknown; no deploy |
 | W2-AICC-PR158-EXTRACT-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/pr158-truncate-text-20260808` | `codex/pr158-truncate-text-20260808` | `d4f245cbef80d2ff5ce36ebc981cdbb0d115430c` | `605a03c6031d605ac535756bafcb90f7320bfc4b` | RED `2 failed`; focused `27 passed`; full `2890 passed`, 1 warning; Ruff clean | draft [#168](https://github.com/dimastov-lab/ai-command-center/pull/168); #158 untouched | boundary/Windows success; Linux pending | unknown until exact-head CI + human review | unknown; no deploy |
@@ -52,6 +53,12 @@ Wave 2 is accepted on AICC main `c07ecaac42f180b0c265e60ea8b7f4ffcc956ad0`. Wave
 - Only explicitly classified provider-local transient failures with verified unchanged workspace evidence advance to the next provider. Authentication, policy, invalid request, cancel, timeout, incomplete result, changed workspace, and unknown exits terminate immediately.
 - Canonical provenance records the route policy/reason and append-only attempt outcomes without prompts or secrets. The hermetic acceptance fixture proves transient A to successful B in exactly two attempts, distinct-provider exhaustion, and non-retryable fail-fast without external provider calls.
 
+## Wave 4 truthful Dashboard and accessibility evidence
+
+- One pure projection consumes canonical `TaskSnapshot`, API-enriched run provenance, authoritative `count_runs`, and stale-run evidence; every aggregate identifies its entity, source, and bounded window.
+- Dashboard delivery rows distinguish unknown, unaccepted, accepted-but-undeployed, verified deploy, stale runtime, and latest runtime SHA mismatch without promoting green CI or health to acceptance/deployment.
+- Status text and semantic roles supplement colour; progress and SVG graphics have accessible names; light/dark status tokens meet WCAG AA contrast; visible focus, keyboard movement, 320 CSS px reflow, and 200% text sizing are exercised in Chromium.
+
 ## Deferred human gates
 
 - Draft PR review/ready/merge requires explicit permission; no accepted delivery head has been merged or deployed.
@@ -61,4 +68,4 @@ Wave 2 is accepted on AICC main `c07ecaac42f180b0c265e60ea8b7f4ffcc956ad0`. Wave
 
 ## Next allowed work
 
-Require exact-head CI and human review for draft PR #171. Do not merge, close PRs, deploy, rewrite history, or delete worktrees without explicit approval.
+Open the Wave 4 draft PR and require exact-head CI plus human review. Do not merge, close PRs, deploy, rewrite history, or delete worktrees without explicit approval.

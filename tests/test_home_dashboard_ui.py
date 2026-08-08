@@ -108,6 +108,35 @@ def _run_component_script() -> AppTest:
     return AppTest.from_function(_component_script, default_timeout=30).run()
 
 
+def _delivery_component_script() -> None:
+    from command_center import dashboard_truth as truth
+    from command_center.ui import home_dashboard as hd
+
+    hd.delivery_rows(
+        [
+            {
+                "run_id": f"run-{index}",
+                "state": state,
+                "label": label,
+                "description": "Проверяемое описание",
+                "accent": "slate",
+                "semantic_role": "status",
+            }
+            for index, (state, label) in enumerate(
+                [
+                    (truth.UNKNOWN, "Доказательства неизвестны"),
+                    (truth.UNACCEPTED, "Кандидат не принят"),
+                    (truth.ACCEPTED_UNDEPLOYED, "Принят, deploy неизвестен"),
+                    (truth.DEPLOYED, "Deploy подтверждён"),
+                    (truth.STALE_RUNTIME, "Runtime устарел"),
+                    (truth.RUNTIME_MISMATCH, "Runtime SHA не совпадает"),
+                ]
+            )
+        ],
+        window_label="Последние 6 из 6 запусков (лимит окна: 200)",
+    )
+
+
 def test_kpi_tiles_render_labels_values_and_sparkline():
     at = _run_component_script()
     assert not at.exception
@@ -129,10 +158,10 @@ def test_queue_rows_show_real_percentage_or_em_dash_when_absent():
 def test_queue_footer_shows_real_counts():
     at = _run_component_script()
     body = "".join(m.value for m in at.markdown)
-    assert "Всего: <b style='color:var(--hx-text)'>5</b>" in body
-    assert "В работе: 1" in body
-    assert "Завершено: 3" in body
-    assert "Ошибки: 1" in body
+    assert "Всего запусков (runtime.db): <b style='color:var(--hx-text)'>5</b>" in body
+    assert "В работе в окне: 1" in body
+    assert "Завершено в окне: 3" in body
+    assert "Ошибки в окне: 1" in body
 
 
 def test_simple_rows_render_with_and_without_right_status():
@@ -161,6 +190,75 @@ def test_metric_list_and_supervisor_status_render():
     body = "".join(m.value for m in at.markdown)
     assert "Задачи завершены" in body and "80%" in body
     assert "AI Supervisor" in body and "Автопилот включён" in body and "94%" in body
+
+
+def test_dashboard_markup_exposes_status_text_progress_names_and_accessible_graphics():
+    at = _run_component_script()
+    body = "".join(m.value for m in at.markdown)
+    assert "role='status'" in body
+    assert "aria-hidden='true'" in body
+    assert "role='progressbar'" in body
+    assert "aria-valuenow='42'" in body
+    assert "role='img'" in body
+    assert "aria-label='Здоровье проекта: 100%, Отлично'" in body
+
+
+def test_delivery_markup_visibly_and_semantically_names_all_truth_states():
+    at = AppTest.from_function(_delivery_component_script, default_timeout=30).run()
+    body = "".join(m.value for m in at.markdown)
+    for text in (
+        "Доказательства неизвестны",
+        "Кандидат не принят",
+        "Принят, deploy неизвестен",
+        "Deploy подтверждён",
+        "Runtime устарел",
+        "Runtime SHA не совпадает",
+    ):
+        assert text in body
+    assert body.count("role='status'") == 6
+
+
+def _light_css_script() -> None:
+    from command_center.ui import home_dashboard as hd
+
+    hd.theme.current_theme_type = lambda: "light"
+    hd.inject_css()
+
+
+def test_dashboard_css_has_visible_focus_reflow_and_theme_specific_contrast_tokens():
+    at = AppTest.from_function(_light_css_script, default_timeout=30).run()
+    body = "".join(m.value for m in at.markdown)
+    assert ":focus-visible" in body
+    assert "outline:3pxsolid" in body.replace(" ", "")
+    assert "@media (max-width: 420px)" in body
+    assert "--hx-green: #15803d" in body
+
+
+def _relative_luminance(hex_color: str) -> float:
+    channels = [int(hex_color[index:index + 2], 16) / 255 for index in (1, 3, 5)]
+    linear = [
+        channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+        for channel in channels
+    ]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(foreground: str, background: str) -> float:
+    lighter, darker = sorted(
+        (_relative_luminance(foreground), _relative_luminance(background)), reverse=True
+    )
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_dashboard_status_tokens_meet_wcag_aa_normal_text_contrast():
+    assert all(
+        _contrast_ratio(color, "#141b2e") >= 4.5
+        for color in home_dashboard._DARK_ACCENTS.values()
+    )
+    assert all(
+        _contrast_ratio(color, "#ffffff") >= 4.5
+        for color in home_dashboard._LIGHT_ACCENTS.values()
+    )
 
 
 # --------------------------------------------------------------------------
@@ -316,7 +414,7 @@ def test_dashboard_localization_is_russian():
     at = _at_on_dashboard()
     body = "".join(m.value for m in at.markdown) + " ".join(c.value for c in at.caption)
     for label in (
-        "Проекты", "Агенты", "Задачи", "Ревью",
+            "Проекты", "Живые прогоны", "Задачи", "Ревью",
         "Очередь выполнения", "Здоровье проекта", "Обзор Kanban",
         "Быстрые действия", "Активные агенты", "AI Supervisor",
     ):
@@ -364,8 +462,8 @@ def test_dashboard_queue_and_footer_reflect_a_genuinely_running_then_completed_s
     assert not at.exception
     body = "".join(m.value for m in at.markdown)
     assert "hx-row" in body  # the live session shows up as a real queue row
-    assert "Всего: <b style='color:var(--hx-text)'>1</b>" in body
-    assert "Завершено: 0" in body  # not finished yet — no fabricated completion
+    assert "Всего запусков (runtime.db): <b style='color:var(--hx-text)'>1</b>" in body
+    assert "Завершено в окне: 0" in body  # not finished yet — no fabricated completion
 
     _wait_for_report(runtime_db.resolve_db_path(), run_id)
 
@@ -373,4 +471,4 @@ def test_dashboard_queue_and_footer_reflect_a_genuinely_running_then_completed_s
     at = at.run()
     assert not at.exception
     body = "".join(m.value for m in at.markdown)
-    assert "Завершено: 1" in body  # now real, observed, exactly the one run
+    assert "Завершено в окне: 1" in body  # now real, observed, exactly the one run

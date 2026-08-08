@@ -301,3 +301,32 @@ def test_native_evidence_upsert_is_idempotent_and_roundtrips_integrity_id(tmp_pa
     assert first == second
     assert first["integrity_id"] == "esf-event-1"
     assert first["native_payload"] == native
+
+
+def test_canonical_view_projects_safe_runtime_evidence_without_native_payload(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _run(db_path, head_sha="a" * 40)
+    event = provenance.RuntimeProbeAdapter().normalize(
+        candidate_sha="a" * 40,
+        payload={
+            "health": "ok",
+            "immutable_sha": "b" * 40,
+            "prompt": "must-not-reach-dashboard",
+        },
+    )
+    provenance.upsert_native_event(db_path, run["id"], event)
+
+    view = provenance.get_view(db_path, run["id"])
+
+    assert view["evidence"] == [
+        {
+            "integrity_id": event["integrity_id"],
+            "adapter": "runtime_probe",
+            "status": "runtime_sha_mismatch",
+            "candidate_sha": "a" * 40,
+            "reported_sha": "b" * 40,
+            "observed_at": event["observed_at"],
+        }
+    ]
+    assert "must-not-reach-dashboard" not in repr(view)

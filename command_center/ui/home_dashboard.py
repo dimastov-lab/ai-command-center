@@ -23,15 +23,26 @@ from command_center.ui import theme
 # Accent palette from the design (indigo/blue/green/amber/teal/violet), kept in
 # one place and reused so a tile, a progress bar and a status dot of the same
 # meaning always share a colour.
-_ACCENTS = {
-    "indigo": "#7c6cf6",
-    "blue": "#3b82f6",
-    "green": "#22c55e",
-    "amber": "#f59e0b",
-    "red": "#ef4444",
-    "teal": "#2dd4bf",
-    "violet": "#a855f7",
-    "slate": "#64748b",
+_DARK_ACCENTS = {
+    "indigo": "#a5b4fc",
+    "blue": "#60a5fa",
+    "green": "#4ade80",
+    "amber": "#fbbf24",
+    "red": "#f87171",
+    "teal": "#5eead4",
+    "violet": "#d8b4fe",
+    "slate": "#cbd5e1",
+}
+
+_LIGHT_ACCENTS = {
+    "indigo": "#4f46a5",
+    "blue": "#1d4ed8",
+    "green": "#15803d",
+    "amber": "#92400e",
+    "red": "#b91c1c",
+    "teal": "#0f766e",
+    "violet": "#7e22ce",
+    "slate": "#475569",
 }
 
 
@@ -71,7 +82,8 @@ def inject_css() -> None:
     except Exception:  # noqa: BLE001
         dark = True
     p = _pal(dark)
-    accents = "\n".join(f"  --hx-{k}: {v};" for k, v in _ACCENTS.items())
+    palette = _DARK_ACCENTS if dark else _LIGHT_ACCENTS
+    accents = "\n".join(f"  --hx-{k}: {v};" for k, v in palette.items())
     st.markdown(
         f"""
 <style>
@@ -94,6 +106,7 @@ def inject_css() -> None:
 .hx-card-head {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }}
 .hx-card-title {{ font-size: 1.05rem; font-weight: 700; color: var(--hx-text); }}
 .hx-card-link {{ font-size: 0.8rem; color: var(--hx-muted); }}
+.hx-page-title {{ font-size:1.55rem; line-height:1.25; margin:0 0 0.25rem; color:var(--hx-text); }}
 
 .hx-kpis {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); gap:16px; margin-bottom:16px; }}
 .hx-kpi {{
@@ -138,6 +151,15 @@ def inject_css() -> None:
 .hx-foot {{ display:flex; gap:16px; font-size:0.8rem; color:var(--hx-muted); margin-top:12px; }}
 .hx-chip {{ font-size:0.72rem; padding:2px 9px; border-radius:999px; font-weight:600;
   background: color-mix(in srgb, var(--hx-accent) 20%, transparent); color: var(--hx-accent); }}
+button:focus-visible, a:focus-visible, [tabindex]:focus-visible {{
+  outline: 3px solid var(--hx-blue) !important;
+  outline-offset: 3px !important;
+}}
+@media (max-width: 420px) {{
+  .hx-kpis, .hx-kanban {{ grid-template-columns: minmax(0, 1fr); }}
+  .hx-row, .hx-foot {{ flex-wrap: wrap; }}
+  .hx-status {{ white-space: normal; }}
+}}
 </style>
 """,
         unsafe_allow_html=True,
@@ -176,7 +198,8 @@ def _sparkline(series: tuple[int, ...], accent: str) -> str:
         f"{i * step:.1f},{h - 2 - (v - lo) / span * (h - 6):.1f}" for i, v in enumerate(series)
     )
     return (
-        f"<svg viewBox='0 0 {w} {h}' preserveAspectRatio='none' "
+        f"<svg viewBox='0 0 {w} {h}' preserveAspectRatio='none' role='img' "
+        f"aria-label='Тренд: {_esc(', '.join(str(item) for item in series))}' "
         f"style='width:100%; height:34px; margin-top:6px; display:block;'>"
         f"<polyline points='{pts}' fill='none' stroke='var(--hx-{accent})' stroke-width='2.5' "
         f"stroke-linecap='round' stroke-linejoin='round' opacity='0.9'/></svg>"
@@ -186,7 +209,7 @@ def _sparkline(series: tuple[int, ...], accent: str) -> str:
 def kpi_tiles(kpis: list[Kpi]) -> None:
     cells = "".join(
         f"<div class='hx-kpi' style='--hx-accent:var(--hx-{k.accent})'>"
-        f"<div class='hx-kpi-ic'>{k.icon}</div>"
+        f"<div class='hx-kpi-ic' aria-hidden='true'>{k.icon}</div>"
         f"<div class='hx-kpi-label'>{_esc(k.label)}</div>"
         f"<div class='hx-kpi-value'>{_esc(k.value)}</div>"
         f"<div class='hx-kpi-sub'>{_esc(k.sub)}</div>"
@@ -197,16 +220,21 @@ def kpi_tiles(kpis: list[Kpi]) -> None:
     st.markdown(f"<div class='hx-kpis'>{cells}</div>", unsafe_allow_html=True)
 
 
-def _bar(pct: int, accent: str) -> str:
+def _bar(pct: int, accent: str, label: str = "Прогресс") -> str:
     pct = max(0, min(100, int(pct)))
-    return f"<div class='hx-bar' style='--hx-accent:var(--hx-{accent})'><span style='width:{pct}%'></span></div>"
+    return (
+        f"<div class='hx-bar' role='progressbar' aria-label='{_esc(label)}' "
+        f"aria-valuemin='0' aria-valuemax='100' aria-valuenow='{pct}' "
+        f"style='--hx-accent:var(--hx-{accent})'><span style='width:{pct}%'></span></div>"
+    )
 
 
 def card_open(title: str, link: str | None = None) -> None:
     link_html = f"<span class='hx-card-link'>{_esc(link)}</span>" if link else ""
     st.markdown(
-        f"<div class='hx-card'><div class='hx-card-head'>"
-        f"<span class='hx-card-title'>{_esc(title)}</span>{link_html}</div>",
+        f"<div class='hx-card' role='region' aria-label='{_esc(title)}'>"
+        f"<div class='hx-card-head'><h2 class='hx-card-title'>{_esc(title)}</h2>"
+        f"{link_html}</div>",
         unsafe_allow_html=True,
     )
 
@@ -223,15 +251,16 @@ def queue_rows(rows: list[dict]) -> None:
         pct_html = (
             f"<div class='hx-pct'>{int(pct)}%</div>" if pct is not None else "<div class='hx-pct'>—</div>"
         )
-        bar = _bar(pct, r.get("accent", "indigo")) if pct is not None else ""
+        bar = _bar(pct, r.get("accent", "indigo"), f"Прогресс: {r.get('name') or 'запуск'}") if pct is not None else ""
         html_rows.append(
             f"<div class='hx-row'>"
-            f"<div class='hx-ic'>{r.get('icon','•')}</div>"
+            f"<div class='hx-ic' aria-hidden='true'>{r.get('icon','•')}</div>"
             f"<div class='hx-grow'><div class='hx-name'>{_esc(r.get('name'))}</div>"
             f"<div class='hx-meta'>{_esc(r.get('meta'))}</div>{bar}</div>"
             f"{pct_html}"
-            f"<div class='hx-status' style='--hx-accent:var(--hx-{r.get('status_accent','slate')})'>"
-            f"<span class='hx-dot'></span>{_esc(r.get('status'))}</div>"
+            f"<div class='hx-status' role='status' aria-label='Статус: {_esc(r.get('status'))}' "
+            f"style='--hx-accent:var(--hx-{r.get('status_accent','slate')})'>"
+            f"<span class='hx-dot' aria-hidden='true'></span>{_esc(r.get('status'))}</div>"
             f"</div>"
         )
     st.markdown("".join(html_rows), unsafe_allow_html=True)
@@ -243,14 +272,15 @@ def simple_rows(rows: list[dict]) -> None:
     for r in rows:
         right = r.get("right")
         right_html = (
-            f"<div class='hx-status' style='--hx-accent:var(--hx-{r.get('right_accent','slate')})'>"
-            f"<span class='hx-dot'></span>{_esc(right)}</div>"
+            f"<div class='hx-status' role='status' aria-label='Статус: {_esc(right)}' "
+            f"style='--hx-accent:var(--hx-{r.get('right_accent','slate')})'>"
+            f"<span class='hx-dot' aria-hidden='true'></span>{_esc(right)}</div>"
             if right
             else ""
         )
         html_rows.append(
             f"<div class='hx-row'>"
-            f"<div class='hx-ic'>{r.get('icon','•')}</div>"
+            f"<div class='hx-ic' aria-hidden='true'>{r.get('icon','•')}</div>"
             f"<div class='hx-grow'><div class='hx-name'>{_esc(r.get('name'))}</div>"
             f"<div class='hx-meta'>{_esc(r.get('meta'))}</div></div>"
             f"{right_html}</div>"
@@ -258,13 +288,23 @@ def simple_rows(rows: list[dict]) -> None:
     st.markdown("".join(html_rows), unsafe_allow_html=True)
 
 
-def queue_footer(total: int, running: int, completed: int, failed: int) -> None:
+def queue_footer(
+    total: int,
+    running: int,
+    completed: int,
+    failed: int,
+    *,
+    loaded: int | None = None,
+    window_limit: int = 200,
+) -> None:
+    loaded = total if loaded is None else loaded
     st.markdown(
-        f"<div class='hx-foot'>"
-        f"<span>Всего: <b style='color:var(--hx-text)'>{total}</b></span>"
-        f"<span style='color:var(--hx-green)'>В работе: {running}</span>"
-        f"<span style='color:var(--hx-blue)'>Завершено: {completed}</span>"
-        f"<span style='color:var(--hx-red)'>Ошибки: {failed}</span>"
+        f"<div class='hx-foot' aria-label='Сводка запусков'>"
+        f"<span>Всего запусков (runtime.db): <b style='color:var(--hx-text)'>{total}</b></span>"
+        f"<span>Окно: последние {loaded} (лимит {window_limit})</span>"
+        f"<span style='color:var(--hx-green)'>В работе в окне: {running}</span>"
+        f"<span style='color:var(--hx-blue)'>Завершено в окне: {completed}</span>"
+        f"<span style='color:var(--hx-red)'>Ошибки в окне: {failed}</span>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -292,7 +332,8 @@ def health_gauge(percent: int, label: str, accent: str = "teal") -> None:
     st.markdown(
         f"""
 <div style='display:flex; justify-content:center; margin:6px 0 4px 0;'>
-<svg width='150' height='150' viewBox='0 0 150 150'>
+<svg width='150' height='150' viewBox='0 0 150 150' role='img'
+  aria-label='Здоровье проекта: {pct}%, {_esc(label)}'>
   <circle cx='75' cy='75' r='{r}' fill='none' stroke='var(--hx-track)' stroke-width='12'/>
   <circle cx='75' cy='75' r='{r}' fill='none' stroke='var(--hx-{accent})' stroke-width='12'
     stroke-linecap='round' stroke-dasharray='{dash:.1f} {circ:.1f}' transform='rotate(-90 75 75)'/>
@@ -308,7 +349,7 @@ def metric_list(metrics: list[tuple[str, int, str]]) -> None:
     """metrics: (name, percent, accent)."""
     rows = "".join(
         f"<div class='hx-metric'><span class='hx-metric-name'>"
-        f"<span class='hx-dot' style='--hx-accent:var(--hx-{acc}); background:var(--hx-{acc})'></span> {_esc(name)}</span>"
+        f"<span class='hx-dot' aria-hidden='true' style='--hx-accent:var(--hx-{acc}); background:var(--hx-{acc})'></span> {_esc(name)}</span>"
         f"<span class='hx-metric-val'>{pct}%</span></div>"
         for name, pct, acc in metrics
     )
@@ -319,11 +360,32 @@ def supervisor_status(percent: int, label: str, *, status: str = "Active", accen
     st.markdown(
         f"<div class='hx-card'><div class='hx-card-head'>"
         f"<span class='hx-card-title'>AI Supervisor</span>"
-        f"<span class='hx-status' style='--hx-accent:var(--hx-{accent})'><span class='hx-dot'></span>{_esc(status)}</span></div>"
+        f"<span class='hx-status' role='status' aria-label='AI Supervisor: {_esc(status)}' "
+        f"style='--hx-accent:var(--hx-{accent})'><span class='hx-dot' aria-hidden='true'></span>{_esc(status)}</span></div>"
         f"<div style='display:flex; justify-content:space-between; align-items:baseline;'>"
-        f"<span class='hx-meta'>Общий статус</span>"
+        f"<span class='hx-meta'>Успех терминальных запусков (7д, окно ≤200)</span>"
         f"<span class='hx-health-num' style='font-size:1.6rem'>{int(percent)}%</span></div>"
-        f"{_bar(percent, accent)}"
+        f"{_bar(percent, accent, 'Здоровье AI Supervisor')}"
         f"<div class='hx-meta' style='margin-top:6px'>{_esc(label)}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def delivery_rows(rows: list[dict], *, window_label: str) -> None:
+    """Render canonical delivery/runtime truth without colour-only meaning."""
+    body = []
+    for row in rows:
+        body.append(
+            f"<div class='hx-row' role='{_esc(row.get('semantic_role') or 'status')}' "
+            f"aria-label='{_esc(row.get('label'))}: {_esc(row.get('description'))}'>"
+            f"<div class='hx-ic' aria-hidden='true'>◆</div>"
+            f"<div class='hx-grow'><div class='hx-name'>{_esc(row.get('label'))}</div>"
+            f"<div class='hx-meta'>{_esc(row.get('description'))}</div>"
+            f"<div class='hx-meta'>Run {_esc(str(row.get('run_id') or 'unknown')[:12])}</div></div>"
+            f"<div class='hx-status' style='--hx-accent:var(--hx-{_esc(row.get('accent') or 'slate')})'>"
+            f"<span class='hx-dot' aria-hidden='true'></span>{_esc(row.get('state'))}</div></div>"
+        )
+    st.markdown(
+        f"<div aria-label='{_esc(window_label)}'>{''.join(body)}</div>",
         unsafe_allow_html=True,
     )
