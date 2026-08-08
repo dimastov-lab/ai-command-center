@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 from command_center import project_config, workspace_provisioning
+from command_center import run_lineage as provenance
 from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -146,7 +147,7 @@ class ExecutionCenterAPI:
         states: Iterable[str] | None = None,
         limit: int | None = None,
     ) -> list[dict]:
-        return db.list_runs(
+        runs = db.list_runs(
             self.db_path,
             session_id=session_id,
             task_id=task_id,
@@ -154,6 +155,12 @@ class ExecutionCenterAPI:
             states=states,
             limit=limit,
         )
+        provenance_by_run = provenance.views_for_runs(
+            self.db_path, [run["id"] for run in runs]
+        )
+        return [
+            {**run, "provenance": provenance_by_run.get(run["id"])} for run in runs
+        ]
 
     def count_runs(self, *, states: Iterable[str] | None = None) -> int:
         """Authoritative total run count without materializing rows (see
@@ -162,7 +169,10 @@ class ExecutionCenterAPI:
         return db.count_runs(self.db_path, states=states)
 
     def get_run(self, run_id: str) -> dict | None:
-        return db.get_run(self.db_path, run_id)
+        run = db.get_run(self.db_path, run_id)
+        if run is None:
+            return None
+        return {**run, "provenance": provenance.get_view(self.db_path, run_id)}
 
     def get_latest_run_for_task(self, task_id: str) -> dict | None:
         return db.get_latest_run_for_task(self.db_path, task_id)

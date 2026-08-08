@@ -1901,6 +1901,29 @@ def _render_execution_center_completion(
             )
 
 
+def _render_execution_center_provenance(session: dict) -> None:
+    """Render only the canonical provenance projection attached by the API."""
+    provenance = session.get("provenance")
+    if not provenance:
+        return
+    with st.expander("Provenance run → delivery", expanded=False):
+        st.write(f"Base → HEAD: `{(provenance.get('base_sha') or 'unknown')[:12]}` → `{(provenance.get('head_sha') or 'unknown')[:12]}`")
+        pr = provenance.get("pr") or {}
+        st.write(
+            f"PR: `#{pr.get('number') or 'unknown'}` · head "
+            f"`{(pr.get('head_sha') or 'unknown')[:12]}`"
+        )
+        conclusions = provenance.get("ci") or []
+        st.write(
+            "CI: "
+            + (", ".join(f"{item.get('name')}: {item.get('conclusion')}" for item in conclusions) or "unknown")
+        )
+        st.write(f"Accepted SHA: `{provenance.get('accepted_sha') or 'unknown'}`")
+        st.write(f"Deployed SHA: `{provenance.get('deployed_sha') or 'unknown'}`")
+        if provenance.get("unknown_fields"):
+            st.caption("Unknown evidence: " + ", ".join(provenance["unknown_fields"]))
+
+
 _PROMPT_PREVIEW_CHARS = 700
 
 _OPEN_TASK_DETAIL_KEY = "open_task_detail_id"
@@ -2153,6 +2176,7 @@ def _render_execution_center_card(
         elif session["last_error"]:
             st.error(f"Последняя ошибка: {session['last_error']}")
 
+        _render_execution_center_provenance(session)
         _render_execution_center_completion(api, session)
 
         # Localized labels (Russian) throughout — the console UI is otherwise

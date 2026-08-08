@@ -273,7 +273,7 @@ def _validate_updatable_fields(fields: dict) -> None:
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -716,6 +716,51 @@ def _migration_12_add_executor_capability_fields(conn: sqlite3.Connection) -> No
                 conn.execute(f"ALTER TABLE run ADD COLUMN {column} TEXT")
 
 
+_SCHEMA_V13 = """
+CREATE TABLE IF NOT EXISTS run_provenance (
+    run_id TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+    repository_path TEXT,
+    worktree_path TEXT,
+    branch TEXT,
+    base_branch TEXT,
+    base_sha TEXT,
+    head_sha TEXT,
+    pull_request_number INTEGER,
+    pull_request_url TEXT,
+    pull_request_head_sha TEXT,
+    ci_conclusions_json TEXT,
+    ci_observed_at TEXT,
+    accepted_sha TEXT,
+    accepted_at TEXT,
+    deployed_sha TEXT,
+    deployment_environment TEXT,
+    deployed_at TEXT,
+    deployment_verified_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_provenance_task_id ON run_provenance(task_id);
+CREATE INDEX IF NOT EXISTS idx_run_provenance_pr ON run_provenance(pull_request_number);
+
+CREATE TABLE IF NOT EXISTS provenance_evidence (
+    integrity_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES run(id) ON DELETE CASCADE,
+    adapter TEXT NOT NULL,
+    status TEXT NOT NULL,
+    candidate_sha TEXT,
+    reported_sha TEXT,
+    native_payload_json TEXT NOT NULL,
+    normalized_json TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_evidence_run_id
+    ON provenance_evidence(run_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -737,6 +782,7 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (10, _SCHEMA_V10),
     (11, _migration_11_add_pre_run_head),
     (12, _migration_12_add_executor_capability_fields),
+    (13, _SCHEMA_V13),
 ]
 
 
@@ -906,6 +952,8 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
+    if current >= 13:
+        backfill_run_provenance(db_path, limit=500)
     # Optional, operator-opted-in retention: run after the migration connection
     # above has closed so VACUUM (if enabled) does not contend with it. See
     # `apply_runtime_retention`.
@@ -1140,6 +1188,12 @@ def create_run(
     command_policy: str | None = None,
     provider_id: str = "claude_code",
     provider_metadata_json: str | None = None,
+    canonical_repository_path: str | None = None,
+    worktree_path: str | None = None,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    base_sha: str | None = None,
+    head_sha: str | None = None,
     enforce_workspace_lock: bool = False,
     max_global_concurrency: int | None = None,
 ) -> dict:
@@ -1263,6 +1317,28 @@ def create_run(
                     VALUES ({", ".join(f":{name}" for name in insert_columns)})""",
                 record,
             )
+            provenance_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
+            ).fetchone()
+            if provenance_table is not None:
+                conn.execute(
+                    """INSERT INTO run_provenance (
+                           run_id, task_id, repository_path, worktree_path, branch,
+                           base_branch, base_sha, head_sha, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        record["id"],
+                        task_id,
+                        canonical_repository_path,
+                        worktree_path or repository_path,
+                        branch,
+                        base_branch,
+                        base_sha,
+                        head_sha,
+                        now,
+                        now,
+                    ),
+                )
     return record
 
 
@@ -1477,6 +1553,240 @@ def update_run_fields(db_path: Path, run_id: str, *, expected_version: int, fiel
                 raise LostUpdateError(f"Run {run_id!r} update affected {cur.rowcount} rows")
             updated = conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
             return dict(updated)
+
+
+# --------------------------------------------------------------------------
+# Canonical run provenance (schema 13)
+# --------------------------------------------------------------------------
+
+
+def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
+    """Backfill at most ``limit`` legacy runs without inventing evidence.
+
+    The historical ``run.repository_path`` named the process cwd, so it is a
+    truthful worktree path but not necessarily the canonical repository. The
+    latter therefore remains NULL. Completion facts are copied only when they
+    were already persisted; accepted SHA is derived only from an explicit
+    TARGET_VERIFIED terminal completion. Repeated calls insert only missing
+    rows and are therefore idempotent.
+    """
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit == 0:
+        return 0
+    now = iso_now()
+    with connect(db_path) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
+        ).fetchone()
+        if table is None:
+            return 0
+        with transaction(conn):
+            cursor = conn.execute(
+                """INSERT INTO run_provenance (
+                       run_id, task_id, repository_path, worktree_path, branch,
+                       base_branch, base_sha, head_sha, pull_request_number,
+                       pull_request_url, pull_request_head_sha, accepted_sha,
+                       accepted_at, created_at, updated_at
+                   )
+                   SELECT r.id, r.task_id, NULL, r.repository_path, c.branch,
+                          c.base_branch, NULL, c.head_commit, c.pull_request_number,
+                          c.pull_request_url,
+                          CASE WHEN c.pull_request_number IS NOT NULL THEN c.head_commit END,
+                          CASE
+                              WHEN c.completion_state = 'COMPLETED'
+                               AND c.last_reason_code = 'TARGET_VERIFIED'
+                              THEN COALESCE(c.merge_commit, c.head_commit)
+                          END,
+                          CASE
+                              WHEN c.completion_state = 'COMPLETED'
+                               AND c.last_reason_code = 'TARGET_VERIFIED'
+                              THEN c.updated_at
+                          END,
+                          r.created_at, ?
+                   FROM run AS r
+                   LEFT JOIN completion AS c ON c.run_id = r.id
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM run_provenance AS p WHERE p.run_id = r.id
+                   )
+                   ORDER BY r.created_at, r.rowid
+                   LIMIT ?""",
+                (now, limit),
+            )
+            return cursor.rowcount
+
+
+def get_run_provenance(db_path: Path, run_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM run_provenance WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return _row_to_dict(row)
+
+
+def get_run_provenance_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM run_provenance WHERE run_id IN ({placeholders})",
+            tuple(run_ids),
+        ).fetchall()
+    return {row["run_id"]: dict(row) for row in rows}
+
+
+def update_run_provenance(db_path: Path, run_id: str, *, fields: dict) -> dict:
+    allowed = {
+        "repository_path",
+        "worktree_path",
+        "branch",
+        "base_branch",
+        "base_sha",
+        "head_sha",
+        "pull_request_number",
+        "pull_request_url",
+        "pull_request_head_sha",
+        "ci_conclusions_json",
+        "ci_observed_at",
+        "accepted_sha",
+        "accepted_at",
+        "deployed_sha",
+        "deployment_environment",
+        "deployed_at",
+        "deployment_verified_at",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise UnknownRunFieldError(f"Not an updatable provenance field: {sorted(unknown)}")
+    if not fields:
+        row = get_run_provenance(db_path, run_id)
+        if row is None:
+            raise KeyError(f"No provenance for run: {run_id!r}")
+        return row
+    values = dict(fields)
+    values["updated_at"] = iso_now()
+    set_clause = ", ".join(f"{key} = :{key}" for key in values)
+    values["run_id"] = run_id
+    with connect(db_path) as conn:
+        with transaction(conn):
+            cursor = conn.execute(
+                f"UPDATE run_provenance SET {set_clause} WHERE run_id = :run_id", values
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"No provenance for run: {run_id!r}")
+            row = conn.execute(
+                "SELECT * FROM run_provenance WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return dict(row)
+
+
+def set_run_provenance_once(
+    db_path: Path,
+    run_id: str,
+    *,
+    field: str,
+    value: str,
+    fields: dict,
+) -> tuple[dict, bool]:
+    """Atomically set an immutable provenance fact once.
+
+    ``matched`` is false only when another immutable value already exists.
+    A replay of the same value is idempotent and does not rewrite timestamps.
+    """
+    if field not in {"accepted_sha", "deployed_sha"}:
+        raise UnknownRunFieldError(f"Not an immutable provenance field: {field!r}")
+    if fields.get(field) != value:
+        raise ValueError(f"fields must bind {field!r} to the immutable value")
+    allowed = {
+        "accepted_sha",
+        "accepted_at",
+        "deployed_sha",
+        "deployment_environment",
+        "deployed_at",
+        "deployment_verified_at",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise UnknownRunFieldError(f"Not an immutable provenance field: {sorted(unknown)}")
+    with connect(db_path) as conn:
+        with transaction(conn):
+            row = conn.execute(
+                "SELECT * FROM run_provenance WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No provenance for run: {run_id!r}")
+            current = dict(row)
+            existing = current.get(field)
+            if existing is not None:
+                return current, existing == value
+            values = dict(fields)
+            values["updated_at"] = iso_now()
+            values["run_id"] = run_id
+            set_clause = ", ".join(f"{key} = :{key}" for key in values if key != "run_id")
+            conn.execute(
+                f"UPDATE run_provenance SET {set_clause} WHERE run_id = :run_id", values
+            )
+            updated = conn.execute(
+                "SELECT * FROM run_provenance WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return dict(updated), True
+
+
+def create_provenance_evidence(
+    db_path: Path,
+    *,
+    run_id: str,
+    integrity_id: str,
+    adapter: str,
+    status: str,
+    candidate_sha: str | None,
+    reported_sha: str | None,
+    native_payload_json: str,
+    normalized_json: str,
+    observed_at: str,
+) -> dict:
+    """Insert one native evidence event, or return its exact prior record.
+
+    Replaying the same integrity id with different content is rejected rather
+    than silently rewriting audit history.
+    """
+    record = {
+        "integrity_id": integrity_id,
+        "run_id": run_id,
+        "adapter": adapter,
+        "status": status,
+        "candidate_sha": candidate_sha,
+        "reported_sha": reported_sha,
+        "native_payload_json": native_payload_json,
+        "normalized_json": normalized_json,
+        "observed_at": observed_at,
+    }
+    with connect(db_path) as conn:
+        with transaction(conn):
+            existing = conn.execute(
+                "SELECT * FROM provenance_evidence WHERE integrity_id = ?",
+                (integrity_id,),
+            ).fetchone()
+            if existing is not None:
+                current = dict(existing)
+                comparable = {key: current[key] for key in record}
+                if comparable != record:
+                    raise ValueError(
+                        f"Evidence integrity id {integrity_id!r} already has different content"
+                    )
+                return current
+            conn.execute(
+                """INSERT INTO provenance_evidence (
+                       integrity_id, run_id, adapter, status, candidate_sha,
+                       reported_sha, native_payload_json, normalized_json, observed_at
+                   ) VALUES (
+                       :integrity_id, :run_id, :adapter, :status, :candidate_sha,
+                       :reported_sha, :native_payload_json, :normalized_json, :observed_at
+                   )""",
+                record,
+            )
+            return record
 
 
 # --------------------------------------------------------------------------

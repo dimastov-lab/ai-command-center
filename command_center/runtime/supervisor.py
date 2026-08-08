@@ -52,6 +52,7 @@ from pathlib import Path
 
 from command_center import agent_runner, capabilities, project_config, workspace_provisioning
 from command_center.models import iso_now
+from command_center import run_lineage as provenance
 from command_center.runtime import context_service, db, identity, outcome, providers, reports, stream_parser
 
 logger = logging.getLogger(__name__)
@@ -668,6 +669,28 @@ class Supervisor:
                 expected_branch=expected_branch,
             )
 
+        # Capability-denied launches must fail without starting *any* subprocess,
+        # including the read-only git commands used to capture provenance.
+        # Their run row is still persisted below, with the unavailable Git facts
+        # left honestly unknown.
+        launch_snapshot = agent_runner.git_snapshot(repo_path) if decision.ok else {}
+        observed_branch = launch_snapshot.get("branch")
+        if observed_branch == "(detached HEAD)":
+            observed_branch = None
+        provenance_base_branch = (
+            workspace_verification.base_branch if workspace_verification is not None else None
+        )
+        provenance_repository = (
+            workspace_verification.repository_path
+            if workspace_verification is not None and workspace_verification.repository_path
+            else canonical_repository_path
+        )
+        provenance_base_sha = (
+            agent_runner.git_commit(repo_path, provenance_base_branch)
+            if provenance_base_branch and decision.ok
+            else launch_snapshot.get("head")
+        )
+
         safe_default_title = "Codex CLI run" if executor_id == providers.CODEX_ID else prompt[:120]
         persisted_title = safe_default_title if executor_id == providers.CODEX_ID else (title or safe_default_title)
         if task_id is None:
@@ -753,6 +776,16 @@ class Supervisor:
                     command_policy=decision.command_policy,
                     provider_id=executor_id,
                     provider_metadata_json=providers.audit_json(spec.audit_metadata),
+                    canonical_repository_path=(
+                        str(Path(provenance_repository).expanduser().resolve())
+                        if provenance_repository
+                        else None
+                    ),
+                    worktree_path=str(repo_path),
+                    branch=observed_branch,
+                    base_branch=provenance_base_branch,
+                    base_sha=provenance_base_sha,
+                    head_sha=launch_snapshot.get("head"),
                     enforce_workspace_lock=True,
                     max_global_concurrency=max_global_concurrency,
                 )
@@ -817,7 +850,7 @@ class Supervisor:
                     )["payload"],
                 )
             run = db.update_run_state(self.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
-            pre_run_snapshot = agent_runner.git_snapshot(repo_path)
+            pre_run_snapshot = launch_snapshot
             pre_run_status = pre_run_snapshot.get("status_summary")
             run = db.update_run_fields(
                 self.db_path,
@@ -1973,6 +2006,14 @@ class Supervisor:
                     )
                     terminal_persisted = True
                     active.terminal_persisted_event.set()
+                    provenance.update_identity(
+                        self.db_path,
+                        run_id,
+                        head_sha=post_head,
+                        branch=post_snapshot.get("branch")
+                        if post_snapshot.get("branch") != "(detached HEAD)"
+                        else None,
+                    )
                     break
                 except (db.LostUpdateError, db.InvalidTransitionError):
                     current = db.get_run(self.db_path, run_id)

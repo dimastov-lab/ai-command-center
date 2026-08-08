@@ -540,7 +540,8 @@ def build_session_view(
     status = derive_status(run, awaiting_handshake=awaiting_handshake, heartbeat_stale=heartbeat_stale)
     started_at = run.get("started_at")
     finished_at = run.get("completed_at")
-    workspace_path = run.get("repository_path")
+    canonical_provenance = run.get("provenance") or {}
+    workspace_path = canonical_provenance.get("worktree") or run.get("repository_path")
     # Only probe the filesystem for live runs — the branch/status of a
     # terminal run was captured at completion time and never changes. This
     # avoids one ``git status`` subprocess (3 git calls) per terminal run,
@@ -583,8 +584,10 @@ def build_session_view(
         "project_id": run.get("project"),
         "executor": executor,
         "workspace_path": workspace_path,
-        "repository_path": (project_cfg or {}).get("repository_path") or workspace_path,
-        "expected_branch": run.get("expected_branch"),
+        "repository_path": canonical_provenance.get("repository")
+        or (project_cfg or {}).get("repository_path")
+        or workspace_path,
+        "expected_branch": canonical_provenance.get("branch") or run.get("expected_branch"),
         "actual_branch": actual_branch,
         "git_status": git_status,
         "launch_source": run.get("launch_source") or "execution_center_adhoc",
@@ -661,6 +664,7 @@ def build_session_view(
         "report_path": report_path,
         "commit_hash": run.get("commit_hash"),
         "pull_request_url": run.get("pull_request_url"),
+        "provenance": run.get("provenance"),
         "latest_event": _summarize_event(latest_event),
         # Post-execution completion pipeline (None until the run completes and a
         # completion row is seeded). This is what lets the UI distinguish

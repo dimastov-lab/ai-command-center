@@ -207,6 +207,37 @@ def test_build_session_view_maps_every_field_with_no_task_or_workspace():
     assert session["elapsed_seconds"] == 1800.0
 
 
+def test_build_session_view_uses_canonical_provenance_projection():
+    now = datetime(2026, 1, 1, 0, 30, 0)
+    provenance = {
+        "repository": "/repos/aicc",
+        "worktree": "/worktrees/aicc/task",
+        "branch": "feature/provenance",
+        "base_branch": "main",
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+        "pr": {"number": 165, "url": "https://github.example/pr/165", "head_sha": "b" * 40},
+        "ci": [{"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "accepted_sha": None,
+        "deployed_sha": None,
+        "unknown_fields": ["accepted_sha", "deployed_sha"],
+    }
+
+    session = session_view.build_session_view(
+        _run(provenance=provenance),
+        kanban_task=None,
+        project_cfg={"repository_path": "/wrong/live/value"},
+        latest_event=None,
+        report_path=None,
+        now=now,
+    )
+
+    assert session["provenance"] is provenance
+    assert session["repository_path"] == "/repos/aicc"
+    assert session["workspace_path"] == "/worktrees/aicc/task"
+    assert session["expected_branch"] == "feature/provenance"
+
+
 def test_build_session_view_uses_kanban_task_title_stage_and_progress():
     now = datetime(2026, 1, 1, 0, 0, 0)
     run = _run()

@@ -304,6 +304,7 @@ def serialize_execution(snap: dict[str, Any]) -> dict[str, Any]:
                 "exit_code": run.get("exit_code"),
                 "failure_reason": run.get("failure_reason"),
                 "verdict": report.get("verdict"),
+                "provenance": run.get("provenance"),
             }
         )
 
