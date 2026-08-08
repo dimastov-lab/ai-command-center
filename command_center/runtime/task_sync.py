@@ -171,6 +171,32 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
     )
 
 
+_STARTUP_DEATH_THRESHOLD_SECONDS = 60
+
+
+def _died_before_producing_output(run: dict) -> bool:
+    """True when an INTERRUPTED run with no first_output_at was genuinely
+    short enough to be a startup crash rather than a supervisor orphan.
+
+    A supervisor that exits before its agent produces any stdout leaves the
+    run in exactly the same observable state as a true startup crash: state
+    INTERRUPTED, first_output_at NULL. We distinguish them by wall-clock
+    duration: if started_at → completed_at span exceeds the threshold the
+    agent almost certainly ran (supervisor just couldn't record the output
+    timestamp), so we do NOT penalise the executor as a failed provider.
+    """
+    started = run.get("started_at")
+    completed = run.get("completed_at")
+    if not started or not completed:
+        return True
+    try:
+        from datetime import datetime
+        delta = datetime.fromisoformat(completed) - datetime.fromisoformat(started)
+        return delta.total_seconds() < _STARTUP_DEATH_THRESHOLD_SECONDS
+    except (ValueError, TypeError):
+        return True
+
+
 def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     """Returns whether `task` was mutated (so the caller knows to persist
     via `save_tasks`)."""
@@ -246,7 +272,9 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     if not already_finalized_for_this_run:
         reason = run.get("failure_reason")
         died_on_startup = (
-            run.get("state") == "INTERRUPTED" and not run.get("first_output_at")
+            run.get("state") == "INTERRUPTED"
+            and not run.get("first_output_at")
+            and _died_before_producing_output(run)
         )
         provider_unavailable = reason in providers.PROVIDER_UNAVAILABLE_REASONS
         if died_on_startup or provider_unavailable:

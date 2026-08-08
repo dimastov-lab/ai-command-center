@@ -57,6 +57,22 @@ REQUIRED_TASK_FIELDS: tuple[str, ...] = ("id", "project", "title", "status")
 _warned_signatures: set[str] = set()
 
 
+class TasksStoreUnreadable(ValueError):
+    """`tasks.json` exists but could not be read or decoded.
+
+    Raised by `load_tasks` instead of returning `[]`, so a corrupt or transiently
+    unreadable store can never be mistaken for an empty one — by a mutator that
+    would then persist the emptiness, or by an operator looking at an empty
+    board. Subclasses `ValueError` so existing `except (JSONDecodeError, OSError,
+    ValueError)` handlers around the task store keep catching it.
+    """
+
+    def __init__(self, path: Path, cause: BaseException) -> None:
+        super().__init__(f"tasks store is unreadable: {path}: {type(cause).__name__}: {cause}")
+        self.path = path
+        self.cause = cause
+
+
 class CompletionEvidenceRequired(ValueError):
     """A planning mutation attempted to assert verified engineering delivery.
 
@@ -162,17 +178,20 @@ def _dedupe_by_id(tasks: list[dict]) -> tuple[list[dict], list[str]]:
     return deduped, dropped
 
 
-def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = False) -> list[dict]:
+def load_tasks(root: Path, *, example_file: Path | None = None) -> list[dict]:
     """Load the task list. A missing file is created empty (or seeded from
     `example_file`) and read back as `[]` — that is a legitimate fresh store.
 
-    `strict` controls what happens when the file *exists* but cannot be decoded
-    (transient `OSError`, a torn write, or non-JSON): the read-only default
-    returns `[]` so a single bad read does not crash the UI, but the
-    read-modify-write path (`mutate_tasks`) passes `strict=True` so a bad read
-    RAISES instead of returning `[]`. Returning `[]` there and then saving would
-    persist `[]` over the real list — the "one transient read error wipes
-    tasks.json" data-loss amplification the audit flagged.
+    A file that *exists* but cannot be decoded (transient `OSError`, a torn
+    write, non-JSON, or a JSON value that is not a list) RAISES
+    `TasksStoreUnreadable` — on every path, read-only included. An unreadable
+    store must never be substituted with `[]`: on the read-modify-write path
+    (`mutate_tasks`) saving that `[]` back overwrites the real list with just
+    the mutator's record (the audit's data-loss amplification), and on the
+    read-only path an empty board is visually indistinguishable from "you have
+    no tasks", so the operator acts on a store they believe is empty. Callers
+    that render a UI catch this and show the failure (see `app.py`); nobody
+    degrades it to an empty list.
 
     Two integrity guards run on every successful read: duplicate ids are
     dropped keep-first (`_dedupe_by_id`), so a downstream `delete_task` can
@@ -191,10 +210,8 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
             save_tasks(root, [])
     try:
         tasks = _decode_tasks(tasks_file)
-    except (json.JSONDecodeError, OSError, ValueError):
-        if strict:
-            raise
-        return []
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        raise TasksStoreUnreadable(tasks_file, exc) from exc
     tasks, dropped = _dedupe_by_id(tasks)
     if dropped:
         _warn_once(
@@ -258,11 +275,12 @@ def mutate_tasks(
     on this; so is `command_center.task_import.apply_task_package`.
     """
     with tasks_lock(root, timeout=timeout):
-        # strict=True: if the existing file cannot be read/decoded, RAISE rather
-        # than proceed against a wrongly-empty list — persisting the mutator's
-        # result would then overwrite tasks.json with just the new record and
-        # drop every other task (the audit's data-loss amplification).
-        tasks = load_tasks(root, strict=True)
+        # `load_tasks` raises `TasksStoreUnreadable` if the existing file cannot
+        # be read/decoded, so we never proceed against a wrongly-empty list —
+        # persisting the mutator's result would then overwrite tasks.json with
+        # just the new record and drop every other task (the audit's data-loss
+        # amplification).
+        tasks = load_tasks(root)
         result = mutator(tasks)
         if persist_if is None or persist_if(result):
             save_tasks(root, tasks)
