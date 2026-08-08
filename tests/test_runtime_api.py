@@ -111,6 +111,17 @@ def test_api_list_and_get_run_share_the_canonical_provenance_view(
     assert listed["provenance"]["branch"] == "main"
     assert len(listed["provenance"]["base_sha"]) == 40
     assert len(listed["provenance"]["head_sha"]) == 40
+    assert listed["provenance"]["provider_route"]["providers"][0] == "claude_code"
+    assert listed["provenance"]["provider_route"]["selection_reason"] == "policy_filtered_preference"
+    assert listed["provenance"]["provider_route"]["policy_version"] == "project_allowed_agents_v1"
+    attempts = listed["provenance"]["provider_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["run_id"] == run["id"]
+    assert attempts[0]["provider_id"] == "claude_code"
+    assert attempts[0]["outcome"] == "succeeded"
+    assert attempts[0]["classification"] == "success"
+    assert attempts[0]["disposition"] == "succeeded"
+    assert attempts[0]["error_code"] is None
 
 
 def test_list_runs_state_and_states_together_raises_value_error(tmp_path):
