@@ -87,6 +87,32 @@ def test_list_runs_states_and_limit_forward_to_db(git_repo, configure_project_re
     assert len(limited) == 1
 
 
+def test_api_list_and_get_run_share_the_canonical_provenance_view(
+    git_repo, configure_project_repo, fake_claude
+):
+    configure_project_repo("AIOS", git_repo)
+    api = ExecutionCenterAPI()
+    run = api.start_run(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        instruction="p",
+        confirmed=True,
+        expected_branch="main",
+    )
+    api.supervisor.wait_for_run(run["id"], timeout=10)
+
+    listed = next(item for item in api.list_runs() if item["id"] == run["id"])
+    fetched = api.get_run(run["id"])
+
+    assert listed["provenance"] == fetched["provenance"]
+    assert listed["provenance"]["repository"] == str(git_repo.resolve())
+    assert listed["provenance"]["worktree"] == str(git_repo.resolve())
+    assert listed["provenance"]["branch"] == "main"
+    assert len(listed["provenance"]["base_sha"]) == 40
+    assert len(listed["provenance"]["head_sha"]) == 40
+
+
 def test_list_runs_state_and_states_together_raises_value_error(tmp_path):
     api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
     with pytest.raises(ValueError):

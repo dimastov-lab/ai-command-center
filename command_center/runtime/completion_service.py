@@ -30,6 +30,7 @@ from pathlib import Path
 
 from command_center import storage
 from command_center.runtime import db as runtime_db
+from command_center import run_lineage as provenance
 from command_center.runtime import git_ops, repo_state, validation
 from command_center.runtime.completion import (
     CompletionAction,
@@ -266,6 +267,21 @@ class CompletionOrchestrator:
             policy_json=policy.to_json(),
             last_reason_code=ReasonCode.EXECUTION_OK,
         )
+        state = repo_state.inspect_repository(
+            repo,
+            base_branch=base_branch,
+            branch=head_branch,
+            remote=DEFAULT_REMOTE,
+            check_remote=False,
+        )
+        provenance.update_identity(
+            self.db_path,
+            run_id,
+            branch=head_branch,
+            base_branch=base_branch,
+            base_sha=state.base_tip,
+            head_sha=head,
+        )
         runtime_db.append_completion_event(
             self.db_path,
             run_id,
@@ -438,6 +454,7 @@ class CompletionOrchestrator:
         )
         if pr is None or not pr.is_open or not pr.number:
             raise ManualMergeError("Открытый pull request не найден.")
+        self._observe_pr(row["run_id"], pr, now=now)
         if pr.checks_failing:
             raise ManualMergeError("CI не прошёл — сначала будет запущена автодоработка.")
         if pr.checks_pending:
@@ -744,6 +761,8 @@ class CompletionOrchestrator:
         pr = None
         if branch and policy.requires_pull_request:
             pr = self._discover_pr(repo, branch=branch, base=base_branch)
+            if pr is not None:
+                self._observe_pr(row["run_id"], pr, now=now)
 
         # A synthetic passed-validation outcome: we only reach this phase after
         # validation already passed (or was not required).
@@ -899,6 +918,7 @@ class CompletionOrchestrator:
             now=now,
             progressed=True,
         )
+        self._observe_pr(row["run_id"], pr, now=now)
         return runtime_db.get_completion(self.db_path, row["run_id"]), True
 
     def _recover_pull_request(self, row, rstate, pr, *, policy, now, task) -> tuple[dict, bool]:
@@ -981,6 +1001,7 @@ class CompletionOrchestrator:
             now=now,
             progressed=True,
         )
+        self._observe_pr(row["run_id"], replacement, now=now)
         return runtime_db.get_completion(self.db_path, row["run_id"]), True
 
     def _merge(self, row, pr, *, policy, now) -> tuple[dict, bool]:
@@ -1055,11 +1076,32 @@ class CompletionOrchestrator:
             merge_commit=row.get("merge_commit"),
             progressed=False,
         )
+        accepted_sha = row.get("merge_commit") or row.get("head_commit")
+        if accepted_sha:
+            provenance.record_acceptance(
+                self.db_path,
+                row["run_id"],
+                accepted_sha=accepted_sha,
+                target_verified=True,
+                observed_at=_iso(now),
+            )
         return runtime_db.get_completion(self.db_path, row["run_id"]), False
 
     # -- persistence helpers ------------------------------------------------------
     def _discover_pr(self, repo: Path, *, branch: str, base: str | None) -> PullRequestState | None:
         return self.github.discover_pull_request(repo, branch=branch, base=base)
+
+    def _observe_pr(self, run_id: str, pr: PullRequestState, *, now: datetime) -> None:
+        raw_checks = pr.raw.get("statusCheckRollup") if isinstance(pr.raw, dict) else []
+        provenance.observe_pull_request(
+            self.db_path,
+            run_id,
+            number=pr.number,
+            url=pr.url,
+            head_sha=pr.head_oid,
+            checks=raw_checks or [],
+            observed_at=_iso(now),
+        )
 
     def _pr_from_row(self, row: dict) -> PullRequestState | None:
         if not row.get("pull_request_number"):

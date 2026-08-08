@@ -335,7 +335,7 @@ def git_snapshot(repo_path: Path) -> dict:
         return {"is_git_repo": False, "branch": None, "head": None, "status_summary": None}
 
     branch = _run_git(["branch", "--show-current"], cwd=repo_path)
-    head = _run_git(["rev-parse", "--short", "HEAD"], cwd=repo_path)
+    head = _run_git(["rev-parse", "HEAD"], cwd=repo_path)
     status = _run_git(["status", "--porcelain"], cwd=repo_path)
 
     status_lines = [line for line in (status.stdout.splitlines() if status and status.returncode == 0 else []) if line]
@@ -346,6 +346,12 @@ def git_snapshot(repo_path: Path) -> dict:
         "head": head.stdout.strip() if head and head.returncode == 0 else None,
         "status_summary": "\n".join(status_lines) if status_lines else "(чисто)",
     }
+
+
+def git_commit(repo_path: Path, ref: str = "HEAD") -> str | None:
+    """Resolve ``ref`` to an exact commit SHA without changing the checkout."""
+    result = _run_git(["rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=repo_path)
+    return result.stdout.strip() if result and result.returncode == 0 else None
 
 
 def build_command(

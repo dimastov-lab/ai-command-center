@@ -337,3 +337,25 @@ def test_serialize_execution_excludes_sensitive_runs_and_reports_real_states():
     assert out["state_counts"]["QUEUED"] == 1
     assert out["state_counts"]["COMPLETED"] == 1
     assert all(run["project"] != "BANK" for run in out["runs"])
+
+
+def test_serialize_execution_projects_the_canonical_provenance_read_model():
+    provenance = {
+        "repository": "/repos/aicc",
+        "worktree": "/worktrees/aicc/task",
+        "branch": "feature/provenance",
+        "base_branch": "main",
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+        "pr": {"number": 165, "url": "https://github.example/pr/165", "head_sha": "b" * 40},
+        "ci": [{"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "accepted_sha": None,
+        "deployed_sha": None,
+        "unknown_fields": ["accepted_sha", "deployed_sha"],
+    }
+    snap = _snapshot()
+    snap["active_runs"][0]["provenance"] = provenance
+
+    out = serialize_execution(snap)
+
+    assert out["runs"][0]["provenance"] is provenance
