@@ -36,6 +36,54 @@ SECTION_LABELS: dict[str, str] = {
     "settings": "Настройки",
 }
 
+OPERATIONS_NOT_LOADED = "Данные загрузятся при открытии раздела."
+OPERATIONS_LOADING = "Загрузка данных…"
+OPERATIONS_ERROR = "Не удалось загрузить данные. Повторите обновление."
+OPERATIONS_EMPTY = "Данных пока нет."
+OPERATIONS_ROWS = "Записей: {count}"
+OPERATIONS_TABLE_ACCESSIBLE = "Таблица раздела «{title}»"
+
+OPERATIONAL_PAGE_TEXT: dict[str, tuple[str, str]] = {
+    "sessions": ("Сессии", "Активные и завершённые рабочие сессии."),
+    "execution": ("Выполнение", "Текущие и недавние запуски агентов."),
+    "git": ("Git", "Состояние репозиториев, веток и worktree."),
+    "artifacts": ("Артефакты", "Созданные в проектах рабочие материалы."),
+    "reports": ("Отчёты", "Результаты и заключения по выполненным запускам."),
+    "agents": ("Агенты", "Доступность провайдеров и текущая загрузка."),
+}
+
+_OPERATION_STATE_LABELS = {
+    "PREPARED": "Подготовлен",
+    "QUEUED": "В очереди",
+    "RUNNING": "Выполняется",
+    "COMPLETED": "Завершён",
+    "FAILED": "Ошибка",
+    "CANCELLED": "Отменён",
+    "INTERRUPTED": "Прерван",
+    "UNKNOWN": "Неизвестно",
+    "ok": "Готов",
+    "missing": "Не найден",
+    "invalid": "Некорректен",
+    "non_git": "Не является репозиторием Git",
+    "available": "Доступен",
+    "not_installed": "Не установлен",
+    "login_required": "Требуется вход",
+    "daemon_unavailable": "Служба недоступна",
+    "no_models": "Нет моделей",
+    "status_unavailable": "Статус недоступен",
+    "auth_unknown": "Авторизация не подтверждена",
+    "contract_pending": "Контракт ожидается",
+}
+
+
+def operation_value(key: str, value: object) -> str:
+    if value in (None, ""):
+        return "—"
+    if key in {"state", "readiness"}:
+        text = str(value)
+        return _OPERATION_STATE_LABELS.get(text, text if any("А" <= char <= "я" for char in text) else "Неизвестно")
+    return str(value)
+
 # --- Top bar --------------------------------------------------------------
 PROJECT_SWITCHER_PLACEHOLDER = "Выберите проект"
 PROJECT_SWITCHER_ACCESSIBLE = "Переключатель проектов"

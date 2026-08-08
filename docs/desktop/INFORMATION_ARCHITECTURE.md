@@ -1,10 +1,8 @@
 # AI Command Center — Desktop Information Architecture
 
-Status: **Target navigation; the D1 subset is shipped.** This document defines the eventual
-navigation structure and the subset of it Desktop Increment 1 activates. The D1 shell now
-implements that subset in `command_center.desktop` (active sections plus the disabled
-placeholders); the fuller structure remains ahead. See `DESKTOP_INCREMENT_1.md` for the binding
-scope of what D1 actually builds.
+Status: **All nine top-level sections active.** The original D1 subset is retained
+below as historical scope; P2 activated Sessions, Execution, Git, Artifacts,
+Reports and Agents through non-blocking application adapters on 2026-08-08.
 
 ## 1. Eventual navigation (target, all increments)
 
@@ -28,14 +26,15 @@ increment beyond what `IMPLEMENTATION_ROADMAP.md` schedules.
 
 ## 2. Desktop Increment 1 navigation
 
-Only three sections are **active** in Desktop Increment 1:
+Desktop Increment 1 originally activated three sections. P2 now activates all
+nine while preserving the same navigation order:
 
 | Section | D1 state | Notes |
 |---|---|---|
 | Home | Active (from D2) | Placeholder-only in D1 itself (see `DESKTOP_INCREMENT_1.md` D1); real data wiring lands in D2 |
 | Projects | Active (from D3) | Repository-path configuration; placeholder-only until D3 |
 | Settings | Active (from D3) | Theme, window, preferences; placeholder-only until D3 |
-| Sessions, Execution, Git, Artifacts, Reports, Agents | **Visibly disabled** | Rendered in the sidebar, greyed out, non-clickable — see §2.1 |
+| Sessions, Execution, Git, Artifacts, Reports, Agents | **Active from P2** | Live runtime/read-model data, non-blocking refresh, Russian empty/error states |
 
 D1 itself (the shell prototype, see `DESKTOP_INCREMENT_1.md`) renders all nine navigation
 entries but wires no real data to any of them — Home/Projects/Settings become genuinely active
@@ -79,7 +78,11 @@ finished.
 | Home | Cross-project rollup: read and display, via `command_center.application`'s Workspace Home adapter | No editing, no run control |
 | Projects | List projects, show per-project repository/worktree state, host repository-path configuration | No task/run creation in D1 |
 | Settings | Theme, density, window-geometry reset, workspace preferences | No repository-path editing (that lives on Projects) |
-| Sessions/Execution/Git/Artifacts/Reports/Agents | Reserved for future increments | Not built in D1 — see `DESKTOP_INCREMENT_1.md` |
+| Sessions | Runtime sessions and latest execution state | No hidden mutation |
+| Execution | Active and recent runs | No implicit launch or cancellation |
+| Git | Repository/worktree status with BANK/LEGAL path redaction | No Git writes |
+| Artifacts/Reports | Sanitized workspace read models | No reconstruction of redacted paths |
+| Agents | Provider readiness and live running count | No direct provider launch |
 
 ## 5. Project selection
 
