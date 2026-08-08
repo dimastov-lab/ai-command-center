@@ -38,11 +38,7 @@ exclude_lines = [
     "if TYPE_CHECKING:",
 ]
 
-[tool.uv.sources]
-aios = { path = "../aios" }
-
 [dependency-groups]
 dev = [
-    "aios",
     "pytest>=9.1.1",
 ]

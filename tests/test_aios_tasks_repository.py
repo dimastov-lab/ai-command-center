@@ -7,15 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 
 from command_center.application import aios_tasks  # noqa: E402
 from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository  # noqa: E402
 
-try:
-    AIOSClient = aios_tasks._load_aios_sdk().AIOSClient
-except ModuleNotFoundError:
-    pytest.skip("optional live AIOS SDK integration is unavailable", allow_module_level=True)
+AIOSClient = aios_tasks._load_aios_sdk().AIOSClient
 
 
 # ---------------------------------------------------------------------------

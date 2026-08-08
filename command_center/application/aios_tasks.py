@@ -13,7 +13,7 @@ from types import ModuleType
 from typing import Any
 
 from command_center import storage
-from command_center.application import tasks_gateway
+from command_center.application import aios_status, tasks_gateway
 
 _AICC_PRIORITY_TO_INT = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
 _INT_TO_AICC_PRIORITY = {value: key for key, value in _AICC_PRIORITY_TO_INT.items()}
@@ -48,12 +48,193 @@ _LANE_TO_TARGET_STATE = {
 }
 
 
+_EXPECTED_SDK_VERSION = "0.2.0"
+_EXPECTED_API_MAJOR = 1
+_EXPECTED_STATUS_SOURCES = {
+    "liveness": "getHealth",
+    "readiness": "getReadiness",
+    "identity_and_capabilities": "whoAmI",
+    "workspace_activity": "listWorkspaceTimeline",
+}
+
+
+def validate_aios_sdk_contract(sdk: ModuleType | Any) -> None:
+    """Reject a mutable or incompatible SDK before any network request."""
+    contract = getattr(sdk, "SDK_CONTRACT", None)
+    if (
+        getattr(sdk, "__version__", None) != _EXPECTED_SDK_VERSION
+        or getattr(contract, "distribution", None) != "aios-sdk"
+        or getattr(contract, "sdk_version", None) != _EXPECTED_SDK_VERSION
+        or getattr(contract, "api_major", None) != _EXPECTED_API_MAJOR
+        or dict(getattr(contract, "core_status_sources", {}))
+        != _EXPECTED_STATUS_SOURCES
+        or tuple(getattr(contract, "unknown_evidence", ()))
+        != ("accepted_sha", "deployed_sha")
+        or not set(_EXPECTED_STATUS_SOURCES.values()).issubset(
+            set(getattr(contract, "callable_operations", ()))
+        )
+    ):
+        raise aios_status.AIOSStatusContractError("incompatible_aios_sdk")
+
+
 def _load_aios_sdk() -> ModuleType:
     # This local, top-level-only import is the one mechanically allowed SDK
     # dependency in AICC production code.
     import aios_sdk
 
+    validate_aios_sdk_contract(aios_sdk)
     return aios_sdk
+
+
+class AIOSSDKStatusClient:
+    """The SDK-backed implementation of AICC's read-only status port."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        tenant_id: str,
+        workspace_id: str,
+        sdk: ModuleType | Any | None = None,
+    ) -> None:
+        self._client = client
+        self._tenant_id = tenant_id
+        self._workspace_id = workspace_id
+        self._sdk = sdk or _load_aios_sdk()
+        validate_aios_sdk_contract(self._sdk)
+
+    def _translate(self, error: Exception) -> aios_status.AIOSStatusError:
+        request_id = getattr(error, "request_id", None)
+        code = str(getattr(error, "code", None) or type(error).__name__)
+        if isinstance(error, self._sdk.AuthenticationError):
+            return aios_status.AIOSStatusAuthenticationError(code, request_id=request_id)
+        if isinstance(error, self._sdk.AuthorizationError):
+            return aios_status.AIOSStatusAuthorizationError(code, request_id=request_id)
+        if isinstance(error, self._sdk.TimeoutError):
+            return aios_status.AIOSStatusTimeoutError(code, request_id=request_id)
+        if isinstance(error, self._sdk.ContractError):
+            return aios_status.AIOSStatusContractError(code, request_id=request_id)
+        return aios_status.AIOSStatusRemoteError(code, request_id=request_id)
+
+    @staticmethod
+    def _evidence(event: str, response: Any) -> aios_status.AIOSStatusEvidence:
+        request_id = getattr(response, "request_id", None)
+        if request_id is not None and not isinstance(request_id, str):
+            raise aios_status.AIOSStatusContractError("invalid_request_id")
+        return aios_status.AIOSStatusEvidence(event, request_id)
+
+    def get_core_status(self) -> aios_status.AIOSCoreStatus:
+        try:
+            return self._get_core_status()
+        except aios_status.AIOSStatusError:
+            raise
+        except (AttributeError, TypeError, ValueError):
+            raise aios_status.AIOSStatusContractError(
+                "invalid_status_contract"
+            ) from None
+
+    def _get_core_status(self) -> aios_status.AIOSCoreStatus:
+        try:
+            health = self._client.health.get()
+            readiness = self._client.readiness.get()
+            identity = self._client.identity.who_am_i()
+            timeline = self._client.workspaces.list_timeline(
+                self._workspace_id, limit=50
+            )
+        except self._sdk.AIOSSDKError as error:
+            raise self._translate(error) from None
+
+        health_data = health.data
+        readiness_data = readiness.data
+        identity_data = identity.data
+        if getattr(identity_data, "tenant_id", None) != self._tenant_id:
+            raise aios_status.AIOSStatusTenantError("tenant_mismatch")
+        health_value = getattr(health_data, "status", None)
+        readiness_value = getattr(readiness_data, "status", None)
+        health_version = getattr(health_data, "build_version", None)
+        readiness_version = getattr(readiness_data, "build_version", health_version)
+        capabilities = getattr(identity_data, "capabilities", None)
+        if (
+            not isinstance(health_value, str)
+            or readiness_value not in {"ready", "not_ready"}
+            or not isinstance(health_version, str)
+            or not health_version
+            or readiness_version != health_version
+            or not isinstance(capabilities, (tuple, list))
+            or any(not isinstance(value, str) or not value for value in capabilities)
+            or len(getattr(timeline, "items", ())) > 50
+        ):
+            raise aios_status.AIOSStatusContractError("invalid_status_contract")
+
+        events: list[aios_status.AIOSStatusTimelineEvent] = []
+        for item in timeline.items:
+            event_id = getattr(item, "id", None)
+            event_type = getattr(item, "event_type", None)
+            occurred_at = getattr(item, "occurred_at", None)
+            if (
+                not isinstance(event_id, str)
+                or not event_id
+                or not isinstance(event_type, str)
+                or not event_type
+                or not isinstance(occurred_at, datetime)
+                or occurred_at.tzinfo is None
+            ):
+                raise aios_status.AIOSStatusContractError("invalid_timeline_event")
+            # Deliberately copy only the allowlisted fields. Actor, subject and
+            # payload can contain principals, prompts and local paths.
+            events.append(
+                aios_status.AIOSStatusTimelineEvent(
+                    event_id=event_id,
+                    event_type=event_type,
+                    occurred_at=occurred_at,
+                )
+            )
+
+        return aios_status.AIOSCoreStatus(
+            readiness=(
+                aios_status.AIOSCoreReadiness.READY
+                if readiness_value == "ready" and health_value == "ok"
+                else aios_status.AIOSCoreReadiness.NOT_READY
+            ),
+            source="AIOS SDK",
+            version=health_version,
+            health=health_value,
+            tenant_id=self._tenant_id,
+            capabilities=tuple(capabilities),
+            evidence=(
+                self._evidence("health.get", health),
+                self._evidence("readiness.get", readiness),
+                self._evidence("identity.who_am_i", identity),
+                self._evidence("workspaces.list_timeline", timeline),
+            ),
+            timeline=tuple(events),
+            accepted_sha=None,
+            deployed_sha=None,
+        )
+
+    def close(self) -> None:
+        self._client.close()
+
+
+def build_aios_status_client(
+    *,
+    url: str,
+    token: str,
+    tenant_id: str,
+    workspace_id: str,
+    sdk: ModuleType | Any | None = None,
+    transport: Any | None = None,
+) -> AIOSSDKStatusClient:
+    sdk_module = sdk or _load_aios_sdk()
+    validate_aios_sdk_contract(sdk_module)
+    kwargs = {"transport": transport} if transport is not None else {}
+    client = sdk_module.AIOSClient(url, token=token, **kwargs)
+    return AIOSSDKStatusClient(
+        client,
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+        sdk=sdk_module,
+    )
 
 
 def task_idempotency_key(task: dict[str, Any]) -> str:

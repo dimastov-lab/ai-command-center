@@ -15,7 +15,11 @@ from pathlib import Path
 import pytest
 
 from command_center import activity_log, project_config, workspace_home
-from command_center.application.aios_status import AIOSCoreReadiness, AIOSCoreStatus
+from command_center.application.aios_status import (
+    AIOSCoreReadiness,
+    AIOSCoreStatus,
+    AIOSStatusEvidence,
+)
 from command_center.application.workspace_home_adapter import WorkspaceHomeAdapter
 from command_center.runtime.api import ExecutionCenterAPI
 
@@ -105,9 +109,9 @@ def test_adapter_exposes_aios_core_status_through_independent_public_port(tmp_pa
         def get_core_status(self):
             return AIOSCoreStatus(
                 readiness=AIOSCoreReadiness.READY,
-                source="AIOS API",
+                source="AIOS SDK",
                 version="0.3.0",
-                evidence=("build:abc123",),
+                evidence=(AIOSStatusEvidence("health.get", "req-1"),),
             )
 
     monkeypatch.setattr(
@@ -125,12 +129,15 @@ def test_adapter_exposes_aios_core_status_through_independent_public_port(tmp_pa
     assert "aios_core" not in snapshot
     assert status == {
         "readiness": "ready",
-        "source": "AIOS API",
+        "source": "AIOS SDK",
         "version": "0.3.0",
         "health": None,
+        "tenant_id": None,
         "capabilities": [],
-        "gates": [],
-        "evidence": ["build:abc123"],
+        "evidence": [{"event": "health.get", "request_id": "req-1"}],
+        "timeline": [],
+        "accepted_sha": None,
+        "deployed_sha": None,
         "detail": None,
     }
 
