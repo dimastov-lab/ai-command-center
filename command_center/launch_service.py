@@ -147,6 +147,15 @@ def prepare_task_launch(*, task: dict | None, project_config: dict | None) -> La
     expected_branch = launch.resolve_expected_branch(task=task, project_config=project_config)
     base_branch = launch.resolve_base_branch(task=task, project_config=project_config)
     source_repository_path = (project_config or {}).get("repository_path")
+    # When the task explicitly sets its own workspace (not falling back to the
+    # project-level repository_path), use the task's repository_path for the
+    # isolation check. This handles projects that span multiple repos: each task
+    # carries its own workspace+repo pair, and the project-level config (which
+    # can only name one repo) would otherwise produce a false isolation failure.
+    if selection.source == launch.WORKSPACE_SOURCE_TASK:
+        task_repo = (task or {}).get("repository_path") or None
+        if task_repo:
+            source_repository_path = task_repo
 
     validation = launch.validate_launch(workspace_path=selection.path, expected_branch=expected_branch)
     resolved_workspace = resolved_workspace_path(selection.path)

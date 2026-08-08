@@ -23,7 +23,12 @@ Current position:
   finalization so slow persistence cannot cause a false timeout or late signal.
 - Normal task-v2 launches require explicit confirmation before any provisioning, may create an
   isolated worktree offline, and fail closed unless source repository, expected branch, worktree
-  isolation and configured status policy verify before process launch.
+  isolation and configured status policy verify before process launch. On `origin/main` the
+  worktree-isolation check still takes its source repository from the *project* config, so a
+  project spanning more than one repository can still produce a false
+  `workspace_belongs_to_repository` failure. The fix that uses the task's own `repository_path`
+  when the workspace comes from the task (`launch_service.prepare_task_launch`, `744a09c`) exists
+  only on the unpushed local branch — see the divergence note under Current boundaries.
 - Application-owned execution-queue mutations hold a same-host cooperative OS advisory lock across
   the complete persisted read-modify-write cycle; raw queue primitives and lock-free reads remain.
 - `ExecutionCenterAPI.plan_schedule` provides deterministic, explainable, read-only scheduling
@@ -44,26 +49,71 @@ Current position:
   `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
-- Founder Functional Audit `9761459` is **closed** (2026-08-07). Of its 14 Still Open rows, 6 are
-  remediated and verified on `main` (report-path containment, per-warning launch acknowledgement,
-  task-delete confirmation, `claude` pre-flight, Workspace Home intelligence, git ahead/behind +
-  fetch), 1 is partial (Portfolio stale-claim recovery: service half only), 1 is folded into the
-  desktop D2 stage tasks, and 6 remain open as `AICC-AUDIT-W*` rows in
-  `docs/roadmap/MASTER_ROADMAP_TASKS.json`. See
-  `docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §Closure.
+- Founder Functional Audit `9761459` is **closed** (2026-08-07), merge-verified against
+  `origin/main` @ `fb3da7f`. Of its 14 Still Open rows, 7 are **merged** and each was re-read in
+  the code on `origin/main` (report-path containment, per-warning launch acknowledgement,
+  Portfolio protected-branch guard, task-delete confirmation, `claude` pre-flight, Workspace Home
+  intelligence, git ahead/behind + fetch); 1 is merged but still partial (Portfolio stale-claim
+  recovery: service half only, no production call site); 1 is folded into the desktop D2 stage
+  tasks; and 5 remain open. The seven merged rows are now `Done` in
+  `docs/roadmap/MASTER_ROADMAP_TASKS.json` — until this pass all 13 `AICC-AUDIT-W*` rows read
+  `Backlog` regardless of what had shipped. See
+  `docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_STATUS.md` §"Merge verification".
+- **The audit closure is enforced, not just written down.**
+  `tests/architecture/test_audit_closure_fitness.py` (parsers and git probes in
+  `tests/architecture/audit_closure.py`) parses the status document's merge-verification table and
+  checks it against `MASTER_ROADMAP_TASKS.json` and against the code on the pinned commit
+  `fb3da7f`: statuses must agree row for row, every `Done` row must cite one of the nine evidence
+  commits, each evidence commit must be an ancestor of the pinned commit, each merged row's symbol
+  must be readable there, the two probeable still-open rows must still be open, `W1-006` must keep
+  no production call site for `recover_stale_claim`, and `W3-002`'s `AICC-D2*` fold targets must
+  exist. The gate is mutation-tested — verified red under five mutations of the real artifacts and
+  green when restored. This closes the reporting gap that let a documentation task pass validation
+  as "1/1 commands passed" (the default `compileall`) while asserting anything at all about the
+  repository. `tests/architecture/` — **17 passed**.
+- Audit evidence set on `origin/main` @ `fb3da7f`: `tests/test_launch.py`,
+  `tests/test_git_info.py`, `tests/test_runtime_report_path_containment.py`,
+  `tests/test_report_path_containment.py`, `tests/test_workspace_home_ui.py`,
+  `tests/test_portfolio_launch.py` — **170 passed, 0 failed** (ambient `AICC_*` stripped,
+  `AICC_DATA_DIR`/`AICC_REPORTS_ROOT` redirected).
 
 Current boundaries:
-- Six audit remediations remain outstanding and are the known functional gaps: `scripts/start-task.sh`
-  accepts 3 of the 11 registered project ids; Portfolio has no protected-branch guard before
-  `git worktree add`; there is no canonical task schema and no dependency-cycle detection; run
-  results reach a task's Timeline only page-driven or under `AICC_BACKGROUND_SYNC`; and the
-  autopilot has no founder batch-confirmation surface before it launches.
+- Five audit remediations remain outstanding and are the known functional gaps: `scripts/start-task.sh`
+  accepts 3 of the 11 registered project ids; there is no canonical task schema; there is no
+  dependency-cycle detection on task writes (cycles surface only as a read-only `break_cycle`
+  recommendation in Portfolio Overview); run results reach a task's Timeline only page-driven or
+  under `AICC_BACKGROUND_SYNC`; and the autopilot has no founder batch-confirmation surface before
+  it launches.
+- Portfolio now refuses `main`/`master` (and their case variants) as a task branch before
+  `git worktree add` runs — `portfolio_launch.PROTECTED_BRANCH_NAMES`, checked on the
+  `launch_portfolio_task` → `build_launch_plan` → `resolve_branch` path, which returns the blocker
+  before `create_worktree` is called. Stale-claim recovery is still service-only:
+  `recover_stale_claim` exists but has no production call site, so an orphaned claim is still
+  cleared by deleting `data/portfolio_locks/<task_id>.lock` by hand.
 - `data/tasks.json` is out of sync with the roadmap for the audit-remediation track: it holds 7 of
-  13 `AICC-AUDIT-W*` rows and three of those contradict `main`. Reconciliation is tracked as
-  `AICC-GOV-F2`; a refreshed audit against current `main` is tracked as `AICC-GOV-F4B`.
-- **Known regression on `main`:** `app.py:3339` calls the removed
-  `execution_queue.reconcile_missing_run_links`, so rendering the Live Execution Center raises
-  `AttributeError`. Introduced by `81833da`; untracked as of this update.
+  13 `AICC-AUDIT-W*` rows, and only 2 of those 7 both are correct and read correctly. Three carry a
+  status contradicting `origin/main` (`W0-006` and `W1-004` sit in `Backlog` though shipped;
+  `W1-005` is still `In Progress` against a closed PR though the fix has shipped) and two more
+  (`W1-007`, `W2-004`) are `Done` and correct but read as failed in the UI. `launch_status` is
+  `"Requires Attention"` on 6 of the 7 and carries no signal on this track. The roadmap JSON side
+  of this gap is now closed (the seven merged rows are `Done`); the `data/tasks.json` side is not.
+  Reconciliation is tracked as `AICC-GOV-F2`; a refreshed audit against current `main` is tracked
+  as `AICC-GOV-F4B`.
+- **Local `main` has diverged from `origin/main`** (re-checked after `git fetch`, 2026-08-07):
+  local `main` holds 3 unpushed commits (`744a09c`, `c41e9bd`, `9553fd6`) and `origin/main`
+  `fb3da7f` holds 8 the local branch lacks; neither is an ancestor of the other. Nothing on the
+  audit-remediation track depends on this — every closure claim is verified against `fb3da7f`, not
+  against the local branch — but the divergence itself is unresolved and grows with each local
+  commit. Two consequences:
+  - The previously recorded "known regression" — `app.py:3339` calling the removed
+    `execution_queue.reconcile_missing_run_links` — is **fixed on `origin/main`** by `b2134c4`,
+    which restores the function (`execution_queue.py:907`). It still reproduces on the local
+    branch, which predates the fix, and clears when that branch is brought up to date. No task
+    needed.
+  - The local-only fix `744a09c` (task-level `repository_path` for workspace isolation) is **not
+    on `origin/main`**: `prepare_task_launch` there still takes `source_repository_path` from the
+    project config only. It needs to be pushed or re-landed before it can be described as
+    delivered.
 - Normal task launches require explicit user action. Scheduler `ASSIGN` results are point-in-time
   advice, not persisted claims; task-id/capacity decisions may race before the separate launch, and
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
