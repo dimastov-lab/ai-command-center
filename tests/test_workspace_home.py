@@ -37,6 +37,13 @@ def _api(tmp_path) -> ExecutionCenterAPI:
     return ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
 
 
+def test_duration_handles_mixed_legacy_and_aware_timestamps():
+    assert workspace_home._duration_seconds(
+        "2026-08-08T12:00:00",
+        "2026-08-08T12:01:00+00:00",
+    ) == 60.0
+
+
 # --------------------------------------------------------------------------
 # Empty-state / degrade-gracefully scenarios (§7.1/F3, §18)
 # --------------------------------------------------------------------------

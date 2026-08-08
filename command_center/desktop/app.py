@@ -56,7 +56,12 @@ def run(argv: list[str] | None = None) -> int:
     # (D2). Import here so importing this module constructs no ExecutionCenterAPI
     # or runtime database at import time (keeps the D1A smoke-test contract).
     from command_center.application.workspace_home_adapter import WorkspaceHomeAdapter
+    from command_center.application.operations_adapter import OperationsAdapter
 
-    shell.load_workspace_home(WorkspaceHomeAdapter())
+    home_adapter = WorkspaceHomeAdapter()
+    shell.load_workspace_home(
+        home_adapter,
+        OperationsAdapter(workspace_home_adapter=home_adapter),
+    )
     shell.show()
     return app.exec()

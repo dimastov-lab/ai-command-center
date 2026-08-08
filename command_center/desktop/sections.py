@@ -20,19 +20,17 @@ class Section:
     enabled: bool  # False → rendered disabled ("Available in a future release")
 
 
-# Order is binding (`INFORMATION_ARCHITECTURE.md` §1). Home / Projects / Settings
-# are the three sections active in Desktop Increment 1 (§2); the other six are
-# rendered visibly disabled rather than hidden, so the sidebar never reflows
-# between increments (§2.1).
+# Order remains binding. P2 activates the six operational sections on top of
+# the completed native foundation.
 SECTIONS: tuple[Section, ...] = (
     Section("home", SECTION_LABELS["home"], enabled=True),
     Section("projects", SECTION_LABELS["projects"], enabled=True),
-    Section("sessions", SECTION_LABELS["sessions"], enabled=False),
-    Section("execution", SECTION_LABELS["execution"], enabled=False),
-    Section("git", SECTION_LABELS["git"], enabled=False),
-    Section("artifacts", SECTION_LABELS["artifacts"], enabled=False),
-    Section("reports", SECTION_LABELS["reports"], enabled=False),
-    Section("agents", SECTION_LABELS["agents"], enabled=False),
+    Section("sessions", SECTION_LABELS["sessions"], enabled=True),
+    Section("execution", SECTION_LABELS["execution"], enabled=True),
+    Section("git", SECTION_LABELS["git"], enabled=True),
+    Section("artifacts", SECTION_LABELS["artifacts"], enabled=True),
+    Section("reports", SECTION_LABELS["reports"], enabled=True),
+    Section("agents", SECTION_LABELS["agents"], enabled=True),
     Section("settings", SECTION_LABELS["settings"], enabled=True),
 )
 
