@@ -152,10 +152,11 @@ def test_dependency_wave_parallel_launch_completion_merge_and_next_wave(
     assert [e["task_id"] for e in waiting] == ["c"]
 
     # --------------------------------------- 2. the agents finish their work
+    # The supervisor auto-commits any uncommitted changes via
+    # `_auto_commit_completed_work`, so the working trees are clean after each
+    # run finishes. No manual commit step is needed here.
     for run in api.list_runs():
         assert api.supervisor.wait_for_run(run["id"], timeout=60)["state"] == "COMPLETED"
-    _commit_agent_work(wt_a, "implement task a")
-    _commit_agent_work(wt_b, "implement task b")
 
     # ------------------------------- 3. completion -> PR -> merge -> verified
     second = task_pipeline.tick(tmp_path, api, configs, github=github, advance_wait_seconds=60)
@@ -225,7 +226,7 @@ def test_auto_merge_opt_in_off_stops_at_an_open_pull_request(tmp_path, api, fake
     assert first.launched(), [d.as_dict() for d in first.decisions]
     for run in api.list_runs():
         api.supervisor.wait_for_run(run["id"], timeout=60)
-    _commit_agent_work(worktree)
+    # The supervisor auto-commits via `_auto_commit_completed_work`; no manual commit.
 
     result = task_pipeline.tick(tmp_path, api, configs, github=github, advance_wait_seconds=60)
     row = runtime_db.get_completion_by_task(api.db_path, "a")

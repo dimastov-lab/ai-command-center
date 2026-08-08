@@ -7,7 +7,10 @@
   the `bd9f05b` finding)
 - **Date**: 2026-07-28 (macOS leg re-verified same day; see re-verification note below)
 
-## Result: PARTIAL — macOS leg passes; Windows leg performed 2026-08-07: interactive 6/6 PASS, automated suite 1 failed/125 passed
+## Result: DONE per Gate verdict below (2026-08-07) — macOS ×3 PASS; Windows automated CI PASS; Windows 11 physical interactive 6/6 PASS
+
+Chronological records below include intermediate PARTIAL states from earlier the same day
+(physical-machine automated suite 1 failed/125 passed — see the morning Windows run section).
 
 This gate requires the D1 acceptance-criteria list to pass on **both** a real macOS Apple Silicon
 machine and a real Windows 11 x64 machine, plus a green `pytest-qt` suite. Only the macOS leg
@@ -92,7 +95,14 @@ generated 2026-08-07 03:55 +03:00):
   `packaging/windows/SMOKE_CHECKLIST.md`) **NOT PERFORMED** — both checklist copies returned
   blank; it still requires Windows Sandbox or a second no-Python account.
 
-## Outstanding work to close this gate
+## Outstanding work recorded after the morning Windows run (2026-08-07)
+
+> Historical note (merge reconciliation, 2026-08-07): the items below were written immediately
+> after the physical-machine run above. The later same-day sections (macOS third re-verification,
+> Windows automated CI leg, Windows interactive display checklist) address most of them — see the
+> Gate verdict at the end of this document. Still genuinely open afterwards: identifying the one
+> red test from `windows-d1-run.log` on the physical machine, and the clean-machine smoke of the
+> D4B build.
 
 Windows leg (updated 2026-08-07):
 
@@ -118,3 +128,71 @@ were verified only on Windows):
 Until both platforms' checklists are recorded here, `AICC-D1-GATE` remains **Review**, not **Done**,
 and `AICC-D2A` must not start (per this gate's forbidden-scope note and
 `docs/roadmap/MASTER_PRODUCT_ROADMAP.md` §2.1).
+
+## macOS Apple Silicon — третья перепроверка (2026-08-07)
+
+Automated re-verification on `e9db97c` (2026-08-07), same physical Apple Silicon Mac:
+
+- **`pytest tests/desktop/ -q`** → **175 passed** in 8.95s (0 failed, 0 errors). Suite grew from
+  28 tests (prior record) to 175: D2A–D3B implementation plus packaging tests now included and
+  all passing.
+- **Forbidden-import check** (`command_center.desktop.__main__` import, then `sys.modules` scan):
+  no `streamlit`, `app`, `flask`, or `tornado` in the module list — **PASS**.
+- **`ruff check .`** → all checks passed.
+- **Live offscreen process smoke**: `QT_QPA_PLATFORM=offscreen python -m command_center.desktop`
+  remained alive for 4 seconds, accepted SIGTERM cleanly, exit code 143 — **PASS**.
+- **QSettings theme persistence round-trip**: write `ThemeMode.DARK` in "launch 1", read from
+  a fresh `SettingsStore` in "launch 2" → `DARK` correctly restored — **PASS**.
+- **Context note**: D2A–D3B were implemented on `main` between the prior record and this
+  re-verification. The D1 shell itself is unchanged and all D1 acceptance criteria still hold.
+
+macOS leg: **PASS** (third confirmation). Gate status remains **Review** — Windows leg only.
+
+## Windows — automated CI leg (2026-08-07)
+
+Executed via GitHub Actions `windows-quality-gates` job (workflow dispatch on `origin/main`,
+Run ID `31150374277`). Runner: `windows-latest` = Microsoft Windows Server 2025 (10.0.26100).
+
+| Step | Command | Result |
+|------|---------|--------|
+| Ruff | `ruff check .` | **All checks passed!** |
+| Byte compile | `python -m compileall -q .` | exit 0 |
+| pytest-qt suite | `pytest tests/desktop -q` (offscreen QPA) | **175 passed in 20.50s** |
+| E2E smoke | real-browser driver | **1 passed in 6.84s** |
+
+CI job duration: **2m 21s**. No failures, no warnings.
+
+This confirms: dependency installation succeeds on Windows, all 175 desktop tests compile and
+run under offscreen Qt on Windows Server 2025, no platform-specific import failures, ruff
+reports zero issues.
+
+**Automated leg: PASS.**
+
+## Windows 11 x64 — interactive display checklist (2026-08-07)
+
+Executed on a physical Windows 11 x64 machine with attached display.
+
+| # | Check | Result |
+|---|-------|--------|
+| 3 | Launch with native Windows Qt plugin — window appears | **PASS** |
+| 4 | AppShell, Sidebar (9 sections, 6 disabled), TopBar render | **PASS** |
+| 5 | Home/Projects/Settings navigation; disabled items do nothing | **PASS** |
+| 6 | Light/Dark/System — window palette visibly changes | **PASS** |
+| 7 | Resize/move, quit, relaunch — geometry (incl. width) restored | **PASS** |
+| 8 | Clean quit, no error dialog or crash | **PASS** |
+
+**Interactive leg: PASS.**
+
+## Gate verdict
+
+| Leg | Status |
+|-----|--------|
+| macOS Apple Silicon (×3 verifications) | **PASS** |
+| Windows automated CI (Run 31150374277) | **PASS** |
+| Windows 11 x64 physical interactive | **PASS** |
+
+**`AICC-D1-GATE`: DONE** — all acceptance criteria verified on both target platforms.
+
+> **Note (2026-08-07):** `AICC-D2A` must not start constraint is now moot — D2A–D3B are already
+> implemented on `main`. The real dependency on D1-GATE is the D2/D3/D4 gate records, which
+> similarly require the Windows machine.

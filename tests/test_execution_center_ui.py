@@ -335,7 +335,9 @@ def test_cancel_action_hidden_for_non_running_states(state):
 
 
 def test_cancel_action_visible_while_running(git_repo, configure_project_repo, fake_claude):
-    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    # 30s (not 5s): the run must still be RUNNING after launch + two AppTest
+    # re-renders, which can exceed 5s on slow CI runners; cancel ends it early.
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "30"
     configure_project_repo("AIOS", git_repo)
 
     at = _at_on_page("execution_center")
@@ -356,7 +358,8 @@ def test_cancel_action_visible_while_running(git_repo, configure_project_repo, f
 
 
 def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo, fake_claude):
-    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    # Same 30s rationale as test_cancel_action_visible_while_running.
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "30"
     configure_project_repo("AIOS", git_repo)
 
     at = _at_on_page("execution_center")

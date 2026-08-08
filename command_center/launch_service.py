@@ -33,6 +33,7 @@ from command_center import (
     agent_runner,
     git_info,
     launch,
+    model_selector,
     models,
     project_config,
     workspace_provisioning,
@@ -44,7 +45,13 @@ from command_center.runtime import context_service, db as runtime_db
 # Kanban launcher and the execution queue branch on, so neither reimplements
 # the "is this launchable / provisionable / fatal?" logic.
 LAUNCH_DECISION_READY = "ready"                      # workspace valid, launch now
-LAUNCH_DECISION_NEEDS_CONFIRMATION = "needs_confirmation"  # valid but has warnings
+# Valid but has confirmable warnings. Since the repository-state gate
+# (`launch.BLOCKING_REPOSITORY_STATE_CODES`) made a dirty tree and a detached
+# HEAD blocking errors, the only condition that reaches this decision is a
+# branch mismatch — a dirty workspace now lands in BLOCKED. Anything that used
+# this decision as a proxy for "the tree is dirty" must ask
+# `validation.has_issue(launch.ISSUE_DIRTY_TREE)` instead.
+LAUNCH_DECISION_NEEDS_CONFIRMATION = "needs_confirmation"
 LAUNCH_DECISION_PROVISIONABLE = "provisionable"      # workspace absent, can be created
 LAUNCH_DECISION_BLOCKED = "blocked"                  # fatal — never launch
 
@@ -313,6 +320,9 @@ def execute_agent_launch_v2(
     provision_workspace: bool = True,
     on_task_state_changed: Callable[[], None] | None = None,
     max_global_concurrency: int | None = None,
+    session_id: str | None = None,
+    is_resume: bool = False,
+    model: str | None = None,
 ) -> dict:
     """Async counterpart to `execute_agent_launch` above — same pre-launch
     bookkeeping (`push_prompt_history`, `launch.begin_launch`), but instead
@@ -397,6 +407,7 @@ def execute_agent_launch_v2(
             repository_path=source_repository_path,
             task_type=task_type,
             status_policy=status_policy,
+            enforce_worktree_isolation=not bool((task or {}).get("workspace_allow_primary")),
         )
         verification_evidence = workspace_provisioning.provision_and_verify(workspace_verification)
         workspace_verification = replace(
@@ -428,6 +439,25 @@ def execute_agent_launch_v2(
             launch.begin_launch(task, executor_id=executor_id, validation=validation)
         if on_task_state_changed is not None:
             on_task_state_changed()
+
+    # Auto-select model and executor when not explicitly set by the caller.
+    # Explicit model/executor from the task or caller always win.
+    if task is not None and executor_id == "claude_code" and model is None:
+        auto_model, auto_executor = model_selector.select_model(task)
+        model = auto_model
+        # Only adopt the auto-selected executor when it is authorized for this
+        # project. A task whose project has not granted e.g. "aider" stays on
+        # "claude_code" with the cheapest viable cloud model — rather than
+        # raising ProviderAuthorizationError inside start_run after the auth
+        # check that runs at line ~361 already passed for "claude_code".
+        if auto_executor != "claude_code":
+            try:
+                project_config.require_execution_provider_allowed(project, auto_executor)
+                executor_id = auto_executor
+            except project_config.ProviderAuthorizationError:
+                pass  # keep executor_id as "claude_code"; model is already set
+        else:
+            executor_id = auto_executor
 
     title = (task or {}).get("title") or ("Codex CLI run" if executor_id == "codex" else prompt[:120])
 
@@ -480,10 +510,17 @@ def execute_agent_launch_v2(
         # path, present or future, can spawn the process without passing this.
         workspace_verification=workspace_verification,
         executor_id=executor_id,
+        session_id=session_id,
+        is_resume=is_resume,
+        model=model,
     )
 
     if task is not None:
         task["current_run_id"] = run["id"]
+        # Once a resume has been dispatched, clear the hint — the new run_id
+        # is now the source of truth; stale session_id would confuse the next
+        # failure handler into resuming a session that has already been resumed.
+        task.pop("resume_session_id", None)
         if on_task_state_changed is not None:
             on_task_state_changed()
 

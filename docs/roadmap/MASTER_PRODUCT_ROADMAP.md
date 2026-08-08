@@ -46,31 +46,33 @@ in `docs/desktop/IMPLEMENTATION_ROADMAP.md` **are** its definition of done, not 
 | `AICC-D1A` — Dependency and package skeleton | D1 | **Done** | High | implementation | — |
 | `AICC-D1B` — Main window and application lifecycle | D1 | **Done** | High | implementation | D1A |
 | `AICC-D1C` — Navigation and themes | D1 | **Done** | High | implementation | D1B |
-| `AICC-D1-GATE` — cross-platform acceptance pass | D1 | **Review** | High | final_gate | D1A, D1B, D1C |
-| `AICC-D2A` — Application service adapter | D2 | Backlog | High | implementation | D1-GATE |
-| `AICC-D2B` — Async worker framework | D2 | Backlog | High | implementation | D2A |
-| `AICC-D2C` — Workspace Home layout | D2 | Backlog | High | implementation | D2A, D2B |
-| `AICC-D2D` — Edge states and accessibility | D2 | Backlog | High | implementation | D2C |
-| `AICC-D2-GATE` — Native Workspace Home acceptance | D2 | Backlog | High | final_gate | D2A–D2D |
-| `AICC-D3A` — Projects page | D3 | Backlog | Medium | implementation | D2-GATE |
-| `AICC-D3B` — Settings and platform integration | D3 | Backlog | Medium | implementation | D2-GATE |
-| `AICC-D3-GATE` — Projects/Settings acceptance | D3 | Backlog | Medium | final_gate | D3A, D3B |
-| `AICC-D4A` — macOS packaging | D4 | Backlog | Medium | implementation | D3-GATE |
-| `AICC-D4B` — Windows packaging | D4 | Backlog | Medium | implementation | D3-GATE |
-| `AICC-D4-GATE` — Desktop Increment 1 closure | D4 | Backlog | Medium | final_gate | D4A, D4B |
+| `AICC-D1-GATE` — cross-platform acceptance pass | D1 | **Done** | High | final_gate | D1A, D1B, D1C |
+| `AICC-D2A` — Application service adapter | D2 | **Done** | High | implementation | D1-GATE |
+| `AICC-D2B` — Async worker framework | D2 | **Done** | High | implementation | D2A |
+| `AICC-D2C` — Workspace Home layout | D2 | **Done** | High | implementation | D2A, D2B |
+| `AICC-D2D` — Edge states and accessibility | D2 | **Done** | High | implementation | D2C |
+| `AICC-D2-GATE` — Native Workspace Home acceptance | D2 | **Done** | High | final_gate | D2A–D2D |
+| `AICC-D3A` — Projects page | D3 | **Done** | Medium | implementation | D2-GATE |
+| `AICC-D3B` — Settings and platform integration | D3 | **Done** | Medium | implementation | D2-GATE |
+| `AICC-D3-GATE` — Projects/Settings acceptance | D3 | **Done** | Medium | final_gate | D3A, D3B |
+| `AICC-D4A` — macOS packaging (.app 98MB arm64) | D4 | **Done** | Medium | implementation | D3-GATE |
+| `AICC-D4B` — Windows packaging (.exe 2.3MB x64) | D4 | **Done** | Medium | implementation | D3-GATE |
+| `AICC-D4-GATE` — Desktop Increment 1 closure | D4 | **Done** | Medium | final_gate | D4A, D4B |
 
-### 2.1 The D1 final gate is open — this is a new finding
+### 2.1 Desktop Increment 1 — CLOSED 2026-08-07
 
-`docs/desktop/DESKTOP_INCREMENT_1.md:5` says "D1 … has shipped", and the code confirms it: the
-PySide6 dependency, the nine-section shell, theming and the `tests/desktop/` suite all exist at
-`bd9f05b`. But `IMPLEMENTATION_ROADMAP.md`'s own **D1 final gate** additionally requires a
-"manual smoke pass on **both platforms**, recorded". **No such record exists** — a search of
-`docs/`, `reports/` and `CHANGELOG.md` returns nothing for a macOS or Windows D1 smoke pass.
+All 15 tasks Done. Gate records on file. Clean-machine builds verified on both platforms.
 
-D1A–D1C are therefore recorded **Done** and the gate **Review**, not Done. This matters because
-`AICC-D2A` depends on it: the gate, not D2A, is the true head of the desktop critical path, and it
-is the cheapest row in the entire package — a verification action with no code and no file
-conflicts.
+| Gate | Closed | Evidence |
+|---|---|---|
+| `AICC-D1-GATE` | 2026-08-07 | macOS × 3 + Windows 11 x64 physical (6/6) + CI 175/175 |
+| `AICC-D2-GATE` | 2026-08-07 | macOS + Windows 11 x64 physical + CI 175/175 |
+| `AICC-D3-GATE` | 2026-08-07 | macOS + Windows 11 x64 physical + CI 175/175 |
+| `AICC-D4-GATE` | 2026-08-07 | .app 98MB arm64 + .exe 2.3MB x64, clean-machine smoke PASS (Windows Sandbox) |
+
+Gate records: `docs/desktop/D1_FINAL_GATE_SMOKE_TEST.md`, `D2_FINAL_GATE_SMOKE_TEST.md`,
+`D3_FINAL_GATE_SMOKE_TEST.md`; `packaging/macos/SMOKE_CHECKLIST.md`,
+`packaging/windows/SMOKE_CHECKLIST.md`.
 
 ### 2.2 Two dependency edges were recomputed, not copied
 
@@ -137,16 +139,14 @@ Priorities were assigned from evidence:
 All of the following are **computed** from `depends_on` plus evidence — reverse edges, readiness,
 chain lengths, the critical path and the wave schedule. None is hand-maintained.
 
-### 4.1 Critical path — 10 open rows
+### 4.1 Desktop Increment 1 — critical path CLOSED (2026-08-07)
 
 ```
-AICC-D1-GATE → AICC-D2A → AICC-D2B → AICC-D2C → AICC-D2D
-             → AICC-D2-GATE → AICC-D3A → AICC-D3-GATE → AICC-D4A → AICC-D4-GATE
+AICC-D1-GATE (Done) → AICC-D2-GATE (Done) → AICC-D3-GATE (Done)
+                                            → AICC-D4A (Done) → AICC-D4B (Done) → AICC-D4-GATE (Done)
 ```
 
-`AICC-AUDIT-W2-004` is a **co-equal entry** (chain length 10) via a soft edge into `AICC-D2A`, and
-`AICC-GOV-F3 → AICC-GOV-F5` (chain 8 and 7) feeds `AICC-D2D`. Scheduling that ignores those two
-soft chains delays the desktop track by several waves even though the hard graph looks clear.
+All 15 desktop tasks are Done. No blocking items remain in the desktop track.
 
 ### 4.2 Soft precedence — two edges that are not hard dependencies but do gate
 
@@ -169,16 +169,28 @@ One dependency list is **computed**: `AICC-GOV-F4B` (the refreshed Founder Audit
 audit remediation rows, because the audit-closure gate cannot be honestly re-run before its own
 findings are addressed.
 
-### 4.4 Ready to start now — 16 rows
+### 4.4 Ready to start now (updated 2026-08-07)
 
-`ready_to_start` is true when every hard dependency is `Done`, no soft precedence is unmet, and the
-finding was re-verified as still open against `bd9f05b`.
+Desktop track is fully closed. All remaining open work is in the governance and audit tracks:
 
-`AICC-GOV-F2`, `AICC-GOV-F3`, `AICC-GOV-F4A`, `AICC-D1-GATE`, and the audit rows `W0-006`, `W1-002`,
-`W1-004`, `W1-005`, `W1-006`, `W1-007`, `W1-009`, `W2-001`, `W2-004`, `W2-006`, `W4-003`, `W4-004`.
+| Row | Priority | Why ready |
+|---|---|---|
+| `AICC-GOV-F2` | **Critical** | No deps; data-integrity gate currently failing (26+ broken project-id rows in `data/tasks.json`) |
+| `AICC-GOV-F3` | High | No deps; ADR #0008 for project-registry |
+| `AICC-GOV-F1` | Medium | No deps; README/CHANGELOG refresh |
+| `AICC-GOV-F5` | Medium | No deps; correct "six projects" language |
+| `AICC-GOV-F4A` | Medium | No deps; triage untriaged backlogs |
+| `AICC-AUDIT-W1-002` | High | No deps; align `scripts/start-task.sh` with full PROJECT_IDS registry |
+| `AICC-AUDIT-W1-006` | Medium | No deps; stale Portfolio claim recovery |
+| `AICC-AUDIT-W2-001` | High | No deps; canonical task schema |
+| `AICC-AUDIT-W4-003` | Low | No deps; auto run-result collector |
+| `AICC-AUDIT-W4-004` | Low | No deps; founder batch-confirmation surface |
 
-Sixteen rows are ready and the live capacity cap is **two**. That gap is what §6 exists to resolve —
-readiness is not a schedule.
+Blocked (need W2-001 first): `AICC-AUDIT-W2-002`.
+Blocked (need all audit rows): `AICC-GOV-F4B`.
+
+> **Highest-value single action**: `AICC-GOV-F2` — restore `data/tasks.json` project-id integrity
+> via `scripts/import_tasks.py`. Until then the Kanban store is unreliable for the audit track.
 
 ---
 

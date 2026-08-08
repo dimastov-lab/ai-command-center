@@ -277,3 +277,77 @@ def test_stage_progress_table_matches_mission_spec():
         "Merged": 100,
     }
     assert models.EXECUTION_STAGES == list(models.STAGE_PROGRESS.keys())
+
+
+# --------------------------------------------------------------------------
+# Time formatting utilities
+# --------------------------------------------------------------------------
+
+
+def test_format_age_just_now():
+    """Timestamps within the last minute should show 'just now'."""
+    now_str = models.iso_now()
+    assert models.format_age(now_str) == "just now"
+
+
+def test_format_age_minutes():
+    """Timestamps from minutes ago should show 'N minutes ago'."""
+    from datetime import datetime, timedelta
+    past = (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")
+    assert models.format_age(past) == "5 minutes ago"
+
+    past_one = (datetime.now() - timedelta(minutes=1)).isoformat(timespec="seconds")
+    assert models.format_age(past_one) == "1 minute ago"
+
+
+def test_format_age_hours():
+    """Timestamps from hours ago should show 'N hours ago'."""
+    from datetime import datetime, timedelta
+    past = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds")
+    assert models.format_age(past) == "2 hours ago"
+
+    past_one = (datetime.now() - timedelta(hours=1)).isoformat(timespec="seconds")
+    assert models.format_age(past_one) == "1 hour ago"
+
+
+def test_format_age_days():
+    """Timestamps from days ago should show 'N days ago'."""
+    from datetime import datetime, timedelta
+    past = (datetime.now() - timedelta(days=3)).isoformat(timespec="seconds")
+    assert models.format_age(past) == "3 days ago"
+
+    past_one = (datetime.now() - timedelta(days=1)).isoformat(timespec="seconds")
+    assert models.format_age(past_one) == "1 day ago"
+
+
+def test_format_age_weeks():
+    """Timestamps from weeks ago should show 'N weeks ago'."""
+    from datetime import datetime, timedelta
+    past = (datetime.now() - timedelta(weeks=2)).isoformat(timespec="seconds")
+    assert models.format_age(past) == "2 weeks ago"
+
+    past_one = (datetime.now() - timedelta(weeks=1)).isoformat(timespec="seconds")
+    assert models.format_age(past_one) == "1 week ago"
+
+
+def test_format_age_handles_none_and_empty_strings():
+    """format_age should return empty string for None or empty input."""
+    assert models.format_age(None) == ""
+    assert models.format_age("") == ""
+    assert models.format_age("   ") == ""
+
+
+def test_format_age_handles_unparseable_strings():
+    """format_age should return empty string for invalid ISO strings."""
+    assert models.format_age("not a date") == ""
+    assert models.format_age("2026-13-45T99:99:99") == ""
+
+
+def test_format_age_handles_iso_with_z_timezone():
+    """format_age should handle ISO strings with Z timezone indicator."""
+    from datetime import datetime, timedelta, timezone
+    # Create a proper UTC timestamp
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+    result = models.format_age(past)
+    # Should parse successfully and show "1 hour ago" (or close to it)
+    assert "hour" in result or "ago" in result

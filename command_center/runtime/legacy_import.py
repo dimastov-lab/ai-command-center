@@ -11,11 +11,14 @@ running the import again only picks up runs that weren't there last time.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from command_center import agent_runner
 from command_center.models import iso_now
-from command_center.runtime import db
+from command_center.runtime import db, reports
+
+logger = logging.getLogger(__name__)
 
 # v1.2 `RUN_STATUSES` -> v2 run states. v1.2's runner was synchronous
 # (README/ARCHITECTURE §11.4), so a legacy row still sitting at "queued" or
@@ -150,7 +153,22 @@ def import_legacy_runs(db_path: Path, *, legacy_runs: list[dict] | None = None) 
 
         report_path = legacy.get("report_path")
         if report_path:
-            db.create_report(db_path, run["id"], report_path)
+            # `data/runs.jsonl` is a plain file on disk, so its `report_path`
+            # is untrusted input to this store: only accept a reference that
+            # stays inside this run's own `reports/<project>/`. A rejected
+            # row simply gets no report (the rest of the run still imports) —
+            # `task_sync` applies the same rule when publishing the path onto
+            # a task, so a legacy escape has no route to a reader either way.
+            if reports.resolve_report_path(report_path, project=project) is not None:
+                db.create_report(db_path, run["id"], report_path)
+            else:
+                logger.warning(
+                    "Skipping legacy report path %r for legacy run %s (project %r): "
+                    "outside reports/<project>/",
+                    report_path,
+                    legacy_id,
+                    project,
+                )
 
         created_run_ids.append(run["id"])
 

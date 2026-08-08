@@ -185,16 +185,18 @@ def validate_worktree(
     mutates the repository or the filesystem.
 
     Every failure mode is reported distinctly. `require_clean=True` (the
-    default for the roadmap launcher — an agent must start from a known-clean
-    tree so its own diff is unambiguous) makes a dirty tree a blocking error;
-    `require_clean=False` downgrades it to a confirmable warning, matching the
-    plain Kanban launcher's more permissive contract.
+    default, and what every production caller passes — the roadmap launcher
+    and `Supervisor._validate_dedicated_worktree`) makes a dirty tree a
+    blocking error, so an agent always starts from a known-clean tree and its
+    own diff is unambiguous. `require_clean=False` downgrades it to a
+    confirmable warning; it is a test-only relaxation and no longer mirrors
+    the plain Kanban launcher, which rejects a dirty tree too (see
+    `launch.BLOCKING_REPOSITORY_STATE_CODES`).
 
-    A branch mismatch, a detached HEAD when a branch was expected, an
-    unregistered worktree, inaccessible git metadata, a non-repository, and a
-    missing/absent workspace are all blocking errors — collectively the
-    "never launch against the wrong worktree / never silently fall back to the
-    main repository" guarantee."""
+    A branch mismatch, a detached HEAD, an unregistered worktree, inaccessible
+    git metadata, a non-repository, and a missing/absent workspace are all
+    blocking errors — collectively the "never launch against the wrong
+    worktree / never silently fall back to the main repository" guarantee."""
     result = WorktreeLaunchValidation(
         repository_root=str(repository_root) if repository_root is not None else None,
         worktree_path=str(worktree_path) if worktree_path is not None else None,
@@ -282,12 +284,24 @@ def validate_worktree(
     actual_branch = status.get("branch")
     result.actual_branch = actual_branch if isinstance(actual_branch, str) else None
     if actual_branch == DETACHED_HEAD:
-        result.warnings.append("Репозиторий в состоянии detached HEAD.")
-        result.checks.append(WorktreeCheck("branch", "Ветка соответствует ожидаемой", CHECK_WARNING, "detached HEAD"))
-        if expected_branch:
-            result.errors.append(
-                f"Ожидалась ветка «{expected_branch}», но HEAD в состоянии detached — запуск против неверного состояния."
-            )
+        # Blocking regardless of whether a branch was expected. A detached
+        # HEAD used to be a mere warning when `expected_branch` was None, so
+        # the exact same unusable state — commits landing on no branch, lost
+        # to the next checkout — passed or failed depending on whether the
+        # *caller* happened to know which branch it wanted. The hazard is in
+        # the repository, not in the caller's knowledge of it.
+        detail = (
+            f"Ожидалась ветка «{expected_branch}», но HEAD в состоянии detached"
+            if expected_branch
+            else "HEAD в состоянии detached"
+        )
+        result.errors.append(
+            f"{detail} — запуск отклонён: коммиты агента не попадут ни в одну ветку. "
+            "Переключитесь на ветку (git switch <branch>) и повторите запуск."
+        )
+        result.checks.append(
+            WorktreeCheck("branch", "Ветка соответствует ожидаемой", CHECK_FAILED, "detached HEAD")
+        )
     elif expected_branch and actual_branch and actual_branch != expected_branch:
         result.errors.append(
             f"Текущая ветка «{actual_branch}» не совпадает с ожидаемой «{expected_branch}» — "

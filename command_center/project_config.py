@@ -124,7 +124,7 @@ CONTEXT_FILES: dict[str, str] = {
 GLOBAL_CONTEXT_FILES: list[str] = ["CURRENT_STATE.md"]
 
 DEFAULT_ALLOWED_AGENTS: list[str] = ["claude_code"]
-EXECUTION_PROVIDER_IDS: frozenset[str] = frozenset({"claude_code", "codex", "ollama", "copilot_cli"})
+EXECUTION_PROVIDER_IDS: frozenset[str] = frozenset({"claude_code", "codex", "ollama", "copilot_cli", "aider"})
 
 
 class ProviderAuthorizationError(ValueError):

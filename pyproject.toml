@@ -41,6 +41,11 @@ exclude_lines = [
 [tool.uv.sources]
 aios = { path = "../aios" }
 
+[tool.pytest.ini_options]
+# 6 workers: 393s → ~92s (4×). --dist=loadscope keeps tests in the same
+# file on one worker so module-scoped fixtures (conftest isolation) stay valid.
+addopts = "-n 6 --dist=loadscope"
+
 [dependency-groups]
 dev = [
     "aios",

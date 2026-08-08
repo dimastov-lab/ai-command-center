@@ -53,6 +53,16 @@ def _safe_path_component(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def project_report_dir(project: str | None) -> Path:
+    """The single directory every report for `project` is allowed to live in.
+
+    `report_path_for` writes here, and `resolve_report_path(..., project=...)`
+    refuses anything that resolves elsewhere — so the two agree on the same
+    sanitized component for a project name like "../../etc".
+    """
+    return REPORTS_ROOT / _safe_path_component(project or "UNKNOWN", "UNKNOWN")
+
+
 def report_path_for(run: dict) -> Path:
     project = _safe_path_component(run.get("project") or "UNKNOWN", "UNKNOWN")
     started = run.get("started_at") or run.get("created_at") or iso_now()
@@ -79,7 +89,7 @@ def stored_report_path(path: Path) -> str:
     return str(Path("reports") / resolved.relative_to(root))
 
 
-def resolve_report_path(report_path: str | None) -> Path | None:
+def resolve_report_path(report_path: str | None, *, project: str | None = None) -> Path | None:
     """Resolve a persisted report reference without allowing root escape.
 
     Canonical ``reports/...`` references are resolved from the configured
@@ -87,6 +97,14 @@ def resolve_report_path(report_path: str | None) -> Path | None:
     Older root-relative references and absolute paths are accepted only when
     they resolve inside REPORTS_ROOT.  ``resolve()`` also closes symlink and
     traversal escapes.  Missing/invalid references return ``None``.
+
+    Pass ``project`` to tighten containment from REPORTS_ROOT to that
+    project's own ``reports/<project>/`` directory — the guarantee callers
+    that *know* which run a report belongs to should ask for, since it also
+    rejects a reference pointing at another project's reports.  Without it,
+    containment is the historical REPORTS_ROOT-wide check (kept for read
+    paths that only have the stored string, e.g. a run row whose project was
+    later renamed).
     """
     if not report_path or not isinstance(report_path, str):
         return None
@@ -99,6 +117,12 @@ def resolve_report_path(report_path: str | None) -> Path | None:
     else:
         # Legacy rows occasionally stored a path relative to REPORTS_ROOT.
         candidate = (REPORTS_ROOT / raw).resolve()
+
+    if project is not None:
+        # Strict containment: the project directory itself is not a report,
+        # so `candidate == root` is refused here (unlike the root-wide check).
+        root = project_report_dir(project).resolve()
+        return candidate if root in candidate.parents else None
 
     root = REPORTS_ROOT.resolve()
     if candidate != root and root not in candidate.parents:

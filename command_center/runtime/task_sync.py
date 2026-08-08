@@ -123,12 +123,15 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
     yet — see `sync_task_from_run`'s ordering)."""
     report_row = db.get_report(db_path, run["id"])
     if report_row:
-        task["report_path"] = report_row["path"]
+        candidate = report_row.get("path") or ""
+        if reports.resolve_report_path(candidate, project=run.get("project")) is not None:
+            task["report_path"] = candidate
 
     task["repository_path"] = run.get("repository_path")
     live_status = session_view.live_git_status(run.get("repository_path"))
     task["branch"] = (live_status or {}).get("branch") or run.get("expected_branch") or task.get("branch")
     task["last_run_at"] = run.get("completed_at")
+    task["last_provider_id"] = run.get("provider_id")
 
     events = db.list_run_events(db_path, run["id"], after_seq=0, limit=1_000_000)
     parsed = report_parser.parse_report(reports.result_text(events)) if events else report_parser.empty_parsed_result()
@@ -169,6 +172,32 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
     models.append_timeline_event(
         task, event_type, f"Синхронизировано из прогона `{run['id'][:8]}` (Live Execution Center v2)."
     )
+
+
+_STARTUP_DEATH_THRESHOLD_SECONDS = 60
+
+
+def _died_before_producing_output(run: dict) -> bool:
+    """True when an INTERRUPTED run with no first_output_at was genuinely
+    short enough to be a startup crash rather than a supervisor orphan.
+
+    A supervisor that exits before its agent produces any stdout leaves the
+    run in exactly the same observable state as a true startup crash: state
+    INTERRUPTED, first_output_at NULL. We distinguish them by wall-clock
+    duration: if started_at → completed_at span exceeds the threshold the
+    agent almost certainly ran (supervisor just couldn't record the output
+    timestamp), so we do NOT penalise the executor as a failed provider.
+    """
+    started = run.get("started_at")
+    completed = run.get("completed_at")
+    if not started or not completed:
+        return True
+    try:
+        from datetime import datetime
+        delta = datetime.fromisoformat(completed) - datetime.fromisoformat(started)
+        return delta.total_seconds() < _STARTUP_DEATH_THRESHOLD_SECONDS
+    except (ValueError, TypeError):
+        return True
 
 
 def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
@@ -243,48 +272,131 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     # agent in the chain (see `execution_queue.select_available_executor`). The
     # task only stays stranded when *every* allowed executor has failed (the
     # launch layer then reports `LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`).
+    #
+    # Special case: INTERRUPTED *after* the agent produced output (e.g. laptop
+    # battery died mid-run, OS killed the process). The agent may have made
+    # real progress; store `resume_session_id` so the next launch can pass
+    # `--resume` to continue the conversation rather than starting from scratch.
     if not already_finalized_for_this_run:
         reason = run.get("failure_reason")
         died_on_startup = (
-            run.get("state") == "INTERRUPTED" and not run.get("first_output_at")
+            run.get("state") == "INTERRUPTED"
+            and not run.get("first_output_at")
+            and _died_before_producing_output(run)
+        )
+        transient_interruption = (
+            run.get("state") == "INTERRUPTED"
+            and run.get("first_output_at")
+            and not _died_before_producing_output(run)
         )
         provider_unavailable = reason in providers.PROVIDER_UNAVAILABLE_REASONS
-        if died_on_startup or provider_unavailable:
-            failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
-            failed_list = list(task.get("failed_executors") or [])
-            if failed_executor not in failed_list:
-                failed_list.append(failed_executor)
-                task["failed_executors"] = failed_list
+
+        if transient_interruption:
+            # Laptop died / OS killed the process mid-run: the executor is fine,
+            # only the OS/power failed. Store the session_id so the next launch
+            # can use --resume to continue from where the agent left off.
+            session_id = run.get("session_id")
+            if session_id:
+                task["resume_session_id"] = session_id
                 mutated = True
-            # Flip any "stranded, won't auto-relaunch" status back to "Ready" so
-            # the next `launch_ready` picks up the next executor in the chain.
-            # `died_on_startup` (INTERRUPTED, no output) resolves to "Requires
-            # Attention"; a classified provider failure (state=FAILED) resolves to
-            # "Failed" — both are stranded statuses, so both are re-queued. A
-            # non-provider failure (`incomplete:working_tree_unchanged`,
-            # `blocked:permission_denied:*`) never reaches here, so its
-            # "Incomplete"/"Blocked" status is preserved.
             if target_launch_status in _STRANDED_LAUNCH_STATUSES:
                 target_launch_status = "Ready"
-                detail = (
-                    f"Исполнитель «{failed_executor}» недоступен ({reason or 'нет вывода'})."
-                    if provider_unavailable
-                    else f"Исполнитель «{failed_executor}» не запустился (нет вывода)."
-                )
                 models.append_timeline_event(
                     task,
-                    "executor_failed",
-                    detail
-                    + " Задача возвращена в очередь для повтора другим агентом.",
+                    "executor_retry",
+                    "Прогон прерван (питание потеряно / процесс завершён ОС). "
+                    "Возобновление сессии при следующем запуске.",
                 )
                 mutated = True
+
+        elif died_on_startup or provider_unavailable:
+            failed_executor = run.get("provider_id") or task.get("executor") or "claude_code"
+
+            # For transient API errors, retry the *same* executor up to 3 times
+            # before declaring it failed and moving on. A 5xx outage usually
+            # resolves in seconds; switching executor after the first glitch would
+            # waste the user's budget on a more expensive fallback unnecessarily.
+            if reason == "provider_api_error" and not died_on_startup:
+                retry_count = int(task.get("provider_error_retry_count") or 0) + 1
+                if retry_count < 3:
+                    task["provider_error_retry_count"] = retry_count
+                    if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                        target_launch_status = "Ready"
+                        models.append_timeline_event(
+                            task,
+                            "executor_retry",
+                            f"API-ошибка от «{failed_executor}» (попытка {retry_count}/3). "
+                            "Повтор того же исполнителя.",
+                        )
+                    mutated = True
+                else:
+                    # Exhausted retries — fall through to the normal failover path.
+                    task.pop("provider_error_retry_count", None)
+                    failed_list = list(task.get("failed_executors") or [])
+                    if failed_executor not in failed_list:
+                        failed_list.append(failed_executor)
+                        task["failed_executors"] = failed_list
+                    if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                        target_launch_status = "Ready"
+                        models.append_timeline_event(
+                            task,
+                            "executor_failed",
+                            f"Исполнитель «{failed_executor}» недоступен после 3 попыток ({reason}). "
+                            "Задача возвращена в очередь для повтора другим агентом.",
+                        )
+                    mutated = True
+            else:
+                failed_list = list(task.get("failed_executors") or [])
+                if failed_executor not in failed_list:
+                    failed_list.append(failed_executor)
+                    task["failed_executors"] = failed_list
+                    mutated = True
+                # Flip any "stranded, won't auto-relaunch" status back to "Ready" so
+                # the next `launch_ready` picks up the next executor in the chain.
+                # `died_on_startup` (INTERRUPTED, no output) resolves to "Requires
+                # Attention"; a classified provider failure (state=FAILED) resolves to
+                # "Failed" — both are stranded statuses, so both are re-queued. A
+                # non-provider failure (`incomplete:working_tree_unchanged`,
+                # `blocked:permission_denied:*`) never reaches here, so its
+                # "Incomplete"/"Blocked" status is preserved.
+                if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                    target_launch_status = "Ready"
+                    detail = (
+                        f"Исполнитель «{failed_executor}» недоступен ({reason or 'нет вывода'})."
+                        if provider_unavailable
+                        else f"Исполнитель «{failed_executor}» не запустился (нет вывода)."
+                    )
+                    models.append_timeline_event(
+                        task,
+                        "executor_failed",
+                        detail
+                        + " Задача возвращена в очередь для повтора другим агентом.",
+                    )
+                    mutated = True
 
     # On a clean completion, clear any accumulated executor failures — the
     # chain is healthy again and a future re-launch should try the configured
     # executor from scratch.
-    if status == session_view.STATUS_COMPLETED and task.get("failed_executors"):
-        task.pop("failed_executors", None)
-        mutated = True
+    if status == session_view.STATUS_COMPLETED:
+        if task.get("failed_executors"):
+            task.pop("failed_executors", None)
+            mutated = True
+        if task.get("provider_error_retry_count"):
+            task.pop("provider_error_retry_count", None)
+            mutated = True
+
+    # When a run is cancelled (user-initiated stop), move the task to the
+    # "Closed" kanban lane to signal this is a resolved-but-not-completed
+    # outcome, distinct from "Failed" (which requires attention/recovery).
+    if status == session_view.STATUS_CANCELLED:
+        if task.get("status") != "Closed":
+            task["status"] = "Closed"
+            models.append_timeline_event(
+                task,
+                "cancelled",
+                f"Прогон `{run['id'][:8]}` отменён оператором.",
+            )
+            mutated = True
 
     if task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
@@ -385,6 +497,16 @@ def sync_task_from_completion(task: dict, completion: dict) -> bool:
             mutated = True
 
     target = _LAUNCH_STATUS_BY_COMPLETION_STATE.get(state)
+    # REQUIRES_ATTENTION with NO_PR_NOT_IN_TARGET means the agent finished
+    # successfully but couldn't open a PR (it ran on the base branch directly).
+    # This is not an error — it's a task waiting for a PR to be created.
+    # Map to "Awaiting PR" instead of "Requires Attention" so the board clearly
+    # distinguishes "needs human intervention to fix" from "ready to ship via PR".
+    if (
+        state == completion_states.CompletionState.REQUIRES_ATTENTION
+        and completion.get("last_reason_code") == "NO_PR_NOT_IN_TARGET"
+    ):
+        target = "Awaiting PR"
     if target and task.get("launch_status") != target:
         task["launch_status"] = target
         mutated = True

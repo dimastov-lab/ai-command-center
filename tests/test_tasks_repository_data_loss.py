@@ -39,14 +39,43 @@ def test_mutate_tasks_raises_and_preserves_a_corrupt_file(isolated_data_dir):
     assert tr.tasks_file_path(root).read_text(encoding="utf-8") == corrupt
 
 
-def test_load_tasks_is_lenient_by_default_strict_raises(isolated_data_dir):
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json at all",
+        '{"tasks": []}',  # valid JSON, but not the list this store holds
+        '[{"id": "a"}, ',  # torn write
+    ],
+)
+def test_load_tasks_raises_on_a_corrupt_file_never_returns_empty(isolated_data_dir, content):
+    """An unreadable store must surface as an error on EVERY path, including the
+    read-only one. Returning `[]` renders an empty board that is indistinguishable
+    from "you have no tasks"."""
     root = isolated_data_dir
     _seed(root, "Alpha")
-    tr.tasks_file_path(root).write_text("not json at all", encoding="utf-8")
+    tr.tasks_file_path(root).write_text(content, encoding="utf-8")
 
-    assert tr.load_tasks(root) == []  # read-only default stays lenient
-    with pytest.raises((json.JSONDecodeError, ValueError)):
-        tr.load_tasks(root, strict=True)
+    # Raise-not-`[]` is asserted against broad built-in types, so this fails as
+    # "DID NOT RAISE" on the old lenient behavior rather than on a missing symbol.
+    with pytest.raises((json.JSONDecodeError, ValueError, OSError)) as excinfo:
+        tr.load_tasks(root)
+    # The error carries what an operator needs to act: which file, and why.
+    assert isinstance(excinfo.value, tr.TasksStoreUnreadable)
+    assert excinfo.value.path == tr.tasks_file_path(root)
+    assert str(tr.tasks_file_path(root)) in str(excinfo.value)
+
+
+def test_load_tasks_raises_when_the_file_cannot_be_read(isolated_data_dir):
+    root = isolated_data_dir
+    _seed(root, "Alpha")
+    tasks_file = tr.tasks_file_path(root)
+    tasks_file.chmod(0o000)
+    try:
+        with pytest.raises((json.JSONDecodeError, ValueError, OSError)) as excinfo:
+            tr.load_tasks(root)
+        assert isinstance(excinfo.value, tr.TasksStoreUnreadable)
+    finally:
+        tasks_file.chmod(0o644)
 
 
 def test_mutate_tasks_happy_path_preserves_every_task(isolated_data_dir):

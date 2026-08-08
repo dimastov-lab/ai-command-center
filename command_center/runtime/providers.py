@@ -27,6 +27,7 @@ CLAUDE_ID = "claude_code"
 CODEX_ID = "codex"
 OLLAMA_ID = "ollama"
 COPILOT_ID = "copilot_cli"
+AIDER_ID = "aider"
 
 # Failure reasons that mean the *executor itself* is unavailable — the provider
 # cannot run this task at all right now, as opposed to the task being too hard
@@ -823,7 +824,11 @@ class CodexProvider:
             str(repository_path),
         ]
         if model:
-            argv.extend(["--model", model])
+            # "ollama/<name>" → codex exec --oss --local-provider ollama --model <name>
+            if model.startswith("ollama/"):
+                argv.extend(["--oss", "--local-provider", "ollama", "--model", model[len("ollama/"):]])
+            else:
+                argv.extend(["--model", model])
         argv.append("-")
         audit = {
             "provider_id": self.id,
@@ -1331,11 +1336,178 @@ class CopilotProvider:
         return "provider_exit_nonzero" if exit_code else None
 
 
+class AiderRuntime:
+    """Text-based runtime for Aider — parses its plain-text output.
+
+    Aider emits coloured prose; we strip ANSI and convert to assistant events.
+    Completion is detected by the "Tokens used:" summary line that Aider always
+    prints on success. Exit-code 0 with no summary still counts as success
+    (requires_valid_result = False) so the Supervisor treats non-zero exit as
+    failure and zero exit as completion regardless.
+    """
+
+    requires_valid_result = False
+    requires_verified_identity = True
+
+    # Matches the "Tokens:" / "Tokens used:" footer Aider prints on finish.
+    _DONE_RE = re.compile(r"Tokens(?: used)?:", re.IGNORECASE)
+    # Strip ANSI escape codes.
+    _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mABCDEFGHJKSTfnsulh]")
+
+    def __init__(self, prompt: str, sensitive_values: tuple[str, ...] = ()) -> None:
+        self._boundary = SanitizationBoundary(prompt, sensitive_values)
+        self._done = False
+
+    def _clean(self, text: str) -> str:
+        return self._ANSI_RE.sub("", text).rstrip()
+
+    def feed_stdout(self, chunk: str) -> list[str]:
+        return self._boundary.feed_stdout(chunk)
+
+    def feed_stderr(self, chunk: str) -> list[str]:
+        return self._boundary.feed_stderr(chunk)
+
+    def flush_stdout(self) -> list[str]:
+        return self._boundary.flush_stdout()
+
+    def flush_stderr(self) -> list[str]:
+        return self._boundary.flush_stderr()
+
+    def parse_stdout_line(self, line: str) -> dict | None:
+        text = self._clean(line)
+        if not text:
+            return None
+        if self._DONE_RE.search(text):
+            self._done = True
+            return {"event_type": "result", "payload": {"type": "text", "text": text}}
+        return {"event_type": "assistant", "payload": {"text": text}}
+
+    @staticmethod
+    def stdout_event_is_readiness(line: str, event: dict | None) -> bool:
+        return bool(line.strip())
+
+    @staticmethod
+    def stderr_line_is_readiness(line: str) -> bool:
+        return bool(line.strip())
+
+    def event_is_valid_result(self, event: dict) -> bool:
+        return event.get("event_type") == "result"
+
+    @staticmethod
+    def event_is_provider_error(event: dict) -> bool:
+        return False
+
+
+class AiderProvider:
+    """Aider CLI as an execution provider — uses local Ollama models by default.
+
+    Aider supports a broad set of models via its ``--model`` flag, including
+    Ollama (``ollama/<name>``) and any OpenAI-compatible backend. It actually
+    edits source files and makes git commits, making it a true local alternative
+    to Claude Code for coding tasks.
+
+    The provider runs Aider non-interactively via ``--message`` (the assembled
+    task prompt) and ``--yes-always`` (no confirmation prompts). Auto-commits
+    are disabled so AICC controls the commit lifecycle.
+    """
+
+    id = AIDER_ID
+    label = "Aider (local)"
+    supports_resume = False
+    requires_dedicated_worktree = False
+
+    # Default model when none specified — good balance of speed and quality.
+    DEFAULT_MODEL = "ollama/qwen2.5-coder:7b-instruct-q4_K_M"
+
+    @staticmethod
+    def validate_prompt(prompt: str) -> None:
+        return None
+
+    def availability(self) -> "ProviderAvailability":
+        exe = shutil.which("aider")
+        if not exe:
+            return ProviderAvailability(
+                self.id, False, "not_found",
+                "Aider not found; install with: brew install aider",
+            )
+        try:
+            result = subprocess.run(
+                [exe, "--version"], capture_output=True, text=True, timeout=5,
+                cwd=os.path.expanduser("~"),
+            )
+            version = (result.stdout.strip() or result.stderr.strip()).split("\n")[0]
+        except Exception:
+            version = "unknown"
+        return ProviderAvailability(self.id, True, "usable", "Aider CLI is available.", exe, version)
+
+    def _resolve_model(self, model: str | None) -> str:
+        return model or os.environ.get("AICC_AIDER_MODEL") or self.DEFAULT_MODEL
+
+    def build_launch(
+        self,
+        *,
+        repository_path: Path,
+        session_id: str,
+        prompt: str,
+        task_type: str,
+        is_resume: bool,
+        model: str | None,
+        untrusted: bool = False,
+        operator_elevated: bool = False,
+        capability_override: str | None = None,
+    ) -> "LaunchSpec":
+        availability = self.availability()
+        if not availability.available or not availability.executable:
+            raise RuntimeError(availability.message)
+
+        resolved_model = self._resolve_model(model)
+        argv = [
+            availability.executable,
+            "--model", resolved_model,
+            "--message", prompt,
+            "--yes-always",
+            "--no-auto-commits",
+            "--no-check-update",
+            "--no-gitignore",
+            "--no-git-commit-verify",
+        ]
+        environment = dict(os.environ)
+        # Suppress colour output so the runtime parser sees plain text.
+        environment["NO_COLOR"] = "1"
+        environment["AIDER_NO_COLOR"] = "1"
+
+        audit = {
+            "provider_id": self.id,
+            "provider_version": availability.version,
+            "model": resolved_model,
+            "non_interactive": True,
+            "result_evidence": "aider_tokens_used_line",
+            "cancellation": "process_group_sigterm_then_sigkill",
+            **_prompt_audit(prompt, "argv_message"),
+        }
+        return LaunchSpec(tuple(argv), environment, None, audit)
+
+    def create_runtime(self, *, prompt: str, environment: dict[str, str]) -> AiderRuntime:
+        return AiderRuntime(prompt, _sensitive_environment_values(environment))
+
+    def parse_stdout_line(self, line: str) -> dict | None:
+        return AiderRuntime("").parse_stdout_line(line)
+
+    @staticmethod
+    def sanitize_stderr(line: str) -> str:
+        return line
+
+    @staticmethod
+    def classify_failure(*, exit_code: int, diagnostic_lines: list[str]) -> str | None:
+        return "provider_exit_nonzero" if exit_code else None
+
+
 _PROVIDERS: dict[str, ExecutionProvider] = {
     CLAUDE_ID: ClaudeProvider(),
     CODEX_ID: CodexProvider(),
     OLLAMA_ID: OllamaProvider(),
     COPILOT_ID: CopilotProvider(),
+    AIDER_ID: AiderProvider(),
 }
 
 

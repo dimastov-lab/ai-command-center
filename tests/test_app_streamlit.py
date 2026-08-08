@@ -209,6 +209,28 @@ def test_kanban_launcher_present_but_never_calls_subprocess_on_render(monkeypatc
     assert any(b.label == "Запустить агента" for b in at.button)
 
 
+def test_corrupt_tasks_file_surfaces_an_error_instead_of_an_empty_board():
+    """A `tasks.json` that exists but cannot be decoded must stop the render with
+    a visible error naming the file. Falling back to `[]` would paint an empty
+    Kanban board that reads exactly like "you have no tasks", so the operator
+    plans and launches against a store they believe is empty."""
+    _seed_task()
+    tasks_path = Path(os.environ["AICC_DATA_DIR"]) / "tasks.json"
+    corrupt = '[{"id": "seeded-task-1", '
+    tasks_path.write_text(corrupt, encoding="utf-8")
+
+    at = _at_on_page("kanban")
+
+    assert not at.exception  # handled deliberately, not an unhandled traceback
+    error_text = " ".join(element.value for element in at.error)
+    assert "tasks.json" in error_text
+    assert str(tasks_path) in error_text
+    # The board itself never renders, so there is no empty-state to misread.
+    assert not any("Запустить агента" == b.label for b in at.button)
+    # And nothing was written over the corrupt file by merely rendering.
+    assert tasks_path.read_text(encoding="utf-8") == corrupt
+
+
 def test_kanban_task_delete_requires_explicit_confirmation():
     task = _seed_task()
     tasks_path = Path(os.environ["AICC_DATA_DIR"]) / "tasks.json"
@@ -929,23 +951,22 @@ def _refuse_claude(monkeypatch, reason: str) -> None:
     monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda _binary=None: (True, ""))
 
 
-def test_launcher_requires_a_separate_ack_for_dirty_tree_and_branch_mismatch(monkeypatch, tmp_path):
-    """The audit's MAJOR-4 regression: both conditions used to be cleared by
-    a single shared "подтверждаю несмотря на предупреждения" checkbox, so an
-    operator who had only registered the dirty tree also silently accepted
-    running on the wrong branch. Each warning must now carry its own
-    acknowledgement, and the launch must stay blocked — server-side, not just
-    via the button's `disabled` attribute — while any one of them is
-    unticked."""
-    _refuse_claude(monkeypatch, "claude must not launch while a warning is unacknowledged")
+def test_dirty_tree_blocks_launch_branch_mismatch_still_shows_its_own_ack(monkeypatch, tmp_path):
+    """A dirty working tree is a blocking *error*, not an acknowledgeable warning.
+    There is no checkbox for it — the launch button is disabled by the blocking
+    error itself, not by an unacknowledged warning. The branch mismatch is an
+    independent *warning* that still renders its own checkbox, but ticking it
+    (together with the main confirmation) is not enough to unblock the launch
+    while the dirty tree remains."""
+    _refuse_claude(monkeypatch, "claude must not launch while a blocking error is present")
 
     repo = tmp_path / "aios"
     repo.mkdir()
     _init_repo(repo)  # on `main`
-    (repo / "uncommitted.txt").write_text("work in progress")  # dirty tree
+    (repo / "uncommitted.txt").write_text("work in progress")  # dirty tree — blocking error
 
     project_config.save_repository_path("AIOS", str(repo))
-    _seed_task(workspace_path=str(repo), branch="feature/expected")  # branch mismatch
+    _seed_task(workspace_path=str(repo), branch="feature/expected")  # branch mismatch — warning
 
     at = _at_on_page("kanban")
     assert not at.exception
@@ -955,17 +976,19 @@ def test_launcher_requires_a_separate_ack_for_dirty_tree_and_branch_mismatch(mon
     dirty_key = "kanban_seeded-task-1_launch_ack_dirty_tree"
     branch_key = "kanban_seeded-task-1_launch_ack_branch_mismatch"
     checkbox_keys = {c.key for c in at.checkbox}
-    assert dirty_key in checkbox_keys and branch_key in checkbox_keys, (
-        "dirty tree and branch mismatch must each render their own acknowledgement checkbox"
+    # Dirty tree is a blocking error — no acknowledgement checkbox for it
+    assert dirty_key not in checkbox_keys, (
+        "dirty tree must not have an ack checkbox — it is a blocking error, not a warning"
     )
-    assert "kanban_seeded-task-1_launch_warnings_ack" not in checkbox_keys, (
-        "the single shared 'launch anyway' checkbox must be gone"
+    # Branch mismatch is still a warning with its own ack checkbox
+    assert branch_key in checkbox_keys, (
+        "branch mismatch must still show its own acknowledgement checkbox"
     )
 
-    # Confirming the launch itself plus *only* the dirty tree leaves the
-    # branch mismatch unacknowledged — the launch stays blocked.
+    # Even with the main confirmation ticked and branch mismatch acknowledged,
+    # the dirty tree blocking error keeps the launch button disabled.
     at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
-    at = at.checkbox(key=dirty_key).check().run()
+    at = at.checkbox(key=branch_key).check().run()
     assert not at.exception
 
     launch_button = at.button(key="kanban_seeded-task-1_launch_launch_btn")
@@ -976,23 +999,6 @@ def test_launcher_requires_a_separate_ack_for_dirty_tree_and_branch_mismatch(mon
     assert not at.exception
     db_path = runtime_db.resolve_db_path()
     assert runtime_db.list_runs(db_path, task_id="seeded-task-1") == []
-    # st.error() inside @st.dialog is not captured by at.error in AppTest;
-    # the key invariant is that no run was started, which is asserted above.
-
-    # Symmetrically: acknowledging only the branch mismatch must not stand in
-    # for the dirty tree either.
-    at = at.checkbox(key=dirty_key).uncheck().run()
-    at = at.checkbox(key=branch_key).check().run()
-    assert not at.exception
-    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
-    at = at.button(key="kanban_seeded-task-1_launch_launch_btn").click().run()
-    assert not at.exception
-    assert runtime_db.list_runs(db_path, task_id="seeded-task-1") == []
-
-    # Only with both ticked does the launch control become actionable.
-    at = at.checkbox(key=dirty_key).check().run()
-    assert not at.exception
-    assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
 
 
 def test_launcher_ack_checkboxes_are_scoped_to_the_conditions_actually_present(monkeypatch, tmp_path):
@@ -1038,8 +1044,7 @@ def test_launcher_forgets_previous_acknowledgements_when_reopened(monkeypatch, t
 
     repo = tmp_path / "aios"
     repo.mkdir()
-    _init_repo(repo)
-    (repo / "uncommitted.txt").write_text("work in progress")
+    _init_repo(repo)  # on `main`, clean — only branch mismatch warning
 
     project_config.save_repository_path("AIOS", str(repo))
     _seed_task(workspace_path=str(repo), branch="feature/expected")
@@ -1047,7 +1052,6 @@ def test_launcher_forgets_previous_acknowledgements_when_reopened(monkeypatch, t
     at = _at_on_page("kanban")
     at = at.button(key="kanban_seeded-task-1_launch_open_btn").click().run()
     at = at.checkbox(key="kanban_seeded-task-1_launch_confirmed").check().run()
-    at = at.checkbox(key="kanban_seeded-task-1_launch_ack_dirty_tree").check().run()
     at = at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").check().run()
     assert not at.exception
     assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is False
@@ -1056,7 +1060,6 @@ def test_launcher_forgets_previous_acknowledgements_when_reopened(monkeypatch, t
     assert not at.exception
 
     assert at.checkbox(key="kanban_seeded-task-1_launch_confirmed").value is False
-    assert at.checkbox(key="kanban_seeded-task-1_launch_ack_dirty_tree").value is False
     assert at.checkbox(key="kanban_seeded-task-1_launch_ack_branch_mismatch").value is False
     assert at.button(key="kanban_seeded-task-1_launch_launch_btn").disabled is True
 
@@ -1712,8 +1715,8 @@ def test_recommendations_panel_launch_blocked_by_dirty_tree_shows_reason(fake_cl
     # the reader by default.
     details = next(e for e in at.expander if "Детали проверки" in e.label)
     report = json.loads(details.json[0].value)
-    assert report["errors"] == []
-    assert any("Рабочее дерево не чистое" in w for w in report["warnings"])
+    assert any("Рабочее дерево не чистое" in e for e in report["errors"])
+    assert report["warnings"] == []
     assert report["git_status"]["dirty"] is True
 
 
@@ -1749,7 +1752,7 @@ def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_
 
     details = next(e for e in at.expander if "seeded-task-1" in e.label)
     report = json.loads(details.json[0].value)
-    assert any("Рабочее дерево не чистое" in w for w in report["warnings"])
+    assert any("Рабочее дерево не чистое" in e for e in report["errors"])
     assert report["workspace_path"] == str(repo)
 
     entries_after = execution_queue.load_queue(data_dir)

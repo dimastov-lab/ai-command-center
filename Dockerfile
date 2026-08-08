@@ -10,7 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Зависимости устанавливаем отдельным слоем — кешируется при изменении кода
+# (vendor/ содержит вендорное колесо aios_sdk, на которое ссылается requirements.txt)
 COPY requirements.txt ./
+COPY vendor/ ./vendor/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Исходный код приложения

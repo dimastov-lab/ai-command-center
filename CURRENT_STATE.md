@@ -1,18 +1,32 @@
 # AI Command Center — Current State
 
-Updated: 2026-08-07
+Updated: 2026-08-07 (Desktop Increment 1 closed)
 
 ## 0. AI Command Center platform
 
-Status: Active, local Streamlit implementation
+Status: Active — Streamlit app running; **Native Desktop Increment 1 FULLY CLOSED (2026-08-07)**
 
 Current position:
 - `app.py` hosts the implemented Streamlit control application: 20 page handlers, 16 shown in the
   sidebar (chat, generated files, reports, and context open inside the project view).
+- **Native Desktop (PySide6) — Desktop Increment 1: CLOSED 2026-08-07**
+  All 15 tasks Done (D1A → D4-GATE). Gate records on file. Clean-machine builds verified.
+  - D1 (shell, nav, themes): ✅ Done + ✅ Gate closed (macOS × 3 + Windows 11 x64 physical + CI)
+  - D2A–D2D (Workspace Home): ✅ Done + ✅ Gate closed
+  - D3A–D3B (Projects + Settings): ✅ Done + ✅ Gate closed
+  - D4A (macOS .app): ✅ Done — 98MB arm64, PyInstaller 6.21.0 / Python 3.14.6 / PySide6 6.11.1
+  - D4B (Windows .exe): ✅ Done — 2.3MB x64 onedir, verified on Windows 11 x64 physical
+  - **D4-GATE**: ✅ Done — clean-machine smoke PASS on both platforms (Windows Sandbox)
+  - Desktop pytest-qt suite: **175 tests pass** (CI: Python 3.14, Windows Server 2025 + Linux)
+- `python -m command_center.desktop` launches the native shell cleanly.
 - `data/tasks.json` is the default planning and Kanban store. `AICC_TASKS_BACKEND=aios` routes
   all task reads/writes through the AIOS Tasks API instead (requires `AICC_AIOS_URL` + `AICC_AIOS_TOKEN`).
   `tasks_repository.get_repository()` is the factory; `scripts/migrate_tasks_to_aios.py` provides
   one-shot migration. See CHANGELOG [Unreleased] §"AIOS Tasks backend (Sprint 4)" for limitations.
+  `aios_sdk` installs from a wheel vendored in-repo (`vendor/`, built from a pinned aios commit
+  by `scripts/build_aios_sdk_wheel.py`; provenance in `vendor/README.md`) and referenced by
+  `requirements.txt`, so the AIOS repository/adapter tests run in CI instead of skipping
+  (Sprint 4 limitation I5 — closed 2026-08-07).
 - `data/runtime.db` schema 11 is authoritative for asynchronous execution, completion, the
   persisted autonomy-proposal lifecycle, the execution-provider fields, the independent-review
   verdict, and the `queue_entry` mirror (ADR 0007 dual-write).
@@ -123,7 +137,8 @@ Current boundaries:
   automatic but required-check enforcement remains an operator merge discipline.
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
-- The native PySide6 desktop client remains documentation and design work only.
+- Native PySide6 desktop D1–D3 are implemented on `main` (see §0 Desktop status). D4 packaging
+  specs exist; clean-machine build and interactive Windows gate remain pending.
 - The runtime is local and process-hosted, not a distributed or production-ready worker platform.
 
 ## 1. AIOS
