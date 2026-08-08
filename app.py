@@ -3759,7 +3759,23 @@ def build_commands() -> list[dict]:
 
 # Data loading happens before the shell render so the top command bar (search,
 # live glyph, Inspector) has the task map + api available without a second pass.
-tasks = load_tasks()
+try:
+    tasks = load_tasks()
+except tasks_repository.TasksStoreUnreadable as exc:
+    # An unreadable store is never degraded to an empty board: an empty Kanban
+    # is indistinguishable from "you have no tasks", so the operator would plan
+    # and launch against a store they believe is empty while the real one sits
+    # on disk. Stop the render here with the failure and the file path instead.
+    st.error(
+        "❌ Хранилище задач `data/tasks.json` не читается — доска не может быть "
+        "показана.\n\n"
+        f"Файл: `{exc.path}`\n\n"
+        f"Причина: `{type(exc.cause).__name__}: {exc.cause}`\n\n"
+        "Данные на диске не изменены. Восстановите файл из резервной копии или "
+        "git, затем перезагрузите страницу. Пустая доска здесь НЕ показывается "
+        "намеренно — она была бы неотличима от «задач нет»."
+    )
+    st.stop()
 tasks_by_id = {task["id"]: task for task in tasks}
 task_counts = read_model.task_snapshot(tasks)
 project_configs = project_config.load_project_configs()
