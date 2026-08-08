@@ -31,10 +31,12 @@ dedicated lightweight `AIOS boundary fitness` workflow).
 No Python file anywhere in the repository (application code, scripts, tests,
 packaging) may import `aios` or any `aios.*` submodule — via `import` /
 `from ... import`, or via `importlib.import_module` / `__import__` with a
-literal module name. The public SDK namespace `aios_sdk` is explicitly
-allowed, so the day the SDK ships, adopting it requires no gate change.
-Detection is an AST walk, not a text grep — comments, docstrings and strings
-cannot trigger or evade it.
+literal module name. The public SDK namespace `aios_sdk` may be imported only
+by `command_center/application/aios_tasks.py`, the single AIOS adapter. That
+adapter may import only the top-level package, never `aios_sdk.*` internals.
+All other product code, scripts, and tests consume AICC's owned
+`TasksGateway` contract instead. Detection is an AST walk, not a text grep —
+comments, docstrings and strings cannot trigger or evade it.
 
 ### Gate 2 — anti-engine growth gate
 

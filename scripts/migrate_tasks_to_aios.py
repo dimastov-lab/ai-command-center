@@ -39,7 +39,7 @@ def main(root: Path, *, dry_run: bool) -> int:
         return 1
 
     from command_center import storage
-    from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository
+    from command_center.application.aios_tasks import AIOSIdMap, build_aios_tasks_repository
     from command_center.tasks_repository import load_tasks
 
     tasks = load_tasks(root)
@@ -54,9 +54,12 @@ def main(root: Path, *, dry_run: bool) -> int:
 
     repo = None
     if not dry_run:
-        from aios_sdk import AIOSClient
-        client = AIOSClient(url, token=token)
-        repo = AIOSTasksRepository(client, id_map)
+        repo = build_aios_tasks_repository(
+            url=url,
+            token=token,
+            map_path=data_dir / "aios_task_map.json",
+            id_map=id_map,
+        )
 
     for task in tasks:
         aicc_id = task.get("id", "")
