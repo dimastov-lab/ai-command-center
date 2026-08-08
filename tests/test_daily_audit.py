@@ -113,6 +113,30 @@ def test_repeated_backend_failures_back_off_exponentially(tmp_path):
     assert datetime.fromisoformat(status["next_run_at"]) == clock[0] + timedelta(hours=2)
 
 
+def test_three_failures_open_circuit_until_explicit_reset(tmp_path):
+    clock = [NOW]
+    db_path = tmp_path / "db.sqlite"
+    failing = Backend(error=RuntimeError("network"))
+    service = DailyAuditService(config(tmp_path), failing, db_path=db_path, clock=lambda: clock[0])
+    for expected_failures, delay in ((1, 1), (2, 2), (3, 4)):
+        with pytest.raises(RuntimeError, match="network"):
+            service.tick()
+        status = service.store.status()
+        assert status["consecutive_failures"] == expected_failures
+        clock[0] += timedelta(hours=delay, seconds=1)
+
+    assert service.store.status()["circuit_open"] == 1
+    assert service.tick() is None
+    assert service.store.request_run_now(now=clock[0]) is False
+    assert len(failing.requests) == 3
+
+    assert service.reset_circuit()
+    status = service.store.status()
+    assert status["circuit_open"] == 0
+    assert status["consecutive_failures"] == 0
+    assert datetime.fromisoformat(status["next_run_at"]) == clock[0] + timedelta(days=1)
+
+
 def test_provider_retry_time_is_preserved_and_delays_next_campaign(tmp_path):
     retry_at = NOW + timedelta(days=4)
     service = DailyAuditService(

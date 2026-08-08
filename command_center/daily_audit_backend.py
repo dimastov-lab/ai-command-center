@@ -25,6 +25,7 @@ from pathlib import Path, PurePosixPath
 from command_center import models, report_parser
 from command_center.daily_audit import CampaignBackendError, CampaignRequest, CampaignResult
 from command_center.runtime import db as runtime_db
+from command_center.runtime import providers
 from command_center.runtime import reports
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.runtime.completion_service import CompletionOrchestrator
@@ -44,6 +45,20 @@ _REQUIRED_GATE_EVIDENCE = (
     "validation",
     "user_journey",
     "queue_waves",
+)
+_TRANSIENT_GIT_ERRORS = (
+    "could not resolve host",
+    "ssl connection timeout",
+    "ssl_error_syscall",
+    "failed to connect",
+    "couldn't connect to server",
+    "connection reset",
+    "connection timed out",
+    "recv failure",
+    "operation timed out",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "remote end hung up",
 )
 
 
@@ -170,24 +185,84 @@ class ExecutionCenterCampaignBackend:
         cwd: Path,
         *args: str,
         timeout_seconds: int = 120,
+        retry_attempts: int = 1,
+        retry_base_seconds: float = 0.0,
     ) -> str:
+        attempts = max(1, retry_attempts)
+        last_detail = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                result = subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                last_detail = f"exceeded its {timeout_seconds}s deadline"
+                transient = True
+            else:
+                if result.returncode == 0:
+                    return result.stdout.strip()
+                last_detail = result.stderr.strip() or result.stdout.strip()
+                transient = any(marker in last_detail.lower() for marker in _TRANSIENT_GIT_ERRORS)
+            if not transient:
+                raise CampaignBackendError(f"git {shlex.join(args)} failed: {last_detail}")
+            if attempt < attempts:
+                self.sleep(retry_base_seconds * (2 ** (attempt - 1)))
+        raise CampaignBackendError(
+            f"git {shlex.join(args)} transient transport exhausted after "
+            f"{attempts} attempt(s): {last_detail}"
+        )
+
+    def preflight(self, request: CampaignRequest) -> dict[str, object]:
+        """Validate the pinned provider and remote route without starting an agent."""
         try:
-            result = subprocess.run(
-                ["git", *args],
-                cwd=cwd,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
+            provider = providers.get_provider(request.provider_id)
+        except ValueError as exc:
+            raise CampaignBackendError(str(exc)) from exc
+        availability = provider.availability()
+        if not availability.available or not availability.executable:
             raise CampaignBackendError(
-                f"git {shlex.join(args)} exceeded its {timeout_seconds}s deadline"
-            ) from exc
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip()
-            raise CampaignBackendError(f"git {shlex.join(args)} failed: {detail}")
-        return result.stdout.strip()
+                f"Provider {request.provider_id!r} unavailable: {availability.message}"
+            )
+        if request.provider_id == providers.CLAUDE_ID:
+            try:
+                auth = subprocess.run(
+                    [availability.executable, "auth", "status"],
+                    cwd=request.repository_path,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=min(30, request.run_timeout_seconds),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise CampaignBackendError("Claude authentication preflight timed out.") from exc
+            except OSError as exc:
+                raise CampaignBackendError(
+                    f"Claude authentication executable could not start: {exc}"
+                ) from exc
+            try:
+                auth_payload = json.loads(auth.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                raise CampaignBackendError("Claude authentication preflight returned invalid JSON.") from exc
+            if auth.returncode != 0 or not auth_payload.get("loggedIn"):
+                detail = auth.stderr.strip() or auth.stdout.strip()
+                raise CampaignBackendError(f"Claude authentication preflight failed: {detail[:500]}")
+        remote_head = self._git(
+            request.repository_path,
+            "ls-remote",
+            "origin",
+            "refs/heads/main",
+            timeout_seconds=request.git_timeout_seconds,
+            retry_attempts=request.transport_retry_attempts,
+            retry_base_seconds=request.transport_retry_base_seconds,
+        )
+        if not remote_head:
+            raise CampaignBackendError("Git remote preflight did not resolve refs/heads/main.")
+        return {"provider_id": request.provider_id, "remote_main": remote_head.split()[0]}
 
     def _git_bytes(
         self,
@@ -229,6 +304,8 @@ class ExecutionCenterCampaignBackend:
             "origin",
             "main",
             timeout_seconds=request.git_timeout_seconds,
+            retry_attempts=request.transport_retry_attempts,
+            retry_base_seconds=request.transport_retry_base_seconds,
         )
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
         branch = f"codex/daily-audit-{stamp}-{request.campaign_id[:8]}"
@@ -383,6 +460,7 @@ class ExecutionCenterCampaignBackend:
             timeout_seconds=request.run_timeout_seconds,
             expected_branch=branch,
             repository_already_validated=True,
+            executor_id=request.provider_id,
         )
         current = self._wait_run(
             run["id"],
@@ -1146,6 +1224,7 @@ Do not approve unless all three supplied SHA256 values are copied exactly.
 
     def run(self, request: CampaignRequest) -> CampaignResult:
         self._ensure_campaign_active(request)
+        self.preflight(request)
         worktree, branch = self._prepare_worktree(request)
         completion_seeded = False
         try:
