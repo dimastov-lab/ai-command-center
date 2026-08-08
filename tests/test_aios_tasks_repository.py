@@ -9,10 +9,13 @@ from typing import Any
 import httpx
 import pytest
 
-pytest.importorskip("aios_sdk")
-
+from command_center.application import aios_tasks  # noqa: E402
 from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository  # noqa: E402
-from aios_sdk import AIOSClient  # noqa: E402
+
+try:
+    AIOSClient = aios_tasks._load_aios_sdk().AIOSClient
+except ModuleNotFoundError:
+    pytest.skip("optional live AIOS SDK integration is unavailable", allow_module_level=True)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +206,8 @@ def test_create_done_task_calls_complete():
         requests.append(req)
         if req.method == "POST" and req.url.path == "/api/v1/tasks":
             return _json_response(201, _task_payload("aios-t1", aicc_id="aicc-1", state="open"))
+        if req.url.path.endswith("/start"):
+            return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="in_progress"))
         return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="completed"))
 
     repo, _ = _make_repo(handler)
@@ -213,6 +218,7 @@ def test_create_done_task_calls_complete():
     }
     repo.create(task_dict)
     paths = [f"{r.method} {r.url.path}" for r in requests]
+    assert "POST /api/v1/tasks/aios-t1/start" in paths
     assert "POST /api/v1/tasks/aios-t1/complete" in paths
 
 
@@ -225,6 +231,8 @@ def test_update_status_to_done_calls_complete():
 
     def handler(req: httpx.Request) -> httpx.Response:
         requests.append(req)
+        if req.method == "GET":
+            return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="in_progress"))
         return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="completed"))
 
     with tempfile.TemporaryDirectory() as d:
@@ -242,6 +250,8 @@ def test_update_status_to_in_progress_calls_start():
 
     def handler(req: httpx.Request) -> httpx.Response:
         requests.append(req)
+        if req.method == "GET":
+            return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="open"))
         return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="in_progress"))
 
     with tempfile.TemporaryDirectory() as d:
@@ -256,7 +266,7 @@ def test_update_status_to_in_progress_calls_start():
 
 def test_update_status_unknown_task_is_noop():
     def handler(req: httpx.Request) -> httpx.Response:
-        return _json_response(200, _task_payload())
+        return _json_response(200, _list_payload([]))
 
     repo, _ = _make_repo(handler)
     # No entry in map -> should not raise, just return None
@@ -273,6 +283,8 @@ def test_delete_known_task_calls_cancel():
 
     def handler(req: httpx.Request) -> httpx.Response:
         requests.append(req)
+        if req.method == "GET":
+            return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="open"))
         return _json_response(200, _task_payload("aios-t1", aicc_id="aicc-1", state="cancelled"))
 
     with tempfile.TemporaryDirectory() as d:
@@ -288,7 +300,7 @@ def test_delete_known_task_calls_cancel():
 
 def test_delete_unknown_task_returns_false():
     def handler(req: httpx.Request) -> httpx.Response:
-        return _json_response(200, _task_payload())
+        return _json_response(200, _list_payload([]))
 
     repo, _ = _make_repo(handler)
     result = repo.delete("nonexistent")

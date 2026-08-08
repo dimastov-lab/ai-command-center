@@ -572,9 +572,11 @@ def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  
             raise RuntimeError(
                 "AICC_TASKS_BACKEND=aios requires AICC_AIOS_TOKEN to be set"
             )
-        from aios_sdk import AIOSClient  # local import: only when AIOS backend requested
-        from command_center.application.aios_tasks import AIOSIdMap, AIOSTasksRepository
-        client = AIOSClient(url, token=token)
-        id_map = AIOSIdMap(storage.resolve_data_dir(root) / "aios_task_map.json")
-        return AIOSTasksRepository(client, id_map)
+        from command_center.application.aios_tasks import build_aios_tasks_repository
+
+        return build_aios_tasks_repository(
+            url=url,
+            token=token,
+            map_path=storage.resolve_data_dir(root) / "aios_task_map.json",
+        )
     return JSONTasksRepository(root)

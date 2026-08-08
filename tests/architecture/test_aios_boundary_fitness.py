@@ -19,7 +19,7 @@ import ast
 from tests.architecture import aios_boundary as boundary
 
 
-def test_no_aios_core_internals_imported_anywhere():
+def test_aios_imports_are_confined_to_the_public_sdk_adapter():
     """No Python file in the repository imports ``aios`` core internals.
 
     Covers every ``*.py`` in the repo (application code, scripts, tests,
@@ -30,13 +30,12 @@ def test_no_aios_core_internals_imported_anywhere():
     for path in boundary.iter_python_files():
         rel_path = path.relative_to(boundary.REPO_ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel_path)
-        for lineno, description in boundary.find_banned_aios_imports(tree):
+        for lineno, description in boundary.find_forbidden_aios_imports(tree, rel_path):
             violations.append(f"{rel_path}:{lineno}: {description}")
     assert not violations, (
-        "AIOS Core internals must never be imported by a product repo "
-        "(ADR-0008 / aios ADR-0015). Use the public SDK namespace "
-        f"'{boundary.SDK_ALLOWED_TOP_LEVEL}' or the versioned HTTP API "
-        "instead.\n" + "\n".join(violations)
+        "AIOS Core internals must never be imported, and the public SDK "
+        f"namespace may be imported only by {boundary.SDK_ADAPTER_PATH}. "
+        "Consume AICC's TasksGateway contract everywhere else.\n" + "\n".join(violations)
     )
 
 
@@ -65,8 +64,11 @@ def test_engine_inventory_matches_frozen_baseline():
 
 def test_scanner_semantics_are_stable():
     """The gate itself must not rot: sdk allowed, core banned, engines detected."""
-    allowed = ast.parse("import aios_sdk\nfrom aios_sdk.client import Client\n")
-    assert boundary.find_banned_aios_imports(allowed) == []
+    allowed = ast.parse("import aios_sdk\n")
+    assert boundary.find_forbidden_aios_imports(allowed, boundary.SDK_ADAPTER_PATH) == []
+    assert boundary.find_forbidden_aios_imports(allowed, "command_center/other.py")
+    deep_sdk = ast.parse("from aios_sdk.client import Client\n")
+    assert boundary.find_forbidden_aios_imports(deep_sdk, boundary.SDK_ADAPTER_PATH)
 
     banned = ast.parse(
         "import aios\n"

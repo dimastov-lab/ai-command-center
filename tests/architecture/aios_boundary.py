@@ -64,6 +64,8 @@ BASELINE_FILE = Path(__file__).resolve().parent / "AIOS_BOUNDARY_BASELINE.json"
 
 #: The one namespace AICC is allowed to import from the AIOS side.
 SDK_ALLOWED_TOP_LEVEL = "aios_sdk"
+#: The one production adapter allowed to import that public top-level package.
+SDK_ADAPTER_PATH = "command_center/application/aios_tasks.py"
 #: The banned core namespace.
 CORE_TOP_LEVEL = "aios"
 
@@ -240,6 +242,21 @@ def _is_banned_module_name(name: str) -> bool:
     return top == CORE_TOP_LEVEL
 
 
+def _is_forbidden_aios_module(name: str, rel_path: str) -> bool:
+    top = _top_level(name)
+    if top == CORE_TOP_LEVEL:
+        return True
+    if top != SDK_ALLOWED_TOP_LEVEL:
+        return False
+    # Even the adapter cannot couple to generated/private SDK modules: every
+    # consumed symbol must be a documented top-level export.
+    return rel_path != SDK_ADAPTER_PATH or name != SDK_ALLOWED_TOP_LEVEL
+
+
+def _literal_string(node: ast.AST) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
 def find_banned_aios_imports(tree: ast.AST) -> list[tuple[int, str]]:
     """(lineno, description) for every ``aios`` core import in ``tree``.
 
@@ -268,6 +285,40 @@ def find_banned_aios_imports(tree: ast.AST) -> list[tuple[int, str]]:
                     literal = first.value
             if literal is not None and _is_banned_module_name(literal):
                 violations.append((node.lineno, f"dynamic import of {literal!r}"))
+    return violations
+
+
+def find_forbidden_aios_imports(
+    tree: ast.AST, rel_path: str
+) -> list[tuple[int, str]]:
+    """Find core imports and SDK imports outside the sole public adapter."""
+    violations: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_forbidden_aios_module(alias.name, rel_path):
+                    violations.append((node.lineno, f"import {alias.name}"))
+        elif isinstance(node, ast.ImportFrom):
+            if (
+                node.level == 0
+                and node.module
+                and _is_forbidden_aios_module(node.module, rel_path)
+            ):
+                violations.append((node.lineno, f"from {node.module} import ..."))
+        elif isinstance(node, ast.Call):
+            literal: str | None = None
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "importlib"
+                and node.func.attr == "import_module"
+                and node.args
+            ):
+                literal = _literal_string(node.args[0])
+            elif isinstance(node.func, ast.Name) and node.func.id == "__import__" and node.args:
+                literal = _literal_string(node.args[0])
+            if literal and _is_forbidden_aios_module(literal, rel_path):
+                violations.append((node.lineno, f"dynamic import {literal}"))
     return violations
 
 

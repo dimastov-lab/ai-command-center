@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-pytest.importorskip("aios_sdk")
+from command_center.application import tasks_gateway
 
 from command_center.application.aios_tasks import (  # noqa: E402
     aicc_dict_to_create_request,
     aios_task_to_aicc_dict,
 )
-from aios_sdk import Task  # noqa: E402
 
 def _make_aicc_task(**overrides) -> dict:
     base = {
@@ -30,38 +31,29 @@ def _make_aicc_task(**overrides) -> dict:
     base.update(overrides)
     return base
 
-def _make_aios_task(**overrides) -> Task:
+def _make_aios_task(**overrides):
     from datetime import datetime, timezone
-    from unittest.mock import MagicMock
-    t = MagicMock(spec=Task)
-    t.id = "aios-task-1"
-    t.title = "Implement auth"
-    t.type = "implementation"
-    t.subject_ref = "AICC/abc123"
-    t.state = "open"
-    t.priority = 2
-    t.assignee = None
-    t.escalated = False
-    t.escalation_target = None
-    t.due_at = None
-    t.created_by = "alice"
-    t.created_at = datetime(2026, 8, 6, 10, 0, tzinfo=timezone.utc)
-    t.updated_at = datetime(2026, 8, 6, 10, 0, tzinfo=timezone.utc)
-    t.payload = {
-        "kanban_status": "Backlog",
-        "project": "AICC",
-        "aicc_id": "abc123",
-        "task_type": "implementation",
-        "workflow_stage": "Draft",
-        "owner": "alice",
-        "estimate_hours": 4.0,
-        "depends_on": [],
-        "goal": "Add auth",
-        "notes": "notes here",
+    values = {
+        "id": "aios-task-1",
+        "title": "Implement auth",
+        "type": "implementation",
+        "subject_ref": "AICC/abc123",
+        "state": "open",
+        "priority": 2,
+        "created_at": datetime(2026, 8, 6, 10, 0, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 8, 6, 10, 0, tzinfo=timezone.utc),
+        "payload": {
+            "project": "AICC",
+            "aicc_id": "abc123",
+            "workflow_stage": "Draft",
+            "owner": "alice",
+            "estimate_hours": 4.0,
+            "depends_on": [],
+            "goal": "Add auth",
+        },
     }
-    for k, v in overrides.items():
-        setattr(t, k, v)
-    return t
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 # --- aicc_dict_to_create_request ---
 
@@ -77,13 +69,13 @@ def test_done_maps_to_completed_state():
     req, target = aicc_dict_to_create_request(_make_aicc_task(status="Done"))
     assert target == "completed"
 
-def test_review_maps_to_in_progress_state():
-    req, target = aicc_dict_to_create_request(_make_aicc_task(status="Review"))
-    assert target == "in_progress"
+def test_review_fails_closed_without_a_lossless_remote_state():
+    with pytest.raises(tasks_gateway.UnsupportedTaskTransitionError, match="Review"):
+        aicc_dict_to_create_request(_make_aicc_task(status="Review"))
 
-def test_next_maps_to_open_state():
+def test_next_maps_to_assigned_state():
     req, target = aicc_dict_to_create_request(_make_aicc_task(status="Next"))
-    assert target == "open"
+    assert target == "assigned"
 
 def test_subject_ref_uses_project_and_id():
     req, _ = aicc_dict_to_create_request(_make_aicc_task(project="AML", id="xyz789"))
@@ -123,9 +115,9 @@ def test_aicc_id_stored_in_payload():
     req, _ = aicc_dict_to_create_request(_make_aicc_task(id="abc123"))
     assert req.payload["aicc_id"] == "abc123"
 
-def test_kanban_status_stored_in_payload():
-    req, _ = aicc_dict_to_create_request(_make_aicc_task(status="Review"))
-    assert req.payload["kanban_status"] == "Review"
+def test_stale_kanban_status_is_not_stored_in_payload():
+    req, _ = aicc_dict_to_create_request(_make_aicc_task(status="In Progress"))
+    assert "kanban_status" not in req.payload
 
 def test_created_by_uses_owner():
     req, _ = aicc_dict_to_create_request(_make_aicc_task(owner="bob"))
@@ -133,13 +125,13 @@ def test_created_by_uses_owner():
 
 # --- aios_task_to_aicc_dict ---
 
-def test_round_trip_preserves_kanban_status():
-    aicc = _make_aicc_task(status="Review")
+def test_round_trip_uses_authoritative_remote_state_not_payload_status():
+    aicc = _make_aicc_task(status="In Progress")
     req, _ = aicc_dict_to_create_request(aicc)
     # Build a fake AIOS task as the server would return it
     aios = _make_aios_task(payload=req.payload | {"kanban_status": "Review"})
     result = aios_task_to_aicc_dict(aios)
-    assert result["status"] == "Review"
+    assert result["status"] == "Backlog"
 
 def test_round_trip_preserves_project():
     aios = _make_aios_task(payload={"kanban_status": "Backlog", "project": "AICC", "aicc_id": "abc123"})
