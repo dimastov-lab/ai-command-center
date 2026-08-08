@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (
 
 from command_center.platform import DensityMode
 
+from . import i18n
 from .pages.home import HomePage
+from .pages.operational import OperationalPage
 from .pages.projects import ProjectsPage
 from .pages.settings_page import SettingsPage
 from .settings import SettingsStore
@@ -61,6 +63,7 @@ class AppShell(QWidget):
         self._cancel_event = threading.Event()
         # Workspace Home data adapter, wired by :meth:`load_workspace_home`.
         self._adapter: object | None = None
+        self._operations_adapter: object | None = None
 
         self.setObjectName("AppShell")
         self.setWindowTitle(WINDOW_TITLE)
@@ -108,6 +111,21 @@ class AppShell(QWidget):
 
         self._add_page(ProjectsPage())
 
+        operational_columns = {
+            "sessions": (("project", "Проект"), ("state", "Состояние"), ("id", "ID"), ("updated_at", "Обновлено")),
+            "execution": (("project", "Проект"), ("state", "Состояние"), ("task_type", "Тип задачи"), ("run_id", "ID запуска"), ("created_at", "Создан")),
+            "git": (("project", "Проект"), ("state", "Состояние"), ("branch", "Ветка"), ("worktrees", "Worktree"), ("path", "Путь")),
+            "artifacts": (("project", "Проект"), ("task_type", "Тип задачи"), ("created_at", "Создан"), ("path", "Путь")),
+            "reports": (("project", "Проект"), ("verdict", "Заключение"), ("created_at", "Создан"), ("path", "Путь")),
+            "agents": (("display_name", "Агент"), ("readiness", "Состояние"), ("running", "Активные запуски"), ("detail", "Подробности")),
+        }
+        self._operational_pages: dict[str, OperationalPage] = {}
+        for key, columns in operational_columns.items():
+            title, description = i18n.OPERATIONAL_PAGE_TEXT[key]
+            page = OperationalPage(key, title, description, columns=columns)
+            self._operational_pages[key] = page
+            self._add_page(page)
+
         settings_page = SettingsPage(
             self._theme.mode,
             self._settings.density_mode(),
@@ -148,6 +166,7 @@ class AppShell(QWidget):
         page = self._pages.get(key)
         if page is not None:
             self.stack.setCurrentWidget(page)
+            self._load_operational_page(key)
 
     @property
     def current_section_key(self) -> str | None:
@@ -180,16 +199,27 @@ class AppShell(QWidget):
         self._settings.sync()
 
     # --- data / refresh ----------------------------------------------------
-    def load_workspace_home(self, adapter: object) -> None:
+    def load_workspace_home(self, adapter: object, operations_adapter: object | None = None) -> None:
         """Wire the Workspace Home data adapter and start the first async load."""
         self._adapter = adapter
+        self._operations_adapter = operations_adapter
         self._home.load(adapter, cancel_event=self._cancel_event)
+
+    def _load_operational_page(self, key: str) -> None:
+        page = self._operational_pages.get(key)
+        adapter = self._operations_adapter
+        fetch = getattr(adapter, key, None) if adapter is not None else None
+        if page is not None and callable(fetch):
+            page.load(fetch, cancel_event=self._cancel_event)
 
     def _on_refresh(self) -> None:
         # Re-run the active page's data load when an adapter is wired; always
         # re-emit so callers/tests can observe the user's refresh intent.
-        if self._adapter is not None:
+        current = self.current_section_key
+        if current == "home" and self._adapter is not None:
             self._home.load(self._adapter, cancel_event=self._cancel_event)
+        elif current is not None:
+            self._load_operational_page(current)
         self.refresh_requested.emit()
 
     # --- geometry / lifecycle ---------------------------------------------
@@ -216,6 +246,8 @@ class AppShell(QWidget):
         drain, then persists state. Returns whether the pool drained in time."""
         self._cancel_event.set()
         self._home.shutdown_workers()
+        for page in self._operational_pages.values():
+            page.shutdown_workers()
         drained = QThreadPool.globalInstance().waitForDone(timeout_ms)
         self._persist_state()
         return drained

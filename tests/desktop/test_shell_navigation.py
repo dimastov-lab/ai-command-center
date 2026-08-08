@@ -1,29 +1,22 @@
-"""Navigation, disabled-section, and accessibility behaviour of the D1 shell.
-
-Covers `DESKTOP_INCREMENT_1.md` §2's acceptance criteria for navigation and
-disabled items, and `INFORMATION_ARCHITECTURE.md` §2.1 / §10.
-"""
+"""Navigation and accessibility behaviour of the P2 native shell."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-
 from command_center.desktop import i18n
-from command_center.desktop.navigation_item import DISABLED_TOOLTIP
 from command_center.desktop.sections import SECTIONS
 
 EXPECTED_ORDER = [
     "home", "projects", "sessions", "execution", "git",
     "artifacts", "reports", "agents", "settings",
 ]
-ENABLED = {"home", "projects", "settings"}
+ENABLED = set(EXPECTED_ORDER)
 
 
 def test_all_nine_sections_render_in_order(shell):
     assert list(shell.sidebar.items().keys()) == EXPECTED_ORDER
 
 
-def test_three_active_six_disabled(shell):
+def test_all_sections_are_active(shell):
     items = shell.sidebar.items()
     for key, item in items.items():
         assert item.isEnabled() == (key in ENABLED), key
@@ -47,20 +40,9 @@ def test_clicking_active_item_switches_page(shell, qtbot):
     assert shell.current_section_key == "settings"
 
 
-def test_clicking_disabled_item_is_inert(shell, qtbot):
-    before = shell.current_section_key
-    sessions = shell.sidebar.items()["sessions"]
-    sessions.click()  # disabled QAbstractButton ignores activation
-    assert shell.current_section_key == before
-    assert not sessions.isChecked()
-
-
-def test_disabled_items_excluded_from_tab_order(shell):
+def test_all_items_are_in_tab_order(shell):
     for key, item in shell.sidebar.items().items():
-        if key in ENABLED:
-            assert item.focusPolicy() != Qt.NoFocus, key
-        else:
-            assert item.focusPolicy() == Qt.NoFocus, key
+        assert item.focusPolicy().value != 0, key
 
 
 def test_home_empty_state_navigates_to_projects(shell, qtbot):
@@ -83,11 +65,10 @@ def test_navigation_item_accessibility(shell):
     items = shell.sidebar.items()
     # Enabled item: accessible name is the visible label.
     assert items["home"].accessibleName() == i18n.SECTION_LABELS["home"]
-    # Disabled item: accessible description mirrors the visible tooltip.
+    # Operational item remains visible, active and named.
     sessions = items["sessions"]
     assert sessions.accessibleName() == i18n.SECTION_LABELS["sessions"]
-    assert sessions.accessibleDescription() == DISABLED_TOOLTIP
-    assert sessions.toolTip() == DISABLED_TOOLTIP
+    assert sessions.isEnabled()
 
 
 def test_sidebar_has_accessible_name(shell):

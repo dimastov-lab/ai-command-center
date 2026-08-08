@@ -1,10 +1,22 @@
 # AI Command Center — Desktop Implementation Roadmap
 
-Status: **D1 complete; D2–D4 remain roadmap.** This document sequences
-`DESKTOP_INCREMENT_1.md`'s four stages (D1–D4) into small, independently reviewable,
-commit-sized steps. D1 (the native shell) has shipped; the D2–D4 steps below are not yet
-implemented — see `DESKTOP_INCREMENT_1.md` for the frozen per-stage scope this roadmap sequences.
-**Next implementation stage is D2 (Native Workspace Home).**
+Status: **D1–D4 foundation complete; P2 operational sections implemented
+2026-08-08.** This document preserves the historical sequence of
+`DESKTOP_INCREMENT_1.md`'s four stages (D1–D4) as small, independently
+reviewable, commit-sized steps. The sections below are historical scope and
+acceptance records, not an open-work claim.
+
+## P2 — Native operational sections
+
+- Sessions and Execution read the canonical runtime database.
+- Git reads repository/worktree status without writes and redacts sensitive
+  project paths.
+- Artifacts and Reports reuse the sanitized Workspace Home read models.
+- Agents combines provider readiness with live scheduler load.
+- Every fetch uses the shared cooperative Qt worker pattern; active-page refresh
+  does not block navigation.
+- Acceptance evidence: application-adapter tests, navigation/rendering tests,
+  Russian UI gate, full desktop suite, and a real production-data read journey.
 
 Every increment below follows the same shape: scope, dependencies, files expected, acceptance
 criteria, test requirements, forbidden scope. An increment is sized to be reviewable as one pull

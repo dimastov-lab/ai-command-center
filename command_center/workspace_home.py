@@ -21,7 +21,7 @@ Kanban board itself is unaffected and remains reachable via its own existing pag
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from command_center import activity_log, agent_runner, models, project_config, report_parser
@@ -200,6 +200,12 @@ def _duration_seconds(started_at: str | None, completed_at: str | None) -> float
         completed = datetime.fromisoformat(completed_at)
     except (ValueError, TypeError):
         return None
+    # Old runtime rows are naive UTC while newer rows carry an explicit offset.
+    # Normalise both so a mixed operational database remains renderable.
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=UTC)
     return (completed - started).total_seconds()
 
 
