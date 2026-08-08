@@ -163,8 +163,8 @@ def test_launch_ready_skips_entry_with_no_workspace_configured(tmp_path):
 
 
 def test_launch_ready_skips_entry_needing_warning_acknowledgement(tmp_path, git_repo):
-    # A dirty tree produces a validation *warning*, which launch_ready must
-    # never auto-acknowledge on the user's behalf.
+    # A dirty tree is a blocking error — launch_ready must refuse to launch
+    # and leave the entry queued so the operator can clean up and retry.
     (git_repo / "untracked.txt").write_text("x")
     task = _task(id="a", workspace_path=str(git_repo))
     tasks_by_id = {"a": task}
@@ -175,21 +175,21 @@ def test_launch_ready_skips_entry_needing_warning_acknowledgement(tmp_path, git_
         tmp_path, entries, [task], tasks_by_id, {"AIOS": {"repository_path": str(git_repo)}}, api
     )
     assert results[0].launched is False
-    assert "подтверждения" in results[0].message
+    assert results[0].reason_code == execution_queue.LAUNCH_SKIP_BLOCKED
     assert updated[0]["state"] == execution_queue.STATE_READY
 
-    # The exact `validate_launch` warning strings are surfaced separately
-    # from the generic `message` — so the UI can render each as its own
-    # bullet instead of paraphrasing them away.
+    # The exact `validate_launch` error strings are surfaced in `warnings`
+    # so the UI can render each as its own bullet (render_skipped_launch uses
+    # the `warnings` list for both BLOCKED and NEEDS_CONFIRMATION results).
     assert len(results[0].warnings) == 1
     assert "Рабочее дерево не чистое" in results[0].warnings[0]
 
     # ...alongside the complete validation report, for an optional "Details"
-    # expander — never just the warning strings in isolation.
+    # expander — never just the error strings in isolation.
     report = results[0].validation_report
     assert report["workspace_path"] == str(git_repo)
-    assert report["errors"] == []
-    assert report["warnings"] == results[0].warnings
+    assert report["errors"] == results[0].warnings   # dirty tree is a blocking error
+    assert report["warnings"] == []
     assert report["git_status"]["dirty"] is True
     assert report["git_status"]["untracked_count"] == 1
 

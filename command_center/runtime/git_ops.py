@@ -71,8 +71,14 @@ def commit_all(repo: Path, *, message: str) -> subprocess.CompletedProcess | Non
     runs sandboxed with no git-write tools, so it leaves its changes uncommitted
     in its own isolated worktree, and the completion pipeline turns those into a
     real commit on the task branch before validating and opening the pull
-    request. Only ever called on a task's own linked worktree (isolation is
-    enforced upstream), never on a primary tree.
+    request.
+
+    Two callers today: the completion pipeline (`completion_service`), which
+    only ever passes a task's own linked worktree (isolation enforced
+    upstream), and the supervisor's post-`COMPLETED` auto-commit
+    (`supervisor._auto_commit_completed_work`), which passes whatever workspace
+    the run itself targeted — including a primary checkout, when the run was
+    launched against one.
 
     Returns the commit `CompletedProcess`, or `None` when there was nothing to
     commit (a clean tree — an idempotent no-op, not an error)."""

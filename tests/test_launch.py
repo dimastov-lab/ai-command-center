@@ -42,13 +42,13 @@ def test_validate_launch_errors_when_not_a_git_repo(tmp_path):
     assert "не является git-репозиторием" in result.errors[0]
 
 
-def test_validate_launch_warns_on_dirty_tree(tmp_path):
+def test_validate_launch_errors_on_dirty_tree(tmp_path):
     _init_repo(tmp_path)
     (tmp_path / "untracked.txt").write_text("x")
     result = launch.validate_launch(workspace_path=str(tmp_path))
-    assert result.can_launch  # dirty tree is a warning, not a blocking error
-    assert result.needs_confirmation
-    assert any("не чистое" in warning for warning in result.warnings)
+    assert not result.can_launch  # dirty tree is a blocking error — not acknowledgeable
+    assert launch.ISSUE_DIRTY_TREE in result.error_codes
+    assert any("не чистое" in error for error in result.errors)
 
 
 def test_validate_launch_warns_on_branch_mismatch(tmp_path):
@@ -71,22 +71,20 @@ def test_validate_launch_clean_repo_no_warnings(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_dirty_tree_and_branch_mismatch_are_separately_acknowledgeable(tmp_path):
+def test_dirty_tree_blocks_and_branch_mismatch_is_a_warning(tmp_path):
+    """Dirty tree is now a blocking error; branch mismatch remains a confirmable warning.
+    The two are independent: a dirty tree blocks outright even when the branch also mismatches."""
     _init_repo(tmp_path)
     (tmp_path / "untracked.txt").write_text("x")
     result = launch.validate_launch(workspace_path=str(tmp_path), expected_branch="some-other-branch")
 
-    assert result.warning_codes == [launch.ISSUE_DIRTY_TREE, launch.ISSUE_BRANCH_MISMATCH]
-    # Acknowledging one says nothing about the other, in either direction.
-    assert result.unacknowledged_warning_codes({launch.ISSUE_DIRTY_TREE}) == [
-        launch.ISSUE_BRANCH_MISMATCH
-    ]
-    assert result.unacknowledged_warning_codes({launch.ISSUE_BRANCH_MISMATCH}) == [
-        launch.ISSUE_DIRTY_TREE
-    ]
+    assert not result.can_launch  # dirty tree blocks
+    assert launch.ISSUE_DIRTY_TREE in result.error_codes
+    # branch mismatch is still recorded as a warning even when launch is blocked
+    assert result.warning_codes == [launch.ISSUE_BRANCH_MISMATCH]
+    # the one remaining warning still requires its own acknowledgement
     assert not result.warnings_acknowledged(None)
-    assert not result.warnings_acknowledged({launch.ISSUE_DIRTY_TREE})
-    assert result.warnings_acknowledged({launch.ISSUE_DIRTY_TREE, launch.ISSUE_BRANCH_MISMATCH})
+    assert result.warnings_acknowledged({launch.ISSUE_BRANCH_MISMATCH})
 
 
 def test_no_warnings_needs_no_acknowledgement(tmp_path):
@@ -99,15 +97,15 @@ def test_no_warnings_needs_no_acknowledgement(tmp_path):
 def test_every_warning_code_has_its_own_distinct_ack_label():
     """The prompts must name the specific hazard being accepted — two
     conditions sharing one wording would reintroduce the single collective
-    checkbox in spirit."""
+    checkbox in spirit.
+
+    dirty_tree and detached_head are now blocking errors and have no ack labels.
+    Only branch_mismatch remains a confirmable warning with its own label."""
     labels = [
         launch.WARNING_ACK_LABELS[code]
-        for code in (launch.ISSUE_DIRTY_TREE, launch.ISSUE_BRANCH_MISMATCH, launch.ISSUE_DETACHED_HEAD)
+        for code in (launch.ISSUE_BRANCH_MISMATCH,)
     ]
     assert len(set(labels)) == len(labels)
-    assert launch.warning_ack_label(
-        launch.LaunchIssue(code=launch.ISSUE_DIRTY_TREE, message="...", severity=launch.SEVERITY_WARNING)
-    ) == launch.WARNING_ACK_LABELS[launch.ISSUE_DIRTY_TREE]
     # An unknown (future) warning code still gets its own prompt rather than
     # silently sharing another condition's.
     unknown = launch.LaunchIssue(code="some_future_code", message="что-то не так", severity=launch.SEVERITY_WARNING)

@@ -210,6 +210,8 @@ def test_entry_without_workspace_is_skipped_with_reason(tmp_path, api):
 
 
 def test_dirty_workspace_is_skipped_and_never_consumes_a_capacity_slot(tmp_path, git_repo, api):
+    """A dirty workspace is now a blocking error (not a confirmable warning), so
+    it is classified as REASON_LAUNCH_BLOCKED — not REASON_NEEDS_CONFIRMATION."""
     (git_repo / "untracked.txt").write_text("x")
     task = _task(id="a", workspace_path=str(git_repo))
     wave = task_pipeline.adapt_ready_entries(
@@ -217,9 +219,8 @@ def test_dirty_workspace_is_skipped_and_never_consumes_a_capacity_slot(tmp_path,
     )
     assert wave.work_items == ()
     skipped = wave.skipped[0]
-    assert skipped.reason_code == task_pipeline.REASON_NEEDS_CONFIRMATION
-    assert skipped.warnings  # the exact validate_launch warnings, for the UI
-    assert "вручную" in skipped.remediation
+    assert skipped.reason_code == task_pipeline.REASON_LAUNCH_BLOCKED
+    assert skipped.explanation  # the blocking error message, for the UI
 
 
 def test_blocked_workspace_is_skipped_with_fatal_messages(tmp_path, api):

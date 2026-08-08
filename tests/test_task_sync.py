@@ -162,7 +162,13 @@ def test_sync_task_from_run_interrupted_with_no_output_auto_retries(tmp_path):
 def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp_path):
     """An INTERRUPTED run that *did* produce output before dying is a genuine
     mid-execution failure — not a startup failure — so it stays "Requires
-    Attention" and does not record a failed executor."""
+    Attention" and does not record a failed executor.
+
+    NOTE: this test uses dates where completed_at < started_at (old fixed date
+    vs. now), so _died_before_producing_output returns True for the duration
+    check, keeping the old behaviour. The new transient-interruption path only
+    fires when the run genuinely ran for >= 60s — see the companion test below.
+    """
     db_path = tmp_path / "runtime-INTERRUPTED-output.db"
     db.migrate(db_path)
     run = _make_run(db_path, state="INTERRUPTED", completed_at="2026-01-01T00:01:00")
@@ -173,6 +179,34 @@ def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp
 
     assert task["launch_status"] == "Requires Attention"
     assert not task.get("failed_executors")
+
+
+def test_sync_task_from_run_interrupted_long_run_schedules_resume(tmp_path):
+    """An INTERRUPTED run that produced output AND ran for >= 60s (e.g. laptop
+    battery died mid-task) is a transient OS interruption, not a provider
+    failure. The executor is not penalised; resume_session_id is stored so the
+    next launch can continue the conversation via --resume."""
+    from datetime import datetime, timedelta, timezone
+    db_path = tmp_path / "runtime-INTERRUPTED-long.db"
+    db.migrate(db_path)
+    now = datetime.now(timezone.utc)
+    started = (now - timedelta(minutes=5)).isoformat()
+    completed = now.isoformat()
+    first_output = (now - timedelta(minutes=4, seconds=30)).isoformat()
+
+    run = _make_run(db_path, state="INTERRUPTED", completed_at=completed)
+    run = db.update_run_fields(
+        db_path, run["id"], expected_version=run["version"],
+        fields={"first_output_at": first_output, "started_at": started},
+    )
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Ready"
+    assert not task.get("failed_executors"), "executor must not be penalised for OS interruption"
+    assert task.get("resume_session_id") == run.get("session_id"), "session_id must be stored for --resume"
+    assert any(e["type"] == "executor_retry" for e in task.get("timeline", []))
 
 
 def test_sync_task_from_run_session_expired_triggers_executor_failover(tmp_path):
@@ -233,7 +267,12 @@ def test_provider_failure_projection_is_idempotent_across_refresh_and_restart(tm
     assert [event["type"] for event in task["timeline"]].count(
         "launch_requires_attention"
     ) == 1
-    assert [event["type"] for event in task["timeline"]].count("executor_failed") == 1
+    # provider_api_error now uses retry logic: first attempt generates executor_retry
+    # (not executor_failed) and does NOT add to failed_executors.
+    assert [event["type"] for event in task["timeline"]].count("executor_retry") == 1
+    assert [event["type"] for event in task["timeline"]].count("executor_failed") == 0
+    assert task.get("provider_error_retry_count") == 1
+    assert not task.get("failed_executors")
 
 
 def test_sync_task_from_run_quota_limit_triggers_executor_failover(tmp_path):
@@ -329,7 +368,10 @@ def test_sync_task_from_run_failed_executors_accumulate_across_providers(tmp_pat
     )
     task_sync.sync_task_from_run(task, run2, db_path=db_path)
 
-    assert task.get("failed_executors") == ["claude_code", "copilot_cli"]
+    # provider_api_error uses retry logic: copilot_cli is NOT yet in failed_executors
+    # (retry count = 1, threshold = 3). Only session_expired (claude_code) is failed.
+    assert task.get("failed_executors") == ["claude_code"]
+    assert task.get("provider_error_retry_count") == 1
 
 
 def test_sync_task_from_run_completed_clears_failed_executors(tmp_path):
@@ -360,7 +402,9 @@ def test_sync_task_from_run_unknown_maps_to_requires_attention(tmp_path):
 
 def test_sync_task_from_run_cancelled_maps_to_failed_launch_status(tmp_path):
     """`models.LAUNCH_STATUSES` has no dedicated Cancelled value — this is
-    the documented simplification (see task_sync.py's module docstring)."""
+    the documented simplification (see task_sync.py's module docstring).
+    Cancelled tasks move to the "Closed" kanban lane to distinguish them
+    from "Failed" (which requires attention/recovery)."""
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)
     run = _make_run(db_path, state="CANCELLED", completed_at="2026-01-01T00:01:00")
@@ -369,6 +413,7 @@ def test_sync_task_from_run_cancelled_maps_to_failed_launch_status(tmp_path):
     task_sync.sync_task_from_run(task, run, db_path=db_path)
 
     assert task["launch_status"] == "Failed"
+    assert task["status"] == "Closed"
 
 
 def test_sync_task_from_run_blocked_maps_to_blocked_launch_status(tmp_path):
@@ -660,3 +705,115 @@ def test_reconcile_and_sync_recovers_stale_current_run_id_pointer(tmp_path):
     assert task["current_run_id"] == new_run["id"]
     assert task["launch_status"] == "Ready"
     assert task.get("failed_executors") == ["claude_code"]
+
+
+# ---------------------------------------------------------------------------
+# provider_error_retry_count — AICC-IMP-004
+# ---------------------------------------------------------------------------
+
+
+def test_provider_api_error_retries_same_executor_up_to_3_times(tmp_path):
+    """provider_api_error increments provider_error_retry_count and keeps the
+    same executor in play (no failed_executors entry) until the 3rd failure."""
+    db_path = tmp_path / "retry.db"
+    db.migrate(db_path)
+    task = _make_task(executor="claude_code")
+
+    def _api_error_run(i):
+        r = _make_run(
+            db_path, state="FAILED",
+            completed_at=f"2026-01-01T00:0{i}:00",
+            failure_reason="provider_api_error",
+            provider_id="claude_code",
+            task_id="task-1",
+        )
+        return r
+
+    # Runs 1 and 2: retry (count < 3)
+    run1 = _api_error_run(1)
+    task_sync.sync_task_from_run(task, run1, db_path=db_path)
+    assert task["launch_status"] == "Ready"
+    assert task.get("provider_error_retry_count") == 1
+    assert not task.get("failed_executors")
+    assert any(e["type"] == "executor_retry" for e in task["timeline"])
+
+    session = db.list_sessions(db_path, task_id="task-1")[0]
+    run2 = db.create_run(
+        db_path, session_id=session["id"], task_id="task-1", project="AICC",
+        task_type="implementation", repository_path="/tmp/x", prompt="p",
+        is_resume=False, provider_id="claude_code",
+    )
+    for state in ("QUEUED", "RUNNING"):
+        run2 = db.update_run_state(db_path, run2["id"], expected_version=run2["version"], new_state=state)
+    run2 = db.update_run_state(
+        db_path, run2["id"], expected_version=run2["version"], new_state="FAILED",
+        fields={"failure_reason": "provider_api_error", "completed_at": "2026-01-01T00:02:00"},
+    )
+    task_sync.sync_task_from_run(task, run2, db_path=db_path)
+    assert task.get("provider_error_retry_count") == 2
+    assert not task.get("failed_executors")
+
+    # Run 3: exhausted → failover
+    run3 = db.create_run(
+        db_path, session_id=session["id"], task_id="task-1", project="AICC",
+        task_type="implementation", repository_path="/tmp/x", prompt="p",
+        is_resume=False, provider_id="claude_code",
+    )
+    for state in ("QUEUED", "RUNNING"):
+        run3 = db.update_run_state(db_path, run3["id"], expected_version=run3["version"], new_state=state)
+    run3 = db.update_run_state(
+        db_path, run3["id"], expected_version=run3["version"], new_state="FAILED",
+        fields={"failure_reason": "provider_api_error", "completed_at": "2026-01-01T00:03:00"},
+    )
+    task_sync.sync_task_from_run(task, run3, db_path=db_path)
+    assert task.get("provider_error_retry_count") is None  # reset
+    assert task.get("failed_executors") == ["claude_code"]
+    assert task["launch_status"] == "Ready"
+    assert any(e["type"] == "executor_failed" for e in task["timeline"])
+
+
+def test_provider_error_retry_count_cleared_on_success(tmp_path):
+    """A clean completion resets both failed_executors and provider_error_retry_count."""
+    db_path = tmp_path / "retry-clear.db"
+    db.migrate(db_path)
+    task = _make_task(executor="claude_code", failed_executors=["claude_code"])
+    task["provider_error_retry_count"] = 2
+
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00")
+    db.append_run_event(db_path, run["id"], "result", {"result": "Verdict: APPROVED FOR COMMIT"})
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert not task.get("failed_executors")
+    assert not task.get("provider_error_retry_count")
+
+
+# ---------------------------------------------------------------------------
+# last_provider_id — task_sync (IMP-NNN)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_task_from_run_completed_records_last_provider_id(tmp_path):
+    """A completed run records the provider_id that executed it as last_provider_id
+    on the task."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00", provider_id="copilot_cli")
+    db.append_run_event(db_path, run["id"], "result", {"result": "Verdict: APPROVED FOR COMMIT"})
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["last_provider_id"] == "copilot_cli"
+
+
+def test_sync_task_from_run_failed_records_last_provider_id(tmp_path):
+    """A failed run records the provider_id that executed it as last_provider_id
+    on the task."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="FAILED", completed_at="2026-01-01T00:01:00", provider_id="claude_code")
+    task = _make_task()
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["last_provider_id"] == "claude_code"

@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from command_center import execution_queue, project_config, tasks_repository  # noqa: E402
+from command_center import execution_queue, project_config, storage, tasks_repository  # noqa: E402
 from command_center.runtime import api as runtime_api, db as run_db  # noqa: E402
 from command_center.runtime import task_sync  # noqa: E402
 
@@ -32,7 +32,8 @@ TASK_ID = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") 
 WAIT = "--no-wait" not in sys.argv
 
 SUPERVISE_INTERVAL = 15  # seconds between reconcile+sync ticks
-RUN_DB = ROOT / "data" / "runtime.db"
+DATA_DIR = storage.resolve_data_dir(ROOT)  # honours AICC_DATA_DIR env override
+RUN_DB = DATA_DIR / "runtime.db"
 
 
 def _launch() -> tuple[runtime_api.ExecutionCenterAPI, str | None]:
@@ -100,6 +101,7 @@ def _supervise(api: runtime_api.ExecutionCenterAPI, run_id: str) -> int:
     threads — if this process exits, they die and no output is captured."""
     print(f"\nСупервизия запуска {run_id[:12]}…  (Ctrl+C для досрочного выхода)\n")
     last_stage = None
+    not_found_streak = 0
     while True:
         try:
             api.reconcile()
@@ -113,6 +115,7 @@ def _supervise(api: runtime_api.ExecutionCenterAPI, run_id: str) -> int:
         run = run_db.get_run(RUN_DB, run_id) if run_id else None
 
         if run is not None and task is not None:
+            not_found_streak = 0
             mutated = task_sync.sync_task_from_run(task, run, db_path=RUN_DB)
             if mutated:
                 tasks_repository.upsert_tasks(ROOT, tasks)
@@ -129,8 +132,11 @@ def _supervise(api: runtime_api.ExecutionCenterAPI, run_id: str) -> int:
                 print(f"\nПрогон завершён: state={state}  stage={stage}  progress={progress}%")
                 return 0 if state == "COMPLETED" else 1
         elif run is None:
-            print(f"\nПрогон {run_id[:12]} не найден в БД — возможно, был удалён.")
-            return 1
+            not_found_streak += 1
+            if not_found_streak >= 3:
+                print(f"\nПрогон {run_id[:12]} не найден в БД после {not_found_streak} попыток — возможно, был удалён.")
+                return 1
+            print(f"  [ожидание] прогон ещё не в БД (попытка {not_found_streak})…")
 
         time.sleep(SUPERVISE_INTERVAL)
 

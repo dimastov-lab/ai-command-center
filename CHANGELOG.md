@@ -8,6 +8,149 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### H1 sprint history
+
+**H1** is the committed-next horizon defined by
+[`docs/roadmap/MASTER_PRODUCT_ROADMAP.md`](docs/roadmap/MASTER_PRODUCT_ROADMAP.md) under
+`DR-ROADMAP-AUTHORITY-001`. It commits to one goal — a **native-desktop, local-first, single-user
+developer control plane** that reaches and then exceeds the Streamlit feature set, with fail-closed
+safety on every privileged action — across three tracks: **Desktop Increment 1** (15 rows),
+**Audit remediation** (13 rows), and **Governance** (6 rows).
+
+This section is the chronological index for that horizon. Every date is derived from the commit
+history on `main` (first appearance of the relevant module or document), not from planning
+documents; the detailed entries for each item are the sections below and in the released versions.
+Work that ran alongside H1 but is not one of its three tracks is listed separately.
+
+#### Timeline
+
+| Date | Milestone | Track |
+|---|---|---|
+| 2026-07-15 | `1.0.0` initial Streamlit application; `1.1.0` (Sprint 2) Executive Dashboard, Command Palette, Focus Mode, Timeline, AI Agents, Smart Tasks, Git Center, Workspace Launcher | Pre-H1 baseline |
+| 2026-07-16 | `1.2.0` `command_center/` package, Project Chat, Claude Code runner, report parser; **Sprint 1** v2 Session Supervisor + `runtime.db` (ADR 0003) | Pre-H1 baseline |
+| 2026-07-17…18 | **Sprint 3** Workspace Home — read model, redaction stage, `git_info`/`artifacts` extraction, Workspace Home page | Platform |
+| 2026-07-18 | **Desktop D0** — the canonical `docs/desktop/` documentation set (vision, architecture, IA, design directions, design system, Workspace Home spec, platform behavior, frozen D1–D4 scope, implementation roadmap). Documentation only | Desktop |
+| 2026-07-19 | Execution queue, Kanban state separation, upgraded recommendations | Platform |
+| 2026-07-20 | Portfolio task planning and safe launch | Platform |
+| 2026-07-21 | Founder Functional Audit `9761459` recorded | Audit remediation |
+| 2026-07-22 | Autonomous Task Completion Pipeline (`AICC-AUTONOMY-001`, ADR 0004) | Platform |
+| 2026-07-23 | Autonomy Proposal Foundation (`AICC-AUTONOMY-002`, ADR 0005) | Platform |
+| 2026-07-27 | **D1A–D1C** — the native PySide6 shell lands: `QApplication` assembly, `AppShell` main window, sidebar/top bar, nine-section navigation, theme controller, settings and window-geometry persistence | Desktop |
+| 2026-07-28 | `MASTER_PRODUCT_ROADMAP.md` — the `AICC-D1-001` epic decomposed into 15 rows (11 increments + 4 gates) | Governance |
+| 2026-07-29 | **D2A** application adapter, **D2B** `QThreadPool` worker framework, **D2C** status/card/row components and live-data wiring, Russian UI + i18n registry with an automated language gate | Desktop |
+| 2026-07-29 | Audit batch: Copilot executor fails closed for untrusted tasks (`SEC-1`/`D-01`); full read-modify-write lock on project/portfolio config (`AR-5`); Done tasks not backed by a verified completion reported (`DATA-D1`) | Audit remediation |
+| 2026-07-30 | **D2D** edge states, loading skeletons, accessibility, and a BANK/LEGAL redaction regression test; **D3A** Projects page with repository paths; **D3B** persistent settings form and platform preference abstraction; read-only AIOS Core status and provider-readiness boundary | Desktop |
+| 2026-07-31 | **D4A** unsigned macOS bundle and **D4B** unsigned Windows 11 x64 bundle via PyInstaller; self-contained Windows runbook | Desktop |
+| 2026-08-01 | **D1 final gate**: macOS Apple Silicon PASS recorded on real hardware; Windows interactive leg still blocked (no hardware). `windows-latest` CI job added for the automated half | Desktop |
+| 2026-08-03 | `run-desktop` project skill (verified macOS launch recipe); live workspace data resolved correctly inside the packaged app; autonomous daily-audit publication and shutdown fenced | Desktop / Governance |
+| 2026-08-03…06 | AML Service phases 1–7 — risk scoring, rule engine, evidence store, case management, 115-ФЗ country pack, Docker, bank acceptance package | Alongside H1 |
+| 2026-08-04 | Report-derived child tasks stamped `untrusted_import` (`SEC-D-02`); PID-reuse recovery covered and single-host lock scope documented | Audit remediation |
+| 2026-08-06 | **Sprint 4** AIOS Tasks backend behind `AICC_TASKS_BACKEND`; ESF/AML project registry; D2 Native Workspace Home tests + `ErrorState` widget | Platform / Desktop |
+| 2026-08-07 | Task-aware executor preflight; load-aware executor selection; `TasksStoreUnreadable` instead of a silent empty read; audit-closure verdict turned into an executable gate with W1/W2 remediation confirmed merged | Audit remediation / Governance |
+| 2026-08-07 | **Sprint 4 acceptance** — `aios_sdk` vendored as a standalone wheel (limitation I5 closed): AIOS backend tests now run in CI; missing `pytest-xdist` dependency restored | Platform |
+
+#### Track 1 — Desktop Increment 1
+
+The D1A→D4 sequence is the approved decomposition of the `AICC-D1-001` epic and closes the §2.1
+desktop parity gate. As of 2026-08-07 the **code** for D1A through D4B has landed on `main`:
+
+- `command_center/desktop/` is a working PySide6/Qt Widgets client launched with
+  `python -m command_center.desktop`. Its startup path imports PySide6 and nothing else — no
+  `app.py`, no Streamlit, no HTTP client — enforced by `tests/desktop/test_lifecycle.py` running a
+  clean interpreter.
+- Three of the nine sections are active (Home, Projects, Settings); the other six render visibly
+  disabled so the sidebar never reflows between increments.
+- Home is a native Workspace Home over `command_center.application.WorkspaceHomeAdapter`, a thin
+  wrapper that returns `build_workspace_home_snapshot`'s output unchanged, inheriting every
+  BANK/LEGAL redaction guarantee verbatim. It loads through the D2B worker framework, so the GUI
+  thread is never blocked.
+- The client is read-only except for repository-path configuration, theme/density preferences, and
+  window geometry — binding decisions 11 and 12 of `DESKTOP_INCREMENT_1.md`.
+- `tests/desktop/` is an offscreen pytest-qt suite: **175 passed** as of 2026-08-07.
+- Packaging produces **unsigned development bundles** for macOS Apple Silicon and Windows 11 x64.
+  No signing, notarization, or auto-update exists.
+
+**Gates remain open.** `AICC-D1-GATE` is still **Review**, not Done: the interactive Windows 11 x64
+acceptance pass has never been performed on real hardware, and that gate's forbidden-scope note
+required it to close before `AICC-D2A` began. The D2/D3/D4 implementations landed anyway, so the
+verification gates lag the merged code rather than leading it.
+
+#### Track 2 — Audit remediation
+
+The Still-Open rows of Founder Functional Audit `9761459`, closing the §2.2 safety gate and §2.5
+audit-closure gate. Landed across 2026-07-29 → 2026-08-07: fail-closed handling of untrusted tasks
+in the Copilot executor, provenance stamping on report-derived child tasks, a full read-modify-write
+lock on project and portfolio configuration, per-warning launch confirmation (each warning
+acknowledged under its own stable issue code, with the launch blocked until every one is ticked),
+Done tasks reported when not backed by a verified completion, and a store-read failure that now
+raises `TasksStoreUnreadable` instead of silently returning an empty list.
+
+The closure verdict itself was made **executable** on 2026-08-07 rather than left as prose, and the
+W1/W2 remediation set was confirmed merged.
+
+#### Track 3 — Governance
+
+The `§8` required follow-ups F1–F5 of the authority record, closing the §2.3 data-integrity gate and
+§2.4 documentation-truth gate: the canonical master roadmap and its machine-readable companion
+(2026-07-28), audit reconciliation and current-state updates, an AIOS boundary fitness baseline, and
+fencing of autonomous daily-audit publication and shutdown.
+
+#### Alongside H1 — not one of the three tracks
+
+The AML Service (phases 1–7, 115-ФЗ compliance, Docker packaging, bank acceptance package) and the
+ESF/AML project registry additions landed during the H1 window but are outside the horizon's three
+committed tracks — recorded here so the timeline is not read as an H1 scope claim.
+
+#### Known status drift
+
+`MASTER_PRODUCT_ROADMAP.md` is a planning snapshot reconciled against `main` @ `bd9f05b` on
+2026-07-28 and still lists `AICC-D2A` through `AICC-D4-GATE` as **Backlog**. The corresponding code
+merged between 2026-07-29 and 2026-07-31. `docs/desktop/README.md` and `CURRENT_STATE.md` likewise
+still describe the desktop client as a pure shell with no data wiring, or as documentation and design
+work only. The code, its tests, and this changelog are the current authority; those three documents
+need reconciliation.
+
+### AIOS Tasks backend accepted — SDK vendored, AIOS tests in CI — 2026-08-07
+
+Closes Sprint 4 limitation I5. `aios_sdk` is no longer a local path dependency that only
+development machines have: it now installs everywhere the suite runs, so the AIOS backend
+tests execute in CI instead of silently skipping.
+
+#### Added
+- **`scripts/build_aios_sdk_wheel.py`**: builds a standalone `aios-sdk` wheel from a pinned
+  commit of the private aios repository. Content is taken via `git archive` (committed state
+  only — never a working tree) and covers only `src/aios_sdk`, which imports nothing from
+  `aios.*` core; the closed core itself is not vendored. The build is deterministic (fixed
+  zip timestamps, sorted entries — mirrors aios `tools/build_distributions.py`), and the
+  pinned commit is embedded as a PEP 440 local segment (`0.1.0+gd3c69e4`). Dependency bands,
+  `requires-python`, author and license metadata are read from the aios `pyproject.toml` at
+  the same ref.
+- **`vendor/aios_sdk-0.1.0+gd3c69e4-py3-none-any.whl`** (25 KB; deps `httpx`, `pydantic`)
+  plus `vendor/README.md` with provenance (source sha, wheel sha256) and refresh
+  instructions. A committed wheel keeps `ci.yml`'s design constraint intact: the workflow
+  still references no secrets even though the SDK's home repository is private.
+- **`requirements.txt`** now installs the vendored wheel (path is resolved by pip against
+  the current directory — install from the repository root, as CI and the Dockerfile do).
+  The `Dockerfile` copies `vendor/` before `pip install`.
+
+#### Fixed
+- **`pytest-xdist` was missing from every requirements file** while `pyproject.toml`
+  addopts run every pytest invocation with `-n 6 --dist=loadscope` (commit `7e4af7f`) —
+  pytest, including CI's required `pytest -q` gate, aborted on the unrecognized `-n` flag
+  before collecting a single test. Added `pytest-xdist>=3.6,<4.0` to `requirements-dev.txt`
+  and to the arch-fitness workflow's minimal install (it runs `pytest tests/architecture`
+  under the same addopts).
+- Five pre-existing Ruff findings in `command_center/ui/awaiting_pr_panel.py` and
+  `scripts/run-imp-sequence.py` (unused imports/variable, extraneous f-string prefix) that
+  failed the `ruff check .` CI gate ahead of the pytest step.
+
+#### Clarified
+- Of the three Sprint 4 test files, only `tests/test_aios_tasks_repository.py` and
+  `tests/test_aios_tasks_adapter.py` were skipped (`pytest.importorskip("aios_sdk")`);
+  `tests/test_tasks_backend_routing.py` always ran — `get_repository()` validates
+  `AICC_AIOS_URL`/`AICC_AIOS_TOKEN` before the lazy SDK import. All 44 tests across the
+  three files now run everywhere.
+
 ### AIOS Tasks backend (Sprint 4) — 2026-08-06
 
 Feature flag `AICC_TASKS_BACKEND=json|aios` selects the tasks persistence layer at runtime.
@@ -35,7 +178,8 @@ to route all task reads/writes through the AIOS Tasks API.
 - C3: `AIOSIdMap` is per-process; multi-worker Streamlit deployments need a shared store.
 - I3: AIOS auth token is not refreshed mid-session (assumed long-lived).
 - I4: `list_tasks()` fetches only the first page (AIOS v1 has no cursor pagination).
-- I5: `aios_sdk` is a local path dep; not in `requirements.txt` — CI skips AIOS tests.
+- I5 (closed 2026-08-07): `aios_sdk` was a local path dep, so CI skipped the AIOS tests.
+  Resolved by the vendored SDK wheel — see "AIOS Tasks backend accepted" above.
 
 ### D1 final gate — cross-platform smoke pass (partial)
 

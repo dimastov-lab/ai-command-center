@@ -1494,7 +1494,13 @@ def remediate_workspaces(
             repoints[task_id] = repoint
             continue
 
-        if prep.decision != launch_service.LAUNCH_DECISION_NEEDS_CONFIRMATION:
+        # Accept both the old NEEDS_CONFIRMATION (dirty tree was a warning) and the
+        # new LAUNCH_DECISION_BLOCKED (dirty tree is now a blocking error). The dirty
+        # check at the next line still guards: only an actually-dirty workspace proceeds.
+        if prep.decision not in (
+            launch_service.LAUNCH_DECISION_NEEDS_CONFIRMATION,
+            launch_service.LAUNCH_DECISION_BLOCKED,
+        ):
             continue
 
         workspace = prep.resolved_workspace or prep.selection.path
@@ -1502,8 +1508,8 @@ def remediate_workspaces(
             continue
         status = git_info.get_status(Path(workspace))
         if not status.get("dirty"):
-            # A warning that is not dirtiness (detached HEAD, branch mismatch)
-            # is a configuration question, not leftovers. Never auto-"fixed".
+            # A non-dirty block (workspace missing, not a git repo) or a non-dirty
+            # warning (branch mismatch) is a configuration question, not leftovers.
             continue
 
         if not workspace_provisioning.is_pipeline_owned_worktree(workspace, repository_path):

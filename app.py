@@ -64,6 +64,7 @@ from command_center.ui import (
     project_intelligence_panel,
     proposals_panel,
     project_selector,
+    awaiting_pr_panel,
     queue_panel,
     recommendations_panel,
     shell,
@@ -2876,6 +2877,13 @@ def _render_board_sections(
         now=now,
     )
 
+    awaiting_pr_panel.render_awaiting_pr_panel(
+        tasks,
+        ROOT,
+        upsert_tasks,
+        db_path=DATA_DIR / "runtime.db",
+    )
+
     done = board[live_board.BUCKET_DONE]
     if done:
         with st.expander(f"✓ {live_board.BUCKET_TITLES[live_board.BUCKET_DONE]} ({len(done)})", expanded=False):
@@ -3336,10 +3344,6 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
         ]
 
     queue_entries = execution_queue.load_queue(ROOT)
-    reconciled_queue = execution_queue.reconcile_missing_run_links(ROOT, queue_entries)
-    if reconciled_queue != queue_entries:
-        execution_queue.save_queue(ROOT, reconciled_queue)
-        queue_entries = reconciled_queue
     dismissed_attention = st.session_state.get(_ATTENTION_DISMISSED_KEY, set())
     visible_board = {
         bucket: list(rows)
@@ -3759,7 +3763,23 @@ def build_commands() -> list[dict]:
 
 # Data loading happens before the shell render so the top command bar (search,
 # live glyph, Inspector) has the task map + api available without a second pass.
-tasks = load_tasks()
+try:
+    tasks = load_tasks()
+except tasks_repository.TasksStoreUnreadable as exc:
+    # An unreadable store is never degraded to an empty board: an empty Kanban
+    # is indistinguishable from "you have no tasks", so the operator would plan
+    # and launch against a store they believe is empty while the real one sits
+    # on disk. Stop the render here with the failure and the file path instead.
+    st.error(
+        "❌ Хранилище задач `data/tasks.json` не читается — доска не может быть "
+        "показана.\n\n"
+        f"Файл: `{exc.path}`\n\n"
+        f"Причина: `{type(exc.cause).__name__}: {exc.cause}`\n\n"
+        "Данные на диске не изменены. Восстановите файл из резервной копии или "
+        "git, затем перезагрузите страницу. Пустая доска здесь НЕ показывается "
+        "намеренно — она была бы неотличима от «задач нет»."
+    )
+    st.stop()
 tasks_by_id = {task["id"]: task for task in tasks}
 task_counts = read_model.task_snapshot(tasks)
 project_configs = project_config.load_project_configs()

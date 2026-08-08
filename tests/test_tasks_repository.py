@@ -33,18 +33,22 @@ def test_load_tasks_seeds_from_example_file(tmp_path):
     assert tasks[0]["progress"] == 0  # backfilled by normalize_task on load
 
 
-def test_load_tasks_returns_empty_list_for_malformed_json(tmp_path):
+def test_load_tasks_raises_for_malformed_json(tmp_path):
+    """Never `[]`: an unreadable store must surface, not masquerade as empty.
+    See tests/test_tasks_repository_data_loss.py for the full contract."""
     tasks_file = tr.tasks_file_path(tmp_path)
     tasks_file.parent.mkdir(parents=True, exist_ok=True)
     tasks_file.write_text("not json")
-    assert tr.load_tasks(tmp_path) == []
+    with pytest.raises((json.JSONDecodeError, ValueError, OSError)):
+        tr.load_tasks(tmp_path)
 
 
-def test_load_tasks_returns_empty_list_when_top_level_is_not_a_list(tmp_path):
+def test_load_tasks_raises_when_top_level_is_not_a_list(tmp_path):
     tasks_file = tr.tasks_file_path(tmp_path)
     tasks_file.parent.mkdir(parents=True, exist_ok=True)
     tasks_file.write_text(json.dumps({"not": "a list"}))
-    assert tr.load_tasks(tmp_path) == []
+    with pytest.raises((json.JSONDecodeError, ValueError, OSError)):
+        tr.load_tasks(tmp_path)
 
 
 def test_save_and_reload_roundtrip(tmp_path):

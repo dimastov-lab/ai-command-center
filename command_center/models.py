@@ -42,7 +42,7 @@ PROJECT_ALIASES: dict[str, str] = {
 # site (`KANBAN_COLUMNS`, `PRIORITIES`) is unchanged.
 # --------------------------------------------------------------------------
 
-KANBAN_STATUSES: list[str] = ["Backlog", "Next", "In Progress", "Review", "Done"]
+KANBAN_STATUSES: list[str] = ["Backlog", "Next", "In Progress", "Review", "Done", "Closed"]
 
 TASK_PRIORITIES: list[str] = ["Low", "Medium", "High", "Critical"]
 
@@ -149,6 +149,44 @@ def iso_now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def format_age(iso_str: str | None) -> str:
+    """ISO timestamp → human-readable relative time (e.g. '2 hours ago', '1 day ago').
+    Returns empty string if input is None, empty, or unparseable."""
+    if not iso_str:
+        return ""
+    text = str(iso_str).strip()
+    if not text:
+        return ""
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+
+    if dt.tzinfo is not None:
+        now = datetime.now(dt.tzinfo)
+    else:
+        now = datetime.now()
+    delta = now - dt
+    seconds = delta.total_seconds()
+
+    if seconds < 0:
+        return ""
+    elif seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    elif seconds < 86400:
+        hours = int(seconds // 3600)
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    elif seconds < 604800:
+        days = int(seconds // 86400)
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    else:
+        weeks = int(seconds // 604800)
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+
+
 def new_id() -> str:
     return uuid.uuid4().hex
 
@@ -170,6 +208,7 @@ def default_task_workflow_fields() -> dict:
         "branch": None,
         "agent": None,
         "last_run_at": None,
+        "last_provider_id": None,
     }
 
 
@@ -223,6 +262,7 @@ LAUNCH_STATUSES: list[str] = [
     "Blocked",
     "Incomplete",
     "Needs Review",
+    "Awaiting PR",
     "Completed",
     "Failed",
     "Requires Attention",
@@ -242,6 +282,13 @@ TIMELINE_EVENT_TYPES: list[str] = [
     "completed",
     "launch_requires_attention",
 ]
+
+
+def truncate_text(text: str, max_len: int) -> str:
+    """Truncate text to at most max_len characters, appending '…' if truncated."""
+    if len(text) <= max_len:
+        return text
+    return text[: max(0, max_len - 1)] + "…"
 
 
 def derive_short_title(text: str, limit: int = 80) -> str:
