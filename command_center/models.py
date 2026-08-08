@@ -244,6 +244,17 @@ TIMELINE_EVENT_TYPES: list[str] = [
 ]
 
 
+def truncate_text(text: str, max_len: int) -> str:
+    """Return text bounded to ``max_len``, using one ellipsis when truncated."""
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return "…"
+    return text[: max_len - 1] + "…"
+
+
 def derive_short_title(text: str, limit: int = 80) -> str:
     collapsed = " ".join(text.split())
     if len(collapsed) <= limit:
