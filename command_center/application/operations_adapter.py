@@ -114,4 +114,3 @@ class OperationsAdapter:
     @staticmethod
     def is_active_state(state: object) -> bool:
         return state in runtime_db.EXECUTION_CENTER_ACTIVE_STATES
-

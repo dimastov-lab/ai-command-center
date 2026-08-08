@@ -30,4 +30,3 @@ def test_navigation_reaches_each_operational_page(shell):
     for key in OPERATIONAL_KEYS:
         shell.navigate_to(key)
         assert shell.current_section_key == key
-

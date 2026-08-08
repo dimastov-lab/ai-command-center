@@ -59,4 +59,3 @@ def test_agents_include_live_load(monkeypatch):
     )
     rows = OperationsAdapter(workspace_home_adapter=FakeWorkspace()).agents()
     assert rows[0]["running"] == 2
-

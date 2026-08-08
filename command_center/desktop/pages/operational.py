@@ -116,4 +116,3 @@ class OperationalPage(BasePage):
         for runnable in tuple(self._runnables.values()):
             runnable.cancel()
         self._runnables.clear()
-
