@@ -3,9 +3,9 @@ name: CI
 # Automated quality gates for AI Command Center.
 #
 # Runs the deterministic local validation commands (whitespace errors, Ruff,
-# byte-compile, full pytest) in a clean, ephemeral environment on every pull
-# request into main and on every push to main, plus on-demand via the Actions
-# tab.
+# byte-compile, full pytest with coverage) in a clean, ephemeral environment on
+# every pull request into main and on every push to main, plus on-demand via the
+# Actions tab.
 #
 # Design constraints (see README "Continuous integration"):
 #   * No secrets are referenced; the suite mocks every real Claude/Codex CLI call
@@ -36,9 +36,9 @@ jobs:
   quality-gates:
     name: Quality gates (whitespace · Ruff · compile · pytest)
     runs-on: ubuntu-latest
-    # 20 was hit twice on 2026-08-07: the full suite now runs ~18-20 min on a
-    # cold ubuntu-latest runner, so the cap must leave real headroom.
-    timeout-minutes: 35
+    # A single coverage-enabled pass normally takes ~10 min on a cold runner;
+    # keep headroom for runner variance while bounding genuine hangs.
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -90,16 +90,17 @@ jobs:
       - name: Compile validation
         run: python -m compileall -q command_center scripts tests app.py
 
-      - name: Pytest
-        run: pytest -q
+      # Collect coverage during the required test run instead of executing all
+      # tests a second time.  No fail-under threshold is configured, so test
+      # failures still gate the job while the coverage percentage remains
+      # informational.  Durations make future runtime regressions visible in
+      # the CI log without adding another test pass.
+      - name: Pytest + coverage
+        run: pytest -q --durations=50 --cov=command_center --cov-report=term --cov-report=xml
 
-      # Informational, non-blocking signals. They never fail the job
-      # (continue-on-error) so the merge gate stays the deterministic quartet
-      # above; these surface coverage and type-check progress without gating on
-      # a codebase that is not yet fully typed or covered.
-      - name: Coverage (informational)
-        continue-on-error: true
-        run: pytest -q --cov=command_center --cov-report=term --cov-report=xml
+      # Informational, non-blocking signal. It never fails the job so the merge
+      # gate stays focused on the deterministic checks above while surfacing
+      # type-check progress for a codebase that is not yet fully typed.
 
       - name: Type check (informational)
         continue-on-error: true
