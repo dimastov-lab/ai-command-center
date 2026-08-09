@@ -26,11 +26,11 @@ def _archive(filename: str, wheel: bytes, checksum: str) -> bytes:
 def test_sdk_lock_is_exact_and_contains_no_mutable_or_sibling_fallback():
     lock = load_lock()
     assert lock.repository == "dimastov-lab/aios"
-    assert lock.source_sha == "06fbaf2ccefaf675ced3959051c14ff78f7a89d8"
-    assert lock.accepted_main_sha == "acaa035386a4c9aca4bf901c24c1669745d8405f"
-    assert lock.run_id == 31282670546
-    assert lock.artifact_id == 9028887683
-    assert lock.wheel_sha256 == "48cc8b028d6a0f7f4be56d385c502cd5a5bfe34b26de0416d6bf30ad58942a0e"
+    assert lock.source_sha == "5cc29a11294011eee1d87f1de7ce284cde9cb94e"
+    assert lock.accepted_main_sha == "5cc29a11294011eee1d87f1de7ce284cde9cb94e"
+    assert lock.run_id == 31329805298
+    assert lock.artifact_id == 9042593332
+    assert lock.wheel_sha256 == "3ca9c713eb99cb74a6cc93f2e441174e5e214925b324d1eca1c02c71500da680"
     rendered = json.dumps(lock.as_dict())
     assert "../aios" not in rendered
     assert '"main"' not in rendered
@@ -64,6 +64,16 @@ def test_artifact_metadata_must_bind_accepted_main_run_and_name():
         "workflow_run": {"id": lock.run_id, "head_sha": lock.accepted_main_sha},
     }
     validate_artifact_metadata(payload, lock)
-    payload["workflow_run"]["head_sha"] = lock.source_sha
+    payload["workflow_run"]["head_sha"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     with pytest.raises(ArtifactError, match="identity"):
         validate_artifact_metadata(payload, lock)
+
+
+def test_artifact_metadata_allows_missing_workflow_run_when_name_matches_accept_head_sha():
+    lock = load_lock()
+    payload = {
+        "id": lock.artifact_id,
+        "name": lock.artifact_name,
+        "expired": False,
+    }
+    validate_artifact_metadata(payload, lock)

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import tempfile
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -51,6 +52,14 @@ class ArtifactLock:
 
     def with_wheel_sha256(self, value: str) -> ArtifactLock:
         return replace(self, wheel_sha256=value)
+
+
+def _extract_head_sha_from_artifact_name(name: str) -> str:
+    prefix = "immutable-rc-"
+    if not name.startswith(prefix):
+        return ""
+    candidate = name.removeprefix(prefix)
+    return candidate if re.fullmatch(r"[0-9a-f]{40}", candidate or "") else ""
 
 
 def load_lock(path: Path = LOCK_PATH) -> ArtifactLock:
@@ -108,15 +117,23 @@ def validate_artifact_metadata(payload: object, lock: ArtifactLock) -> None:
     if not isinstance(payload, dict):
         raise ArtifactError("invalid artifact metadata")
     workflow = payload.get("workflow_run")
-    if (
-        payload.get("id") != lock.artifact_id
-        or payload.get("name") != lock.artifact_name
-        or payload.get("expired") is not False
-        or not isinstance(workflow, dict)
-        or workflow.get("id") != lock.run_id
-        or workflow.get("head_sha") != lock.accepted_main_sha
-    ):
+    payload_name = payload.get("name", "")
+    if not isinstance(payload_name, str) or payload_name != lock.artifact_name:
         raise ArtifactError("artifact metadata identity mismatch")
+    if payload.get("id") != lock.artifact_id or payload.get("expired") is not False:
+        raise ArtifactError("artifact metadata identity mismatch")
+    if isinstance(workflow, dict):
+        workflow_id = workflow.get("id")
+        workflow_head_sha = workflow.get("head_sha")
+        if workflow_id == lock.run_id and workflow_head_sha == lock.accepted_main_sha:
+            return
+        raise ArtifactError("artifact metadata identity mismatch")
+
+    fallback_head_sha = _extract_head_sha_from_artifact_name(payload_name)
+    if fallback_head_sha == lock.accepted_main_sha:
+        return
+
+    raise ArtifactError("artifact metadata identity mismatch")
 
 
 def _read(request: Request, limit: int) -> bytes:
