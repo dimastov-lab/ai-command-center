@@ -14,6 +14,13 @@ _SHELL_REPAIR = """
 <script>
 (() => {
   const document = window.parent.document;
+  const stateKey = "__aiccAccessibilityRepair";
+  const state = window.parent[stateKey] || {
+    activeObservers: 0,
+    callbackCount: 0,
+    installCount: 0,
+    observer: null,
+  };
 
   const repair = () => {
     const main = document.querySelector("section[data-testid='stMain']");
@@ -26,7 +33,10 @@ _SHELL_REPAIR = """
       sidebar.setAttribute("aria-label", "Основная навигация");
     }
 
-    document.querySelectorAll("h1 a, h2 a, h3 a, h4 a, h5 a, h6 a")
+    document.querySelectorAll(
+      "[data-testid='stHeaderActionElements'] a, " +
+      "a[data-testid='stHeaderActionElements']"
+    )
       .forEach((anchor) => {
         anchor.setAttribute("aria-hidden", "true");
         anchor.setAttribute("tabindex", "-1");
@@ -49,11 +59,27 @@ _SHELL_REPAIR = """
       });
   };
 
-  repair();
-  new MutationObserver(repair).observe(document.body, {
-    childList: true,
-    subtree: true,
-  });
+  const install = () => {
+    if (state.observer) {
+      state.observer.disconnect();
+      state.activeObservers -= 1;
+    }
+    repair();
+    state.observer = new MutationObserver(() => {
+      state.callbackCount += 1;
+      repair();
+    });
+    state.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+    state.activeObservers += 1;
+    state.installCount += 1;
+  };
+
+  window.parent[stateKey] = state;
+  window.parent.__aiccInstallAccessibilityRepair = install;
+  install();
 })();
 </script>
 """

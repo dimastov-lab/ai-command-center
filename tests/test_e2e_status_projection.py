@@ -228,6 +228,47 @@ def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
         surface = page.locator("[data-testid='stMain']")
         _dashboard_action_names(surface)
 
+        # Streamlit keeps the parent document across Python reruns. Reinstalling
+        # the shell repair must disconnect the previous observer instead of
+        # accumulating one callback per rerun.
+        initial_installs = page.evaluate("window.__aiccAccessibilityRepair.installCount")
+        page.get_by_role("button", name="Проекты", exact=True).click()
+        page.get_by_text("Обзор всех проектов", exact=False).first.wait_for()
+        page.get_by_role("button", name="Обзор", exact=True).click()
+        _dashboard_action_names(surface)
+
+        # Exercise the reinstall path explicitly as well: Streamlit currently
+        # preserves an unchanged st.html node on these reruns, but a future
+        # renderer may execute it again.
+        page.evaluate(
+            "window.__aiccInstallAccessibilityRepair();"
+            "window.__aiccInstallAccessibilityRepair();"
+        )
+        assert page.evaluate("window.__aiccAccessibilityRepair.installCount") == initial_installs + 2
+        assert page.evaluate("window.__aiccAccessibilityRepair.activeObservers") == 1
+        page.evaluate("window.__aiccAccessibilityRepair.callbackCount = 0")
+        page.evaluate(
+            "document.querySelector('[data-testid=stMain]').appendChild(document.createElement('i'))"
+        )
+        page.wait_for_function("window.__aiccAccessibilityRepair.callbackCount >= 1")
+        assert page.evaluate("window.__aiccAccessibilityRepair.callbackCount") == 1
+
+        # A content link inside a heading is meaningful and must remain exposed;
+        # only Streamlit's empty permalink control is decorative.
+        page.evaluate(
+            "const link = document.createElement('a');"
+            "link.href = '/operator-guide';"
+            "link.textContent = 'Руководство оператора';"
+            "document.querySelector('h2').appendChild(link);"
+        )
+        meaningful_link = page.get_by_role("link", name="Руководство оператора", exact=True)
+        meaningful_link.wait_for()
+        assert meaningful_link.get_attribute("aria-hidden") is None
+        assert page.get_by_role(
+            "button",
+            name=re.compile(r"^(Скрыть|Показать|Открыть) навигацию$"),
+        ).count() == 1
+
         results = Axe().run(
             page,
             options={
@@ -247,10 +288,9 @@ def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
             "axe_serious": [violation["id"] for violation in serious],
             "empty_checkbox_names": page.get_by_role("checkbox", name="", exact=True).count(),
             "focusable_sections": page.locator("section[tabindex]:not([tabindex='-1'])").count(),
-            "heading_links": page.locator(
-                "h1 a:not([aria-hidden='true']), h2 a:not([aria-hidden='true']), "
-                "h3 a:not([aria-hidden='true']), h4 a:not([aria-hidden='true']), "
-                "h5 a:not([aria-hidden='true']), h6 a:not([aria-hidden='true'])"
+            "decorative_heading_links": page.locator(
+                "[data-testid='stHeaderActionElements'] a:not([aria-hidden='true']), "
+                "a[data-testid='stHeaderActionElements']:not([aria-hidden='true'])"
             ).count(),
             "icon_names_in_buttons": page.get_by_role(
                 "button",
@@ -261,7 +301,7 @@ def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
             "axe_serious": [],
             "empty_checkbox_names": 0,
             "focusable_sections": 0,
-            "heading_links": 0,
+            "decorative_heading_links": 0,
             "icon_names_in_buttons": 0,
         }, results.generate_report()
         browser.close()
