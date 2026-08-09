@@ -304,11 +304,19 @@ python -m compileall -q command_center scripts tests app.py
 pytest -q
 ```
 
-`.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
-compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
-Python 3.14. The workflow uses a read-only token, pins actions to commit SHAs, and cancels
-superseded runs for the same ref. The workflow does not itself configure branch protection;
-repository settings must separately require the check if merges are to be blocked on it.
+`.github/workflows/ci.yml` publishes stable Linux, Windows, security, and production-web-build
+contexts; `.github/workflows/arch-fitness.yml` publishes the AIOS boundary context. Browser and
+accessibility journeys remain covered inside both platform contexts. The workflows use read-only
+tokens, pin actions to commit SHAs, and cancel superseded runs for the same ref. They do not
+configure branch protection; repository settings must separately require their exact context names.
+
+Each context has a maintainer-controlled deliberate-failure canary. Adding one of the
+`release-gate-canary-{linux,windows,security,build,boundary}` labels to a pull request reruns the
+workflows and fails that context at its named canary step. Remove the label after recording the
+failure; the `unlabeled` event produces a clean replacement run. Never use a canary label on a
+mergeable change. Mutable vulnerability-advisory feeds, human approval, conversation resolution,
+and release-environment protection remain separate repository controls rather than claims made by
+these deterministic workflows.
 
 ## Current limitations and risks
 
@@ -319,10 +327,9 @@ repository settings must separately require the check if merges are to be blocke
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - A static type checker is now configured (permissive, non-strict) via `pyproject.toml` and
   surfaced as a non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
-- The checked-in CI workflow is automatic but does not itself enforce branch protection; the
-  repository's current plan/settings must be checked before treating it as a required merge gate.
-  Enable "Require status checks to pass before merging" on `main` with the `Quality gates` check
-  to make the workflow a real gate.
+- The checked-in workflows are automatic but do not themselves enforce branch protection; the
+  repository's current settings must be checked before treating any context as a required merge
+  gate. Bind all five exact names only after they have appeared green on an exact pull-request head.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
   it, and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
