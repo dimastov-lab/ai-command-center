@@ -355,9 +355,13 @@ jobs:
         uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b
 
       - name: Release gate policy
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: pytest -q tests/test_release_gate_policy.py
 
       - name: Focused security regressions
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: |
           pytest -q \
             tests/test_provenance_gating.py \
