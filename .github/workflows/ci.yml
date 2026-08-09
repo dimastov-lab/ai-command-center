@@ -39,6 +39,8 @@ jobs:
     # A single coverage-enabled pass normally takes ~10 min on a cold runner;
     # keep headroom for runner variance while bounding genuine hangs.
     timeout-minutes: 20
+    env:
+      AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -71,6 +73,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
           pip install -r requirements-web.txt
+
+      - name: Install exact accepted AIOS SDK artifact
+        env:
+          AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
+        run: |
+          python scripts/fetch_aios_sdk_artifact.py --output .artifacts
+          pip install "$AICC_AIOS_SDK_WHEEL"
 
       - name: Whitespace errors
         shell: bash
@@ -133,6 +142,7 @@ jobs:
       # `setdefault`s this, but set it explicitly so a non-empty value is
       # guaranteed (an empty value would crash Qt, per WINDOWS_RUNBOOK.md §2).
       QT_QPA_PLATFORM: "offscreen"
+      AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -156,6 +166,13 @@ jobs:
           pip install -r requirements-dev.txt
           pip install -r requirements-web.txt
           pip install -r requirements-desktop.txt
+
+      - name: Install exact accepted AIOS SDK artifact
+        env:
+          AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
+        run: |
+          python scripts/fetch_aios_sdk_artifact.py --output .artifacts
+          pip install "$env:AICC_AIOS_SDK_WHEEL"
 
       - name: Ruff
         run: ruff check .

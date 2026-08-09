@@ -11,6 +11,9 @@ is inherited verbatim. No Qt import lives here.
 from __future__ import annotations
 
 from command_center.application.aios_status import (
+    AIOSCoreReadiness,
+    AIOSCoreStatus,
+    AIOSStatusError,
     AIOSStatusClient,
     create_aios_status_client,
 )
@@ -69,15 +72,28 @@ class WorkspaceHomeAdapter:
 
     def aios_core_status(self) -> dict:
         """Fetch AIOS independently so remote latency cannot block local Home."""
-        status = self._aios_status_client.get_core_status()
+        try:
+            status = self._aios_status_client.get_core_status()
+        except AIOSStatusError as error:
+            status = AIOSCoreStatus(
+                readiness=AIOSCoreReadiness.ERROR,
+                source="AIOS SDK",
+                detail=error.code,
+                evidence=(),
+                accepted_sha=None,
+                deployed_sha=None,
+            )
         return {
             "readiness": status.readiness.value,
             "source": status.source,
             "version": status.version,
             "health": status.health,
+            "tenant_id": status.tenant_id,
             "capabilities": list(status.capabilities),
-            "gates": list(status.gates),
-            "evidence": list(status.evidence),
+            "evidence": [item.as_dict() for item in status.evidence],
+            "timeline": [item.as_dict() for item in status.timeline],
+            "accepted_sha": status.accepted_sha,
+            "deployed_sha": status.deployed_sha,
             "detail": status.detail,
         }
 

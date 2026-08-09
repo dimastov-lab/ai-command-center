@@ -1,0 +1,12 @@
+{
+  "accepted_main_sha": "acaa035386a4c9aca4bf901c24c1669745d8405f",
+  "api_major": 1,
+  "artifact_id": 9028887683,
+  "artifact_name": "aios-sdk-0.2.0-acaa035386a4c9aca4bf901c24c1669745d8405f",
+  "repository": "dimastov-lab/aios",
+  "run_id": 31282670546,
+  "source_sha": "06fbaf2ccefaf675ced3959051c14ff78f7a89d8",
+  "version": "0.2.0",
+  "wheel_filename": "aios_sdk-0.2.0-py3-none-any.whl",
+  "wheel_sha256": "48cc8b028d6a0f7f4be56d385c502cd5a5bfe34b26de0416d6bf30ad58942a0e"
+}

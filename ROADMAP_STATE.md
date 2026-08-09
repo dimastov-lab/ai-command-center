@@ -6,12 +6,13 @@ Tracking issue: [#174](https://github.com/dimastov-lab/ai-command-center/issues/
 
 ## Dependency gate
 
-Wave 4 is accepted on AICC main `802ac54e9a1838c1ac7157571eed291a7accbfce` with successful exact-main CI. W5-AICC-TASKS-GATEWAY-001 is an independent preparatory boundary only: dependent AICC cutover remains blocked until this task and the AIOS SDK task are separately accepted. Merge, production deploy, PR closure, and worktree cleanup remain explicit human gates. PR #157 and PR #158 remain untouched by this task.
+Wave 5 TasksGateway is accepted on AICC main `9613d805041ac581cec885f25e50dcdd73eae72f`; AIOS SDK is accepted on main `acaa035386a4c9aca4bf901c24c1669745d8405f`. W5-AICC-SDK-CONTRACT-001 is the dependent immutable artifact and read-only status cutover only. Supervisor/provider/execution cutover, merge, production deploy, PR closure, and worktree cleanup remain explicit later gates. PR #157 and PR #158 remain untouched.
 
 ## Required provenance
 
 | task_id | repository | worktree | branch | base_sha | head_sha | tests | pr | ci | accepted_sha | deployed_sha |
 |---|---|---|---|---|---|---|---|---|---|---|
+| W5-AICC-SDK-CONTRACT-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave5-sdk-contract-20260809` | `codex/wave5-sdk-contract-20260809` | `9613d805041ac581cec885f25e50dcdd73eae72f` | implementation/final head tracked by draft PR | RED import/collection failure; focused `44 passed`; full exactly once `2939 passed, 1 skipped, 1 environment failure` (missing local Chromium); targeted browser remediation `1 passed`; 86% coverage; Ruff/compile/diff clean | issue [#176](https://github.com/dimastov-lab/ai-command-center/issues/176); draft [#177](https://github.com/dimastov-lab/ai-command-center/pull/177) | pending exact-head Linux/Windows/boundary CI | unknown until exact-head CI + human review | unknown; no deploy |
 | W5-AICC-TASKS-GATEWAY-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave5-tasks-gateway-20260809` | `codex/wave5-tasks-gateway-20260809` | `802ac54e9a1838c1ac7157571eed291a7accbfce` | implementation `04a8646326d9f3b7b7a0b3535adb671d779ccaed`; remediation/final head tracked by PR | RED import/collection failure; focused `123 passed`; full exactly once `2933 passed`, 185 warnings, 86% coverage; review remediation `76 passed`, cross-process contract `16 passed`; Ruff/compileall/diff-check clean | issue [#174](https://github.com/dimastov-lab/ai-command-center/issues/174); draft [#175](https://github.com/dimastov-lab/ai-command-center/pull/175) | fresh exact-head Linux/Windows/boundary CI pending | unknown until exact-head CI + human review | unknown; no deploy |
 | W4-AICC-TRUTHFUL-DASHBOARD-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave4-truthful-dashboard-20260809` | `codex/wave4-truthful-dashboard-20260809` | `857ddcbbffea87f797382300ee93c787ae7b8c07` | implementation `a8e4047db63d820e6a178d8ac7938250461fdf27`; final docs head tracked by PR | RED import failure; final focused truth/provenance/UI/browser/architecture `64 passed`; broader API/DB/UI/architecture/browser `167 passed`; Chromium keyboard/semantics/320px/200%-text journey `1 passed`; full ran exactly once and produced empty `lastfailed` plus finalized coverage XML, but terminal summary/exit was lost during tool transport, so no local count is claimed; Ruff/compileall/diff-check clean | issue [#172](https://github.com/dimastov-lab/ai-command-center/issues/172); draft [#173](https://github.com/dimastov-lab/ai-command-center/pull/173) | exact-head Linux/Windows/boundary CI in progress; authoritative full-suite gate | unknown until exact-head CI + human review | unknown; no deploy |
 | W3-AICC-PROVIDER-ROUTE-001 | `dimastov-lab/ai-command-center` | `/Users/dmitrijcernikov/Projects/_worktrees/ai-command-center/wave3-provider-route-20260808` | `codex/wave3-provider-route-20260808` | `c07ecaac42f180b0c265e60ea8b7f4ffcc956ad0` | implementation `0539cfdbf7085de5d85d6d752dc893f23eb0039d`; final docs head tracked by PR | RED import failure; focused `132 passed`; Supervisor failure/lifecycle `7 passed`; manual hermetic journey green with zero external calls; full ran once: `2909 passed, 1 failed` (legacy policy exception ordering), remediated focused `36 passed`; final route/idempotency `15 passed`; architecture `17 passed`; exact-head CI authoritative | issue [#170](https://github.com/dimastov-lab/ai-command-center/issues/170); draft [#171](https://github.com/dimastov-lab/ai-command-center/pull/171) | pending exact-head Linux/Windows/boundary CI | unknown until exact-head CI + human review | unknown; no deploy |
@@ -69,6 +70,13 @@ Wave 4 is accepted on AICC main `802ac54e9a1838c1ac7157571eed291a7accbfce` with 
 - The adapter owns and exposes client close/context-manager lifecycle; mandatory contract tests remain hermetic and do not skip when the AIOS SDK artifact is absent.
 - Final AIOS artifact pinning, status/core/execution cutover, Supervisor retirement, merge, and deploy are outside this task.
 
+## Wave 5 immutable SDK and status evidence
+
+- AICC pins the accepted AIOS main `acaa035386a4c9aca4bf901c24c1669745d8405f`, artifact id `9028887683`, and wheel SHA-256 `48cc8b028d6a0f7f4be56d385c502cd5a5bfe34b26de0416d6bf30ad58942a0e`; acquisition has no sibling-path, branch, latest, or vendored fallback.
+- Clean CI must download with the existing read-only artifact secret, verify both the artifact manifest and locked checksum, install the exact wheel, and run mandatory SDK tests without import skips. The broad token should be rotated later to a fine-grained Actions-read credential.
+- The sole SDK adapter composes health, readiness, whoami, and bounded workspace timeline into an AICC-owned port. Timeline projection allowlists only event id/type/time; request IDs remain evidence while principals, payloads, prompts, and paths do not cross the boundary.
+- Tenant/auth/authz/timeout/remote/contract failures are typed and fail closed. Health, readiness, CI, or a timeline never infer `accepted_sha` or `deployed_sha`; both remain unknown without qualifying immutable evidence.
+
 ## Deferred human gates
 
 - Draft PR review/ready/merge requires explicit permission; no accepted delivery head has been merged or deployed.
@@ -78,4 +86,4 @@ Wave 4 is accepted on AICC main `802ac54e9a1838c1ac7157571eed291a7accbfce` with 
 
 ## Next allowed work
 
-Require exact-head CI and human review for draft PR #175. Do not begin dependent AICC cutover, merge, close PRs, deploy, rewrite history, or delete worktrees without explicit approval.
+Require focused/full verification, exact-head CI, and human review for W5-AICC-SDK-CONTRACT-001. Do not begin Supervisor/provider/execution cutover, merge, close PRs, deploy, rewrite history, or delete worktrees without explicit approval.
