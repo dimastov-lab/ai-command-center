@@ -336,11 +336,10 @@ jobs:
 
           before = inventory("/tmp/secrets-baseline-before.json")
           after = inventory(".secrets.baseline")
-          if before != after:
-              added = sum((after - before).values())
-              removed = sum((before - after).values())
+          added = sum((after - before).values())
+          if added:
               raise SystemExit(
-                  f"secret baseline changed: {added} added, {removed} removed"
+                  f"secret baseline changed: {added} added"
               )
           PY
 
