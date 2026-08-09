@@ -142,6 +142,47 @@ def test_board_shows_blocked_lane_and_accounts_for_every_task(live_app):
     assert "Done" in body
 
 
+def _dashboard_action_names(surface, *, timeout: int = 90000) -> list[str]:
+    # Streamlit delivers the dashboard incrementally over its WebSocket.  An
+    # earlier heading or status region is not a readiness signal for the action
+    # surface rendered later in the script, so synchronize on that surface.
+    surface.locator("button").filter(has_text="Быстро:").first.wait_for(timeout=timeout)
+    action_names = surface.locator("button").evaluate_all(
+        "els => els.map(el => el.getAttribute('aria-label') || el.innerText).filter(Boolean)"
+    )
+    return [
+        name
+        for name in action_names
+        if any(
+            marker in name
+            for marker in ("Быстро:", "arrow_forward", "Открыть Execution Center", "Открыть задачу")
+        )
+    ]
+
+
+def test_dashboard_action_probe_waits_for_incremental_streamlit_render():
+    with sync_api.sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 320, "height": 800})
+        page.set_content("<main data-testid='stMain'><h2>Очередь выполнения</h2></main>")
+        page.evaluate(
+            "setTimeout(() => {"
+            "const status = document.createElement('div');"
+            "status.setAttribute('role', 'status');"
+            "status.textContent = 'Готово';"
+            "const button = document.createElement('button');"
+            "button.textContent = 'Быстро: новая задача';"
+            "document.querySelector('main').appendChild(status);"
+            "document.querySelector('main').appendChild(button);"
+            "}, 100)"
+        )
+
+        surface = page.locator("[data-testid='stMain']")
+        assert _dashboard_action_names(surface, timeout=5000) == ["Быстро: новая задача"]
+        assert surface.locator("[role='status']").count() == 1
+        browser.close()
+
+
 def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
     with sync_api.sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -150,6 +191,7 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
         page.wait_for_selector("text=Очередь выполнения", timeout=90000)
 
         surface = page.locator("[data-testid='stMain']")
+        dashboard_action_names = _dashboard_action_names(surface)
         assert surface.locator("h1").count() >= 1
         assert surface.locator("h2").count() >= 1
         assert surface.locator("[role='status']").count() >= 1
@@ -157,18 +199,6 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
         assert surface.locator("svg[role='img'][aria-label]").count() >= 1
         assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
 
-        action_names = surface.locator("button").evaluate_all(
-            "els => els.map(el => el.getAttribute('aria-label') || el.innerText).filter(Boolean)"
-        )
-        assert action_names
-        dashboard_action_names = [
-            name
-            for name in action_names
-            if any(
-                marker in name
-                for marker in ("Быстро:", "arrow_forward", "Открыть Execution Center", "Открыть задачу")
-            )
-        ]
         assert dashboard_action_names
         assert len(dashboard_action_names) == len(set(dashboard_action_names))
 
