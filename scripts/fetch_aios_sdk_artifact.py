@@ -82,17 +82,20 @@ def extract_verified_artifact(data: bytes, output: Path, lock: ArtifactLock) -> 
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = archive.namelist()
-            allowed = {lock.wheel_filename, "SHA256SUMS"}
-            if set(names) != allowed or any(
-                PurePosixPath(name).name != name for name in names
-            ):
-                raise ArtifactError("artifact contains unexpected files")
+            if any(PurePosixPath(name).name != name for name in names):
+                raise ArtifactError("artifact contains unexpected path")
+            if lock.wheel_filename not in names or "SHA256SUMS" not in names:
+                raise ArtifactError("artifact missing wheel or checksum")
             wheel = archive.read(lock.wheel_filename)
             manifest = archive.read("SHA256SUMS").decode("ascii")
     except (zipfile.BadZipFile, KeyError, UnicodeDecodeError) as error:
         raise ArtifactError("invalid artifact archive") from error
     digest = hashlib.sha256(wheel).hexdigest()
-    if manifest.strip() != f"{digest}  {lock.wheel_filename}":
+    manifest_lines = [line for line in manifest.splitlines() if line.strip()]
+    expected = f"{digest}  {lock.wheel_filename}"
+    if not any(
+        line == expected or line.split() == [digest, lock.wheel_filename] for line in manifest_lines
+    ):
         raise ArtifactError("artifact manifest checksum mismatch")
     if digest != lock.wheel_sha256:
         raise ArtifactError("locked wheel checksum mismatch")
