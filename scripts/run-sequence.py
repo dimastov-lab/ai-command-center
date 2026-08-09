@@ -81,10 +81,14 @@ def _launch(task_id: str, dry_run: bool = False) -> None:
         print(f"[DRY-RUN] Would launch {task_id} via relaunch-task.py", flush=True)
         return
     print(f"[SEQ] Launching {task_id}…", flush=True)
-    subprocess.Popen(
-        [sys.executable, str(ROOT / "scripts" / "relaunch-task.py"), task_id],
+    subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "relaunch-task.py"), task_id, "--no-wait"],
         cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    
 
 
 def _wait_for_terminal(task_id: str, dry_run: bool = False) -> str:
