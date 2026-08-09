@@ -292,7 +292,7 @@ jobs:
           pip install --require-hashes --no-deps -r requirements-security.lock
 
       - name: Build Python dependency SBOM
-        run: python -m pip inspect --local --json > security-sbom.json
+        run: python -m pip inspect --local > security-sbom.json
 
       - name: Critical/high vulnerability scan (pip-audit)
         run: |
