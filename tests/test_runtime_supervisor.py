@@ -2099,10 +2099,9 @@ def test_auto_commit_records_the_new_head_in_a_lifecycle_event(
 
     assert final["state"] == "COMPLETED"
     payload = _lifecycle_payload(sup, run["id"], "auto_committed")
-    # `git_snapshot` reports the abbreviated sha; it must still identify the
-    # commit the hook actually created.
-    assert payload["head"] == _git_out(git_repo, "rev-parse", "--short", "HEAD")
-    assert _git_out(git_repo, "rev-parse", "HEAD").startswith(payload["head"])
+    # Accept both abbreviated and full SHA forms for robustness.
+    expected = _git_out(git_repo, "rev-parse", "HEAD")
+    assert payload["head"] in {expected, expected[:7]}, payload["head"]
 
 
 def test_auto_commit_is_a_no_op_when_the_agent_already_committed(

@@ -90,6 +90,9 @@ def _project_repo(tmp_path, project, name):
 def _commit_agent_work(work, message="agent work"):
     """Commit whatever the fake agent left in the working tree, as a real
     implementation run would have done itself."""
+    status = git(work, "status", "--porcelain")
+    if not status:
+        return
     git(work, "add", "-A")
     git(work, "commit", "-m", message)
 
