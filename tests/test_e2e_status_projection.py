@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -22,6 +23,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from axe_playwright_python.sync_playwright import Axe
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
@@ -215,4 +217,51 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
         page.set_viewport_size({"width": 640, "height": 800})
         page.evaluate("document.documentElement.style.fontSize = '200%'")
         assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        browser.close()
+
+
+def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
+    with sync_api.sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 320, "height": 800})
+        page.goto(live_app, wait_until="load")
+        surface = page.locator("[data-testid='stMain']")
+        _dashboard_action_names(surface)
+
+        results = Axe().run(
+            page,
+            options={
+                "runOnly": {
+                    "type": "tag",
+                    "values": ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"],
+                },
+                "resultTypes": ["violations"],
+            },
+        )
+        serious = [
+            violation
+            for violation in results.response["violations"]
+            if violation.get("impact") in {"critical", "serious"}
+        ]
+        residuals = {
+            "axe_serious": [violation["id"] for violation in serious],
+            "empty_checkbox_names": page.get_by_role("checkbox", name="", exact=True).count(),
+            "focusable_sections": page.locator("section[tabindex]:not([tabindex='-1'])").count(),
+            "heading_links": page.locator(
+                "h1 a:not([aria-hidden='true']), h2 a:not([aria-hidden='true']), "
+                "h3 a:not([aria-hidden='true']), h4 a:not([aria-hidden='true']), "
+                "h5 a:not([aria-hidden='true']), h6 a:not([aria-hidden='true'])"
+            ).count(),
+            "icon_names_in_buttons": page.get_by_role(
+                "button",
+                name=re.compile(r"(arrow_forward|task_alt|refresh|settings|delete|close)"),
+            ).count(),
+        }
+        assert residuals == {
+            "axe_serious": [],
+            "empty_checkbox_names": 0,
+            "focusable_sections": 0,
+            "heading_links": 0,
+            "icon_names_in_buttons": 0,
+        }, results.generate_report()
         browser.close()

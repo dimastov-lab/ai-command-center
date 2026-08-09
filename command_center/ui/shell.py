@@ -10,7 +10,7 @@ from typing import Callable
 
 import streamlit as st
 
-from command_center.ui import sidebar, theme, top_bar
+from command_center.ui import accessibility, sidebar, theme, top_bar
 
 
 def render_shell(
@@ -40,6 +40,7 @@ def render_shell(
     # App-wide CSS (UX-2a): fragment fade-in + card hover transitions. Emitted
     # every run so it survives reruns (see theme.inject_global_css docstring).
     theme.inject_global_css()
+    accessibility.repair_streamlit_shell_semantics()
 
     top_bar.render_top_bar(
         title,
