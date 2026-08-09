@@ -15,7 +15,7 @@ BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 EXPECTED_CONTEXTS = {
     "quality-gates": "Quality gates (whitespace · Ruff · compile · pytest)",
     "windows-quality-gates": "Windows quality gates (Ruff · compile · pytest)",
-    "security-gates": "Security gates (workflow policy · provenance · path containment)",
+    "security-gates": "Security gates (workflow policy · provenance · supply chain)",
     "build-gates": "Build gates (web production)",
     "final-gate": "Final merge gate",
     "boundary-fitness": "Boundary fitness (import ban · anti-engine baseline)",
@@ -24,7 +24,16 @@ EXPECTED_CONTEXTS = {
 EXPECTED_STEPS = {
     "quality-gates": {"Pytest + coverage", "Real-browser E2E"},
     "windows-quality-gates": {"Desktop pytest-qt suite", "Real-browser E2E"},
-    "security-gates": {"Release gate policy", "Focused security regressions"},
+    "security-gates": {
+        "Release gate policy",
+        "Build Python dependency SBOM",
+        "Critical/high vulnerability scan (pip-audit)",
+        "Secret scan",
+        "Initialize CodeQL",
+        "Autobuild for CodeQL",
+        "Run CodeQL analysis",
+        "Focused security regressions",
+    },
     "build-gates": {"Web production build"},
     "final-gate": {"Assert required checks"},
     "boundary-fitness": {"AIOS boundary fitness tests"},
@@ -70,7 +79,13 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
             "labeled",
             "unlabeled",
         }
-        assert workflow["permissions"] == {"contents": "read"}
+        if workflow is ci:
+            assert workflow["permissions"] == {
+                "contents": "read",
+                "security-events": "write",
+            }
+        else:
+            assert workflow["permissions"] == {"contents": "read"}
 
     for job_id, required_steps in EXPECTED_STEPS.items():
         step_names = {step.get("name") for step in jobs[job_id]["steps"]}
