@@ -320,8 +320,29 @@ jobs:
       - name: Secret scan
         run: |
           python -m pip install detect-secrets==1.5.0
+          cp .secrets.baseline /tmp/secrets-baseline-before.json
           detect-secrets scan --baseline .secrets.baseline
-          git diff --exit-code -- .secrets.baseline
+          python - <<'PY'
+          import collections
+          import json
+
+          def inventory(path):
+              data = json.load(open(path, "r", encoding="utf-8"))
+              return collections.Counter(
+                  (filename, finding["type"], finding["hashed_secret"])
+                  for filename, findings in data.get("results", {}).items()
+                  for finding in findings
+              )
+
+          before = inventory("/tmp/secrets-baseline-before.json")
+          after = inventory(".secrets.baseline")
+          if before != after:
+              added = sum((after - before).values())
+              removed = sum((before - after).values())
+              raise SystemExit(
+                  f"secret baseline changed: {added} added, {removed} removed"
+              )
+          PY
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b
