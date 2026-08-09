@@ -47,6 +47,23 @@ def test_artifact_extracts_only_exact_checksum_verified_wheel(tmp_path):
     assert path.read_bytes() == wheel
 
 
+def test_artifact_extracts_with_release_archive_extra_files(tmp_path):
+    lock = load_lock()
+    wheel = b"wheel-bytes"
+    checksum = hashlib.sha256(wheel).hexdigest()
+    test_lock = lock.with_wheel_sha256(checksum)
+
+    with io.BytesIO() as buffer:
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(lock.wheel_filename, wheel)
+            archive.writestr("SHA256SUMS", f"{checksum}  {lock.wheel_filename}\n")
+            archive.writestr("release-manifest.json", "{}")
+        full_archive = buffer.getvalue()
+
+    path = extract_verified_artifact(full_archive, tmp_path, test_lock)
+    assert path.read_bytes() == wheel
+
+
 def test_checksum_mismatch_fails_closed_without_writing_wheel(tmp_path):
     lock = load_lock()
     archive = _archive(lock.wheel_filename, b"tampered", lock.wheel_sha256)
