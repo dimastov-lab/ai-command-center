@@ -88,7 +88,7 @@ def _launch(task_id: str, dry_run: bool = False) -> None:
         capture_output=True,
         text=True,
     )
-    
+
 
 
 def _wait_for_terminal(task_id: str, dry_run: bool = False) -> str:
