@@ -68,3 +68,8 @@ runtime.db
 runtime.db-shm
 runtime.db-wal
 .worktrees/
+
+# Aider AI coding assistant artifacts
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v4/
