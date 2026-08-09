@@ -164,20 +164,22 @@ def test_dashboard_action_probe_waits_for_incremental_streamlit_render():
     with sync_api.sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page(viewport={"width": 320, "height": 800})
-        page.set_content(
-            "<main data-testid='stMain'><h2>Очередь выполнения</h2>"
-            "<div role='status'>Готово</div></main>"
-        )
+        page.set_content("<main data-testid='stMain'><h2>Очередь выполнения</h2></main>")
         page.evaluate(
             "setTimeout(() => {"
+            "const status = document.createElement('div');"
+            "status.setAttribute('role', 'status');"
+            "status.textContent = 'Готово';"
             "const button = document.createElement('button');"
             "button.textContent = 'Быстро: новая задача';"
+            "document.querySelector('main').appendChild(status);"
             "document.querySelector('main').appendChild(button);"
             "}, 100)"
         )
 
         surface = page.locator("[data-testid='stMain']")
         assert _dashboard_action_names(surface, timeout=5000) == ["Быстро: новая задача"]
+        assert surface.locator("[role='status']").count() == 1
         browser.close()
 
 
@@ -189,6 +191,7 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
         page.wait_for_selector("text=Очередь выполнения", timeout=90000)
 
         surface = page.locator("[data-testid='stMain']")
+        dashboard_action_names = _dashboard_action_names(surface)
         assert surface.locator("h1").count() >= 1
         assert surface.locator("h2").count() >= 1
         assert surface.locator("[role='status']").count() >= 1
@@ -196,7 +199,6 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
         assert surface.locator("svg[role='img'][aria-label]").count() >= 1
         assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
 
-        dashboard_action_names = _dashboard_action_names(surface)
         assert dashboard_action_names
         assert len(dashboard_action_names) == len(set(dashboard_action_names))
 
