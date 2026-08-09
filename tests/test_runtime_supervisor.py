@@ -7,7 +7,7 @@ import time
 import pytest
 
 from command_center import agent_runner
-from command_center.runtime import context_service, db, identity, supervisor
+from command_center.runtime import context_service, db, git_ops, identity, supervisor
 
 
 class _NeverExitedProcess:
@@ -2007,6 +2007,269 @@ def test_exit_zero_with_changes_and_no_blockers_is_genuinely_completed(
     assert final["working_tree_changed"] == 1
     assert final["state"] == "COMPLETED"
     assert final["failure_reason"] is None
+
+
+# --------------------------------------------------------------------------
+# Post-COMPLETED auto-commit — a run that finishes COMPLETED with a dirty
+# working tree has its work committed by the supervisor, so agent work is
+# never lost to a forgotten commit. Strictly best-effort: it runs *after*
+# the terminal state is persisted and can never demote a COMPLETED run.
+# --------------------------------------------------------------------------
+
+
+def _lifecycles(sup, run_id):
+    events = db.list_run_events(sup.db_path, run_id)
+    return [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
+
+
+def _lifecycle_payload(sup, run_id, lifecycle):
+    events = db.list_run_events(sup.db_path, run_id)
+    for event in events:
+        if event["event_type"] == "lifecycle" and event["payload"].get("lifecycle") == lifecycle:
+            return event["payload"]
+    raise AssertionError(f"no {lifecycle!r} lifecycle event for run {run_id}")
+
+
+def _git_out(repo, *args):
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _start_completed_run(sup, git_repo, task_type="implementation"):
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type=task_type, prompt="do a thing",
+        confirmed=True,
+    )
+    return run, sup.wait_for_run(run["id"], timeout=10)
+
+
+def test_completed_run_with_dirty_tree_is_auto_committed(git_repo, configure_project_repo, fake_claude):
+    """The headline behavior: the agent leaves work uncommitted, the run
+    completes, and the supervisor turns that work into a real commit."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = "f.txt"  # modify a *tracked* file
+    configure_project_repo("AIOS", git_repo)
+    head_before = _git_out(git_repo, "rev-parse", "HEAD")
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "COMPLETED"
+    assert _git_out(git_repo, "status", "--porcelain") == "", "the tree must be clean after the auto-commit"
+    head_after = _git_out(git_repo, "rev-parse", "HEAD")
+    assert head_after != head_before, "the auto-commit must advance HEAD"
+    assert "modified by fake_claude" in _git_out(git_repo, "show", "HEAD:f.txt")
+
+
+def test_auto_commit_message_carries_the_run_id_for_traceability(
+    git_repo, configure_project_repo, fake_claude
+):
+    """The whole point of the message contract: a commit made by this hook can
+    be traced back to the run that produced it."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+    assert final["state"] == "COMPLETED"
+
+    message = _git_out(git_repo, "log", "-1", "--format=%B")
+    assert run["id"] in message.splitlines()[0], "the run id belongs in the subject line"
+    assert f"Run-Id: {run['id']}" in message, "a machine-greppable trailer must carry the run id too"
+
+
+def test_auto_commit_stages_untracked_files(git_repo, configure_project_repo, fake_claude):
+    """`git add -A` semantics: a brand-new file the agent created (untracked,
+    so invisible to a bare `git commit -a`) must land in the commit."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = "brand_new_file.txt"
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "COMPLETED"
+    assert _git_out(git_repo, "status", "--porcelain") == ""
+    assert "brand_new_file.txt" in _git_out(git_repo, "show", "--name-only", "--format=", "HEAD")
+
+
+def test_auto_commit_records_the_new_head_in_a_lifecycle_event(
+    git_repo, configure_project_repo, fake_claude
+):
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "COMPLETED"
+    payload = _lifecycle_payload(sup, run["id"], "auto_committed")
+    # Accept both abbreviated and full SHA forms for robustness.
+    expected = _git_out(git_repo, "rev-parse", "HEAD")
+    assert payload["head"] in {expected, expected[:7]}, payload["head"]
+
+
+def test_auto_commit_is_a_no_op_when_the_agent_already_committed(
+    git_repo, configure_project_repo, fake_claude
+):
+    """An agent that commits its own work leaves a clean tree. The hook must
+    not manufacture an empty commit on top of it."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = ""
+    fake_claude["FAKE_CLAUDE_COMMIT"] = "implement feature X"
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "COMPLETED"
+    assert _git_out(git_repo, "log", "-1", "--format=%s") == "implement feature X", (
+        "the agent's own commit must remain HEAD — no empty auto-commit on top"
+    )
+    lifecycles = _lifecycles(sup, run["id"])
+    assert "auto_commit_skipped_clean_tree" in lifecycles
+    assert "auto_committed" not in lifecycles
+
+
+def test_read_only_completed_run_with_clean_tree_commits_nothing(
+    git_repo, configure_project_repo, fake_claude
+):
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = ""
+    configure_project_repo("AIOS", git_repo)
+    head_before = _git_out(git_repo, "rev-parse", "HEAD")
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo, task_type="review")
+
+    assert final["state"] == "COMPLETED"
+    assert _git_out(git_repo, "rev-parse", "HEAD") == head_before
+
+
+def test_failed_run_is_never_auto_committed(git_repo, configure_project_repo, fake_claude):
+    """Only COMPLETED triggers the hook. A blocked run left a dirty tree, and
+    that dirt must stay visible for a human to inspect — committing it would
+    launder a failure into a clean-looking commit."""
+    lines = [
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps(
+            {
+                "type": "result",
+                "result": "DONE",
+                "permission_denials": [{"tool_name": "Write", "tool_use_id": "x", "tool_input": {}}],
+            }
+        ),
+    ]
+    fake_claude["FAKE_CLAUDE_LINES"] = json.dumps(lines)
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = "f.txt"
+    configure_project_repo("AIOS", git_repo)
+    head_before = _git_out(git_repo, "rev-parse", "HEAD")
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "FAILED"
+    assert _git_out(git_repo, "rev-parse", "HEAD") == head_before, "a FAILED run must not commit"
+    assert _git_out(git_repo, "status", "--porcelain") != "", "the failure's working tree stays as-is"
+    assert "auto_committed" not in _lifecycles(sup, run["id"])
+
+
+def test_cancelled_run_is_never_auto_committed(git_repo, configure_project_repo, fake_claude):
+    """Reinforces `cancel()`'s standing invariant: cancellation never touches
+    the working tree — not to restore it, and now not to commit it either."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = "f.txt"
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "10"
+    configure_project_repo("AIOS", git_repo)
+    head_before = _git_out(git_repo, "rev-parse", "HEAD")
+
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+    )
+    time.sleep(0.5)
+    result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
+
+    assert result["state"] == "CANCELLED"
+    assert _git_out(git_repo, "rev-parse", "HEAD") == head_before
+    assert "modified by fake_claude" in (git_repo / "f.txt").read_text()
+    assert "auto_committed" not in _lifecycles(sup, run["id"])
+
+
+def test_auto_commit_failure_never_demotes_a_completed_run(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """The safety property. The terminal state is already persisted when the
+    hook runs, so a git failure is recorded and swallowed — the run stays
+    COMPLETED and the work stays in the working tree, exactly where it was
+    before this hook existed."""
+    configure_project_repo("AIOS", git_repo)
+
+    def boom(repo, *, message):
+        raise git_ops.GitOpsError(["commit"], 128, "fatal: unable to write new index file")
+
+    monkeypatch.setattr(supervisor.git_ops, "commit_all", boom)
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "COMPLETED"
+    assert final["failure_reason"] is None
+    assert db.get_run(sup.db_path, run["id"])["state"] == "COMPLETED"
+    assert _git_out(git_repo, "status", "--porcelain") != "", "the uncommitted work is left intact"
+    assert "unable to write new index file" in _lifecycle_payload(sup, run["id"], "auto_commit_failed")["error"]
+
+
+def test_nonzero_commit_exit_is_recorded_without_demoting_the_run(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """`git_ops.commit_all` reports a failed `git commit` by returncode rather
+    than by raising — that branch must be handled too."""
+    configure_project_repo("AIOS", git_repo)
+
+    def failing_commit(repo, *, message):
+        return subprocess.CompletedProcess(
+            args=["git", "commit"], returncode=1, stdout="", stderr="error: gpg failed to sign the data\n"
+        )
+
+    monkeypatch.setattr(supervisor.git_ops, "commit_all", failing_commit)
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "COMPLETED"
+    payload = _lifecycle_payload(sup, run["id"], "auto_commit_failed")
+    assert payload["returncode"] == 1
+    assert "gpg failed to sign" in payload["error"]
+    assert "auto_committed" not in _lifecycles(sup, run["id"])
+
+
+def test_auto_commit_does_not_rewrite_the_runs_recorded_git_evidence(
+    git_repo, configure_project_repo, fake_claude
+):
+    """`post_run_git_status`/`working_tree_changed` record what the *agent*
+    left behind — the inputs the outcome classifier already ruled on. The
+    supervisor's own commit must not overwrite that evidence with its own
+    (clean) after-picture."""
+    fake_claude["FAKE_CLAUDE_TOUCH_FILE"] = "f.txt"
+    configure_project_repo("AIOS", git_repo)
+
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+
+    assert final["state"] == "COMPLETED"
+    reloaded = db.get_run(sup.db_path, run["id"])
+    assert reloaded["working_tree_changed"] == 1
+    assert reloaded["post_run_git_status"] != "(чисто)", (
+        "the recorded status must still show the dirt the agent produced"
+    )
+    assert _git_out(git_repo, "status", "--porcelain") == "", "…even though the tree is now clean"
+
+
+def test_auto_commit_appears_in_the_runs_report(git_repo, configure_project_repo, fake_claude):
+    """The hook runs before report persistence, so the commit is part of the
+    run's own audit trail rather than an invisible side effect."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run, final = _start_completed_run(sup, git_repo)
+    assert final["state"] == "COMPLETED"
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    lifecycles = [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
+    assert lifecycles.index("auto_committed") > lifecycles.index("process_exited")
+    assert db.get_report(sup.db_path, run["id"]) is not None, "the run still gets a report"
 
 
 # --------------------------------------------------------------------------

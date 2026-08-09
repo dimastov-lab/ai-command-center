@@ -14,7 +14,10 @@ Normative decisions (frozen for Sprint 1 — see the Sprint 1 brief):
   (`subprocess.DEVNULL`).
 - The Supervisor owns: process lifecycle, PID/process-start metadata, stdout/
   stderr consumption, incremental `RunEvent` persistence, cancellation,
-  timeout enforcement, and startup reconciliation. Claude owns: reasoning,
+  timeout enforcement, startup reconciliation, and the post-`COMPLETED`
+  auto-commit of work the agent left uncommitted
+  (`_auto_commit_completed_work` — the one place this module *writes* git;
+  `cancel()` still never does). Claude owns: reasoning,
   conversation, and provider session state — this module never inspects or
   interprets assistant content beyond classifying it for storage
   (`stream_parser`).
@@ -59,7 +62,16 @@ from command_center import (
 )
 from command_center.models import iso_now
 from command_center import run_lineage as provenance
-from command_center.runtime import context_service, db, identity, outcome, providers, reports, stream_parser
+from command_center.runtime import (
+    context_service,
+    db,
+    git_ops,
+    identity,
+    outcome,
+    providers,
+    reports,
+    stream_parser,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1413,6 +1425,63 @@ class Supervisor:
         except Exception:
             logger.exception("Could not persist %s lifecycle event for run %s", lifecycle, run_id)
 
+    def _auto_commit_completed_work(self, run_id: str, repo_path: Path) -> str | None:
+        """Commit whatever a `COMPLETED` run left uncommitted, so an agent's
+        work is never lost to a forgotten commit.
+
+        Best-effort *by construction*: the run's terminal state is already
+        persisted when this runs, and every failure path here is swallowed into
+        a lifecycle event. A commit that cannot be made must never demote a
+        genuine `COMPLETED` — the changes then simply stay in the working tree
+        exactly as the agent left them, which is where they were before this
+        hook existed.
+
+        Note this never rewrites the run row: `post_run_git_status` /
+        `working_tree_changed` deliberately keep recording what the *agent*
+        left behind, not what the supervisor did afterwards, because those are
+        the inputs `outcome.classify_process_result` already ruled on.
+
+        Returns the new HEAD sha on success, `None` when the tree was already
+        clean (an idempotent no-op — the agent committed its own work, or the
+        run was read-only) or the commit could not be made.
+        """
+        message = (
+            f"chore(agent): auto-commit work from run {run_id}\n"
+            "\n"
+            "Committed automatically by the AI Command Center supervisor: the "
+            "run finished COMPLETED with a dirty working tree.\n"
+            "\n"
+            f"Run-Id: {run_id}"
+        )
+        try:
+            proc = git_ops.commit_all(repo_path, message=message)
+        except Exception as exc:
+            logger.exception("Auto-commit failed for run %s", run_id)
+            self._append_lifecycle_event_best_effort(
+                "auto_commit_failed", run_id, error=str(exc)
+            )
+            return None
+
+        if proc is None:
+            self._append_lifecycle_event_best_effort("auto_commit_skipped_clean_tree", run_id)
+            return None
+        if proc.returncode != 0:
+            self._append_lifecycle_event_best_effort(
+                "auto_commit_failed",
+                run_id,
+                returncode=proc.returncode,
+                error=(proc.stderr or "").strip()[:400],
+            )
+            return None
+
+        head = None
+        try:
+            head = agent_runner.git_snapshot(repo_path).get("head")
+        except Exception:  # pragma: no cover - snapshot is telemetry only
+            logger.exception("Could not read HEAD after auto-commit for run %s", run_id)
+        self._append_lifecycle_event_best_effort("auto_committed", run_id, head=head)
+        return head
+
     def _persist_run_failure(
         self,
         run_id: str,
@@ -2140,6 +2209,11 @@ class Supervisor:
                     pre_run_git_status=pre_status,
                     post_run_git_status=post_status,
                 )
+
+            # Runs before the report so the commit (or its failure) is part of
+            # the run's own persisted audit trail.
+            if new_state == "COMPLETED":
+                self._auto_commit_completed_work(run_id, repo_path)
 
             if new_state in ("COMPLETED", "FAILED", "CANCELLED"):
                 try:
