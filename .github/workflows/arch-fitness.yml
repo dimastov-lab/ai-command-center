@@ -1,32 +1,30 @@
 name: AIOS boundary fitness
-
-# Dedicated, fast architecture-fitness gate for the AIOS Core acceptance
-# criterion AC-01 (see docs/AIOS_BOUNDARY.md, ADR-0008, aios ADR-0015):
-#
-#   * no Python file imports AIOS Core internals (`aios.*`; only `aios_sdk`
-#     is allowed);
-#   * AICC's frozen queue/orchestration/authz/audit/memory subsystems do not
-#     grow beyond tests/architecture/AIOS_BOUNDARY_BASELINE.json.
-#
-# The required merge gate (ci.yml's `pytest -q`) already collects these tests;
-# this workflow exists as a separate named status so the AC-01 evidence line
-# ("architecture fitness checks are green in each attached product repository")
-# is directly visible per commit, and it stays green/red in ~a minute because
-# it installs only the minimal runtime deps the shared tests/conftest.py needs.
-#
-# Deliberately a separate file rather than an edit to ci.yml: the open PR
-# backlog rebases against ci.yml; a new workflow file conflicts with nothing.
-
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, reopened, synchronize, labeled]
+    paths:
+      - "app.py"
+      - "command_center/**"
+      - "scripts/**"
+      - "tests/**"
+      - "requirements*.txt"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/arch-fitness.yml"
   push:
     branches: [main]
+    paths:
+      - "app.py"
+      - "command_center/**"
+      - "scripts/**"
+      - "tests/**"
+      - "requirements*.txt"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/arch-fitness.yml"
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -34,31 +32,23 @@ permissions:
 
 jobs:
   boundary-fitness:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'full-ci') && contains(github.event.pull_request.labels.*.name, 'full-ci'))
     name: Boundary fitness (import ban · anti-engine baseline)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: Deliberate failure canary
-        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-boundary')
-        run: exit 1
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@v5
         with:
           python-version: "3.14"
           cache: pip
           cache-dependency-path: requirements.txt
 
-      # Minimal environment: the boundary tests themselves are stdlib-only, but
-      # the suite-wide tests/conftest.py imports command_center runtime modules
-      # (streamlit/PyYAML via requirements.txt). Same pytest band as
-      # requirements-dev.txt.
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt "pytest>=9.0,<10.0"
 
       - name: AIOS boundary fitness tests
