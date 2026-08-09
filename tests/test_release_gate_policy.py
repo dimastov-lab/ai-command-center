@@ -17,6 +17,7 @@ EXPECTED_CONTEXTS = {
     "windows-quality-gates": "Windows quality gates (Ruff · compile · pytest)",
     "security-gates": "Security gates (workflow policy · provenance · path containment)",
     "build-gates": "Build gates (web production)",
+    "final-gate": "Final merge gate",
     "boundary-fitness": "Boundary fitness (import ban · anti-engine baseline)",
 }
 
@@ -25,6 +26,7 @@ EXPECTED_STEPS = {
     "windows-quality-gates": {"Desktop pytest-qt suite", "Real-browser E2E"},
     "security-gates": {"Release gate policy", "Focused security regressions"},
     "build-gates": {"Web production build"},
+    "final-gate": {"Assert required checks"},
     "boundary-fitness": {"AIOS boundary fitness tests"},
 }
 
@@ -76,7 +78,9 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
 
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
-    for job_id, job in _all_jobs().items():
+    jobs = _all_jobs()
+    for job_id in CANARY_LABELS:
+        job = jobs[job_id]
         (canary,) = [step for step in job["steps"] if step.get("name") == "Deliberate failure canary"]
         assert CANARY_LABELS[job_id] in canary["if"]
         assert canary["run"].strip() == "exit 1"
@@ -87,3 +91,33 @@ def test_all_actions_are_immutable_sha_pinned() -> None:
         for step in job["steps"]:
             if uses := step.get("uses"):
                 assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses), uses
+
+
+def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
+    final_gate = _workflow(CI_WORKFLOW)["jobs"]["final-gate"]
+    required = {
+        "quality-gates",
+        "windows-quality-gates",
+        "security-gates",
+        "build-gates",
+    }
+
+    assert final_gate["if"] == "always()"
+    assert set(final_gate["needs"]) == required
+
+    (assertion_step,) = [
+        step for step in final_gate["steps"] if step.get("name") == "Assert required checks"
+    ]
+    script = assertion_step["run"]
+    for job_id in required:
+        assert f'${{{{ needs.{job_id}.result }}}}" != "success"' in script
+
+    def accepted(results: dict[str, str]) -> bool:
+        return all(results[job_id] == "success" for job_id in required)
+
+    success = {job_id: "success" for job_id in required}
+    assert accepted(success)
+    for job_id in required:
+        for negative_result in ("failure", "cancelled", "skipped"):
+            results = success | {job_id: negative_result}
+            assert not accepted(results), (job_id, negative_result)
