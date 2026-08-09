@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -22,6 +23,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from axe_playwright_python.sync_playwright import Axe
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
@@ -215,4 +217,91 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
         page.set_viewport_size({"width": 640, "height": 800})
         page.evaluate("document.documentElement.style.fontSize = '200%'")
         assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        browser.close()
+
+
+def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
+    with sync_api.sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 320, "height": 800})
+        page.goto(live_app, wait_until="load")
+        surface = page.locator("[data-testid='stMain']")
+        _dashboard_action_names(surface)
+
+        # Streamlit keeps the parent document across Python reruns. Reinstalling
+        # the shell repair must disconnect the previous observer instead of
+        # accumulating one callback per rerun.
+        initial_installs = page.evaluate("window.__aiccAccessibilityRepair.installCount")
+        page.get_by_role("button", name="Проекты", exact=True).click()
+        page.get_by_text("Обзор всех проектов", exact=False).first.wait_for()
+        page.get_by_role("button", name="Обзор", exact=True).click()
+        _dashboard_action_names(surface)
+
+        # Exercise the reinstall path explicitly as well: Streamlit currently
+        # preserves an unchanged st.html node on these reruns, but a future
+        # renderer may execute it again.
+        page.evaluate(
+            "window.__aiccInstallAccessibilityRepair();"
+            "window.__aiccInstallAccessibilityRepair();"
+        )
+        assert page.evaluate("window.__aiccAccessibilityRepair.installCount") == initial_installs + 2
+        assert page.evaluate("window.__aiccAccessibilityRepair.activeObservers") == 1
+        page.evaluate("window.__aiccAccessibilityRepair.callbackCount = 0")
+        page.evaluate(
+            "document.querySelector('[data-testid=stMain]').appendChild(document.createElement('i'))"
+        )
+        page.wait_for_function("window.__aiccAccessibilityRepair.callbackCount >= 1")
+        assert page.evaluate("window.__aiccAccessibilityRepair.callbackCount") == 1
+
+        # A content link inside a heading is meaningful and must remain exposed;
+        # only Streamlit's empty permalink control is decorative.
+        page.evaluate(
+            "const link = document.createElement('a');"
+            "link.href = '/operator-guide';"
+            "link.textContent = 'Руководство оператора';"
+            "document.querySelector('h2').appendChild(link);"
+        )
+        meaningful_link = page.get_by_role("link", name="Руководство оператора", exact=True)
+        meaningful_link.wait_for()
+        assert meaningful_link.get_attribute("aria-hidden") is None
+        assert page.get_by_role(
+            "button",
+            name=re.compile(r"^(Скрыть|Показать|Открыть) навигацию$"),
+        ).count() == 1
+
+        results = Axe().run(
+            page,
+            options={
+                "runOnly": {
+                    "type": "tag",
+                    "values": ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"],
+                },
+                "resultTypes": ["violations"],
+            },
+        )
+        serious = [
+            violation
+            for violation in results.response["violations"]
+            if violation.get("impact") in {"critical", "serious"}
+        ]
+        residuals = {
+            "axe_serious": [violation["id"] for violation in serious],
+            "empty_checkbox_names": page.get_by_role("checkbox", name="", exact=True).count(),
+            "focusable_sections": page.locator("section[tabindex]:not([tabindex='-1'])").count(),
+            "decorative_heading_links": page.locator(
+                "[data-testid='stHeaderActionElements'] a:not([aria-hidden='true']), "
+                "a[data-testid='stHeaderActionElements']:not([aria-hidden='true'])"
+            ).count(),
+            "icon_names_in_buttons": page.get_by_role(
+                "button",
+                name=re.compile(r"(arrow_forward|task_alt|refresh|settings|delete|close)"),
+            ).count(),
+        }
+        assert residuals == {
+            "axe_serious": [],
+            "empty_checkbox_names": 0,
+            "focusable_sections": 0,
+            "decorative_heading_links": 0,
+            "icon_names_in_buttons": 0,
+        }, results.generate_report()
         browser.close()

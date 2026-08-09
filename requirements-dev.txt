@@ -27,3 +27,5 @@ httpx>=0.27,<1.0
 # (`python -m playwright install chromium`) so it actually runs there. Held to
 # the validated 1.x line.
 playwright>=1.55,<2.0
+# Local axe-core bundle for real-browser WCAG checks (no CDN/network at test time).
+axe-playwright-python==0.1.8
