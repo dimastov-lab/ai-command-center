@@ -18,6 +18,7 @@ name: CI
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
   workflow_dispatch:
@@ -46,6 +47,10 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+
+      - name: Deliberate failure canary
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-linux')
+        run: exit 1
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -129,10 +134,10 @@ jobs:
   # display checklist (exact-width geometry round-trip, visible palette switch)
   # still needs a human on a real Windows 11 x64 machine with a display — see
   # `docs/desktop/WINDOWS_RUNBOOK.md` Part B. Per that runbook and the gate
-  # definition, a green run here does NOT by itself close the gate. Kept
-  # non-required/informational so a transient Windows-environment hiccup can
-  # never wedge merges into main (the deterministic ubuntu `quality-gates` job
-  # remains the merge gate).
+  # definition, a green run here does NOT by itself close the interactive gate.
+  # The automated Windows context is nevertheless release-relevant: after this
+  # workflow has appeared green on an exact PR head, branch protection can bind
+  # its stable job name without relying on an agent report.
   windows-quality-gates:
     name: Windows quality gates (Ruff · compile · pytest)
     runs-on: windows-latest
@@ -148,6 +153,10 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+
+      - name: Deliberate failure canary
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-windows')
+        run: exit 1
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -198,3 +207,71 @@ jobs:
         run: |
           python -m playwright install chromium
           pytest -q tests/test_e2e_status_projection.py
+
+  # A deterministic security regression context. Dependency-vulnerability
+  # feeds are deliberately excluded because mutable remote advisory state would
+  # make a merge gate non-reproducible; those belong in a separately managed
+  # alerting control. This gate verifies the workflow policy itself plus the
+  # product's fail-closed provenance and report-path containment boundaries.
+  security-gates:
+    name: Security gates (workflow policy · provenance · path containment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Deliberate failure canary
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-security')
+        run: exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install minimal test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "pytest>=9.0,<10.0"
+
+      - name: Release gate policy
+        run: pytest -q tests/test_release_gate_policy.py
+
+      - name: Focused security regressions
+        run: |
+          pytest -q \
+            tests/test_provenance_gating.py \
+            tests/test_report_path_containment.py \
+            tests/test_runtime_report_path_containment.py \
+            tests/test_codex_safety_boundaries.py
+
+  # Build a real production artefact instead of treating Python byte-compilation
+  # as a product build. `npm ci` is locked by web/package-lock.json and the Vite
+  # command includes the TypeScript project build before emitting web/dist/.
+  build-gates:
+    name: Build gates (web production)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Deliberate failure canary
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-build')
+        run: exit 1
+
+      - name: Set up Node
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install locked web dependencies
+        run: npm ci --prefix web
+
+      - name: Web production build
+        run: npm run build --prefix web
