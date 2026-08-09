@@ -320,9 +320,7 @@ jobs:
       - name: Secret scan
         run: |
           python -m pip install detect-secrets==1.5.0
-          detect-secrets scan --all-files \
-            --exclude-files '(^|/)(security-sbom|dependency-vulns|secret-scan)\.json$' \
-            . > secret-scan.json
+          detect-secrets scan > secret-scan.json
           python - <<'PY'
           import json
 
