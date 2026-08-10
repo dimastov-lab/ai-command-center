@@ -11,6 +11,7 @@ from scripts.fetch_aios_sdk_artifact import (
     ArtifactError,
     extract_verified_artifact,
     load_lock,
+    resolve_artifact_token,
     validate_artifact_metadata,
 )
 
@@ -94,3 +95,13 @@ def test_artifact_metadata_allows_missing_workflow_run_when_name_matches_accept_
         "expired": False,
     }
     validate_artifact_metadata(payload, lock)
+
+
+def test_resolve_artifact_token_prefers_readonly_then_legacy():
+    assert resolve_artifact_token({"AIOS_ARTIFACT_READONLY_TOKEN": "new", "AIOS_ARTIFACT_READ_TOKEN": "old"}) == "new"
+    assert resolve_artifact_token({"AIOS_ARTIFACT_READ_TOKEN": "old"}) == "old"
+
+
+def test_resolve_artifact_token_requires_one_of_envs():
+    with pytest.raises(ArtifactError, match="AIOS_ARTIFACT_READONLY_TOKEN or AIOS_ARTIFACT_READ_TOKEN"):
+        resolve_artifact_token({})

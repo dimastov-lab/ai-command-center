@@ -20,6 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = REPO_ROOT / "aios-sdk.lock.json"
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
+READONLY_TOKEN_ENV = "AIOS_ARTIFACT_READONLY_TOKEN"
+LEGACY_TOKEN_ENV = "AIOS_ARTIFACT_READ_TOKEN"
 
 
 class ArtifactError(RuntimeError):
@@ -152,7 +154,7 @@ def _read(request: Request, limit: int) -> bytes:
 
 def fetch_artifact(lock: ArtifactLock, token: str) -> bytes:
     if not token:
-        raise ArtifactError("AIOS_ARTIFACT_READ_TOKEN is required")
+        raise ArtifactError(f"{READONLY_TOKEN_ENV} or {LEGACY_TOKEN_ENV} is required")
     root = f"https://api.github.com/repos/{lock.repository}/actions/artifacts/{lock.artifact_id}"
     headers = {
         "Accept": "application/vnd.github+json",
@@ -167,12 +169,23 @@ def fetch_artifact(lock: ArtifactLock, token: str) -> bytes:
     return _read(Request(f"{root}/zip", headers=headers), MAX_ARTIFACT_BYTES)
 
 
+def resolve_artifact_token(env: dict[str, str] | None = None) -> str:
+    mapping = os.environ if env is None else env
+    token = mapping.get(READONLY_TOKEN_ENV, "")
+    if token:
+        return token
+    legacy = mapping.get(LEGACY_TOKEN_ENV, "")
+    if legacy:
+        return legacy
+    raise ArtifactError(f"{READONLY_TOKEN_ENV} or {LEGACY_TOKEN_ENV} is required")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     lock = load_lock()
-    data = fetch_artifact(lock, os.environ.get("AIOS_ARTIFACT_READ_TOKEN", ""))
+    data = fetch_artifact(lock, resolve_artifact_token())
     path = extract_verified_artifact(data, args.output, lock)
     print(path)
     return 0

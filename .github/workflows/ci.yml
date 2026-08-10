@@ -106,6 +106,7 @@ jobs:
       - name: Install exact accepted AIOS SDK artifact
         if: steps.change-scope.outputs.docs_only != 'true'
         env:
+          AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
         run: |
           python scripts/fetch_aios_sdk_artifact.py --output .artifacts
@@ -229,6 +230,7 @@ jobs:
       - name: Install exact accepted AIOS SDK artifact
         if: steps.change-scope.outputs.docs_only != 'true'
         env:
+          AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
         run: |
           python scripts/fetch_aios_sdk_artifact.py --output .artifacts

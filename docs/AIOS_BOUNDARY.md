@@ -40,10 +40,12 @@ comments, docstrings and strings cannot trigger or evade it.
 
 The SDK itself is acquired from `aios-sdk.lock.json`: an accepted-main SHA,
 Actions run/artifact identity, filename, API major, version, and SHA-256 are all
-immutable inputs. `scripts/fetch_aios_sdk_artifact.py` requires the dedicated
-CI artifact-read credential and rejects an absent credential, extra archive
-members, manifest mismatch, or wheel checksum mismatch. There is deliberately
-no sibling checkout, mutable ref, package-index, or vendored-wheel fallback.
+immutable inputs. `scripts/fetch_aios_sdk_artifact.py` requires a dedicated
+CI artifact-read credential and prefers `AIOS_ARTIFACT_READONLY_TOKEN`
+with explicit fallback to `AIOS_ARTIFACT_READ_TOKEN` during rotation.
+It rejects an absent credential, extra archive members, manifest mismatch,
+or wheel checksum mismatch. There is deliberately no sibling checkout,
+mutable ref, package-index, or vendored-wheel fallback.
 
 The same sole adapter implements AICC's read-only status port with only the
 SDK's public health, readiness, whoami, and workspace-timeline surfaces. Its
