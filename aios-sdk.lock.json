@@ -1,12 +1,10 @@
 {
-  "accepted_main_sha": "5cc29a11294011eee1d87f1de7ce284cde9cb94e",
+  "accepted_main_sha": "f1f7d90374afa236fe572c77ccc59c99849b6f86",
   "api_major": 1,
-  "artifact_id": 9042593332,
-  "artifact_name": "immutable-rc-5cc29a11294011eee1d87f1de7ce284cde9cb94e",
+  "release_tag": "v0.2.2rc3",
   "repository": "dimastov-lab/aios",
-  "run_id": 31329805298,
-  "source_sha": "5cc29a11294011eee1d87f1de7ce284cde9cb94e",
+  "source_sha": "f1f7d90374afa236fe572c77ccc59c99849b6f86",
   "version": "0.2.0",
   "wheel_filename": "aios_sdk-0.2.0-py3-none-any.whl",
-  "wheel_sha256": "3ca9c713eb99cb74a6cc93f2e441174e5e214925b324d1eca1c02c71500da680"
+  "wheel_sha256": "b27882375dc48a7f03864705ff75d51606d67a2d5c8c6b774bd8ad68fbb95ccd"
 }

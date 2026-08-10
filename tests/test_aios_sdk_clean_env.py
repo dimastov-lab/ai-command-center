@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import subprocess
 import venv
-import zipfile
 
 import pytest
 
@@ -30,22 +29,25 @@ def _resolve_pinned_sdk_wheel(tmp_path: Path) -> Path:
         if digest == expected_sha256:
             return local_candidate
 
-    artifact_zip = tmp_path / "aios_sdk_artifact.zip"
     try:
-        with artifact_zip.open("wb") as handle:
-            subprocess.run(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{lock['repository']}/actions/artifacts/{lock['artifact_id']}/zip",
-                ],
-                check=True,
-                timeout=120,
-                stdout=handle,
-            )
-        with zipfile.ZipFile(artifact_zip) as archive:
-            wheel_bytes = archive.read(expected_filename)
-    except (FileNotFoundError, subprocess.CalledProcessError, KeyError, zipfile.BadZipFile):
+        subprocess.run(
+            [
+                "gh",
+                "release",
+                "download",
+                str(lock["release_tag"]),
+                "--repo",
+                str(lock["repository"]),
+                "--pattern",
+                expected_filename,
+                "--dir",
+                str(tmp_path / "release-asset"),
+            ],
+            check=True,
+            timeout=120,
+        )
+        wheel_bytes = (tmp_path / "release-asset" / expected_filename).read_bytes()
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
         pytest.skip(
             "Pinned AIOS SDK wheel is unavailable locally. "
             "Set AICC_AIOS_SDK_WHEEL or place the verified wheel in .artifacts/."
