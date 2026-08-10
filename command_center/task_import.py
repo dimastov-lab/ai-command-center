@@ -57,16 +57,17 @@ Pipeline
 """
 
 from __future__ import annotations
-import threading
-_REGISTRY_LOCK = threading.Lock()
 
 import hashlib
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from command_center import artifacts, models, project_config, storage, tasks_repository
+
+_REGISTRY_LOCK = threading.Lock()
 
 SCHEMA_VERSION = "1"
 
