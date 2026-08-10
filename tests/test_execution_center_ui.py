@@ -369,17 +369,12 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
         at, session_view.STATUS_CANCELLED
     )
 
-    deadline = time.monotonic() + 10
-    displayed_cancelled = False
-    while time.monotonic() < deadline:
-        at = at.run()
-        if _shows_status(at, session_view.STATUS_CANCELLED):
-            displayed_cancelled = True
-            break
-        time.sleep(0.2)
-
-    assert displayed_cancelled
     _wait_for_report(runtime_db.resolve_db_path(), run_id)
+    # Start a new render after the cancellation thread has committed its final
+    # report. Reusing the in-flight AppTest session races its Streamlit script
+    # runner on slower CI hosts and can retain an obsolete widget tree.
+    at = _at_on_page("execution_center")
+    assert _shows_status(at, session_view.STATUS_CANCELLED)
 
 
 # --------------------------------------------------------------------------

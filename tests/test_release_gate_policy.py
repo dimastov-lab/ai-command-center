@@ -13,7 +13,6 @@ CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
 EXPECTED_CONTEXTS = {
-    "detect-scope": "Detect change scope",
     "quality-gates": "Quality gates (whitespace · Ruff · compile · pytest)",
     "windows-quality-gates": "Windows quality gates (Ruff · compile · pytest)",
     "security-gates": "Security gates (workflow policy · provenance · supply chain)",
@@ -117,12 +116,9 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
         "security-gates",
         "build-gates",
     }
-    # detect-scope is a shared prerequisite job listed in needs but not a
-    # gating check — it only feeds outputs to downstream jobs.
-    all_needs = {"detect-scope", *required}
 
     assert final_gate["if"] == "always()"
-    assert set(final_gate["needs"]) == all_needs
+    assert set(final_gate["needs"]) == required
 
     (assertion_step,) = [
         step for step in final_gate["steps"] if step.get("name") == "Assert required checks"
@@ -131,29 +127,12 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
     for job_id in required:
         assert f'${{{{ needs.{job_id}.result }}}}" != "success"' in script
 
-    # windows-quality-gates is intentionally skipped on docs-only PRs; the
-    # final-gate script accepts 'skipped' for that job only.
-    skip_allowed = {"windows-quality-gates"}
-
     def accepted(results: dict[str, str]) -> bool:
-        for job_id in required:
-            r = results[job_id]
-            if r == "success":
-                continue
-            if r == "skipped" and job_id in skip_allowed:
-                continue
-            return False
-        return True
+        return all(results[job_id] == "success" for job_id in required)
 
     success = {job_id: "success" for job_id in required}
     assert accepted(success)
-    # skipped is acceptable only for skip_allowed jobs
-    for job_id in skip_allowed:
-        assert accepted(success | {job_id: "skipped"}), (job_id, "skipped")
-    # failure and cancellation always block the gate
     for job_id in required:
-        for negative_result in ("failure", "cancelled"):
-            assert not accepted(success | {job_id: negative_result}), (job_id, negative_result)
-    # skipped is NOT acceptable for non-skip_allowed jobs
-    for job_id in required - skip_allowed:
-        assert not accepted(success | {job_id: "skipped"}), (job_id, "skipped")
+        for negative_result in ("failure", "cancelled", "skipped"):
+            results = success | {job_id: negative_result}
+            assert not accepted(results), (job_id, negative_result)
