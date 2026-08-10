@@ -2,17 +2,64 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
 import venv
+import zipfile
+
+import pytest
+
+
+def _resolve_pinned_sdk_wheel(tmp_path: Path) -> Path:
+    raw_wheel = os.environ.get("AICC_AIOS_SDK_WHEEL", "")
+    if raw_wheel:
+        wheel = Path(raw_wheel).resolve()
+        if wheel.is_file():
+            return wheel
+
+    source_root = Path(__file__).resolve().parents[1]
+    lock = json.loads((source_root / "aios-sdk.lock.json").read_text(encoding="utf-8"))
+    expected_filename = str(lock["wheel_filename"])
+    expected_sha256 = str(lock["wheel_sha256"])
+    local_candidate = source_root / ".artifacts" / expected_filename
+    if local_candidate.is_file():
+        digest = hashlib.sha256(local_candidate.read_bytes()).hexdigest()
+        if digest == expected_sha256:
+            return local_candidate
+
+    artifact_zip = tmp_path / "aios_sdk_artifact.zip"
+    try:
+        with artifact_zip.open("wb") as handle:
+            subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{lock['repository']}/actions/artifacts/{lock['artifact_id']}/zip",
+                ],
+                check=True,
+                timeout=120,
+                stdout=handle,
+            )
+        with zipfile.ZipFile(artifact_zip) as archive:
+            wheel_bytes = archive.read(expected_filename)
+    except (FileNotFoundError, subprocess.CalledProcessError, KeyError, zipfile.BadZipFile):
+        pytest.skip(
+            "Pinned AIOS SDK wheel is unavailable locally. "
+            "Set AICC_AIOS_SDK_WHEEL or place the verified wheel in .artifacts/."
+        )
+    digest = hashlib.sha256(wheel_bytes).hexdigest()
+    assert digest == expected_sha256, "downloaded pinned SDK artifact checksum mismatch"
+    wheel = tmp_path / expected_filename
+    with wheel.open("wb") as handle:
+        handle.write(wheel_bytes)
+    return wheel
 
 
 def test_pinned_artifact_imports_and_builds_aicc_gateways_in_clean_venv(tmp_path):
-    raw_wheel = os.environ.get("AICC_AIOS_SDK_WHEEL", "")
-    assert raw_wheel, "AICC_AIOS_SDK_WHEEL must identify the verified pinned artifact"
-    wheel = Path(raw_wheel).resolve()
-    assert wheel.is_file(), f"verified SDK wheel is missing: {wheel}"
+    wheel = _resolve_pinned_sdk_wheel(tmp_path).resolve()
 
     environment = tmp_path / "clean-sdk-env"
     venv.EnvBuilder(with_pip=True).create(environment)
@@ -22,7 +69,6 @@ def test_pinned_artifact_imports_and_builds_aicc_gateways_in_clean_venv(tmp_path
         check=True,
         timeout=120,
     )
-    source_root = Path(__file__).resolve().parents[1]
     probe = """
 from pathlib import Path
 from command_center.application import aios_tasks
@@ -38,6 +84,7 @@ tasks.close()
 status.close()
 assert sdk.__version__ == '0.2.0'
 """
+    source_root = Path(__file__).resolve().parents[1]
     clean_env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(source_root)}
     completed = subprocess.run(
         [str(python), "-c", probe],
