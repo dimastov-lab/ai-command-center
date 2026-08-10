@@ -10,6 +10,8 @@ import pytest
 
 from command_center.release_manifest import build_release_manifest
 
+SOURCE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -26,7 +28,7 @@ def test_build_release_manifest_emits_hashes_signing_and_relative_paths(tmp_path
     wheel.write_bytes(wheel_bytes)
 
     manifest = build_release_manifest(
-        source_sha="b0594b131e30eab0e85128b8da114e0647712cf3",
+        source_sha=SOURCE_SHA,
         artifact_specs=[
             {
                 "path": web.as_posix(),
@@ -48,7 +50,7 @@ def test_build_release_manifest_emits_hashes_signing_and_relative_paths(tmp_path
     )
 
     assert manifest["schema_version"] == 1
-    assert manifest["source_sha"] == "b0594b131e30eab0e85128b8da114e0647712cf3"
+    assert manifest["source_sha"] == SOURCE_SHA
     assert manifest["artifacts"] == [
         {
             "artifact_type": "python_wheel",
@@ -94,7 +96,7 @@ def test_build_release_manifest_rejects_invalid_signing_status(tmp_path):
     file_path.write_bytes(b"x")
     with pytest.raises(ValueError, match="signing_status"):
         build_release_manifest(
-            source_sha="b0594b131e30eab0e85128b8da114e0647712cf3",
+            source_sha=SOURCE_SHA,
             artifact_specs=[
                 {
                     "path": file_path.as_posix(),
@@ -133,7 +135,7 @@ def test_build_release_manifest_script_writes_json(tmp_path):
             sys.executable,
             str(script),
             "--source-sha",
-            "b0594b131e30eab0e85128b8da114e0647712cf3",
+            SOURCE_SHA,
             "--spec-file",
             str(spec_file),
             "--output",
@@ -146,5 +148,5 @@ def test_build_release_manifest_script_writes_json(tmp_path):
     assert completed.returncode == 0, completed.stderr
     assert output.exists()
     payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["source_sha"] == "b0594b131e30eab0e85128b8da114e0647712cf3"
+    assert payload["source_sha"] == SOURCE_SHA
     assert payload["artifacts"][0]["platform"] == "macos"

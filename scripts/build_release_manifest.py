@@ -6,10 +6,6 @@ from pathlib import Path
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from command_center.release_manifest import build_release_manifest
 
 
 def _load_specs(path: Path) -> list[dict[str, object]]:
@@ -28,6 +24,10 @@ def _load_specs(path: Path) -> list[dict[str, object]]:
 
 
 def main() -> int:
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from command_center.release_manifest import build_release_manifest
+
     parser = argparse.ArgumentParser(
         description="Build reproducible release manifest with artifact hashes and signing slots."
     )
