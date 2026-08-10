@@ -207,6 +207,8 @@ def detect_completion_evidence(text: str | None) -> str | None:
 # Read/Edit/Write/other Bash. Such denials must NOT fail an otherwise-productive
 # run. (`git stash` is included because the disallow pattern also catches the
 # read-only `git stash list` the agent sometimes runs to inspect state.)
+_PERMISSION_PHRASE = re.compile(r"permission", re.I)
+
 _EXPECTED_GIT_DENIAL_MARKERS: tuple[str, ...] = (
     "git apply", "git checkout", "git restore", "git switch",
     "git stash", "git push", "git merge", "git reset",
@@ -282,7 +284,14 @@ def classify_process_result(
 
     blocker_phrase = detect_actionable_blocker_language(result_text)
     if blocker_phrase:
-        return BLOCKED, f"final_response:{blocker_phrase}"
+        # When every structured denial was an intentionally-blocked git-write
+        # command, a permission-flavored phrase in the final message is the
+        # agent narrating that same expected denial — the sandbox working as
+        # designed, not an independent blocker (W4 #192, found live by the
+        # #191 delivery chain). Non-permission blocker language still blocks.
+        only_expected_git_denials = bool(permission_denials) and not denied_tools
+        if not (only_expected_git_denials and _PERMISSION_PHRASE.search(blocker_phrase)):
+            return BLOCKED, f"final_response:{blocker_phrase}"
 
     if task_type in REQUIRES_CHANGES_TASK_TYPES and not working_tree_changed:
         # The recurring false negative: a task whose implementation already
