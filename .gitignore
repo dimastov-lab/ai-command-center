@@ -1,75 +1,26 @@
-# Runtime data (local, machine-specific — see README "Runtime Data")
-data/tasks.json
-data/runs.jsonl
-data/chats.json
-data/activity.jsonl
-data/project_config.json
-data/execution_queue.json
-data/portfolio_config.json
-data/portfolio_launches.json
-data/portfolio_locks/
-data/pipeline_settings.json
-# Glob, not a by-name list: every lock added with a new feature was otherwise
-# missed, leaving AICC's own tree dirty and tripping its UNCOMMITTED_CHANGES gate.
-data/*.lock
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
 
-# SQLite runtime database and its WAL/SHM sidecars. Local execution state —
-# must never be committed. (Previously excluded only via .git/info/exclude,
-# which does not survive a fresh clone; this checked-in rule closes that gap.)
-data/runtime.db
-data/runtime.db-wal
-data/runtime.db-shm
-data/*.db
-data/*.db-wal
-data/*.db-shm
-data/*.db-journal
+# Environments
+venv/
+.venv/
+env/
 
-# Runtime logs written by the daily-audit campaign runner and friends. Local
-# stdout/stderr capture — never committed. Left unignored these dirty the
-# working tree and trip AICC's own UNCOMMITTED_CHANGES launch gate.
-data/*.log
+# Environment variables / Secrets
+.env
+.env.local
 
-# Transient AI task artifacts and agent reports generated at runtime
-# (scripts/start-task.sh and the v1.2 Claude Code runner)
-generated/
-reports/
-
-# macOS
+# IDEs & System
+.vscode/
+.idea/
 .DS_Store
 
-# Local Claude Code configuration (checked-in project skills are allowed)
-.agents/
-.claude/*
-!.claude/skills/
+# Repomix & Audits
+repomix-output.xml
+pack.js
 
-# Local environment variables (OPENAI_API_KEY, etc.) — see .env.example
-.env
-
-# Python tooling caches
-__pycache__/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-
-# Local virtual environments (machine-specific — e.g. the desktop PySide6 venv)
-.venv/
-.venv-*/
-venv/
-
-# PyInstaller desktop build output (packaging/*; produced by scripts/build-desktop-*)
-build/
-dist/
-# Local backup artifacts
-data/backups/
-roadmap/*.zip
-
-# stray test artifacts at repo root
-runtime.db
-runtime.db-shm
-runtime.db-wal
-.worktrees/
-
-# Aider AI coding assistant artifacts
-.aider.chat.history.md
-.aider.input.history
-.aider.tags.cache.v4/
+# Lock files (optional, keeps repository lightweight)
+*.lock
