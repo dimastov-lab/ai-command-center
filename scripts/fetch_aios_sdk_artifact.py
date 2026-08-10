@@ -1,27 +1,37 @@
-"""Fetch and verify the exact accepted AIOS SDK artifact (no mutable fallback)."""
+"""Fetch and verify the exact accepted AIOS SDK wheel from a permanent
+GitHub Release asset (no mutable fallback).
+
+Earlier revisions pinned a CI Actions artifact; those expire (the pinned
+artifact 9042593332 did), turning the fail-closed gate into a permanent
+failure. Published GitHub Release assets of an immutable release do not
+expire, so the lock now pins a release tag and the exact wheel checksum,
+and the fetch additionally proves the tag still points at the accepted
+main commit (peeled through the annotated tag object).
+"""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
 import hashlib
-import io
 import json
 import os
-from pathlib import Path, PurePosixPath
-import tempfile
+from pathlib import Path
 import re
+import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = REPO_ROOT / "aios-sdk.lock.json"
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
+CHECKSUM_MANIFEST_NAME = "SHA256SUMS"
 READONLY_TOKEN_ENV = "AIOS_ARTIFACT_READONLY_TOKEN"
 LEGACY_TOKEN_ENV = "AIOS_ARTIFACT_READ_TOKEN"
+
+_RELEASE_TAG_PATTERN = re.compile(r"^v[0-9][0-9A-Za-z.+-]*$")
 
 
 class ArtifactError(RuntimeError):
@@ -41,9 +51,7 @@ class ArtifactLock:
     repository: str
     source_sha: str
     accepted_main_sha: str
-    run_id: int
-    artifact_id: int
-    artifact_name: str
+    release_tag: str
     wheel_filename: str
     wheel_sha256: str
     version: str
@@ -56,14 +64,6 @@ class ArtifactLock:
         return replace(self, wheel_sha256=value)
 
 
-def _extract_head_sha_from_artifact_name(name: str) -> str:
-    prefix = "immutable-rc-"
-    if not name.startswith(prefix):
-        return ""
-    candidate = name.removeprefix(prefix)
-    return candidate if re.fullmatch(r"[0-9a-f]{40}", candidate or "") else ""
-
-
 def load_lock(path: Path = LOCK_PATH) -> ArtifactLock:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -74,24 +74,67 @@ def load_lock(path: Path = LOCK_PATH) -> ArtifactLock:
         len(lock.source_sha) != 40
         or len(lock.accepted_main_sha) != 40
         or len(lock.wheel_sha256) != 64
-        or not all(value > 0 for value in (lock.run_id, lock.artifact_id, lock.api_major))
+        or lock.api_major <= 0
+        or not _RELEASE_TAG_PATTERN.fullmatch(lock.release_tag)
     ):
         raise ArtifactError("invalid AIOS SDK lock identity")
     return lock
 
 
-def extract_verified_artifact(data: bytes, output: Path, lock: ArtifactLock) -> Path:
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = archive.namelist()
-            if any(PurePosixPath(name).name != name for name in names):
-                raise ArtifactError("artifact contains unexpected path")
-            if lock.wheel_filename not in names or "SHA256SUMS" not in names:
-                raise ArtifactError("artifact missing wheel or checksum")
-            wheel = archive.read(lock.wheel_filename)
-            manifest = archive.read("SHA256SUMS").decode("ascii")
-    except (zipfile.BadZipFile, KeyError, UnicodeDecodeError) as error:
-        raise ArtifactError("invalid artifact archive") from error
+def validate_release_metadata(payload: object, lock: ArtifactLock) -> dict[str, int]:
+    """Return {asset_name: asset_id} for the wheel and checksum manifest.
+
+    Fails closed unless the payload is the published (non-draft) release for
+    exactly the locked tag and carries both required assets.
+    """
+    if not isinstance(payload, dict):
+        raise ArtifactError("invalid release metadata")
+    if payload.get("tag_name") != lock.release_tag or payload.get("draft") is not False:
+        raise ArtifactError("release metadata identity mismatch")
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise ArtifactError("release metadata identity mismatch")
+    wanted = {lock.wheel_filename, CHECKSUM_MANIFEST_NAME}
+    resolved: dict[str, int] = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = asset.get("name")
+        asset_id = asset.get("id")
+        if name in wanted and isinstance(asset_id, int) and asset_id > 0:
+            resolved[name] = asset_id
+    if set(resolved) != wanted:
+        raise ArtifactError("release is missing wheel or checksum asset")
+    return resolved
+
+
+def validate_tag_binding(ref_payload: object, tag_payload: object, lock: ArtifactLock) -> None:
+    """Prove the locked tag still points at the accepted main commit.
+
+    ``ref_payload`` is ``git/ref/tags/<tag>``. A lightweight tag points
+    straight at the commit; an annotated tag points at a tag object whose
+    dereferenced target (``tag_payload``, from ``git/tags/<sha>``) must be
+    the accepted commit.
+    """
+    if not isinstance(ref_payload, dict):
+        raise ArtifactError("invalid tag reference metadata")
+    obj = ref_payload.get("object")
+    if not isinstance(obj, dict):
+        raise ArtifactError("invalid tag reference metadata")
+    if obj.get("type") == "commit":
+        if obj.get("sha") != lock.accepted_main_sha:
+            raise ArtifactError("release tag no longer points at the accepted commit")
+        return
+    if obj.get("type") != "tag":
+        raise ArtifactError("invalid tag reference metadata")
+    if not isinstance(tag_payload, dict):
+        raise ArtifactError("invalid tag object metadata")
+    target = tag_payload.get("object")
+    if not isinstance(target, dict) or target.get("sha") != lock.accepted_main_sha:
+        raise ArtifactError("release tag no longer points at the accepted commit")
+
+
+def verify_wheel(wheel: bytes, manifest: str, lock: ArtifactLock) -> str:
     digest = hashlib.sha256(wheel).hexdigest()
     manifest_lines = [line for line in manifest.splitlines() if line.strip()]
     expected = f"{digest}  {lock.wheel_filename}"
@@ -101,6 +144,11 @@ def extract_verified_artifact(data: bytes, output: Path, lock: ArtifactLock) -> 
         raise ArtifactError("artifact manifest checksum mismatch")
     if digest != lock.wheel_sha256:
         raise ArtifactError("locked wheel checksum mismatch")
+    return digest
+
+
+def persist_verified_wheel(wheel: bytes, manifest: str, output: Path, lock: ArtifactLock) -> Path:
+    verify_wheel(wheel, manifest, lock)
     output.mkdir(parents=True, exist_ok=True)
     target = output / lock.wheel_filename
     temporary: Path | None = None
@@ -118,29 +166,6 @@ def extract_verified_artifact(data: bytes, output: Path, lock: ArtifactLock) -> 
     return target
 
 
-def validate_artifact_metadata(payload: object, lock: ArtifactLock) -> None:
-    if not isinstance(payload, dict):
-        raise ArtifactError("invalid artifact metadata")
-    workflow = payload.get("workflow_run")
-    payload_name = payload.get("name", "")
-    if not isinstance(payload_name, str) or payload_name != lock.artifact_name:
-        raise ArtifactError("artifact metadata identity mismatch")
-    if payload.get("id") != lock.artifact_id or payload.get("expired") is not False:
-        raise ArtifactError("artifact metadata identity mismatch")
-    if isinstance(workflow, dict):
-        workflow_id = workflow.get("id")
-        workflow_head_sha = workflow.get("head_sha")
-        if workflow_id == lock.run_id and workflow_head_sha == lock.accepted_main_sha:
-            return
-        raise ArtifactError("artifact metadata identity mismatch")
-
-    fallback_head_sha = _extract_head_sha_from_artifact_name(payload_name)
-    if fallback_head_sha == lock.accepted_main_sha:
-        return
-
-    raise ArtifactError("artifact metadata identity mismatch")
-
-
 def _read(request: Request, limit: int) -> bytes:
     try:
         with build_opener(_CredentialSafeRedirect()).open(request, timeout=30) as response:
@@ -152,21 +177,57 @@ def _read(request: Request, limit: int) -> bytes:
     return data
 
 
-def fetch_artifact(lock: ArtifactLock, token: str) -> bytes:
-    if not token:
-        raise ArtifactError(f"{READONLY_TOKEN_ENV} or {LEGACY_TOKEN_ENV} is required")
-    root = f"https://api.github.com/repos/{lock.repository}/actions/artifacts/{lock.artifact_id}"
-    headers = {
-        "Accept": "application/vnd.github+json",
+def _api_headers(token: str, *, accept: str) -> dict[str, str]:
+    return {
+        "Accept": accept,
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def _read_json(url: str, token: str) -> object:
+    raw = _read(
+        Request(url, headers=_api_headers(token, accept="application/vnd.github+json")),
+        MAX_METADATA_BYTES,
+    )
     try:
-        metadata = json.loads(_read(Request(root, headers=headers), MAX_METADATA_BYTES))
+        return json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise ArtifactError("invalid artifact metadata") from error
-    validate_artifact_metadata(metadata, lock)
-    return _read(Request(f"{root}/zip", headers=headers), MAX_ARTIFACT_BYTES)
+        raise ArtifactError("invalid release metadata") from error
+
+
+def fetch_release_wheel(lock: ArtifactLock, token: str) -> tuple[bytes, str]:
+    """Download (wheel bytes, checksum manifest text) from the locked release."""
+    if not token:
+        raise ArtifactError(f"{READONLY_TOKEN_ENV} or {LEGACY_TOKEN_ENV} is required")
+    api = f"https://api.github.com/repos/{lock.repository}"
+
+    release = _read_json(f"{api}/releases/tags/{lock.release_tag}", token)
+    assets = validate_release_metadata(release, lock)
+
+    ref = _read_json(f"{api}/git/ref/tags/{lock.release_tag}", token)
+    tag_object: object = None
+    if isinstance(ref, dict):
+        obj = ref.get("object")
+        if isinstance(obj, dict) and obj.get("type") == "tag":
+            tag_object = _read_json(f"{api}/git/tags/{obj.get('sha')}", token)
+    validate_tag_binding(ref, tag_object, lock)
+
+    def _asset(name: str, limit: int) -> bytes:
+        return _read(
+            Request(
+                f"{api}/releases/assets/{assets[name]}",
+                headers=_api_headers(token, accept="application/octet-stream"),
+            ),
+            limit,
+        )
+
+    wheel = _asset(lock.wheel_filename, MAX_ARTIFACT_BYTES)
+    try:
+        manifest = _asset(CHECKSUM_MANIFEST_NAME, MAX_METADATA_BYTES).decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ArtifactError("invalid checksum manifest") from error
+    return wheel, manifest
 
 
 def resolve_artifact_token(env: dict[str, str] | None = None) -> str:
@@ -185,8 +246,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     lock = load_lock()
-    data = fetch_artifact(lock, resolve_artifact_token())
-    path = extract_verified_artifact(data, args.output, lock)
+    wheel, manifest = fetch_release_wheel(lock, resolve_artifact_token())
+    path = persist_verified_wheel(wheel, manifest, args.output, lock)
     print(path)
     return 0
 
