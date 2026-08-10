@@ -35,14 +35,16 @@ permissions:
   security-events: write
 
 jobs:
-  quality-gates:
-    name: Quality gates (whitespace · Ruff · compile · pytest)
+  # Fast, lightweight job that detects whether the PR only touches documentation.
+  # Both quality-gate jobs depend on this output so they can skip or reduce work
+  # without each duplicating the detection logic.
+  detect-scope:
+    name: Detect change scope
     runs-on: ubuntu-latest
-    # A single coverage-enabled pass normally takes ~10 min on a cold runner;
-    # keep headroom for runner variance while bounding genuine hangs.
-    timeout-minutes: 20
-    env:
-      AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.change-scope.outputs.docs_only }}
+      e2e_relevant: ${{ steps.change-scope.outputs.e2e_relevant }}
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -58,12 +60,14 @@ jobs:
         run: |
           if [[ "$EVENT_NAME" != "pull_request" ]]; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "e2e_relevant=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           CHANGED_FILES="$(git diff --name-only "$BASE_SHA...HEAD")"
           if [[ -z "$CHANGED_FILES" ]]; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "e2e_relevant=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -73,12 +77,36 @@ jobs:
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
           fi
 
+          # E2E is only relevant when web UI, core logic, app entry-point, or E2E
+          # tests themselves change. Skip the Playwright install + run on PRs that
+          # only touch unrelated backend/config/test files.
+          if echo "$CHANGED_FILES" | grep -qE '^(web/|command_center/|app\.py|tests/test_e2e)'; then
+            echo "e2e_relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "e2e_relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  quality-gates:
+    name: Quality gates (whitespace · Ruff · compile · pytest)
+    runs-on: ubuntu-latest
+    needs: detect-scope
+    # A single coverage-enabled pass normally takes ~10 min on a cold runner;
+    # keep headroom for runner variance while bounding genuine hangs.
+    timeout-minutes: 20
+    env:
+      AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
       - name: Deliberate failure canary
         if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-linux')
         run: exit 1
 
       - name: Set up Python
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
@@ -92,19 +120,19 @@ jobs:
       # (even non-desktop ones) can run. Cheap (apt), only needed when the
       # desktop deps are installed.
       - name: Install Qt system libraries (for optional desktop shell)
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
 
       - name: Install dependencies
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
       - name: Install exact accepted AIOS SDK artifact
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         env:
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
         run: |
@@ -124,11 +152,11 @@ jobs:
           fi
 
       - name: Ruff
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         run: ruff check .
 
       - name: Compile validation
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         run: python -m compileall -q command_center scripts tests app.py
 
       # Collect coverage during the required test run instead of executing all
@@ -137,7 +165,7 @@ jobs:
       # informational.  Durations make future runtime regressions visible in
       # the CI log without adding another test pass.
       - name: Pytest + coverage
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         run: pytest -q --durations=50 --cov=command_center --cov-report=term --cov-report=xml
 
       # Informational, non-blocking signal. It never fails the job so the merge
@@ -145,14 +173,22 @@ jobs:
       # type-check progress for a codebase that is not yet fully typed.
 
       - name: Type check (informational)
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: needs.detect-scope.outputs.docs_only != 'true'
         continue-on-error: true
         run: mypy command_center || true
 
       # Real-browser lifecycle projection is a release invariant, not an
       # informational signal: a failing user journey must fail this check.
+      # Skip on PRs that don't touch web UI, core logic, app entry-point, or
+      # E2E tests — saves ~2-3 min Playwright install+run on unrelated changes.
+      # Use the 'test-e2e' label to force E2E on any PR regardless of paths.
       - name: Real-browser E2E
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: |
+          needs.detect-scope.outputs.docs_only != 'true' && (
+            github.event_name != 'pull_request' ||
+            needs.detect-scope.outputs.e2e_relevant == 'true' ||
+            contains(github.event.pull_request.labels.*.name, 'test-e2e')
+          )
         run: |
           python -m playwright install chromium
           pytest -q tests/test_e2e_status_projection.py
@@ -168,8 +204,12 @@ jobs:
   # The automated Windows context is nevertheless release-relevant: after this
   # workflow has appeared green on an exact PR head, branch protection can bind
   # its stable job name without relying on an agent report.
+  #
+  # Skipped entirely on documentation-only PRs (no code to validate on Windows).
   windows-quality-gates:
     name: Windows quality gates (Ruff · compile · pytest)
+    needs: detect-scope
+    if: needs.detect-scope.outputs.docs_only != 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -184,36 +224,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect docs-only change scope
-        id: change-scope
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          CHANGED_FILES="$(git diff --name-only "$BASE_SHA...HEAD")"
-          if [[ -z "$CHANGED_FILES" ]]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if echo "$CHANGED_FILES" | rg -qv '(^README\.md$|^CHANGELOG\.md$|^docs/|\.md$)'; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Deliberate failure canary
         if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-windows')
         run: exit 1
 
       - name: Set up Python
-        if: steps.change-scope.outputs.docs_only != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
@@ -221,13 +236,11 @@ jobs:
           cache-dependency-path: requirements-ci-windows.lock
 
       - name: Install dependencies
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-windows.lock
 
       - name: Install exact accepted AIOS SDK artifact
-        if: steps.change-scope.outputs.docs_only != 'true'
         env:
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
         run: |
@@ -235,20 +248,19 @@ jobs:
           pip install "$env:AICC_AIOS_SDK_WHEEL"
 
       - name: Ruff
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: ruff check .
 
       - name: Compile validation
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: python -m compileall -q command_center scripts tests app.py
 
       # The desktop pytest-qt suite is the deterministic Windows-relevant signal
-      # for the D1 desktop gate. Kept informational for the merge gate (not
-      # required) but mirrors the ubuntu job's coverage so Windows regressions
-      # surface early. This is exactly the automated half WINDOWS_RUNBOOK.md
-      # Step 2 calls for (ruff · compile · `pytest tests/desktop`).
+      # for the D1 desktop gate. On PRs, only run when the 'test-desktop' label
+      # is present — saves ~5-8 min on unrelated PRs. Always runs on push to main
+      # (full release validation).
       - name: Desktop pytest-qt suite
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: |
+          github.event_name != 'pull_request' ||
+          contains(github.event.pull_request.labels.*.name, 'test-desktop')
         run: pytest tests/desktop -q
 
       # Real-browser E2E of the status projection. The full repository `pytest -q` is deliberately
@@ -257,8 +269,12 @@ jobs:
       # Windows console `charmap` codec, so a Windows full-suite run is pure
       # noise plus ~23 min of runtime that risks cancelling the job. The
       # desktop gate signal is the `tests/desktop` suite above.
+      # On PRs, skip E2E unless paths are relevant or 'test-e2e' label is set.
       - name: Real-browser E2E
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: |
+          github.event_name != 'pull_request' ||
+          needs.detect-scope.outputs.e2e_relevant == 'true' ||
+          contains(github.event.pull_request.labels.*.name, 'test-e2e')
         run: |
           python -m playwright install chromium
           pytest -q tests/test_e2e_status_projection.py
@@ -343,15 +359,29 @@ jobs:
               )
           PY
 
+      # CodeQL static analysis is expensive (~3-5 min) and its findings are
+      # persistent: code merged to main is always analyzed.  On PRs, only run
+      # when the 'security-review' label is explicitly applied — this preserves
+      # the full security signal for deliberate security reviews while saving
+      # runner-minutes on routine feature/bug-fix PRs.
       - name: Initialize CodeQL
+        if: |
+          github.event_name == 'push' ||
+          contains(github.event.pull_request.labels.*.name, 'security-review')
         uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b
         with:
           languages: python
 
       - name: Autobuild for CodeQL
+        if: |
+          github.event_name == 'push' ||
+          contains(github.event.pull_request.labels.*.name, 'security-review')
         uses: github/codeql-action/autobuild@c4dd10e44af883a891fe31ced449bcb4a6728b9b
 
       - name: Run CodeQL analysis
+        if: |
+          github.event_name == 'push' ||
+          contains(github.event.pull_request.labels.*.name, 'security-review')
         uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b
 
       - name: Release gate policy
@@ -406,6 +436,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
+      - detect-scope
       - quality-gates
       - windows-quality-gates
       - security-gates
@@ -418,7 +449,10 @@ jobs:
             echo "quality-gates did not succeed"
             exit 1
           fi
-          if [[ "${{ needs.windows-quality-gates.result }}" != "success" ]]; then
+          # windows-quality-gates is skipped on docs-only PRs; skipped is
+          # acceptable here because detect-scope already validated the scope.
+          if [[ "${{ needs.windows-quality-gates.result }}" != "success" && \
+                "${{ needs.windows-quality-gates.result }}" != "skipped" ]]; then
             echo "windows-quality-gates did not succeed"
             exit 1
           fi
