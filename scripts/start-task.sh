@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="${AICC_START_TASK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 PROJECT="${1:-}"
 TASK_TYPE="${2:-implementation}"
@@ -13,9 +13,17 @@ if [[ -z "$PROJECT" ]]; then
   echo "  ./scripts/start-task.sh AIOS implementation \"Describe the task\""
   echo
   echo "Projects:"
+  echo "  AICC"
   echo "  AIOS"
+  echo "  AICOS"
+  echo "  PRODUCT"
+  echo "  ECOSYSTEM"
+  echo "  ESF"
+  echo "  AML"
   echo "  BANK"
   echo "  LEGAL"
+  echo "  BUSINESS"
+  echo "  PERSONAL"
   exit 1
 fi
 
@@ -23,6 +31,10 @@ PROJECT_UPPER="$(printf '%s' "$PROJECT" | tr '[:lower:]' '[:upper:]')"
 TASK_TYPE_LOWER="$(printf '%s' "$TASK_TYPE" | tr '[:upper:]' '[:lower:]')"
 
 case "$PROJECT_UPPER" in
+  AICC|AICOS|PRODUCT|ECOSYSTEM|ESF|AML|BUSINESS|PERSONAL)
+    CONTEXT_FILE="$ROOT_DIR/CURRENT_STATE.md"
+    PROJECT_FILE="$ROOT_DIR/projects/${PROJECT_UPPER}.md"
+    ;;
   AIOS)
     CONTEXT_FILE="$ROOT_DIR/context/AIOS_CONTEXT.md"
     PROJECT_FILE="$ROOT_DIR/projects/AIOS.md"
@@ -38,10 +50,18 @@ case "$PROJECT_UPPER" in
     ;;
   *)
     echo "Unknown project: $PROJECT"
-    echo "Supported projects: AIOS, BANK, LEGAL"
+    echo "Supported projects: AICC, AIOS, AICOS, PRODUCT, ECOSYSTEM, ESF, AML, BANK, LEGAL, BUSINESS, PERSONAL"
     exit 1
     ;;
 esac
+
+if [[ ! -f "$CONTEXT_FILE" ]]; then
+  CONTEXT_FILE="$ROOT_DIR/CURRENT_STATE.md"
+fi
+
+if [[ ! -f "$PROJECT_FILE" ]]; then
+  PROJECT_FILE="$ROOT_DIR/CURRENT_STATE.md"
+fi
 
 case "$TASK_TYPE_LOWER" in
   implementation|review|remediation|final_gate|architecture_review)
@@ -233,3 +253,7 @@ Return:
 Save the final report content so it can be copied into:
 
 $REPORT_FILE
+EOF
+
+echo "Task prompt generated: $OUTPUT_FILE"
+echo "Final report target: $REPORT_FILE"
