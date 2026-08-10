@@ -369,8 +369,14 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
     # Start a new render after the cancellation thread has committed its final
     # report. Reusing the in-flight AppTest session races its Streamlit script
     # runner on slower CI hosts and can retain an obsolete widget tree.
-    at = _at_on_page("execution_center")
-    assert _shows_status(at, session_view.STATUS_CANCELLED)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        at = _at_on_page("execution_center")
+        if _shows_status(at, session_view.STATUS_CANCELLED):
+            return
+        time.sleep(0.2)
+
+    raise AssertionError("durably cancelled run was not projected into the execution center")
 
 
 # --------------------------------------------------------------------------
