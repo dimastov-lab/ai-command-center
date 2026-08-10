@@ -57,6 +57,8 @@ Pipeline
 """
 
 from __future__ import annotations
+import threading
+_REGISTRY_LOCK = threading.Lock()
 
 import hashlib
 import json
