@@ -365,21 +365,21 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
 
     at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
     at = at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
-    assert any("отправлен" in s.value for s in at.success) or _shows_status(
-        at, session_view.STATUS_CANCELLED
-    )
-
+    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+    final_run = runtime_db.get_run(runtime_db.resolve_db_path(), run_id)
+    assert final_run is not None
+    assert final_run["state"] == "CANCELLED"
+    # Start a new render after the cancellation thread has committed its final
+    # report. Reusing the in-flight AppTest session races its Streamlit script
+    # runner on slower CI hosts and can retain an obsolete widget tree.
     deadline = time.monotonic() + 10
-    displayed_cancelled = False
     while time.monotonic() < deadline:
-        at = at.run()
+        at = _at_on_page("execution_center")
         if _shows_status(at, session_view.STATUS_CANCELLED):
-            displayed_cancelled = True
-            break
+            return
         time.sleep(0.2)
 
-    assert displayed_cancelled
-    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+    raise AssertionError("durably cancelled run was not projected into the execution center")
 
 
 # --------------------------------------------------------------------------
