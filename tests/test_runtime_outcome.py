@@ -270,3 +270,41 @@ def test_non_git_permission_denial_still_blocks():
     )
     assert result == outcome.BLOCKED
     assert "WebFetch" in reason
+
+
+def test_narrated_expected_git_denial_in_final_response_is_not_a_blocker():
+    """W4 #192 (found by the #191 live chain): when every structured denial is
+    an intentionally-blocked git-write command, the agent's final message
+    narrating that same "permission denied" must not reclassify a delivered
+    run as blocked — the denial is the sandbox working as designed."""
+    denials = [
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push -u origin docs/branch 2>&1"},
+        }
+    ]
+    result, reason = outcome.classify_process_result(
+        task_type="implementation",
+        result_text=(
+            "Committed the change locally. Permission denied for git push, "
+            "so the branch was not pushed."
+        ),
+        permission_denials=denials,
+        working_tree_changed=True,
+    )
+    assert result == outcome.OK
+    assert reason is None
+
+
+def test_non_permission_blocker_language_still_blocks_despite_expected_denials():
+    denials = [
+        {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}}
+    ]
+    result, reason = outcome.classify_process_result(
+        task_type="implementation",
+        result_text="I cannot proceed because the build is broken.",
+        permission_denials=denials,
+        working_tree_changed=True,
+    )
+    assert result == outcome.BLOCKED
+    assert reason is not None and reason.startswith("final_response:")
