@@ -368,8 +368,32 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
         at = _launch_via_ui(at)
         run_id = _most_recent_run_id(db_path)
 
-        at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
-        at = at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
+        cancel_ack_key = f"exec_card_cancel_ack_{run_id}"
+        cancel_btn_key = f"exec_card_cancel_btn_{run_id}"
+
+        # Re-render in a poll loop until the cancel controls are visible.  On a
+        # loaded CI host the background supervisor thread may not have advanced
+        # the DB row to RUNNING by the time the first render completes, so the
+        # cancel section (only shown for live-process states) may be absent.
+        # This also serves as the definitive check that the hold file is
+        # keeping fake_claude alive: if the process had already exited the
+        # cancel controls would never appear.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if any(cb.key == cancel_ack_key for cb in at.checkbox):
+                break
+            at = at.run()
+            time.sleep(0.05)
+        else:
+            raise AssertionError(
+                f"Cancel controls did not appear for run {run_id!r} within 15 s — "
+                "the fake process may have exited before the cancel could be requested"
+            )
+
+        at.checkbox(key=cancel_ack_key).check().run()
+        at = at.button(key=cancel_btn_key).click().run()
+        # supervisor.cancel() blocks until done_event is set (report saved), so
+        # by the time the button-click render returns the run is fully terminal.
         _wait_for_report(db_path, run_id)
         final_run = runtime_db.get_run(db_path, run_id)
         assert final_run is not None
