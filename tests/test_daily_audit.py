@@ -228,8 +228,8 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
     service = DailyAuditService(
         config(
             tmp_path,
-            lease_duration=timedelta(milliseconds=120),
-            lease_heartbeat_seconds=0.02,
+            lease_duration=timedelta(milliseconds=300),
+            lease_heartbeat_seconds=0.05,
         ),
         backend,
         db_path=db_path,
@@ -246,7 +246,10 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
         assert time.monotonic() < deadline
         time.sleep(0.01)
 
-    time.sleep(0.13)
+    # Wait past the *original* lease deadline so a missing heartbeat would hand
+    # ownership to a second contender, while still expecting the refreshed lease
+    # to remain valid.
+    time.sleep(0.35)
     contender = DailyAuditStore(db_path)
     assert contender.acquire_due(
         now=utc_now(), owner="two", lease_duration=timedelta(seconds=1)
