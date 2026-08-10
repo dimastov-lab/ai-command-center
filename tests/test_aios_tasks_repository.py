@@ -301,3 +301,24 @@ def test_delete_unknown_task_returns_false():
     repo, _ = _make_repo(handler)
     result = repo.delete("nonexistent")
     assert result is False
+
+
+def test_delete_already_cancelled_task_is_idempotent_false():
+    """A reconciled cancelled task is already deleted: no second cancel call."""
+    requests: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        requests.append(req)
+        if req.method == "GET":
+            return _json_response(
+                200,
+                _list_payload(
+                    [_task_payload("aios-t1", aicc_id="aicc-1", state="cancelled")["data"]]
+                ),
+            )
+        raise AssertionError(f"unexpected mutation request: {req.method} {req.url.path}")
+
+    repo, _ = _make_repo(handler)
+    result = repo.delete("aicc-1")
+    assert result is False
+    assert all(r.method == "GET" for r in requests)

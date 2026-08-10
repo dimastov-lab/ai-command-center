@@ -690,6 +690,12 @@ class AIOSTasksRepository:
         current = self._current(task_id)
         if current is None:
             return False
+        if current.task.state == "cancelled":
+            # Already deleted remotely (e.g. a replayed delete after the map
+            # entry was removed): a second cancel would be an
+            # invalid_transition upstream, so treat it as the no-op it is.
+            self._id_map.remove(task_id)
+            return False
         self._gateway.cancel_task(current.task.id)
         self._id_map.remove(task_id)
         return True
