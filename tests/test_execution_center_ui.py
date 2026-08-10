@@ -356,30 +356,39 @@ def test_cancel_action_visible_while_running(git_repo, configure_project_repo, f
 
 
 def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo, fake_claude):
-    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    hold_file = git_repo.parent / "fake-claude-cancelled-status.hold"
+    hold_file.touch()
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold_file)
     configure_project_repo("AIOS", git_repo)
 
-    at = _at_on_page("execution_center")
-    at = _launch_via_ui(at)
-    run_id = _most_recent_run_id(runtime_db.resolve_db_path())
-
-    at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
-    at = at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
-    _wait_for_report(runtime_db.resolve_db_path(), run_id)
-    final_run = runtime_db.get_run(runtime_db.resolve_db_path(), run_id)
-    assert final_run is not None
-    assert final_run["state"] == "CANCELLED"
-    # Start a new render after the cancellation thread has committed its final
-    # report. Reusing the in-flight AppTest session races its Streamlit script
-    # runner on slower CI hosts and can retain an obsolete widget tree.
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
+    db_path = runtime_db.resolve_db_path()
+    run_id = None
+    try:
         at = _at_on_page("execution_center")
-        if _shows_status(at, session_view.STATUS_CANCELLED):
-            return
-        time.sleep(0.2)
+        at = _launch_via_ui(at)
+        run_id = _most_recent_run_id(db_path)
 
-    raise AssertionError("durably cancelled run was not projected into the execution center")
+        at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
+        at = at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
+        _wait_for_report(db_path, run_id)
+        final_run = runtime_db.get_run(db_path, run_id)
+        assert final_run is not None
+        assert final_run["state"] == "CANCELLED"
+        # Start a new render after the cancellation thread has committed its final
+        # report. Reusing the in-flight AppTest session races its Streamlit script
+        # runner on slower CI hosts and can retain an obsolete widget tree.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            at = _at_on_page("execution_center")
+            if _shows_status(at, session_view.STATUS_CANCELLED):
+                return
+            time.sleep(0.2)
+
+        raise AssertionError("durably cancelled run was not projected into the execution center")
+    finally:
+        hold_file.unlink(missing_ok=True)
+        if run_id is not None:
+            _wait_for_report(db_path, run_id)
 
 
 # --------------------------------------------------------------------------
