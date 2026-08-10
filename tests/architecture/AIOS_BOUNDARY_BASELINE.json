@@ -41,9 +41,6 @@
     "command_center/evidence_store.py": [
       "memory"
     ],
-    "command_center/evidence_store.py": [
-      "memory"
-    ],
     "command_center/execution_queue.py": [
       "queue"
     ],
@@ -100,6 +97,10 @@
       "runtime_package"
     ],
     "command_center/runtime/log_tail.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/maintenance.py": [
+      "memory",
       "runtime_package"
     ],
     "command_center/runtime/outcome.py": [
