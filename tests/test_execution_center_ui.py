@@ -366,6 +366,9 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
     at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
     at = at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
     _wait_for_report(runtime_db.resolve_db_path(), run_id)
+    final_run = runtime_db.get_run(runtime_db.resolve_db_path(), run_id)
+    assert final_run is not None
+    assert final_run["state"] == "CANCELLED"
     # Start a new render after the cancellation thread has committed its final
     # report. Reusing the in-flight AppTest session races its Streamlit script
     # runner on slower CI hosts and can retain an obsolete widget tree.
