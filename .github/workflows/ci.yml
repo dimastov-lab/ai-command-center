@@ -204,8 +204,12 @@ jobs:
   # The automated Windows context is nevertheless release-relevant: after this
   # workflow has appeared green on an exact PR head, branch protection can bind
   # its stable job name without relying on an agent report.
+  #
+  # Skipped entirely on documentation-only PRs (no code to validate on Windows).
   windows-quality-gates:
     name: Windows quality gates (Ruff · compile · pytest)
+    needs: detect-scope
+    if: needs.detect-scope.outputs.docs_only != 'true'
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -220,43 +224,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect docs-only change scope
-        id: change-scope
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          CHANGED_FILES="$(git diff --name-only "$BASE_SHA...HEAD")"
-          if [[ -z "$CHANGED_FILES" ]]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if echo "$CHANGED_FILES" | rg -qv '(^README\.md$|^CHANGELOG\.md$|^docs/|\.md$)'; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          # E2E path relevance (mirrors linux job logic).
-          if echo "$CHANGED_FILES" | grep -qE '^(web/|command_center/|app\.py|tests/test_e2e)'; then
-            echo "e2e_relevant=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "e2e_relevant=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Deliberate failure canary
         if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-windows')
         run: exit 1
 
       - name: Set up Python
-        if: steps.change-scope.outputs.docs_only != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
@@ -264,13 +236,11 @@ jobs:
           cache-dependency-path: requirements-ci-windows.lock
 
       - name: Install dependencies
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-windows.lock
 
       - name: Install exact accepted AIOS SDK artifact
-        if: steps.change-scope.outputs.docs_only != 'true'
         env:
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
         run: |
@@ -278,23 +248,19 @@ jobs:
           pip install "$env:AICC_AIOS_SDK_WHEEL"
 
       - name: Ruff
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: ruff check .
 
       - name: Compile validation
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: python -m compileall -q command_center scripts tests app.py
 
       # The desktop pytest-qt suite is the deterministic Windows-relevant signal
       # for the D1 desktop gate. On PRs, only run when the 'test-desktop' label
-      # is present or when desktop-related files changed — saves ~5-8 min on
-      # unrelated PRs. Always runs on push to main (full release validation).
+      # is present — saves ~5-8 min on unrelated PRs. Always runs on push to main
+      # (full release validation).
       - name: Desktop pytest-qt suite
         if: |
-          steps.change-scope.outputs.docs_only != 'true' && (
-            github.event_name != 'pull_request' ||
-            contains(github.event.pull_request.labels.*.name, 'test-desktop')
-          )
+          github.event_name != 'pull_request' ||
+          contains(github.event.pull_request.labels.*.name, 'test-desktop')
         run: pytest tests/desktop -q
 
       # Real-browser E2E of the status projection. The full repository `pytest -q` is deliberately
@@ -306,11 +272,9 @@ jobs:
       # On PRs, skip E2E unless paths are relevant or 'test-e2e' label is set.
       - name: Real-browser E2E
         if: |
-          steps.change-scope.outputs.docs_only != 'true' && (
-            github.event_name != 'pull_request' ||
-            steps.change-scope.outputs.e2e_relevant == 'true' ||
-            contains(github.event.pull_request.labels.*.name, 'test-e2e')
-          )
+          github.event_name != 'pull_request' ||
+          needs.detect-scope.outputs.e2e_relevant == 'true' ||
+          contains(github.event.pull_request.labels.*.name, 'test-e2e')
         run: |
           python -m playwright install chromium
           pytest -q tests/test_e2e_status_projection.py
@@ -472,6 +436,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
+      - detect-scope
       - quality-gates
       - windows-quality-gates
       - security-gates
@@ -484,7 +449,10 @@ jobs:
             echo "quality-gates did not succeed"
             exit 1
           fi
-          if [[ "${{ needs.windows-quality-gates.result }}" != "success" ]]; then
+          # windows-quality-gates is skipped on docs-only PRs; skipped is
+          # acceptable here because detect-scope already validated the scope.
+          if [[ "${{ needs.windows-quality-gates.result }}" != "success" && \
+                "${{ needs.windows-quality-gates.result }}" != "skipped" ]]; then
             echo "windows-quality-gates did not succeed"
             exit 1
           fi
