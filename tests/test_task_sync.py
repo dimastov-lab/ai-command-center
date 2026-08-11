@@ -159,10 +159,13 @@ def test_sync_task_from_run_interrupted_with_no_output_auto_retries(tmp_path):
     assert "claude_code" in (task.get("failed_executors") or [])
 
 
-def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp_path):
-    """An INTERRUPTED run that *did* produce output before dying is a genuine
-    mid-execution failure — not a startup failure — so it stays "Requires
-    Attention" and does not record a failed executor."""
+def test_sync_task_from_run_interrupted_with_output_requeues_without_blaming_executor(tmp_path):
+    """An INTERRUPTED run that *did* produce output before dying is a host/
+    dispatcher death, not a provider fault (NIGHT-W7-AICC-AUTONOMY): the task
+    is re-queued for an automatic bounded retry (launch_status "Ready" +
+    relaunch_requested for the pipeline's re-enqueue step) and the executor
+    is NOT recorded as failed — nothing here is evidence against it. The
+    scheduler's retry budget and backoff still bound the relaunch."""
     db_path = tmp_path / "runtime-INTERRUPTED-output.db"
     db.migrate(db_path)
     run = _make_run(db_path, state="INTERRUPTED", completed_at="2026-01-01T00:01:00")
@@ -171,7 +174,8 @@ def test_sync_task_from_run_interrupted_with_output_stays_requires_attention(tmp
 
     task_sync.sync_task_from_run(task, run, db_path=db_path)
 
-    assert task["launch_status"] == "Requires Attention"
+    assert task["launch_status"] == "Ready"
+    assert task.get("relaunch_requested") is True
     assert not task.get("failed_executors")
 
 

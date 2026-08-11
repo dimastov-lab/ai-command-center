@@ -237,3 +237,141 @@ def test_auto_merge_opt_in_off_stops_at_an_open_pull_request(tmp_path, api, fake
     assert github.merged == []
     assert result.completed_task_ids == ()
     assert tasks_repository.load_tasks(tmp_path)[0]["status"] != "Done"
+
+
+def test_dispatcher_restart_mid_run_yields_no_duplicates(tmp_path, api, fake_claude):
+    """NIGHT-W7-AICC-AUTONOMY: the dispatcher (tick loop) dies while an agent
+    run is in flight; a fresh dispatcher instance reconciles and retries.
+    The invariants under test: exactly one live attempt at a time, the
+    crashed attempt is classified truthfully (never fabricated COMPLETED),
+    and the task ends with exactly one PR and one merge — no duplicates.
+    """
+    import os
+    import signal
+    import time
+
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True,
+            auto_launch=True,
+            auto_merge_after_checks=True,
+            max_global_concurrency=2,
+            max_agent_concurrency=2,
+        ),
+    )
+    remote, _work = _project_repo(tmp_path, "AIOS", "proj-r")
+    wt = tmp_path / "wt" / "r"
+    task = _task("r", "AIOS", wt, branch="task/r")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"r": task})
+    configs = project_config.load_project_configs()
+    github = FakeGitHubClient(
+        on_merge=lambda pr: merge_into_main(remote, tmp_path, pr.head_ref)
+    )
+
+    # Keep the fake agent alive until the hold file disappears, so the
+    # crash window is deterministic instead of racing a sleep.
+    hold = tmp_path / "hold-r"
+    hold.write_text("")
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold)
+
+    first = task_pipeline.tick(tmp_path, api, configs, github=github, advance_wait_seconds=60)
+    launched = first.launched()
+    assert [d.task_id for d in launched] == ["r"]
+    run_id = launched[0].run_id
+
+    # ------------------------------- crash: agent SIGKILLed, dispatcher gone
+    # Mid-run, not at startup: wait until the agent produced real output so
+    # the crash is a host/dispatcher death, not the provider-dead-on-startup
+    # failover path (that one is a different, already-covered behavior).
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        run = api.get_run(run_id)
+        if run.get("first_output_at"):
+            break
+        time.sleep(0.1)
+    assert run.get("first_output_at"), "agent never produced output"
+    os.kill(run["pid"], signal.SIGKILL)
+    deadline = time.time() + 10
+    while time.time() > 0 and time.time() < deadline:
+        try:
+            os.kill(run["pid"], 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    # The old dispatcher would normally record the exit itself; a true
+    # dispatcher death happens BEFORE that finalization. Let the doomed
+    # in-process watcher finish, then reconstruct the exact crash window it
+    # would have left behind: the run row still RUNNING, the pid dead --
+    # precisely the state `Supervisor.reconcile()` exists to classify.
+    api.supervisor.wait_for_run(run_id, timeout=30)
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state=?, completed_at=NULL, failure_reason=NULL, exit_code=NULL WHERE id=?",
+                ("RUNNING", run_id),
+            )
+    del api  # the old dispatcher, and its in-memory Popen registry, are gone
+
+    # ------------------------------------- restart: fresh dispatcher instance
+    api2 = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    try:
+        reconciled = api2.reconcile()
+        crashed = api2.get_run(run_id)
+        # Truthful classification: the crashed attempt is terminal and NOT
+        # COMPLETED — reconcile never guesses success.
+        assert crashed["state"] in {"INTERRUPTED", "FAILED"}, crashed["state"]
+        assert crashed["state"] != "COMPLETED"
+        assert any(r["id"] == run_id for r in api2.list_runs()) and reconciled is not None
+
+        # Time passes beyond the deterministic backoff window (simulated by
+        # anchoring the crashed attempt in the past — the policy itself is
+        # exercised, not bypassed: without this the planner must DEFER).
+        deferred = task_pipeline.tick(
+            tmp_path, api2, configs, github=github, advance_wait_seconds=60
+        )
+        assert deferred.launched() == [], "retry must respect backoff, not relaunch instantly"
+
+        with runtime_db.connect(api2.db_path) as conn:
+            with runtime_db.transaction(conn):
+                conn.execute(
+                    "UPDATE run SET completed_at = datetime(completed_at, '-15 minutes') WHERE id = ?",
+                    (run_id,),
+                )
+
+        hold.unlink()  # let the *next* attempt's agent run to completion
+        fake_claude.pop("FAKE_CLAUDE_HOLD_FILE", None)
+
+        retry = task_pipeline.tick(
+            tmp_path, api2, configs, github=github, advance_wait_seconds=60
+        )
+        relaunched = retry.launched()
+        assert [d.task_id for d in relaunched] == ["r"], [(d.reason_code, d.explanation) for d in retry.decisions]
+        assert relaunched[0].attempt == 2
+        assert relaunched[0].run_id != run_id
+        # One live attempt only: exactly two runs exist, one terminal crash +
+        # one new attempt.
+        assert len(api2.list_runs(task_id="r")) == 2
+
+        assert api2.supervisor.wait_for_run(relaunched[0].run_id, timeout=60)[
+            "state"
+        ] == "COMPLETED"
+        _commit_agent_work(wt, "implement task r")
+
+        final = task_pipeline.tick(
+            tmp_path, api2, configs, github=github, advance_wait_seconds=60
+        )
+        assert not final.errors, final.errors
+        row = runtime_db.get_completion_by_task(api2.db_path, "r")
+        assert row is not None
+        assert row["completion_state"] == completion_domain.CompletionState.COMPLETED
+        # No duplicates anywhere: one PR for the branch, one merge commit,
+        # still exactly two run rows.
+        assert [pr.head_ref for pr in github.created] == ["task/r"]
+        assert row["merge_commit"]
+        assert len(api2.list_runs(task_id="r")) == 2
+        persisted = {t["id"]: t for t in tasks_repository.load_tasks(tmp_path)}
+        assert persisted["r"]["status"] == "Done"
+    finally:
+        _drain_runs(api2)
