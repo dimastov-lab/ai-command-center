@@ -67,6 +67,7 @@ import contextlib
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+import dataclasses
 from pathlib import Path
 
 from command_center import (
@@ -2327,3 +2328,59 @@ def stop_background_sync() -> None:
     graceful path used by tests and an orderly shutdown."""
     if _background_sync_stop is not None:
         _background_sync_stop.set()
+
+
+def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
+    """One-action emergency stop for the desktop autopilot
+    (NIGHT-W7-AICC-AUTONOMY).
+
+    Two effects, in fail-closed order:
+
+    1. **Persist the master switch off** (`pipeline_settings.enabled=False`)
+       *first*, so every subsequent tick — in this process or any other —
+       refuses to launch even if step 2 is interrupted mid-way.
+    2. **Cancel every actively supervised run** in this process instance
+       (SIGTERM, then SIGKILL after the grace period — the supervisor's
+       ordinary confirmed-cancellation path; working trees are left intact).
+
+    Runs supervised by a *different* process instance cannot be signalled
+    from here (no Popen handle — see `Supervisor.cancel`); they are reported
+    under ``not_cancellable`` rather than silently ignored, and the disabled
+    master switch guarantees they are never followed by new launches.
+
+    Returns a truthful report: ``{"disabled": bool, "cancelled": [run_id],
+    "cancel_errors": {run_id: str}, "not_cancellable": [run_id]}``.
+    """
+    from command_center.runtime import context_service
+
+    context_service.require_launch_confirmation(confirmed, what="Kill switch")
+
+    settings = pipeline_settings.load_settings(root)
+    if settings.enabled:
+        pipeline_settings.save_settings(
+            root, dataclasses.replace(settings, enabled=False)
+        )
+
+    cancelled: list[str] = []
+    cancel_errors: dict[str, str] = {}
+    not_cancellable: list[str] = []
+    active = [
+        run
+        for run in api.list_runs()
+        if run.get("state") in runtime_db.EXECUTION_CENTER_ACTIVE_STATES
+    ]
+    for run in active:
+        try:
+            api.request_cancel(run["id"], confirmed=True)
+            cancelled.append(run["id"])
+        except Exception as exc:  # noqa: BLE001 — every failure is reported, none hides
+            if "not an actively supervised run" in str(exc):
+                not_cancellable.append(run["id"])
+            else:
+                cancel_errors[run["id"]] = str(exc)
+    return {
+        "disabled": True,
+        "cancelled": cancelled,
+        "cancel_errors": cancel_errors,
+        "not_cancellable": not_cancellable,
+    }

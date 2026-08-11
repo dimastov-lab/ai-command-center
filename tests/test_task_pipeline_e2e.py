@@ -375,3 +375,60 @@ def test_dispatcher_restart_mid_run_yields_no_duplicates(tmp_path, api, fake_cla
         assert persisted["r"]["status"] == "Done"
     finally:
         _drain_runs(api2)
+
+
+def test_kill_switch_stops_running_work_and_blocks_future_launches(
+    tmp_path, api, fake_claude
+):
+    """NIGHT-W7-AICC-AUTONOMY kill switch: one action cancels the live run
+    and persists the master switch off, so no tick — this process or any
+    other — launches anything afterwards."""
+    import time
+
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_global_concurrency=2, max_agent_concurrency=2
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-k")
+    wt = tmp_path / "wt" / "k"
+    task = _task("k", "AIOS", wt, branch="task/k")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"k": task})
+    configs = project_config.load_project_configs()
+
+    hold = tmp_path / "hold-k"
+    hold.write_text("")
+    fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold)
+
+    first = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
+    launched = first.launched()
+    assert [d.task_id for d in launched] == ["k"]
+    run_id = launched[0].run_id
+
+    # Unconfirmed invocation is refused before any effect (fail-closed).
+    with pytest.raises(Exception):
+        task_pipeline.kill_switch(tmp_path, api, confirmed=False)
+    assert pipeline_settings.load_settings(tmp_path).enabled is True
+
+    report = task_pipeline.kill_switch(tmp_path, api, confirmed=True)
+    assert report["disabled"] is True
+    assert report["cancelled"] == [run_id]
+    assert report["cancel_errors"] == {}
+
+    # The run terminates (CANCELLED after grace) and the switch is durably off.
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        state = api.get_run(run_id)["state"]
+        if state in runtime_db.TERMINAL_STATES:
+            break
+        time.sleep(0.2)
+    assert api.get_run(run_id)["state"] == "CANCELLED"
+    assert pipeline_settings.load_settings(tmp_path).enabled is False
+
+    # A later tick — same or fresh dispatcher — launches nothing.
+    api2 = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    after = task_pipeline.tick(tmp_path, api2, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
+    assert after.ran is False
+    assert after.launched() == []
