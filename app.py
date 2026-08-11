@@ -56,6 +56,7 @@ from command_center.ui import (
     execution_strip,
     home_dashboard,
     inspector,
+    legacy_task_helpers,
     live_board,
     waves_panel,
     content_area,
@@ -303,157 +304,34 @@ def parse_project_statuses() -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 
-# Task persistence itself lives in `command_center.tasks_repository` (pure
-# Python, no Streamlit) — see `docs/adr/0001-engineering-control-center-v2-
-# increment-1.md`. These are thin wrappers binding in this app's ROOT/
-# TASKS_EXAMPLE_FILE constants so every existing call site below is unchanged.
+# Task persistence wrappers moved to `command_center/ui/legacy_task_helpers.py`
+# (NIGHT-W9-AICC-ARCH slice 1) — pure delegation to `tasks_repository`/`models`,
+# no second engine. Re-exported here so every existing call site (and every
+# `app.<name>` test reference) keeps working unchanged. The single writer of
+# `data/tasks.json` remains `tasks_repository.py` (docs/AUTHORITY_MAP.md);
+# `tests/architecture/test_tasks_json_single_writer_fitness.py` enforces that
+# this file never grows a direct write to that store again.
 
-
-def normalize_task(task: dict) -> dict:
-    return tasks_repository.normalize_task(task)
-
-
-def load_tasks() -> list[dict]:
-    return tasks_repository.get_repository(ROOT).load_all()
-
-
-# No `save_tasks(tasks)` wrapper here (deliberately removed): writing back
-# whatever `tasks` this script run loaded at the top would silently discard
-# any concurrent writer's change made since that load (see
-# `tasks_repository`'s module docstring). Every write path in this file goes
-# through `create_task`/`update_task_status`/`delete_task`/`upsert_tasks`/
-# `tasks_repository.upsert_task`/`tasks_repository.mutate_tasks` instead,
-# each of which locks and reloads fresh immediately before writing.
-
-
-def upsert_tasks(tasks: list[dict]) -> None:
-    """The `save_tasks_fn` callback handed to `recommendations_panel`/
-    `queue_panel`: both mutate a subset of `tasks_by_id`'s dicts in place
-    (via `execution_queue.launch_ready`, exactly like `launch_service`) and
-    need to commit exactly those changes. Locked bulk upsert, not a blind
-    overwrite of this script run's entire (possibly-stale) `tasks` snapshot."""
-    tasks_repository.get_repository(ROOT).upsert_all(tasks)
-
-
-def new_task_record(
-    project: str,
-    title: str,
-    task_type: str,
-    status: str,
-    *,
-    goal: str | None = None,
-    notes: str = "",
-    priority: str = "Medium",
-    owner: str = "",
-    estimate_hours: float = 0.0,
-    depends_on: list[str] | None = None,
-    parent_task_id: str | None = None,
-    prior_run_id: str | None = None,
-    workflow_stage: str = "Draft",
-    workspace_path: str | None = None,
-    branch: str | None = None,
-    executor: str | None = None,
-    prompt: str | None = None,
-    untrusted_import: bool = False,
-) -> dict:
-    return tasks_repository.new_task_record(
-        project,
-        title,
-        task_type,
-        status,
-        goal=goal,
-        notes=notes,
-        priority=priority,
-        owner=owner,
-        estimate_hours=estimate_hours,
-        depends_on=depends_on,
-        parent_task_id=parent_task_id,
-        prior_run_id=prior_run_id,
-        workflow_stage=workflow_stage,
-        workspace_path=workspace_path,
-        branch=branch,
-        executor=executor,
-        prompt=prompt,
-        untrusted_import=untrusted_import,
-    )
-
-
-def create_task(
-    project: str,
-    title: str,
-    task_type: str,
-    status: str,
-    *,
-    goal: str | None = None,
-    notes: str = "",
-    priority: str = "Medium",
-    owner: str = "",
-    estimate_hours: float = 0.0,
-    depends_on: list[str] | None = None,
-    parent_task_id: str | None = None,
-    prior_run_id: str | None = None,
-    workflow_stage: str = "Draft",
-    workspace_path: str | None = None,
-    branch: str | None = None,
-    executor: str | None = None,
-    prompt: str | None = None,
-    untrusted_import: bool = False,
-) -> dict:
-    """Locked create — every page that adds a task to the Kanban board must
-    call this (never `tasks.append(new_task_record(...)); save_tasks(tasks)`
-    against its own possibly-stale in-memory `tasks` list, which is exactly
-    the pattern that silently drops a concurrent writer's task). See
-    `tasks_repository.create_task`/module docstring.
-
-    `untrusted_import` stamps the provenance flag `agent_runner.is_untrusted_task`
-    gates on, so a task synthesized from untrusted report content (the "create
-    next task" widget, chat "convert message to task") is not laundered into a
-    trusted run — audit SEC-D-02, mirroring `backlog_proposals.apply_candidate`."""
-    _repo = tasks_repository.get_repository(ROOT)
-    return _repo.create(new_task_record(
-        project,
-        title,
-        task_type,
-        status,
-        goal=goal,
-        notes=notes,
-        priority=priority,
-        owner=owner,
-        estimate_hours=estimate_hours,
-        depends_on=depends_on,
-        parent_task_id=parent_task_id,
-        prior_run_id=prior_run_id,
-        workflow_stage=workflow_stage,
-        workspace_path=workspace_path,
-        branch=branch,
-        executor=executor,
-        prompt=prompt,
-        untrusted_import=untrusted_import,
-    ))
-
-
-def update_task_status(task_id: str, new_status: str) -> dict | None:
-    return tasks_repository.get_repository(ROOT).update_status(task_id, new_status)
+normalize_task = legacy_task_helpers.normalize_task
+load_tasks = legacy_task_helpers.load_tasks
+upsert_tasks = legacy_task_helpers.upsert_tasks
+new_task_record = legacy_task_helpers.new_task_record
+create_task = legacy_task_helpers.create_task
+update_task_status = legacy_task_helpers.update_task_status
+task_label = legacy_task_helpers.task_label
+unmet_dependencies = legacy_task_helpers.unmet_dependencies
+is_blocked = legacy_task_helpers.is_blocked
 
 
 def delete_task(task_id: str) -> None:
-    tasks_repository.get_repository(ROOT).delete(task_id)
-    # Also remove the task's runtime.db footprint (session/run/event/report/
-    # completion cascade) so a deleted Kanban card leaves no orphan rows in the
-    # unified Runs/Timeline/metrics views (audit AR-1).
-    get_execution_center_api().delete_task(task_id)
-
-
-def task_label(task: dict) -> str:
-    return tasks_repository.task_label(task)
-
-
-def unmet_dependencies(task: dict, tasks_by_id: dict[str, dict]) -> list[str]:
-    return models.unmet_dependencies(task, tasks_by_id)
-
-
-def is_blocked(task: dict, tasks_by_id: dict[str, dict]) -> bool:
-    return models.is_blocked(task, tasks_by_id)
+    """Locked delete plus the runtime.db footprint cascade (session/run/event/
+    report/completion) so a deleted Kanban card leaves no orphan rows in the
+    unified Runs/Timeline/metrics views (audit AR-1). The cascade stays here
+    because `get_execution_center_api` is this app's `st.cache_resource`
+    singleton; `legacy_task_helpers.delete_task` takes it as a callback."""
+    legacy_task_helpers.delete_task(
+        task_id, on_deleted=lambda tid: get_execution_center_api().delete_task(tid)
+    )
 
 
 # --------------------------------------------------------------------------
