@@ -54,13 +54,32 @@ if ! "$PYTHON_BIN" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v npm >/dev/null 2>&1; then
-  echo "Error: npm is not available on PATH." >&2
-  exit 1
-fi
+# Cached SPA: reuse web/dist and skip npm entirely when the built bundle is
+# newer than every frontend source. AICC_WEB_REBUILD=1 forces a rebuild;
+# AICC_WEB_REBUILD=0 forbids one (fails fast if the bundle is missing).
+REBUILD="${AICC_WEB_REBUILD:-auto}"
+DIST_MARKER="web/dist/index.html"
 
-(cd web && npm ci)
-(cd web && npm run build)
+needs_build() {
+  [[ ! -f "$DIST_MARKER" ]] && return 0
+  # Any frontend file newer than the built bundle invalidates the cache.
+  [[ -n "$(find web -path web/dist -prune -o -path web/node_modules -prune \
+      -o -type f -newer "$DIST_MARKER" -print -quit)" ]]
+}
+
+if [[ "$REBUILD" == "1" ]] || { [[ "$REBUILD" != "0" ]] && needs_build; }; then
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "Error: npm is not available on PATH." >&2
+    exit 1
+  fi
+  (cd web && npm ci)
+  (cd web && npm run build)
+elif [[ ! -f "$DIST_MARKER" ]]; then
+  echo "Error: web/dist is missing and AICC_WEB_REBUILD=0 forbids building." >&2
+  exit 1
+else
+  echo "Reusing cached SPA bundle in web/dist (AICC_WEB_REBUILD=$REBUILD)."
+fi
 
 exec "$PYTHON_BIN" -m uvicorn "command_center.webapi.app:create_app" --factory \
   --host localhost --port "${PORT:-8791}"
