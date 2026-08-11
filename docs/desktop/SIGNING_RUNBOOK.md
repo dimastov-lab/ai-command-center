@@ -34,26 +34,22 @@
 
 ## 2. Автоматизируемая часть (после появления identity)
 
-macOS, поверх текущей unsigned-сборки (`packaging/macos/ai-command-center.spec`):
+Скриптована (эта секция — push-button):
 
-```
-codesign --force --deep --options runtime --timestamp \
-  --sign "Developer ID Application: <owner> (<TEAMID>)" \
-  "dist/macos/AI Command Center.app"
-hdiutil create -volname "AI Command Center" -srcfolder \
-  "dist/macos/AI Command Center.app" -ov -format UDZO dist/macos/AICommandCenter.dmg
-xcrun notarytool submit dist/macos/AICommandCenter.dmg \
-  --keychain-profile aicc-notary --wait
-xcrun stapler staple dist/macos/AICommandCenter.dmg
-```
+- **macOS:** `scripts/sign-desktop-macos.sh` — inside-out подпись вложенных
+  Mach-O + бандла (hardened runtime, `packaging/macos/entitlements.plist`),
+  `hdiutil` → DMG, `notarytool submit --wait`, `stapler staple`, финальная
+  проверка `spctl … context:primary-signature` → `accepted`. Identity берётся
+  из Keychain автоматически (или `AICC_SIGN_IDENTITY`), профиль —
+  `AICC_NOTARY_PROFILE` (default `aicc-notary`). Без identity/профиля скрипт
+  падает с отсылкой к §1.
+- **Windows:** `scripts/sign-desktop-windows.ps1` — `signtool sign /fd SHA256
+  /td SHA256 /tr <timestamp>` + `signtool verify /pa`; сертификат — по
+  `AICC_SIGN_THUMBPRINT` или единственный из `Cert:\CurrentUser\My`.
 
-Верификация: `spctl -a -t open --context context:primary-signature -v *.dmg`
-→ `accepted`; чистая машина открывает DMG без обхода Gatekeeper.
-
-Windows: `signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com
-…` поверх артефакта `packaging/windows/ai-command-center.spec`; верификация
-`signtool verify /pa` + первый запуск на физическом Windows 11 x64 без
-SmartScreen-предупреждения «unknown publisher».
+Приёмка после подписи: чистая машина открывает DMG без обхода Gatekeeper;
+первый запуск на физическом Windows 11 x64 без SmartScreen-предупреждения
+«unknown publisher».
 
 ## 3. Границы
 
