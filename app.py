@@ -54,6 +54,7 @@ from command_center.ui import (
     board_style,
     execution_metrics,
     execution_strip,
+    git_readers,
     home_dashboard,
     inspector,
     legacy_task_helpers,
@@ -368,36 +369,22 @@ def run_start_task_script(
 
 
 # --------------------------------------------------------------------------
-# Git (read-only) — thin wrappers over command_center.git_info, pinned to ROOT
+# Git (read-only) — moved to command_center/ui/git_readers.py (NIGHT-W9 slice 2)
 # --------------------------------------------------------------------------
 
+# Read-only status/log/diff/branch/remote/worktree wrappers over
+# `command_center.git_info`, pinned to this repo's ROOT, now live in
+# `command_center/ui/git_readers.py`. Re-exported here so every existing call
+# site keeps working. The write side of git stays in
+# `command_center/runtime/git_ops.py` — never mixed into the readers.
 
-def run_git_command(args: list[str], timeout: int = 5) -> subprocess.CompletedProcess | None:
-    return git_info.run_git_command(ROOT, args, timeout=timeout)
-
-
-def get_git_status() -> dict[str, object]:
-    return git_info.get_status(ROOT)
-
-
-def get_git_log(limit: int = 20) -> list[dict[str, str]]:
-    return git_info.get_log(ROOT, limit=limit)
-
-
-def get_git_diff_stat(staged: bool = False) -> str:
-    return git_info.get_diff_stat(ROOT, staged=staged)
-
-
-def get_git_branches() -> list[str]:
-    return git_info.get_branches(ROOT)
-
-
-def get_git_remotes() -> list[tuple[str, str]]:
-    return git_info.get_remotes(ROOT)
-
-
-def get_git_worktrees() -> list[dict[str, str]]:
-    return git_info.get_worktrees(ROOT)
+run_git_command = git_readers.run_git_command
+get_git_status = git_readers.get_git_status
+get_git_log = git_readers.get_git_log
+get_git_diff_stat = git_readers.get_git_diff_stat
+get_git_branches = git_readers.get_git_branches
+get_git_remotes = git_readers.get_git_remotes
+get_git_worktrees = git_readers.get_git_worktrees
 
 
 # --------------------------------------------------------------------------
