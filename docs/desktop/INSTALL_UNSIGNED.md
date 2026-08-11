@@ -21,12 +21,15 @@
 
 ```bash
 brew tap dimastov-lab/tap
-brew install --cask --no-quarantine ai-command-center
+brew trust dimastov-lab/tap
+brew install --cask ai-command-center
+xattr -dr com.apple.quarantine "/Applications/AI Command Center.app"
 ```
 
-`--no-quarantine` обязателен: сборка не нотаризована, без флага Gatekeeper
-заблокирует запуск. Альтернатива без флага — один раз: правый клик по
-`AI Command Center.app` → «Открыть» → «Открыть».
+Homebrew 6: сторонние tap требуют `brew trust`, флаг `--no-quarantine`
+удалён — карантин снимается `xattr` после установки (сборка не нотаризована,
+иначе Gatekeeper заблокирует запуск). Альтернатива без `xattr` — один раз:
+правый клик по `AI Command Center.app` → «Открыть» → «Открыть».
 
 Ручная установка без brew: скачать `AI-Command-Center-macos-arm64.zip` из
 Releases, проверить хеш (`shasum -a 256 -c *.sha256`), распаковать в
@@ -55,8 +58,8 @@ winget проверит SHA-256 и установит portable-сборку (а�
 
 ## Что остаётся на потом (owner-only)
 
-- Apple Developer Program + Developer ID → notarization (уберёт
-  `--no-quarantine`); Azure Trusted Signing / OV-серт → уберёт SmartScreen.
+- Apple Developer Program + Developer ID → notarization (уберёт шаг снятия
+  карантина); Azure Trusted Signing / OV-серт → уберёт SmartScreen.
   Скрипты подписи уже готовы: `scripts/sign-desktop-*.{sh,ps1}`.
 - Публикация манифеста в microsoft/winget-pkgs (PR в публичный репозиторий,
   принимают и неподписанные zip/portable — валидация по хешу).

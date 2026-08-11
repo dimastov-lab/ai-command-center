@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 PackageIdentifier: DimastovLab.AICommandCenter
-PackageVersion: 0.0.0
+PackageVersion: 0.1.0
 PackageLocale: en-US
 Publisher: dimastov-lab
 PackageName: AI Command Center
