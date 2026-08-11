@@ -167,6 +167,7 @@ TICK_DISABLED = "autopilot_disabled"
 TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
+LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -2219,13 +2220,27 @@ def _locked_tick(
         root, api, tasks, project_configs, settings, now=models.iso_now()
     )
 
-    # 9. Dispatch — only ASSIGN decisions, only on an active explicit opt-in.
-    if settings.auto_launch_active:
+    # 9. Dispatch — only ASSIGN decisions, only on an active explicit opt-in,
+    #    and only while the daily spend budget (when set) has headroom. The
+    #    budget gates NEW launches exclusively: running work, completions and
+    #    merges continue — stopping mid-flight work is the kill switch's job.
+    spend_budget_exhausted = False
+    if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
+        try:
+            spend_budget_exhausted = (
+                daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+            _record(exc, "daily_spend_budget")
+            spend_budget_exhausted = True
+    if settings.auto_launch_active and not spend_budget_exhausted:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
     else:
-        launch_status = LAUNCH_DISABLED
+        launch_status = (
+            LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
+        )
 
     # 9b. Nothing silently stuck: compute, from the post-dispatch state, every
     #     task that has stopped without reaching Done. Read-only.
@@ -2384,3 +2399,37 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
         "cancel_errors": cancel_errors,
         "not_cancellable": not_cancellable,
     }
+
+
+def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
+    """Sum of the providers' own reported `total_cost_usd` over the trailing
+    24 hours (runs whose `completed_at` falls in the window, plus still-running
+    work started in it). Reads only the final `result` stream events, which are
+    the single truthful cost source — nothing is estimated or fabricated; a
+    run whose provider reported no cost contributes 0.
+    """
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td
+
+    anchor = _dt.fromisoformat(now) if now else _dt.now()
+    cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")
+    total = 0.0
+    with runtime_db.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT run_event.payload_json AS payload FROM run_event
+              JOIN run ON run.id = run_event.run_id
+               AND run_event.payload_json LIKE '%total_cost_usd%'
+               AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
+            """,
+            (cutoff, cutoff),
+        ).fetchall()
+    for row in rows:
+        try:
+            payload = _json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        cost = payload.get("total_cost_usd")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            total += float(cost)
+    return total

@@ -432,3 +432,61 @@ def test_kill_switch_stops_running_work_and_blocks_future_launches(
     after = task_pipeline.tick(tmp_path, api2, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert after.ran is False
     assert after.launched() == []
+
+
+def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
+    """NIGHT-W7-AICC-AUTONOMY spend budget: with the trailing-24h provider
+    cost at/over `max_daily_spend_usd`, a tick launches nothing and says why
+    (`daily_spend_budget_exhausted`); with budget off (0) it launches."""
+    import json as _json
+
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-s")
+    wt = tmp_path / "wt" / "s"
+    task = _task("s", "AIOS", wt, branch="task/s")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"s": task})
+    configs = project_config.load_project_configs()
+
+    # Seed a prior completed run whose provider reported $1.50 spent today.
+    prior_task = runtime_db.create_task(
+        api.db_path, project="AIOS", title="prior", task_type="implementation"
+    )
+    prior_session = runtime_db.create_session(
+        api.db_path, task_id=prior_task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    prior = runtime_db.create_run(
+        api.db_path, session_id=prior_session["id"], task_id=prior_task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="prior", is_resume=False,
+    )
+    runtime_db.append_run_event(
+        api.db_path, prior["id"], "stream_event",
+        {"type": "result", "total_cost_usd": 1.5, "usage": {"input_tokens": 1}},
+    )
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), prior["id"]),
+            )
+
+    assert task_pipeline.daily_spend_usd(api.db_path) == pytest.approx(1.5)
+
+    gated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
+    assert gated.launched() == []
+    assert gated.launch_status == task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+
+    # Budget off -> the same task launches normally.
+    settings = pipeline_settings.load_settings(tmp_path)
+    pipeline_settings.save_settings(
+        tmp_path, __import__("dataclasses").replace(settings, max_daily_spend_usd=0.0)
+    )
+    ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
+    assert [d.task_id for d in ungated.launched()] == ["s"]
