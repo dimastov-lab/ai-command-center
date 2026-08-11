@@ -15,6 +15,10 @@ runtime database — the exact production wiring of ``app.run`` — and prove:
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from PySide6.QtCore import QSettings
 
 from command_center import project_config
@@ -73,6 +77,14 @@ def test_first_run_empty_data_root_loads_every_section_without_error(
     assert shell.shutdown() is True
 
 
+@pytest.mark.skipif(
+    os.name != "posix",
+    reason=(
+        "The seeded journey executes a real run through Supervisor, which "
+        "structurally refuses non-POSIX hosts (no waitid/WNOWAIT process-tree "
+        "ownership) -- the same refusal production enforces."
+    ),
+)
 def test_sections_populate_from_seeded_data_root_through_the_port(
     shell, qtbot, tmp_path, git_repo, configure_project_repo, fake_claude
 ):
