@@ -438,7 +438,6 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     """NIGHT-W7-AICC-AUTONOMY spend budget: with the trailing-24h provider
     cost at/over `max_daily_spend_usd`, a tick launches nothing and says why
     (`daily_spend_budget_exhausted`); with budget off (0) it launches."""
-    import json as _json
 
     pipeline_settings.save_settings(
         tmp_path,
