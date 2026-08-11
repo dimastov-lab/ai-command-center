@@ -2145,13 +2145,15 @@ def _locked_tick(
         tasks_by_id_sync = {t["id"]: t for t in tasks if t.get("id")}
         for task in tasks:
             if (
-                task.get("failed_executors")
+                (task.get("failed_executors") or task.get("relaunch_requested"))
                 and task.get("launch_status") == "Ready"
                 and task.get("status") != "Done"
             ):
                 execution_queue.enqueue_and_persist(
                     root, task, tasks_by_id_sync
                 )
+                if task.pop("relaunch_requested", None):
+                    tasks_repository.save_tasks(root, tasks)
                 reenqueued.append(task["id"])
     except Exception as exc:  # noqa: BLE001
         _record(exc, "reenqueue_executor_retry")

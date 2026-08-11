@@ -278,6 +278,28 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
                     + " Задача возвращена в очередь для повтора другим агентом.",
                 )
                 mutated = True
+        elif run.get("state") == "INTERRUPTED":
+            # Mid-run interruption (the agent HAD produced output, so the
+            # provider itself is fine): a host/dispatcher death, a SIGKILL, a
+            # reboot (NIGHT-W7-AICC-AUTONOMY). Stranding this as "Requires
+            # Attention" would make every dispatcher restart a human incident;
+            # instead re-queue for an automatic bounded retry — the scheduler's
+            # own gate (`_RETRY_GATED_STATES` + `RetryPolicy` budget/backoff)
+            # still governs when and how often it relaunches. The executor is
+            # NOT marked failed: nothing here is evidence against the provider.
+            if target_launch_status in _STRANDED_LAUNCH_STATUSES:
+                target_launch_status = "Ready"
+                models.append_timeline_event(
+                    task,
+                    "run_interrupted",
+                    "Прогон прерван (перезапуск диспетчера или падение хоста). "
+                    "Задача возвращена в очередь для автоматического повтора.",
+                )
+                # Explicit signal for the pipeline's re-enqueue step (6b):
+                # the launched queue entry is closed, so without this the
+                # planner would never see the task again.
+                task["relaunch_requested"] = True
+                mutated = True
 
     # On a clean completion, clear any accumulated executor failures — the
     # chain is healthy again and a future re-launch should try the configured
