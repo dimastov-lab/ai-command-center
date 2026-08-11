@@ -112,6 +112,17 @@ def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int
     return number
 
 
+def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
+    """A float within `[minimum, maximum]`, or `default`; bools rejected like
+    `_bounded_int`, out-of-range falls back rather than clamping."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    number = float(value)
+    if number < minimum or number > maximum:
+        return default
+    return number
+
+
 def _concurrency(value: object, default: int) -> int:
     """A concurrency cap within `[MIN_CONCURRENCY, MAX_CONCURRENCY]`."""
     return _bounded_int(value, default, MIN_CONCURRENCY, MAX_CONCURRENCY)
@@ -139,6 +150,10 @@ class PipelineSettings:
     max_rework_attempts: int = DEFAULT_MAX_REWORK_ATTEMPTS
     max_run_attempts: int = DEFAULT_MAX_RUN_ATTEMPTS
     run_timeout_seconds: int = DEFAULT_RUN_TIMEOUT_SECONDS
+    # Daily agent-spend ceiling in USD, summed from the providers' own
+    # result-event `total_cost_usd` over the trailing 24h. `0.0` = no budget
+    # (off, the default). Gates NEW launches only — running work finishes.
+    max_daily_spend_usd: float = 0.0
     updated_at: str | None = None
     updated_by: str | None = None
 
@@ -206,6 +221,7 @@ class PipelineSettings:
             "max_rework_attempts": self.max_rework_attempts,
             "max_run_attempts": self.max_run_attempts,
             "run_timeout_seconds": self.run_timeout_seconds,
+            "max_daily_spend_usd": self.max_daily_spend_usd,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
         }
@@ -242,6 +258,9 @@ class PipelineSettings:
                 DEFAULT_MAX_RUN_ATTEMPTS,
                 MIN_RUN_ATTEMPTS,
                 MAX_RUN_ATTEMPTS,
+            ),
+            max_daily_spend_usd=_bounded_float(
+                data.get("max_daily_spend_usd"), 0.0, 0.0, 10_000.0
             ),
             run_timeout_seconds=_bounded_int(
                 data.get("run_timeout_seconds"),
