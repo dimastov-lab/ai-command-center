@@ -38,6 +38,7 @@ from command_center.events import (
     ProposalPromotedToTask,
     default_bus,
 )
+from command_center.project_config import is_sensitive
 from command_center.runtime import db
 from command_center.runtime.db.core import resolve_db_path
 
@@ -92,16 +93,22 @@ class OwnerAutofill:
     # -- shared creation seam ---------------------------------------------
 
     def _ensure_item(
-        self, *, title: str, source_ref: str, detail: str | None = None, due: str | None = None
+        self, *, title: str, source_ref: str, detail: str | None = None,
+        due: str | None = None, project_ref: str | None = None,
     ) -> dict | None:
         """Create one owner item unless its ``source_ref`` is already present.
         Returns the created row, or ``None`` when it already existed (idempotent
-        event → item)."""
+        event → item), or ``None`` when ``project_ref`` names a sensitive
+        (BANK/LEGAL) project — such an item is never created, so its subject
+        never lands on «Мой день» (audit MED-1)."""
+        if project_ref and is_sensitive(project_ref):
+            return None
         path = self._db_path()
         if self._existing_source_refs(path) & {source_ref}:
             return None
         row = db.create_owner_item(
-            path, title=title, detail=detail, due=due, source_ref=source_ref
+            path, title=title, detail=detail, due=due, source_ref=source_ref,
+            project_ref=project_ref,
         )
         # Announce on the same bus the manual POST path uses, so the day list has
         # one consistent event trail whether an item was typed or auto-filled.
@@ -127,6 +134,7 @@ class OwnerAutofill:
             title="Отследить задачу из принятого предложения",
             detail=f"task {event.task_id}",
             source_ref=f"promotion:{event.proposal_id}",
+            project_ref=event.project_ref or None,
         )
 
     def on_proposal_created(self, event: ProposalCreated) -> None:
@@ -136,6 +144,7 @@ class OwnerAutofill:
             title="Решение владельца по предложению (owner-gate)",
             detail=f"{event.kind} · {event.project_ref}",
             source_ref=f"proposal:{event.proposal_id}",
+            project_ref=event.project_ref or None,
         )
 
     def on_incident_opened(self, event: IncidentOpened) -> None:
@@ -146,6 +155,7 @@ class OwnerAutofill:
             detail=f"{event.severity}"
             + (f" · {event.project_ref}" if event.project_ref else ""),
             source_ref=f"incident:{event.incident_id}",
+            project_ref=event.project_ref or None,
         )
 
     # -- direct seams (no bus event yet — Board / networking land later) ---

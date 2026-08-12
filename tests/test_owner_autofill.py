@@ -119,3 +119,27 @@ def test_complete_owner_item_idempotent_and_missing() -> None:
 
 def test_install_default_autofill_is_idempotent() -> None:
     assert install_default_autofill() is install_default_autofill()
+
+
+# --- redaction: sensitive projects never reach «Мой день» (audit MED-1b) ---
+
+
+def test_gated_sensitive_proposal_creates_no_owner_item(bus) -> None:
+    # Even when an operator gates a sensitive project, its proposal must not
+    # land on «Мой день» — the subject would leak through the owner list.
+    OwnerAutofill(gates=OwnerGateConfig(gate_projects=frozenset({"BANK"}))).register(bus)
+    bus.publish(ProposalCreated(proposal_id="p1", kind="trend", project_ref="BANK"))
+    assert "proposal:p1" not in _source_refs()
+    assert _items() == []
+
+
+def test_sensitive_incident_creates_no_owner_item(bus) -> None:
+    OwnerAutofill().register(bus)
+    bus.publish(IncidentOpened(incident_id="i1", severity="sev1", project_ref="LEGAL"))
+    assert "incident:i1" not in _source_refs()
+
+
+def test_sensitive_promotion_creates_no_owner_item(bus) -> None:
+    OwnerAutofill().register(bus)
+    bus.publish(ProposalPromotedToTask(proposal_id="p1", task_id="t1", project_ref="BANK"))
+    assert "promotion:p1" not in _source_refs()

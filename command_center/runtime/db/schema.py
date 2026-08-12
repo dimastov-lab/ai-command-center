@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -629,6 +629,35 @@ def _migration_16_add_digest_day_and_position(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_digest_item_day ON digest_item(day)")
 
 
+def _migration_17_add_owner_digest_project_ref(conn: sqlite3.Connection) -> None:
+    """Give ``owner_item`` and ``digest_item`` an explicit, nullable
+    ``project_ref`` so the redaction policy (drop BANK/LEGAL rows —
+    ``project_config.is_sensitive``) can be enforced *in the SQL query* the same
+    way it already is for ``advisor_proposal.project_ref``.
+
+    Before this column the two surfaces carried no project binding, so a
+    sensitive row could only be filtered after the fact — which under-returns a
+    limit/offset page (audit MED-1/MED-2). Keying the exclusion on a real column
+    lets ``list_owner_items``/``list_digest_items`` page over *visible* rows
+    only, and lets an ad-hoc/auto-filled row record which project it belongs to.
+
+    Additive and optional: ``project_ref`` defaults to ``NULL`` (an un-attributed
+    item), so every pre-existing row and every write that does not name a
+    project reads exactly as before. Same idempotent check-then-``ALTER TABLE
+    ADD COLUMN`` shape as the earlier callable migrations, in one
+    ``BEGIN IMMEDIATE`` transaction — safe to re-run and safe under concurrent
+    first-application."""
+    with db.transaction(conn):
+        owner_cols = {row["name"] for row in conn.execute("PRAGMA table_info(owner_item)").fetchall()}
+        if "project_ref" not in owner_cols:
+            conn.execute("ALTER TABLE owner_item ADD COLUMN project_ref TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_owner_item_project ON owner_item(project_ref)")
+        digest_cols = {row["name"] for row in conn.execute("PRAGMA table_info(digest_item)").fetchall()}
+        if "project_ref" not in digest_cols:
+            conn.execute("ALTER TABLE digest_item ADD COLUMN project_ref TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_digest_item_project ON digest_item(project_ref)")
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -654,4 +683,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (14, _SCHEMA_V14),
     (15, _SCHEMA_V15),
     (16, _migration_16_add_digest_day_and_position),
+    (17, _migration_17_add_owner_digest_project_ref),
 ]
