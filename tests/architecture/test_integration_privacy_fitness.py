@@ -29,6 +29,9 @@ SCOPED_PATHS = (
     "command_center/advisor",
     "command_center/conflicts",
     "command_center/audit",
+    "command_center/dispatch",
+    "command_center/task_ordering.py",
+    "command_center/ui/task_dependencies.py",
     "command_center/events",
     "command_center/ui/operator_dashboard.py",
     "docs/INTEGRATION_CENTER.md",
@@ -41,6 +44,8 @@ SCOPED_PATHS = (
     "tests/test_conflict_intake.py",
     "tests/api/test_conflict_endpoints.py",
     "tests/api/test_digest_ownerday_endpoints.py",
+    "tests/dispatch",
+    "tests/webapi/test_dispatch_endpoints.py",
     "tests/architecture/test_integration_privacy_fitness.py",
 )
 

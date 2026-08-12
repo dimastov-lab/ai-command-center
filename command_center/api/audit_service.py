@@ -60,9 +60,13 @@ class SensitiveProjectRefError(Exception):
 
 
 class FindingNotPromotableError(Exception):
-    """Raised when a promote is requested on a finding already resolved
-    (``fixed``). Surfaced as HTTP 409 so a resolved finding is never silently
-    re-opened into a new task."""
+    """Raised when a promote is requested on a finding that cannot be promoted:
+    one already resolved (``fixed``), or one already promoted (it carries a
+    ``promoted_task_id`` / sits in ``ack``). Surfaced as HTTP 409 so a resolved
+    finding is never silently re-opened, and an already-promoted finding never
+    spawns a *second* orphan task and then 500s on the illegal ``ack`` → ``ack``
+    transition — the double-promote is rejected cleanly before any task is
+    created."""
 
 
 def _db_path() -> Path:
@@ -160,41 +164,56 @@ def run_audit(payload: a.AuditRunRequest) -> a.AuditRunResult:
         path, project_ref=project, checks=intended_checks, status="running"
     )
     run_id = run_row["id"]
+    # A raise anywhere between "run created (running)" and "run finalized" must
+    # not leave a dangling ``running`` row: the check pass blowing up, a
+    # finding-persist failing mid-loop, or the finalize itself failing. The run
+    # holds ``version == 0`` throughout (findings are separate rows; only the
+    # finalize bumps it), so the failed-marking CAS at ``expected_version=0`` is
+    # valid for every one of those failure points.
     try:
         result = runner.collect(ctx, checks=payload.checks)
-    except Exception:
-        # A check pass that blows up must not leave a dangling "running" row.
-        db.set_audit_run_status(path, run_id, expected_version=0, status="failed")
-        raise
 
-    finding_models: list[models.AuditFinding] = []
-    for finding in result.findings:
-        row = db.create_audit_finding(
-            path,
-            run_id=run_id,
-            category=finding.category,
-            summary=finding.summary,
-            owner=finding.owner,
-            severity=finding.severity,
-            file_path=finding.file_path,
-            loc=finding.loc,
-            project_ref=project,
-        )
-        finding_models.append(_finding_from_row(row))
-        default_bus().publish(
-            AuditFindingCreated(
-                finding_id=row["id"],
+        finding_models: list[models.AuditFinding] = []
+        for finding in result.findings:
+            row = db.create_audit_finding(
+                path,
                 run_id=run_id,
-                category=row["category"],
-                severity=row["severity"],
-            ),
-            raise_errors=False,
-        )
+                category=finding.category,
+                summary=finding.summary,
+                owner=finding.owner,
+                severity=finding.severity,
+                file_path=finding.file_path,
+                loc=finding.loc,
+                project_ref=project,
+            )
+            finding_models.append(_finding_from_row(row))
+            default_bus().publish(
+                AuditFindingCreated(
+                    finding_id=row["id"],
+                    run_id=run_id,
+                    category=row["category"],
+                    severity=row["severity"],
+                ),
+                raise_errors=False,
+            )
 
-    finalized = db.set_audit_run_status(
-        path, run_id, expected_version=0, status="completed",
-        finding_count=len(finding_models),
-    )
+        finalized = db.set_audit_run_status(
+            path, run_id, expected_version=0, status="completed",
+            finding_count=len(finding_models),
+        )
+    except Exception:
+        # Best-effort: mark the run failed so it is never left ``running``.
+        # ``finalize`` is the last statement in the try and is atomic, so on any
+        # raise here the run is still ``running`` at ``version == 0``. Guard the
+        # marking anyway and swallow its errors so the original failure is what
+        # propagates.
+        try:
+            db.set_audit_run_status(
+                path, run_id, expected_version=0, status="failed"
+            )
+        except Exception:  # noqa: BLE001 — never mask the original failure
+            pass
+        raise
     default_bus().publish(
         AuditRunCompleted(
             run_id=run_id,
@@ -289,6 +308,16 @@ def promote_finding(finding_id: str) -> a.PromoteFindingResponse | None:
     if row["status"] == "fixed":
         raise FindingNotPromotableError(
             f"finding {finding_id!r} is {row['status']!r}, not promotable"
+        )
+    # Reject a double-promote *before* creating a task. An already-promoted
+    # finding carries a ``promoted_task_id`` (and sits in ``ack``); re-promoting
+    # it would create a SECOND orphan task and then raise on the illegal
+    # ``ack`` -> ``ack`` transition (a 500). Fail closed with a clean 409 and
+    # leave the board untouched.
+    if row.get("promoted_task_id") or row["status"] == "ack":
+        raise FindingNotPromotableError(
+            f"finding {finding_id!r} is already promoted "
+            f"(task {row.get('promoted_task_id')!r}); refusing to promote again"
         )
     project_ref = row.get("project_ref") or ""
     title = _task_title(row)

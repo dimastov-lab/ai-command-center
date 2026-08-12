@@ -84,6 +84,24 @@
       "audit",
       "orchestration"
     ],
+    "command_center/dispatch/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/api.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/models.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/policy.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/policy_config.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/service.py": [
+      "orchestration"
+    ],
     "command_center/evidence_store.py": [
       "memory"
     ],
