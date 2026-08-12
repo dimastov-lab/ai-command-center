@@ -9,16 +9,26 @@ pass-through (no business logic of its own).
 
 from __future__ import annotations
 
+import dataclasses
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 import command_center.dispatch.api as apimod
+from command_center import pipeline_settings, tasks_repository, task_pipeline
+from command_center.dispatch import service as dispatch_service
 from command_center.dispatch.models import (
     ASSIGNED,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
+    ExecutorProfile,
 )
 from command_center.webapi.app import create_app
+
+# `AICC_DATA_DIR` (session conftest) redirects all board storage, so the root
+# handed to the service is an inert sentinel.
+_ROOT = Path("/unused-AICC_DATA_DIR-overrides")
 
 
 def _client() -> TestClient:
@@ -124,3 +134,51 @@ def test_put_policy_accepts_bare_body_as_changes(monkeypatch):
     _client().put("/api/v1/dispatch/policy", json={"prefer_local": True})
 
     assert captured["changes"] == {"prefer_local": True}
+
+
+# --- redaction: a BANK task never surfaces in /dispatch/plan --------------
+
+
+def test_get_plan_never_leaks_a_sensitive_project_task(monkeypatch):
+    """End-to-end through the *real* service: a BANK task on the board must
+    never appear (by id or by project) in the /dispatch/plan response, while a
+    non-sensitive task in the same window is planned normally."""
+    # Point the controller at the sandboxed board and drive the real service.
+    monkeypatch.setattr(apimod, "_root", lambda: _ROOT)
+    # Deterministic inputs so the pipeline runs without touching real CLIs/db.
+    monkeypatch.setattr(
+        dispatch_service,
+        "collect_executor_pool",
+        lambda policy: [
+            ExecutorProfile(
+                id="ollama", label="Ollama", kind="cli", is_local=True,
+                available=True, cost_per_task_usd=0.0,
+            )
+        ],
+    )
+    monkeypatch.setattr(dispatch_service, "active_by_executor", lambda db_path: {})
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", lambda *_a, **_k: 0.0)
+    settings = pipeline_settings.load_settings(_ROOT)
+    pipeline_settings.save_settings(_ROOT, dataclasses.replace(settings, enabled=True))
+
+    bank = tasks_repository.create_task(
+        _ROOT, project="BANK", title="wire reconciliation",
+        task_type="implementation", status="Backlog",
+    )
+    ok = tasks_repository.create_task(
+        _ROOT, project="AICC", title="ship dispatch",
+        task_type="implementation", status="Backlog",
+    )
+
+    r = _client().get("/api/v1/dispatch/plan")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    task_ids = {d["task_id"] for d in body["decisions"]}
+    projects = {d["project"] for d in body["decisions"]}
+
+    assert ok["id"] in task_ids
+    assert bank["id"] not in task_ids
+    assert "BANK" not in projects
+    # Belt and suspenders: the sensitive id/ref appears nowhere in the payload.
+    assert bank["id"] not in r.text
+    assert "BANK" not in r.text

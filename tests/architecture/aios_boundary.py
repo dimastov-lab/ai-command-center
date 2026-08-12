@@ -154,6 +154,7 @@ NAME_TOKEN_SIGNATURES: dict[str, frozenset[str]] = {
             "supervisor",
             "orchestrator",
             "orchestration",
+            "dispatch",
             "dispatcher",
             "autopilot",
             "autonomy",

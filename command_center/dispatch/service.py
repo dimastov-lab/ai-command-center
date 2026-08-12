@@ -25,6 +25,7 @@ from pathlib import Path
 from command_center import executors as executors_module
 from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
+from command_center.project_config import is_sensitive
 from command_center.dispatch import policy_config
 from command_center.dispatch.models import (
     DispatchPlan,
@@ -87,10 +88,20 @@ def _permitted_executors(task: dict) -> frozenset[str] | None:
 
 
 def collect_queued_tasks(root: Path) -> list[QueuedTask]:
-    """Read the board and reduce the queued tasks to the engine's view."""
+    """Read the board and reduce the queued tasks to the engine's view.
+
+    Applies the BANK/LEGAL redaction policy at collection: a task whose project
+    :func:`is_sensitive` is dropped before it reaches the engine, so a sensitive
+    project's ``id`` and ``project_ref`` never surface in a dispatch plan (the
+    same per-read exclusion the conflicts/audit surfaces enforce). Dispatch of
+    sensitive work is out of scope for this operator-facing plane entirely — the
+    task is not merely redacted in the response, it is never considered.
+    """
     queued: list[QueuedTask] = []
     for task in tasks_repository.load_tasks(root):
         if task.get("status") not in QUEUED_STATUSES:
+            continue
+        if is_sensitive(task.get("project") or ""):
             continue
         pinned = task.get("executor") if task.get("executor_pinned") else None
         queued.append(

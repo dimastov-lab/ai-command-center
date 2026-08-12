@@ -99,6 +99,20 @@ def test_collect_queued_tasks_only_returns_backlog_and_next(monkeypatch):
     assert all("claude_code" in (t.allowed_executors or set()) for t in queued)
 
 
+def test_collect_queued_tasks_redacts_sensitive_projects(monkeypatch):
+    # BANK/LEGAL work is never dispatched by this operator-facing plane: a
+    # sensitive-project task is dropped at collection so its id/project never
+    # reaches the engine (mirrors the conflicts/audit per-read exclusion).
+    _queued_task(title="bank", project="BANK", status="Backlog")
+    _queued_task(title="legal", project="LEGAL", status="Next")
+    ok = _queued_task(title="ok", project="AICC", status="Backlog")
+
+    queued = service.collect_queued_tasks(ROOT)
+
+    assert [t.id for t in queued] == [ok["id"]]
+    assert all(t.project not in {"BANK", "LEGAL"} for t in queued)
+
+
 def test_collect_queued_tasks_reads_pin_and_priority(monkeypatch):
     _queued_task(title="pinned", priority="Critical", executor="codex",
                  executor_pinned=True)

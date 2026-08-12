@@ -132,6 +132,28 @@ def test_run_unknown_check_is_client_error(client) -> None:
     assert r.status_code == 400
 
 
+def test_run_marks_failed_when_finding_persist_raises_mid_loop(monkeypatch) -> None:
+    # A raise while persisting findings must not leave a dangling ``running``
+    # run: the finalize loop is guarded so the run is marked ``failed`` and the
+    # original error still propagates.
+    boom = RuntimeError("db exploded mid-persist")
+
+    def _raise(*_a, **_k):
+        raise boom
+
+    monkeypatch.setattr(audit_service.db, "create_audit_finding", _raise)
+    client = TestClient(create_app(), raise_server_exceptions=False)
+
+    r = client.post("/api/v1/audit/run", json={"project": "AICC"})
+    assert r.status_code == 500
+
+    # The run exists and is terminal-failed, never left ``running``.
+    path = audit_service._db_path()
+    runs = db.list_audit_runs(path, project="AICC")
+    assert runs, "the run row should have been created before the failure"
+    assert all(run["status"] == "failed" for run in runs)
+
+
 # --- runs: list / get -----------------------------------------------------
 
 
@@ -184,6 +206,28 @@ def test_promote_fixed_finding_is_conflict(client) -> None:
     client.post(f"/api/v1/audit/findings/{fid}/status", json={"status": "fixed"})
     assert client.post(f"/api/v1/audit/findings/{fid}/promote").status_code == 409
     assert client.post("/api/v1/audit/findings/nope/promote").status_code == 404
+
+
+def test_re_promote_is_clean_conflict_not_a_second_orphan_task(client) -> None:
+    # A finding promoted once must not be promotable again: the second call is
+    # rejected with a clean 409 *before* any task is created — it must never
+    # spawn a second orphan task nor 500 on the illegal ack -> ack transition.
+    fid = client.post("/api/v1/audit/run", json={"project": "AICC"}).json()["findings"][0]["id"]
+    first = client.post(f"/api/v1/audit/findings/{fid}/promote")
+    assert first.status_code == 200, first.text
+    task_id = first.json()["task_id"]
+
+    before = {t["id"] for t in load_tasks(audit_service.ROOT)}
+
+    second = client.post(f"/api/v1/audit/findings/{fid}/promote")
+    assert second.status_code == 409, second.text
+
+    # No second task landed on the board, and the recorded link is unchanged.
+    after = {t["id"] for t in load_tasks(audit_service.ROOT)}
+    assert after == before
+    row = db.get_audit_finding(audit_service._db_path(), fid)
+    assert row["promoted_task_id"] == task_id
+    assert row["status"] == "ack"
 
 
 # --- redaction: sensitive rows never leave the surface --------------------
