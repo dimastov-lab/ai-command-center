@@ -1,0 +1,176 @@
+"""SQLite runtime store for the v2 Session Supervisor.
+
+Schema (Task 1:N Session, Session 1:N Run, Run 0..1 Report, Run 1:N RunEvent):
+
+    task        -- one row per unit of work (mirrors, but does not replace, the
+                   v1.2 Kanban task record)
+    session     -- one row per Claude Code conversation. `session.id` *is* the
+                   UUID passed to `claude --session-id`/`claude --resume`.
+    run         -- one row per subprocess launch against a session. Mutable
+                   current-state row, guarded by a `version` column for
+                   compare-and-set updates and by an explicit state-transition
+                   table (`ALLOWED_TRANSITIONS`) that refuses to move a run back
+                   out of a terminal state.
+    run_event   -- append-only. Every line of stream-json, every stderr line,
+                   and every lifecycle event (process started/exited, cancel
+                   requested, reconciliation outcome, ...) is one row here,
+                   ordered by a per-run monotonic `seq`.
+    report      -- at most one immutable row per run, pointing at the rendered
+                   report file under `reports/<PROJECT>/...` (see `reports.py`).
+
+Every write goes through `connect()`/`transaction()`, which open a fresh
+connection per operation (safe under WAL: SQLite serializes writers itself, and
+`busy_timeout` makes a writer wait rather than fail when another writer briefly
+holds the lock) and keep transactions short and explicit. No transaction here
+ever spans a subprocess call — the supervisor always closes out (commits) an
+event write before it goes back to reading the next line of subprocess output.
+"""
+
+# Facade of the runtime-store package (NIGHT-W9 follow-up: former 3299-line
+# runtime/db.py split by table-family — core/schema/execution/provenance/
+# completion/proposal). Every public *and* private name is re-exported here by
+# explicit import so `from command_center.runtime import db` keeps working
+# unchanged, including test monkeypatching of facade attributes.
+
+from command_center import storage  # noqa: F401  (re-export: db.storage)
+from command_center.models import iso_now, new_id  # noqa: F401
+from command_center.runtime import autonomy as autonomy_domain  # noqa: F401
+from command_center.runtime import completion as completion_domain  # noqa: F401
+
+from command_center.runtime.db.core import (  # noqa: F401
+    ALLOWED_TRANSITIONS,
+    DatabaseBusyTimeoutError,
+    EXECUTION_CENTER_ACTIVE_STATES,
+    GlobalConcurrencyLimitError,
+    InvalidCompletionTransitionError,
+    InvalidProposalTransitionError,
+    InvalidTransitionError,
+    LostUpdateError,
+    ProposalEvidenceFrozenError,
+    ProposalFieldFrozenError,
+    ROOT,
+    RUN_STATES,
+    TERMINAL_STATES,
+    TaskAlreadyActiveError,
+    UnknownRunFieldError,
+    WorkspaceLockedError,
+    _BUSY_RETRY_DEADLINE_SECONDS,
+    _BUSY_RETRY_INITIAL_SLEEP_SECONDS,
+    _BUSY_RETRY_MAX_SLEEP_SECONDS,
+    _SCHEMA_VERSION_TABLE_SQL,
+    _T,
+    _UPDATABLE_RUN_FIELDS,
+    _is_busy_or_locked,
+    _new_session_id,
+    _retry_on_busy,
+    _row_to_dict,
+    _validate_updatable_fields,
+    apply_runtime_retention,
+    connect,
+    current_schema_version,
+    maybe_apply_runtime_retention,
+    migrate,
+    resolve_db_path,
+    transaction,
+)
+from command_center.runtime.db.schema import (  # noqa: F401
+    MIGRATIONS,
+    SCHEMA_VERSION,
+    _SCHEMA_V1,
+    _SCHEMA_V10,
+    _SCHEMA_V13,
+    _SCHEMA_V14,
+    _SCHEMA_V5,
+    _SCHEMA_V6,
+    _migration_11_add_pre_run_head,
+    _migration_12_add_executor_capability_fields,
+    _migration_2_add_failure_reason,
+    _migration_3_add_live_execution_center_v2_fields,
+    _migration_4_add_first_output_at,
+    _migration_7_add_proposal_parameters_json,
+    _migration_8_add_independent_review_fields,
+    _migration_9_add_execution_provider_fields,
+)
+from command_center.runtime.db.execution import (  # noqa: F401
+    _QUEUE_ENTRY_COLUMNS,
+    append_run_event,
+    count_runs,
+    create_report,
+    create_run,
+    create_session,
+    create_task,
+    delete_task,
+    get_latest_run_for_task,
+    get_report,
+    get_reports_for_runs,
+    get_run,
+    get_session,
+    get_task,
+    latest_events_for_runs,
+    list_queue_entries,
+    list_run_events,
+    list_runs,
+    list_sessions,
+    list_tasks,
+    replace_queue_entries,
+    set_run_result_fields,
+    tail_run_events,
+    update_run_fields,
+    update_run_state,
+)
+from command_center.runtime.db.provenance import (  # noqa: F401
+    backfill_run_provenance,
+    create_provenance_evidence,
+    finish_provider_attempt,
+    get_provenance_evidence_for_runs,
+    get_provider_attempts_for_runs,
+    get_provider_route,
+    get_provider_routes_for_runs,
+    get_run_provenance,
+    get_run_provenance_for_runs,
+    list_provider_attempts,
+    set_run_provenance_once,
+    start_provider_attempt,
+    update_run_provenance,
+)
+from command_center.runtime.db.completion import (  # noqa: F401
+    _COMPLETION_INSERT_COLUMNS,
+    _UPDATABLE_COMPLETION_FIELDS,
+    _validate_updatable_completion_fields,
+    append_completion_event,
+    create_completion,
+    get_completion,
+    get_completion_by_task,
+    get_completions_for_runs,
+    list_completion_events,
+    list_completions,
+    list_validation_results,
+    record_validation_result,
+    update_completion,
+)
+from command_center.runtime.db.proposal import (  # noqa: F401
+    _PROPOSAL_AUTHORITY_FIELDS,
+    _PROPOSAL_DECISION_FIELDS,
+    _PROPOSAL_FIELDS_BY_STATE,
+    _PROPOSAL_INSERT_COLUMNS,
+    _UPDATABLE_PROPOSAL_FIELDS,
+    _canonical_proposal_parameters_json,
+    _proposal_event_from_spec,
+    _proposal_event_insert,
+    _proposal_evidence_insert,
+    _proposal_next_seq,
+    _proposal_update,
+    _validate_proposal_fields_for_state,
+    _validate_updatable_proposal_fields,
+    append_proposal_event,
+    append_proposal_evidence,
+    apply_assessment_atomic,
+    create_proposal,
+    create_proposal_atomic,
+    get_proposal,
+    list_proposal_events,
+    list_proposal_evidence,
+    list_proposals,
+    transition_proposal_atomic,
+    update_proposal,
+)

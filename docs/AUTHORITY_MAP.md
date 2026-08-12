@@ -16,7 +16,10 @@ Conventions used below:
 
 ## SQLite — `data/runtime.db` (the execution source of truth)
 
-Writer: `command_center/runtime/db.py` only (every other runtime module goes
+Writer: `command_center/runtime/db.py` only — since the NIGHT-W9 decomposition
+a package (`command_center/runtime/db/`, split by table-family: core/schema/
+execution/provenance/completion/proposal) whose `__init__` facade re-exports
+the same functions unchanged (every other runtime module goes
 through its functions; WAL, optimistic `version` columns).
 
 | Field family (tables) | Authority | Recovery |
