@@ -397,6 +397,8 @@ _DIGEST_ITEM_COLUMNS: tuple[str, ...] = (
     "body",
     "category",
     "refs_json",
+    "day",
+    "position",
     "created_at",
 )
 
@@ -409,11 +411,19 @@ def create_digest_item(
     category: str | None = None,
     refs: list[str] | None = None,
     item_id: str | None = None,
+    day: str | None = None,
+    position: int = 0,
 ) -> dict:
     """Insert one write-once ``digest_item`` row and return it (with ``refs``
-    decoded back to a list). ``refs`` is a list of opaque string references."""
+    decoded back to a list). ``refs`` is a list of opaque string references.
+
+    ``day`` (``YYYY-MM-DD``) and ``position`` scope and order a row inside one
+    day's morning digest; both are optional so an ad-hoc entry (no day, no rank)
+    still round-trips. ``position`` must be non-negative."""
     if not title or not str(title).strip():
         raise ValueError("digest_item.title must be non-empty")
+    if position < 0:
+        raise ValueError(f"digest_item.position must be non-negative, got {position}")
     refs = list(refs or [])
     if not all(isinstance(ref, str) for ref in refs):
         raise ValueError("digest_item.refs must be a list of strings")
@@ -424,6 +434,8 @@ def create_digest_item(
         "body": body,
         "category": category,
         "refs_json": json.dumps(refs, ensure_ascii=False),
+        "day": day,
+        "position": position,
         "created_at": now,
     }
     columns = ", ".join(_DIGEST_ITEM_COLUMNS)
@@ -435,6 +447,34 @@ def create_digest_item(
                 record,
             )
     return _decode_digest_row(record)
+
+
+def delete_digest_items_for_day(db_path: Path, day: str) -> int:
+    """Delete every digest row built for ``day`` and return how many were
+    removed. The idempotency primitive behind a per-day rebuild: the digest
+    engine deletes the day, then re-inserts the freshly assembled rows, so a
+    second build for the same day replaces rather than duplicates."""
+    if not day or not str(day).strip():
+        raise ValueError("delete_digest_items_for_day requires a non-empty day")
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            cur = conn.execute("DELETE FROM digest_item WHERE day = ?", (day,))
+            return cur.rowcount
+
+
+def list_digest_items_for_day(db_path: Path, day: str) -> list[dict]:
+    """Return one day's digest, in stable assembly order (``position`` asc, then
+    ``created_at``/``id`` to fully break any tie). Distinct from
+    :func:`list_digest_items`, which pages the whole table newest-first."""
+    if not day or not str(day).strip():
+        raise ValueError("list_digest_items_for_day requires a non-empty day")
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM digest_item WHERE day = ? "
+            "ORDER BY position ASC, created_at ASC, id ASC",
+            (day,),
+        ).fetchall()
+        return [_decode_digest_row(dict(row)) for row in rows]
 
 
 def get_digest_item(db_path: Path, item_id: str) -> dict | None:

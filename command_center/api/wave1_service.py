@@ -28,6 +28,8 @@ from pathlib import Path
 
 from command_center.api import models
 from command_center.api import wave1_schemas as w
+from command_center.digest import DigestService
+from command_center.digest import complete_owner_item as _complete_owner_item
 from command_center.events import (
     DigestReady,
     OwnerItemCreated,
@@ -263,3 +265,37 @@ def list_digest_items(
 def get_digest_item(item_id: str) -> models.DigestItem | None:
     row = db.get_digest_item(_db_path(), item_id)
     return _digest_from_row(row) if row is not None else None
+
+
+# --------------------------------------------------------------------------
+# Дайджест build / «Мой день» complete — delegate to the digest engine
+# --------------------------------------------------------------------------
+#
+# The morning-digest assembly and the owner-item auto-fill/complete logic live
+# in ``command_center.digest`` (the Wave-1 «Мой день»/Дайджест engine). This
+# service maps its rows onto the API contract, keeping the controller thin and
+# the domain engine free of HTTP concerns.
+
+
+def build_digest() -> w.DigestItemList:
+    """Build (idempotently rebuild) today's morning digest and return it in
+    order. Backs ``POST /digest/build``."""
+    rows = DigestService(root=ROOT).build()
+    return w.DigestItemList(
+        items=[_digest_from_row(r) for r in rows], limit=len(rows), offset=0
+    )
+
+
+def list_digest_today() -> w.DigestItemList:
+    """Today's already-built digest in assembly order. Backs ``GET /digest/today``."""
+    rows = DigestService(root=ROOT).today()
+    return w.DigestItemList(
+        items=[_digest_from_row(r) for r in rows], limit=len(rows), offset=0
+    )
+
+
+def complete_owner_item(item_id: str) -> models.OwnerItem | None:
+    """Mark an owner item done; ``None`` if it does not exist. Backs
+    ``POST /owner-items/{id}/complete``."""
+    row = _complete_owner_item(item_id, root=ROOT)
+    return _owner_item_from_row(row) if row is not None else None
