@@ -1,7 +1,7 @@
 """Contract tests for the new-engine model skeletons (``command_center.api.models``).
 
 The test pins the *shape*: the still-skeletal entities construct with defaults,
-and the constrained fields (``Proposal.kind``, ``ModelEntry.source``) reject
+and the constrained fields (``Proposal.kind``, ``ModelEntry.kind``) reject
 out-of-contract values — so a later increment cannot silently drift the contract
 the shells were built against.
 
@@ -23,7 +23,7 @@ def test_skeleton_entities_construct_with_defaults() -> None:
     # Entities still in the contract-only phase construct with bare defaults.
     for name in (
         "Motion", "Vote", "Decision",
-        "Incident", "ModelEntry",
+        "Incident",
     ):
         cls = getattr(models, name)
         assert cls().model_dump() is not None
@@ -72,11 +72,18 @@ def test_proposal_kind_is_constrained() -> None:
         models.Proposal(id="p", project_ref="AICC", kind="not-a-kind")
 
 
-def test_model_entry_source_is_constrained() -> None:
-    assert models.ModelEntry(source="external").source == "external"
-    assert models.ModelEntry(source="local").source == "local"
-    with pytest.raises(ValidationError):
-        models.ModelEntry(source="cloud")
+def test_model_entry_is_routed_and_kind_is_constrained() -> None:
+    # ModelEntry is a Wave-3 routed entity: a response never carries an empty id.
+    entry = models.ModelEntry(id="m1", kind="local")
+    assert entry.id == "m1" and entry.kind == "local" and entry.status == "available"
+    assert models.ModelEntry(id="m2", kind="external").kind == "external"
+    for bad in (
+        lambda: models.ModelEntry(),  # missing id
+        lambda: models.ModelEntry(id="m", kind="cloud"),  # kind not in contract
+        lambda: models.ModelEntry(id="m", status="offline"),  # status not in contract
+    ):
+        with pytest.raises(ValidationError):
+            bad()
 
 
 def test_proposal_carries_advisor_triage_fields() -> None:

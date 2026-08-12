@@ -98,6 +98,36 @@ class AuditFindingPromotedToTask(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class ModelRegistered(Event):
+    """A model (VOYN-W3-MODELS) was added to the registry. Carries only routing
+    facts — the model id, its kind and provider; a subscriber re-reads the entry
+    by id rather than receiving the whole row here."""
+
+    model_id: str = ""
+    kind: str = ""
+    provider: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStatusChanged(Event):
+    """A model moved along its availability lifecycle (e.g. a local model finished
+    downloading and is now ``installed``)."""
+
+    model_id: str = ""
+    status: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ModelAssigned(Event):
+    """A model was assigned to a task/agent. ``target_ref`` is the opaque
+    task/agent reference; downstream services consume this. Never carries the
+    payload routed to the model — only that an assignment happened."""
+
+    model_id: str = ""
+    target_ref: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class IncidentOpened(Event):
     """An operational incident was opened. Part of the typed event vocabulary
     the Wave-1 services publish/consume; the Incident entity itself is persisted

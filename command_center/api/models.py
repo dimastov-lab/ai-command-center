@@ -207,20 +207,66 @@ class Conflict(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Model catalog — ModelEntry
+# Model catalog — ModelEntry / ModelEvent
 # --------------------------------------------------------------------------
+
+#: An entry's provenance kind: a hosted external API provider vs. a local model.
+ModelKind = Literal["external", "local"]
+
+#: A model's availability lifecycle. ``available`` is the initial state (an
+#: external model is available the moment it is registered; a local model starts
+#: available and moves through the download lifecycle). ``downloading`` and
+#: ``installed`` are the local-download milestones; ``error`` is the failure
+#: state a download or probe can land in.
+ModelStatus = Literal["available", "downloading", "installed", "error"]
+
+#: The governance-log action vocabulary. A model's *history* is the ordered list
+#: of these actions (VOYN-W3 traceability acceptance).
+ModelAction = Literal[
+    "register", "download-request", "download-progress", "assign", "use", "status-change"
+]
 
 
 class ModelEntry(BaseModel):
-    """One entry in the model catalog. ``source`` distinguishes a hosted,
-    external provider model from a locally run one; ``status`` is its current
-    availability."""
+    """One entry in the AI-model catalog — an external (hosted API) model or a
+    local one. Routed entity: ``id`` is required (a response never carries an
+    empty id).
 
-    id: str = ""
+    ``kind`` distinguishes external from local; ``status`` is the current point
+    in its availability lifecycle, and ``download_progress`` (0..100) tracks a
+    local model's download. ``cost``/``quality``/``latency_ms`` are the metadata
+    the auto-select helper weighs (prefer local for cost); ``provenance`` records
+    where the model came from so its origin is traceable."""
+
+    id: str
     name: str = ""
-    source: Literal["external", "local"] = "external"
-    status: Literal["available", "degraded", "offline"] = "available"
+    kind: ModelKind = "external"
     provider: str | None = None
+    status: ModelStatus = "available"
+    cost: float | None = None
+    quality: float | None = None
+    latency_ms: int | None = None
+    provenance: str | None = None
+    download_progress: int = 0
+    created_at: str | None = None
+
+
+class ModelEvent(BaseModel):
+    """One entry in a model's governance log — the append-only record that makes
+    its history fully traceable. ``seq`` orders the log per model; ``action`` is
+    what happened; ``target_ref`` is the opaque task/agent an ``assign``/``use``
+    acted on; ``provenance`` and ``metadata`` carry the coarse facts of the move."""
+
+    model_config = {"protected_namespaces": ()}
+
+    seq: int
+    model_id: str
+    action: ModelAction
+    actor: str | None = None
+    target_ref: str | None = None
+    provenance: str | None = None
+    metadata: dict = Field(default_factory=dict)
+    created_at: str | None = None
 
 
 # --------------------------------------------------------------------------

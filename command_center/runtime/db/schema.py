@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -765,6 +765,69 @@ CREATE INDEX IF NOT EXISTS idx_audit_finding_project ON audit_finding(project_re
 """
 
 
+# Wave-3 model registry (VOYN-W3-MODELS): two additive, standalone table
+# families backing the AI-model catalog surface (`api/model_registry_routes.py` →
+# `model_registry_service.py` → this repository), wholly distinct from every
+# family above.
+#
+#   model_entry -- one mutable current-state row per registered model, external
+#                  (a hosted API provider) or local. Guarded by a `version`
+#                  compare-and-set column and an explicit status-transition
+#                  allowlist (`model_registry.MODEL_STATUS_TRANSITIONS`). A local
+#                  model's download is a real status lifecycle — available →
+#                  downloading → installed — with a 0..100 `download_progress`;
+#                  the actual byte transfer is an injectable downloader in the
+#                  service, but this row's lifecycle is real, not a placeholder.
+#                  `cost`/`quality`/`latency_ms` are the auto-select signals;
+#                  `provenance` records where the model came from.
+#   model_event -- append-only governance log, one row per model action
+#                  (register, download-request, download-progress, assign, use,
+#                  status-change), ordered by a per-model monotonic `seq`. This
+#                  is what makes a model's history fully traceable (the VOYN-W3
+#                  acceptance): every action a model takes part in is recorded
+#                  here with its `provenance`, and the log is never rewritten.
+#
+# Statuses/kinds/actions are stored as their stable string *values* (never a
+# Python enum's member name), so a column round-trips to exactly the Literal the
+# API contract (`api/models.py`) declares — the enum-name lesson carried forward
+# from the earlier migration renumbering.
+_SCHEMA_V20 = """
+CREATE TABLE IF NOT EXISTS model_entry (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'external',
+    provider TEXT,
+    status TEXT NOT NULL DEFAULT 'available',
+    cost REAL,
+    quality REAL,
+    latency_ms INTEGER,
+    provenance TEXT,
+    download_progress INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_entry_kind ON model_entry(kind);
+CREATE INDEX IF NOT EXISTS idx_model_entry_status ON model_entry(status);
+
+CREATE TABLE IF NOT EXISTS model_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_id TEXT NOT NULL REFERENCES model_entry(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT,
+    target_ref TEXT,
+    provenance TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(model_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_event_model_id ON model_event(model_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -793,4 +856,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (17, _migration_17_add_owner_digest_project_ref),
     (18, _SCHEMA_V18),
     (19, _SCHEMA_V19),
+    (20, _SCHEMA_V20),
 ]

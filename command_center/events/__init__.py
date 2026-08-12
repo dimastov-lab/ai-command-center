@@ -27,6 +27,9 @@ from command_center.events.types import (
     DigestReady,
     Event,
     IncidentOpened,
+    ModelAssigned,
+    ModelRegistered,
+    ModelStatusChanged,
     OwnerItemCreated,
     ProposalCreated,
     ProposalPromotedToTask,
@@ -46,4 +49,7 @@ __all__ = [
     "AuditRunCompleted",
     "AuditFindingCreated",
     "AuditFindingPromotedToTask",
+    "ModelRegistered",
+    "ModelStatusChanged",
+    "ModelAssigned",
 ]
