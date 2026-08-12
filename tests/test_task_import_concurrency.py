@@ -96,6 +96,7 @@ def test_unsafe_read_modify_write_pattern_loses_tasks(tmp_path):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.serial  # threaded lock-deadline (join timeout=15); flaky when xdist saturates all cores
 def test_two_different_packages_imported_concurrently_both_survive_threaded(tmp_path):
     start = threading.Barrier(2)
     errors: list[Exception] = []
