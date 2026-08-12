@@ -25,32 +25,32 @@ import html
 
 import streamlit as st
 
+from command_center.design import Theme, color
 from command_center.ui import live_board, theme
 
-# GitHub-derived palette, identical to `.streamlit/config.toml`'s
-# `[theme.light]`/`[theme.dark]`. Each tone carries a *line* colour (the strong
-# accent used for text, numbers and the rail) and a *fill* colour (a faint tint
-# used for the tile background). The fills are the line hue at low alpha so they
-# sit correctly on either background without a second hand-picked value.
+# Board palette, derived from the platform-canonical
+# `command_center/design/tokens.json` (the same source `.streamlit/config.toml`'s
+# `[theme.light]`/`[theme.dark]` mirror). Each bucket tone carries a *line* colour
+# (the strong hue used for text, numbers and the rail) and a *fill* colour (a
+# faint tint used for the tile background). The fills are the line hue at low
+# alpha (see `_fill`) so they sit correctly on either background without a second
+# hand-picked value — and, crucially, without a raw hex living here: change a hue
+# once in `tokens.json` and the board follows.
+def _board_palette(t: Theme) -> dict[str, str]:
+    return {
+        "surface": color("surface", t),
+        "border": color("line", t),
+        "muted": color("text-2", t),
+        "live_line": color("accent", t),
+        "waiting_line": color("warn", t),
+        "attention_line": color("crit", t),
+        "done_line": color("ok", t),
+    }
+
+
 _PALETTE: dict[str, dict[str, str]] = {
-    "light": {
-        "surface": "#ffffff",
-        "border": "#d0d7de",
-        "muted": "#57606a",
-        "live_line": "#0969da",
-        "waiting_line": "#bf8700",
-        "attention_line": "#cf222e",
-        "done_line": "#1a7f37",
-    },
-    "dark": {
-        "surface": "#161b22",
-        "border": "#30363d",
-        "muted": "#8b949e",
-        "live_line": "#58a6ff",
-        "waiting_line": "#d29922",
-        "attention_line": "#f85149",
-        "done_line": "#3fb950",
-    },
+    "light": _board_palette("light"),
+    "dark": _board_palette("dark"),
 }
 
 # Per-bucket tone: which line colour a bucket's tile and cards wear.
