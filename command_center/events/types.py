@@ -65,6 +65,39 @@ class DigestReady(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class AuditRunCompleted(Event):
+    """An audit run (VOYN-W2-AUD) finished. Carries only routing facts — the
+    run id, its project, terminal status and how many findings it produced; a
+    subscriber re-reads the run/findings by id rather than receiving them here."""
+
+    run_id: str = ""
+    project_ref: str = ""
+    status: str = ""
+    finding_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AuditFindingCreated(Event):
+    """One audit finding was persisted. Every finding carries a status and an
+    owner by construction; the event surfaces the coarse triage facts."""
+
+    finding_id: str = ""
+    run_id: str = ""
+    category: str = ""
+    severity: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AuditFindingPromotedToTask(Event):
+    """An audit finding was promoted into a task on the board. ``task_id`` is the
+    id returned by the existing tasks path; downstream services consume this."""
+
+    finding_id: str = ""
+    task_id: str = ""
+    project_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class IncidentOpened(Event):
     """An operational incident was opened. Part of the typed event vocabulary
     the Wave-1 services publish/consume; the Incident entity itself is persisted

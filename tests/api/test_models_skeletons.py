@@ -22,7 +22,7 @@ from command_center.api import models
 def test_skeleton_entities_construct_with_defaults() -> None:
     # Entities still in the contract-only phase construct with bare defaults.
     for name in (
-        "Motion", "Vote", "Decision", "AuditRun", "AuditFinding",
+        "Motion", "Vote", "Decision",
         "Incident", "ModelEntry",
     ):
         cls = getattr(models, name)
@@ -38,6 +38,28 @@ def test_routed_entities_require_identity_fields() -> None:
         lambda: models.Proposal(id="p"),  # missing project_ref
         lambda: models.OwnerItem(),  # missing id
         lambda: models.DigestItem(),  # missing id
+    ):
+        with pytest.raises(ValidationError):
+            bad()
+
+
+def test_audit_entities_require_identity_and_triage_fields() -> None:
+    # AuditRun/AuditFinding are Wave-2 routed entities: a response never carries
+    # an empty id, and a finding always names its run, category and owner.
+    run = models.AuditRun(id="r1", project_ref="AICC")
+    assert run.id == "r1" and run.status == "queued"
+    finding = models.AuditFinding(
+        id="f1", run_id="r1", category="lint", owner="engineering"
+    )
+    assert finding.status == "open" and finding.owner == "engineering"
+    for bad in (
+        lambda: models.AuditRun(),  # missing id + project_ref
+        lambda: models.AuditRun(id="r"),  # missing project_ref
+        lambda: models.AuditFinding(),  # missing id/run_id/category/owner
+        lambda: models.AuditFinding(id="f", run_id="r", category="lint"),  # missing owner
+        lambda: models.AuditFinding(
+            id="f", run_id="r", category="bogus", owner="x"
+        ),  # category not in contract
     ):
         with pytest.raises(ValidationError):
             bad()
