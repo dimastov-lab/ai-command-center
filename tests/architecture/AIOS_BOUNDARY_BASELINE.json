@@ -143,6 +143,9 @@
     "command_center/runtime/reports.py": [
       "runtime_package"
     ],
+    "command_center/runtime/run_finalizer.py": [
+      "runtime_package"
+    ],
     "command_center/runtime/runs_read.py": [
       "runtime_package"
     ],
@@ -156,8 +159,11 @@
     "command_center/runtime/stream_parser.py": [
       "runtime_package"
     ],
-    "command_center/runtime/supervisor.py": [
+    "command_center/runtime/stream_reader.py": [
       "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/supervisor.py": [
       "orchestration",
       "runtime_package"
     ],
