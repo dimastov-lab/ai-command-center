@@ -129,6 +129,14 @@ def create_owner_item(payload: w.OwnerItemCreate) -> models.OwnerItem:
     return service.create_owner_item(payload)
 
 
+@router.post("/owner-items/{item_id}/complete", response_model=models.OwnerItem)
+def complete_owner_item(item_id: str) -> models.OwnerItem:
+    done = service.complete_owner_item(item_id)
+    if done is None:
+        raise HTTPException(status_code=404, detail="owner item not found")
+    return done
+
+
 # --------------------------------------------------------------------------
 # Дайджест — digest items
 # --------------------------------------------------------------------------
@@ -141,6 +149,20 @@ def list_digest_items(
     offset: int = Query(default=0, ge=0),
 ) -> w.DigestItemList:
     return service.list_digest_items(category=category, limit=limit, offset=offset)
+
+
+@router.post("/digest/build", response_model=w.DigestItemList)
+def build_digest() -> w.DigestItemList:
+    # Assemble (or rebuild, idempotently) today's morning digest from the real
+    # in-repo sources and return it in order.
+    return service.build_digest()
+
+
+@router.get("/digest/today", response_model=w.DigestItemList)
+def digest_today() -> w.DigestItemList:
+    # Registered before ``/digest/{item_id}`` so "today" is never captured as an
+    # item id.
+    return service.list_digest_today()
 
 
 @router.get("/digest/{item_id}", response_model=models.DigestItem)
