@@ -41,4 +41,14 @@ exclude_lines = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-xdist>=3.6",
+]
+
+[tool.pytest.ini_options]
+# `serial` tests are timing-sensitive subprocess tests that miss their
+# deadlines when pytest-xdist saturates the CPU. Local parallel invocation
+# (CI stays serial):
+#   pytest -q -n 8 -m "not serial" && pytest -q -m serial
+markers = [
+    "serial: must not run concurrently with other tests (excluded from pytest-xdist runs; see README Validation)",
 ]
