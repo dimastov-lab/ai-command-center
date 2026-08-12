@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
+from command_center.advisor import api as advisor_api
+from command_center.advisor.schemas import AdvisorRunRequest, AdvisorRunResponse
 from command_center.api import models
 from command_center.api import wave1_schemas as w
 from command_center.api import wave1_service as service
@@ -32,11 +34,12 @@ _MAX_LIMIT = 500
 def list_proposals(
     project: str | None = None,
     status: str | None = None,
+    kind: str | None = None,
     limit: int = Query(default=100, ge=1, le=_MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> w.ProposalList:
     return service.list_proposals(
-        project=project, status=status, limit=limit, offset=offset
+        project=project, status=status, kind=kind, limit=limit, offset=offset
     )
 
 
@@ -62,6 +65,41 @@ def promote_proposal(proposal_id: str) -> w.PromoteResponse:
     if result is None:
         raise HTTPException(status_code=404, detail="proposal not found")
     return result
+
+
+# --------------------------------------------------------------------------
+# Советник — advisor engine (E-Советник)
+# --------------------------------------------------------------------------
+
+
+@router.post("/advisor/run", response_model=AdvisorRunResponse)
+def advisor_run(payload: AdvisorRunRequest | None = None) -> AdvisorRunResponse:
+    """Trigger one advisor collection pass: run the collectors, dedup, score,
+    persist the surviving proposals (emitting ProposalCreated) and auto-promote
+    any that the configured rules select. Returns a summary of the pass."""
+    request = payload or AdvisorRunRequest()
+    try:
+        return advisor_api.run_pass(
+            collectors=request.collectors, project=request.project
+        )
+    except KeyError as exc:
+        # Unknown collector name — a client error, not a server fault.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/advisor/proposals", response_model=w.ProposalList)
+def list_advisor_proposals(
+    project: str | None = None,
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = Query(default=100, ge=1, le=_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+) -> w.ProposalList:
+    """The Советник inbox, filterable by ``kind`` and ``status`` (and project).
+    Promotion reuses ``POST /proposals/{id}/promote``."""
+    return service.list_proposals(
+        project=project, status=status, kind=kind, limit=limit, offset=offset
+    )
 
 
 # --------------------------------------------------------------------------
