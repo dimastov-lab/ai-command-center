@@ -28,6 +28,7 @@ SCOPED_PATHS = (
     "command_center/digest",
     "command_center/advisor",
     "command_center/conflicts",
+    "command_center/audit",
     "command_center/events",
     "command_center/ui/operator_dashboard.py",
     "docs/INTEGRATION_CENTER.md",

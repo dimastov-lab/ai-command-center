@@ -27,7 +27,13 @@ import os
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from command_center.api import conflict_routes, schemas, service, wave1_routes
+from command_center.api import (
+    audit_routes,
+    conflict_routes,
+    schemas,
+    service,
+    wave1_routes,
+)
 
 # All read-only endpoints hang off one versioned router; the Wave-1 write
 # endpoints live on their own router (also ``/api/v1``) and are included below.
@@ -96,6 +102,7 @@ def create_app() -> FastAPI:
     app.include_router(_build_read_router())
     app.include_router(wave1_routes.router)
     app.include_router(conflict_routes.router)
+    app.include_router(audit_routes.router)
     return app
 
 
