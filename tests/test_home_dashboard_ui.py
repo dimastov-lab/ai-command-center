@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from command_center import models, tasks_repository
@@ -439,6 +440,7 @@ def _wait_for_report(db_path, run_id: str, *, timeout: float = 10.0) -> None:
     raise AssertionError(f"run {run_id!r} did not finish in the background within {timeout}s")
 
 
+@pytest.mark.serial  # real subprocess + DB running-then-completed timing; flaky when xdist saturates all cores
 def test_dashboard_queue_and_footer_reflect_a_genuinely_running_then_completed_session(
     git_repo, configure_project_repo, fake_claude
 ):
