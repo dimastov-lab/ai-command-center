@@ -71,5 +71,6 @@ jobs:
       - name: Uninstall
         shell: pwsh
         run: |
-          winget uninstall DimastovLab.AICommandCenter --disable-interactivity
+          winget uninstall DimastovLab.AICommandCenter `
+            --accept-source-agreements --disable-interactivity
           if ($LASTEXITCODE -ne 0) { throw "winget uninstall failed: $LASTEXITCODE" }
