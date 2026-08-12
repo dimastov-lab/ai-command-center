@@ -206,6 +206,23 @@ from command_center.runtime.db.audit import (  # noqa: F401
     set_audit_finding_status,
     set_audit_run_status,
 )
+from command_center.runtime.db.model_registry import (  # noqa: F401
+    MODEL_ACTIONS,
+    MODEL_KINDS,
+    MODEL_STATUS_TRANSITIONS,
+    MODEL_STATUSES,
+    InvalidModelStatusTransitionError,
+    _append_model_event,
+    _decode_event_row,
+    _next_model_seq,
+    append_model_event,
+    create_model_entry,
+    get_model_entry,
+    list_model_entries,
+    list_model_events,
+    set_model_status,
+    update_download_progress,
+)
 from command_center.runtime.db.proposal import (  # noqa: F401
     _PROPOSAL_AUTHORITY_FIELDS,
     _PROPOSAL_DECISION_FIELDS,

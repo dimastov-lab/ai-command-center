@@ -169,6 +169,10 @@
       "memory",
       "runtime_package"
     ],
+    "command_center/runtime/db/model_registry.py": [
+      "memory",
+      "runtime_package"
+    ],
     "command_center/runtime/db/proposal.py": [
       "memory",
       "runtime_package"
