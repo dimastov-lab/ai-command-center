@@ -16,7 +16,10 @@ Conventions used below:
 
 ## SQLite — `data/runtime.db` (the execution source of truth)
 
-Writer: `command_center/runtime/db.py` only (every other runtime module goes
+Writer: `command_center/runtime/db.py` only — since the NIGHT-W9 decomposition
+a package (`command_center/runtime/db/`, split by table-family: core/schema/
+execution/provenance/completion/proposal) whose `__init__` facade re-exports
+the same functions unchanged (every other runtime module goes
 through its functions; WAL, optimistic `version` columns).
 
 | Field family (tables) | Authority | Recovery |
@@ -27,6 +30,7 @@ through its functions; WAL, optimistic `version` columns).
 | `queue_entry` (mirror) | **Read-only mirror** of `data/execution_queue.json` for SQL joins (`execution_queue._mirror_to_runtime_db`); the JSON file is authoritative, divergence is detected (`queue_divergence`), the mirror is backfillable (`backfill_mirror`). | Rebuild from the JSON queue file. |
 | `proposal`, `proposal_evidence`, `proposal_event` | Autonomy proposals/policy approvals (`runtime/autonomy_service.py` via db.py). | db backup. |
 | `run_provider_route`, `provider_attempt` | Provider routing + attempt outcomes per run. | db backup. |
+| `advisor_proposal`, `owner_item`, `digest_item` | Wave-1 "new engine" surfaces — Советник advisor inbox, «Мой день» owner list, Дайджест rollup (`runtime/db/wave1.py`, written via `api/wave1_service.py` and the `command_center/digest` engine — morning-digest build + «Мой день» event auto-fill; version-CAS rows, status-transition allowlist, per-day idempotent digest rebuild). `advisor_proposal.promoted_task_id` only *records* a task the caller created through `tasks_repository`. | db backup. |
 
 ## JSON (file-locked, atomic-replace via `command_center/storage.py`)
 
@@ -38,6 +42,7 @@ through its functions; WAL, optimistic `version` columns).
 | `data/project_config.json` (+lock) | Project registry: repository paths, allowed execution providers, default branches. | `project_config.py` | `project_config.example.json` + operator re-entry. |
 | `data/portfolio_launches.json`, `data/portfolio_locks/` | Portfolio launch records/locks. | `portfolio_launch.py` | Append-only; truncate to last valid line on corruption. |
 | `data/chats.json` | Project chat threads (UI convenience). | `chat_service.py` | Non-critical; loss is acceptable by design. |
+| `data/integration_registry.json` (+lock) | Integration Center project registry (AICC-INT-001): locally-configured repositories — machine-local paths, `gh` remotes, task-namespace mapping. Machine-local configuration, gitignored; contents are never committed. Operator configuration, never execution truth (see `docs/INTEGRATION_CENTER.md`). | `command_center/integration/registry.py` | Seeded defaults (`DEFAULT_ENTRIES`) + operator re-entry of paths. |
 
 ## JSONL (append-only, crash-truncatable)
 

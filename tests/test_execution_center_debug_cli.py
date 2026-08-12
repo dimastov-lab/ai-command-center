@@ -143,6 +143,7 @@ def test_ctrl_c_triggers_confirmed_cancellation_and_reaches_terminal_state(confi
     assert identity.process_exists(pid) is False, "the underlying claude process must not survive Ctrl+C either"
 
 
+@pytest.mark.serial  # spawns a real 3-level process tree on a deadline; times out under xdist CPU load
 def test_no_orphan_at_any_level_when_cancelled_via_ctrl_c(configured_repo):
     """3+4 combined, using the parent->child->grandchild fixture: Ctrl+C
     during `launch` must clean up the entire process tree, not just the

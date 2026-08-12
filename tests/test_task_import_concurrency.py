@@ -168,6 +168,7 @@ def test_import_lock_times_out_with_a_clear_error_instead_of_hanging(tmp_path):
     assert result.imported_ids == ["TIMEOUT-1"]
 
 
+@pytest.mark.serial  # many concurrent registry writers on a lock deadline; flaky when xdist saturates all cores
 def test_registry_stays_valid_json_after_many_concurrent_imports(tmp_path):
     task_id_batches = [[f"BULK-{i}-1", f"BULK-{i}-2"] for i in range(8)]
     start = threading.Barrier(len(task_id_batches))

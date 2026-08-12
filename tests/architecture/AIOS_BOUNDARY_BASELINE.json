@@ -80,7 +80,36 @@
     "command_center/runtime/context_service.py": [
       "runtime_package"
     ],
-    "command_center/runtime/db.py": [
+    "command_center/runtime/db/__init__.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/completion.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/core.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/execution.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/proposal.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/provenance.py": [
+      "audit",
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/schema.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/wave1.py": [
       "memory",
       "runtime_package"
     ],
@@ -118,6 +147,9 @@
     "command_center/runtime/reports.py": [
       "runtime_package"
     ],
+    "command_center/runtime/run_finalizer.py": [
+      "runtime_package"
+    ],
     "command_center/runtime/runs_read.py": [
       "runtime_package"
     ],
@@ -131,8 +163,11 @@
     "command_center/runtime/stream_parser.py": [
       "runtime_package"
     ],
-    "command_center/runtime/supervisor.py": [
+    "command_center/runtime/stream_reader.py": [
       "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/supervisor.py": [
       "orchestration",
       "runtime_package"
     ],
