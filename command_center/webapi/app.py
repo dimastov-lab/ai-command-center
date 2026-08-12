@@ -33,6 +33,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from command_center.dispatch.api import create_dispatch_router
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.webapi.serializers import serialize_execution, serialize_home
 from command_center.workspace_home import build_workspace_home_snapshot
@@ -75,6 +76,11 @@ def create_app() -> FastAPI:
             app.state.execution_center_api = api
         snapshot = build_workspace_home_snapshot(execution_center_api=api)
         return serialize_execution(snapshot)
+
+    # Agent-dispatch policy layer (VOYN-W2-AGENT): `/api/v1/dispatch/*`.
+    # Registered before the SPA mount so its routes resolve ahead of the
+    # catch-all static handler.
+    app.include_router(create_dispatch_router())
 
     # Serve the built SPA (built via `web/`'s `npm run build`) from the same
     # origin as the API, so production needs no CORS configuration. Mounted
