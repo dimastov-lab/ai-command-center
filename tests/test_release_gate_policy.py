@@ -17,12 +17,24 @@ EXPECTED_CONTEXTS = {
     "windows-quality-gates": "Windows quality gates (Ruff · compile · pytest)",
     "security-gates": "Security gates (workflow policy · provenance · supply chain)",
     "build-gates": "Build gates (web production)",
+    # Advisory-only fast pre-check (dependency-based test-impact selection). It is
+    # deliberately NOT wired into `final-gate.needs` (see
+    # `test_final_gate_is_fail_closed_for_every_upstream_result`), so it can never
+    # become the sole gate and never reduces coverage.
+    "impact-fast-check": "Impact fast pre-check (advisory)",
     "final-gate": "Final merge gate",
     "boundary-fitness": "Boundary fitness (import ban · anti-engine baseline)",
 }
 
 EXPECTED_STEPS = {
-    "quality-gates": {"Pytest + coverage", "Real-browser E2E"},
+    # The required test gate runs as a parallel body (pytest-xdist) plus a short
+    # serial tail; both together run every test exactly once.
+    "quality-gates": {
+        "Pytest + coverage (parallel)",
+        "Pytest (serial tail)",
+        "Real-browser E2E",
+    },
+    "impact-fast-check": {"Select impacted tests", "Run impacted tests (parallel)"},
     "windows-quality-gates": {"Desktop pytest-qt suite", "Real-browser E2E"},
     "security-gates": {
         "Release gate policy",
