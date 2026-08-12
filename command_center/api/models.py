@@ -143,6 +143,38 @@ class Incident(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Conflicts / Incidents engine — Conflict
+# --------------------------------------------------------------------------
+
+ConflictKind = Literal["merge", "perf", "budget", "security"]
+
+
+class Conflict(BaseModel):
+    """A tracked conflict/incident moving through open → mitigating → resolved.
+
+    ``kind`` classifies the friction (a ``merge`` collision, a ``perf``
+    regression, a ``budget`` overrun, a ``security`` exposure). ``source_ref`` is
+    the opaque origin reference the conflict was opened from (e.g.
+    ``incident:<id>``, a PR ref) and is what the BANK/LEGAL redaction protects —
+    a conflict whose ``project_ref`` is sensitive is dropped from every read so
+    its ``source_ref`` never leaves the surface. ``owner`` and ``mitigation`` are
+    the two facts a conflict must carry before it may reach ``resolved`` (the
+    invariant is enforced in the service, not the DB).
+    """
+
+    id: str = ""
+    kind: ConflictKind = "merge"
+    source_ref: str = ""
+    severity: Literal["sev1", "sev2", "sev3", "sev4"] = "sev3"
+    status: Literal["open", "mitigating", "resolved"] = "open"
+    owner: str | None = None
+    mitigation: str | None = None
+    project_ref: str | None = None
+    opened_at: str | None = None
+    resolved_at: str | None = None
+
+
+# --------------------------------------------------------------------------
 # Model catalog — ModelEntry
 # --------------------------------------------------------------------------
 
