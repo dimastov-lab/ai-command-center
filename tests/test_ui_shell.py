@@ -82,6 +82,7 @@ def test_priority_and_launch_status_color_tokens_are_unchanged():
         "Running": "blue",
         "Completed": "green",
         "Failed": "red",
+        "Cancelled": "gray",
         "Requires Attention": "orange",
     }
 

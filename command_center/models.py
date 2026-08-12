@@ -225,6 +225,10 @@ LAUNCH_STATUSES: list[str] = [
     "Needs Review",
     "Completed",
     "Failed",
+    # Operator-stopped run — distinct from "Failed" so a deliberate stop is
+    # never rendered as a defect; the task itself retires to the read-side
+    # "Closed" lane (AICC-IMP-006, see `runtime.task_sync`).
+    "Cancelled",
     "Requires Attention",
 ]
 

@@ -23,7 +23,10 @@ from dataclasses import dataclass
 # legacy/live data already contains it and those tasks must be visible rather
 # than silently dropped (audit D2). Any status outside this set is counted in
 # `other`.
-CANONICAL_LANES: tuple[str, ...] = ("Backlog", "Next", "In Progress", "Review", "Blocked", "Done")
+# `Closed` is likewise read-side only: operator-cancelled tasks retire there
+# (AICC-IMP-006, `runtime.task_sync`) instead of masquerading as failures in
+# the planning lanes.
+CANONICAL_LANES: tuple[str, ...] = ("Backlog", "Next", "In Progress", "Review", "Blocked", "Done", "Closed")
 
 # Lanes that represent in-flight or ready-to-start work — neither resolved
 # (`Done`) nor stuck (`Blocked`).
@@ -68,8 +71,11 @@ def task_snapshot(tasks: list[dict]) -> TaskSnapshot:
         # strength of a stale `launch_status` — that renders one task as both
         # Done and needing-attention on adjacent widgets (audit DATA-D4). A Done
         # task needs attention only via an explicit post-Done regression flag.
+        # `Closed` is retired work (operator-cancelled, AICC-IMP-006) — like
+        # `Done`, a stale launch_status on it must not resurrect attention.
         if task.get("regressed_after_done") or (
-            status != "Done" and task.get("launch_status") == "Requires Attention"
+            status not in ("Done", "Closed")
+            and task.get("launch_status") == "Requires Attention"
         ):
             attention += 1
     return TaskSnapshot(

@@ -145,3 +145,17 @@ def test_run_attention_states_match_execution_strip():
     assert read_model.RUN_ATTENTION_STATES == execution_strip._ATTENTION_STATES
     assert read_model.RUN_LIVE_STATES == execution_strip._LIVE_STATES
     assert read_model.RUN_WAITING_STATES == execution_strip._WAITING_STATES
+
+
+def test_closed_is_a_canonical_lane_and_suppresses_attention():
+    """Operator-cancelled tasks retire to `Closed` (AICC-IMP-006): counted in
+    their own lane, and a stale attention launch_status on them is ignored,
+    same as for `Done`."""
+    tasks = [
+        {"status": "Closed", "launch_status": "Requires Attention"},
+        {"status": "Next", "launch_status": "Requires Attention"},
+    ]
+    snap = read_model.task_snapshot(tasks)
+    assert snap.by_lane["Closed"] == 1
+    assert snap.other == 0
+    assert snap.attention == 1
