@@ -25,6 +25,7 @@ from pathlib import Path
 
 from command_center.digest import sources
 from command_center.events import DigestReady, EventBus, default_bus
+from command_center.models import SENSITIVE_PROJECT_IDS
 from command_center.runtime import db
 from command_center.runtime.db.core import resolve_db_path
 
@@ -83,6 +84,7 @@ class DigestService:
                     "body": row.get("detail", ""),
                     "category": CATEGORY_OVERNIGHT,
                     "refs": _refs(row["ref"]),
+                    "project_ref": row.get("project"),
                 }
             )
         for row in commits:
@@ -92,6 +94,7 @@ class DigestService:
                     "body": row.get("detail", ""),
                     "category": CATEGORY_OVERNIGHT,
                     "refs": _refs(row["ref"]),
+                    "project_ref": None,
                 }
             )
 
@@ -102,6 +105,7 @@ class DigestService:
                     "body": row.get("detail", ""),
                     "category": CATEGORY_ADVISOR,
                     "refs": _refs(row["ref"], "action:/api/v1/proposals"),
+                    "project_ref": row.get("project"),
                 }
             )
 
@@ -112,6 +116,7 @@ class DigestService:
                     "body": row.get("detail", ""),
                     "category": CATEGORY_ATTENTION,
                     "refs": _refs(row["ref"]),
+                    "project_ref": row.get("project"),
                 }
             )
 
@@ -125,6 +130,7 @@ class DigestService:
                 "body": f"всего запусков: {status['total']}",
                 "category": CATEGORY_STATUS,
                 "refs": _refs("action:/api/v1/agents"),
+                "project_ref": None,
             }
         )
         return pending
@@ -149,6 +155,7 @@ class DigestService:
                 body=entry["body"],
                 category=entry["category"],
                 refs=entry["refs"],
+                project_ref=entry.get("project_ref"),
                 day=day,
                 position=position,
             )
@@ -162,8 +169,14 @@ class DigestService:
 
     def today(self, *, day: str | None = None) -> list[dict]:
         """The already-built digest for ``day`` (default: today), in assembly
-        order. Read-only: never triggers a build."""
-        return db.list_digest_items_for_day(self._db_path(), day or today_str())
+        order. Read-only: never triggers a build. Sensitive-project rows are
+        dropped in the query (defence in depth — the sources already exclude
+        them at build time)."""
+        return db.list_digest_items_for_day(
+            self._db_path(),
+            day or today_str(),
+            exclude_projects=sorted(SENSITIVE_PROJECT_IDS),
+        )
 
 
 def _refs(*refs: str) -> list[str]:

@@ -25,6 +25,28 @@ from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
+
+def _exclude_projects_clause(
+    exclude_projects: Iterable[str] | None, *, allow_null: bool
+) -> tuple[str | None, list[str]]:
+    """Build a ``WHERE`` fragment that drops rows whose ``project_ref`` is in
+    ``exclude_projects`` — the redaction policy expressed *in SQL* so that a
+    ``LIMIT``/``OFFSET`` page counts only visible rows (audit MED-2).
+
+    ``allow_null`` keeps rows with no project attribution (``NULL``) — correct
+    for ``owner_item``/``digest_item`` where the column is optional; pass
+    ``False`` for ``advisor_proposal`` whose ``project_ref`` is ``NOT NULL``.
+    Returns ``(None, [])`` when there is nothing to exclude."""
+    projects = [p for p in (exclude_projects or []) if p]
+    if not projects:
+        return None, []
+    placeholders = ", ".join("?" for _ in projects)
+    if allow_null:
+        clause = f"(project_ref IS NULL OR project_ref NOT IN ({placeholders}))"
+    else:
+        clause = f"project_ref NOT IN ({placeholders})"
+    return clause, projects
+
 # --------------------------------------------------------------------------
 # advisor_proposal — Советник
 # --------------------------------------------------------------------------
@@ -138,12 +160,17 @@ def list_advisor_proposals(
     project: str | None = None,
     statuses: Iterable[str] | None = None,
     kind: str | None = None,
+    exclude_projects: Iterable[str] | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict]:
     """List advisor proposals, newest first, optionally filtered by project, a
     set of ``statuses`` and/or a ``kind``. ``limit``/``offset`` page the result
-    (stable order: ``created_at DESC, id DESC``)."""
+    (stable order: ``created_at DESC, id DESC``).
+
+    ``exclude_projects`` drops rows for those projects *in the query* (the
+    redaction policy — see :func:`_exclude_projects_clause`), so a page counts
+    only visible rows rather than being trimmed after the fact."""
     if limit < 0:
         raise ValueError(f"limit must be non-negative, got {limit}")
     if offset < 0:
@@ -163,6 +190,10 @@ def list_advisor_proposals(
         placeholders = ", ".join("?" for _ in statuses)
         clauses.append(f"status IN ({placeholders})")
         params.extend(statuses)
+    exclude_clause, exclude_params = _exclude_projects_clause(exclude_projects, allow_null=False)
+    if exclude_clause is not None:
+        clauses.append(exclude_clause)
+        params.extend(exclude_params)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
@@ -275,6 +306,7 @@ _OWNER_ITEM_COLUMNS: tuple[str, ...] = (
     "due",
     "done",
     "source_ref",
+    "project_ref",
     "version",
     "created_at",
     "updated_at",
@@ -288,10 +320,15 @@ def create_owner_item(
     detail: str | None = None,
     due: str | None = None,
     source_ref: str | None = None,
+    project_ref: str | None = None,
     item_id: str | None = None,
     done: bool = False,
 ) -> dict:
-    """Insert one ``owner_item`` row and return it. ``title`` must be non-empty."""
+    """Insert one ``owner_item`` row and return it. ``title`` must be non-empty.
+
+    ``project_ref`` (optional) records which project the item belongs to so the
+    redaction policy can drop it in the SQL query when that project is sensitive;
+    an un-attributed item (``None``) is never redacted."""
     if not title or not str(title).strip():
         raise ValueError("owner_item.title must be non-empty")
     now = db.iso_now()
@@ -302,6 +339,7 @@ def create_owner_item(
         "due": due,
         "done": 1 if done else 0,
         "source_ref": source_ref,
+        "project_ref": project_ref,
         "version": 0,
         "created_at": now,
         "updated_at": now,
@@ -329,11 +367,16 @@ def list_owner_items(
     db_path: Path,
     *,
     done: bool | None = None,
+    exclude_projects: Iterable[str] | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict]:
     """List owner items, newest first, optionally filtered by ``done`` state,
-    paged by ``limit``/``offset``."""
+    paged by ``limit``/``offset``.
+
+    ``exclude_projects`` drops rows attributed to those projects *in the query*
+    (redaction — see :func:`_exclude_projects_clause`); un-attributed rows
+    (``project_ref IS NULL``) are kept."""
     if limit < 0:
         raise ValueError(f"limit must be non-negative, got {limit}")
     if offset < 0:
@@ -343,6 +386,10 @@ def list_owner_items(
     if done is not None:
         clauses.append("done = ?")
         params.append(1 if done else 0)
+    exclude_clause, exclude_params = _exclude_projects_clause(exclude_projects, allow_null=True)
+    if exclude_clause is not None:
+        clauses.append(exclude_clause)
+        params.extend(exclude_params)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
@@ -397,6 +444,7 @@ _DIGEST_ITEM_COLUMNS: tuple[str, ...] = (
     "body",
     "category",
     "refs_json",
+    "project_ref",
     "day",
     "position",
     "created_at",
@@ -410,6 +458,7 @@ def create_digest_item(
     body: str = "",
     category: str | None = None,
     refs: list[str] | None = None,
+    project_ref: str | None = None,
     item_id: str | None = None,
     day: str | None = None,
     position: int = 0,
@@ -434,6 +483,7 @@ def create_digest_item(
         "body": body,
         "category": category,
         "refs_json": json.dumps(refs, ensure_ascii=False),
+        "project_ref": project_ref,
         "day": day,
         "position": position,
         "created_at": now,
@@ -462,17 +512,28 @@ def delete_digest_items_for_day(db_path: Path, day: str) -> int:
             return cur.rowcount
 
 
-def list_digest_items_for_day(db_path: Path, day: str) -> list[dict]:
+def list_digest_items_for_day(
+    db_path: Path, day: str, *, exclude_projects: Iterable[str] | None = None
+) -> list[dict]:
     """Return one day's digest, in stable assembly order (``position`` asc, then
     ``created_at``/``id`` to fully break any tie). Distinct from
-    :func:`list_digest_items`, which pages the whole table newest-first."""
+    :func:`list_digest_items`, which pages the whole table newest-first.
+
+    ``exclude_projects`` drops rows attributed to those projects (redaction);
+    un-attributed rows (``project_ref IS NULL``) are kept."""
     if not day or not str(day).strip():
         raise ValueError("list_digest_items_for_day requires a non-empty day")
+    clauses = ["day = ?"]
+    params: list[Any] = [day]
+    exclude_clause, exclude_params = _exclude_projects_clause(exclude_projects, allow_null=True)
+    if exclude_clause is not None:
+        clauses.append(exclude_clause)
+        params.extend(exclude_params)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM digest_item WHERE day = ? "
+            f"SELECT * FROM digest_item WHERE {' AND '.join(clauses)} "
             "ORDER BY position ASC, created_at ASC, id ASC",
-            (day,),
+            params,
         ).fetchall()
         return [_decode_digest_row(dict(row)) for row in rows]
 
@@ -489,11 +550,16 @@ def list_digest_items(
     db_path: Path,
     *,
     category: str | None = None,
+    exclude_projects: Iterable[str] | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[dict]:
     """List digest items, newest first, optionally filtered by ``category``,
-    paged by ``limit``/``offset``."""
+    paged by ``limit``/``offset``.
+
+    ``exclude_projects`` drops rows attributed to those projects *in the query*
+    (redaction — see :func:`_exclude_projects_clause`); un-attributed rows
+    (``project_ref IS NULL``) are kept, so a page counts only visible rows."""
     if limit < 0:
         raise ValueError(f"limit must be non-negative, got {limit}")
     if offset < 0:
@@ -503,6 +569,10 @@ def list_digest_items(
     if category is not None:
         clauses.append("category = ?")
         params.append(category)
+    exclude_clause, exclude_params = _exclude_projects_clause(exclude_projects, allow_null=True)
+    if exclude_clause is not None:
+        clauses.append(exclude_clause)
+        params.extend(exclude_params)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     params.extend([limit, offset])
     with db.connect(db_path) as conn:

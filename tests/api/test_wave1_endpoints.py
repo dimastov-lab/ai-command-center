@@ -25,9 +25,9 @@ from command_center.events import (
     default_bus,
 )
 from command_center.tasks_repository import load_tasks
-from command_center.runtime.db.wave1 import get_advisor_proposal
+from command_center.runtime.db.wave1 import create_advisor_proposal, get_advisor_proposal
 from command_center.runtime.db.core import resolve_db_path
-from command_center.api.wave1_service import ROOT
+from command_center.api.wave1_service import ROOT, _db_path
 
 
 @pytest.fixture
@@ -111,9 +111,30 @@ def test_create_proposal_rejects_bad_kind(client) -> None:
 # --- proposals: privacy redaction -----------------------------------------
 
 
+def _insert_legacy_sensitive_proposal(title: str = "secret leaky") -> dict:
+    """Insert a BANK proposal straight through the repository, bypassing the
+    write-time rejection — a stand-in for a row that predates the redaction
+    fix. The read path must still drop it."""
+    return create_advisor_proposal(
+        _db_path(), kind="trend", title=title, project_ref="BANK", body="b"
+    )
+
+
+def test_sensitive_proposal_is_rejected_at_write(client) -> None:
+    # The manual POST never persists a sensitive title (MED-1c): it is rejected,
+    # so the title cannot leak through any later read.
+    r = client.post(
+        "/api/v1/proposals",
+        json={"kind": "trend", "title": "secret leaky", "project_ref": "BANK"},
+    )
+    assert r.status_code == 400, r.text
+    listed = client.get("/api/v1/proposals").json()["proposals"]
+    assert all("secret" not in (p["title"] or "") for p in listed)
+
+
 def test_sensitive_proposal_is_dropped_from_list_and_detail(client) -> None:
     visible = _create_proposal(client, project_ref="AICC", title="visible")
-    secret = _create_proposal(client, project_ref="BANK", title="secret leaky")
+    secret = _insert_legacy_sensitive_proposal()
 
     listed = client.get("/api/v1/proposals").json()["proposals"]
     ids = {p["id"] for p in listed}
@@ -167,7 +188,9 @@ def test_promote_missing_proposal_is_404(client) -> None:
 
 
 def test_promote_sensitive_proposal_is_404(client) -> None:
-    secret = _create_proposal(client, project_ref="BANK")
+    # A legacy sensitive row (inserted below the write-guard) is still
+    # unpromotable — it reads as not-found, so it can never become a task.
+    secret = _insert_legacy_sensitive_proposal()
     assert client.post(f"/api/v1/proposals/{secret['id']}/promote").status_code == 404
 
 
@@ -193,6 +216,29 @@ def test_owner_item_create_list_and_event(client, events) -> None:
     assert len(created) == 1 and created[0].item_id == item["id"]
 
 
+def test_owner_item_manual_sensitive_is_rejected(client) -> None:
+    r = client.post(
+        "/api/v1/owner-items",
+        json={"title": "secret", "project_ref": "BANK"},
+    )
+    assert r.status_code == 400, r.text
+    assert client.get("/api/v1/owner-items").json()["items"] == []
+
+
+def test_owner_item_sensitive_is_dropped_from_list_and_detail(client) -> None:
+    # A legacy owner item flagged to a sensitive project (inserted below the
+    # write-guard) is dropped on list and reads as not-found on detail.
+    from command_center.runtime.db.wave1 import create_owner_item
+
+    visible = create_owner_item(_db_path(), title="visible", project_ref="AICC")
+    secret = create_owner_item(_db_path(), title="secret", project_ref="BANK")
+
+    listed = client.get("/api/v1/owner-items").json()["items"]
+    ids = {i["id"] for i in listed}
+    assert visible["id"] in ids and secret["id"] not in ids
+    assert client.get(f"/api/v1/owner-items/{secret['id']}").status_code == 404
+
+
 # --- digest ---------------------------------------------------------------
 
 
@@ -210,3 +256,26 @@ def test_digest_create_list_and_event(client, events) -> None:
 
     ready = [e for e in events if isinstance(e, DigestReady)]
     assert len(ready) == 1 and ready[0].digest_id == item["id"]
+
+
+def test_digest_manual_sensitive_is_rejected(client) -> None:
+    r = client.post(
+        "/api/v1/digest",
+        json={"title": "secret", "project_ref": "BANK"},
+    )
+    assert r.status_code == 400, r.text
+    assert client.get("/api/v1/digest").json()["items"] == []
+
+
+def test_digest_sensitive_is_dropped_from_list_and_detail(client) -> None:
+    # A legacy digest row flagged to a sensitive project is dropped on list and
+    # reads as not-found on detail — its title never leaves the surface.
+    from command_center.runtime.db.wave1 import create_digest_item
+
+    visible = create_digest_item(_db_path(), title="visible", project_ref="AICC")
+    secret = create_digest_item(_db_path(), title="secret", project_ref="BANK")
+
+    listed = client.get("/api/v1/digest").json()["items"]
+    ids = {i["id"] for i in listed}
+    assert visible["id"] in ids and secret["id"] not in ids
+    assert client.get(f"/api/v1/digest/{secret['id']}").status_code == 404

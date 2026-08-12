@@ -173,3 +173,53 @@ def test_digest_item_list_filters_by_category(db_path: Path) -> None:
 def test_digest_item_rejects_non_string_refs(db_path: Path) -> None:
     with pytest.raises(ValueError):
         db.create_digest_item(db_path, title="t", refs=[1, 2])  # type: ignore[list-item]
+
+
+# --- redaction is applied in the SQL query (audit MED-2) ------------------
+
+
+def test_list_advisor_proposals_exclude_projects_pages_over_visible_only(db_path: Path) -> None:
+    # Interleave sensitive rows between visible ones. With redaction pushed into
+    # the WHERE clause, a limit/offset page must return a *full* page of visible
+    # rows — never one under-filled because a sensitive row fell inside it.
+    for i in range(5):
+        db.create_advisor_proposal(
+            db_path, kind="trend", title=f"v{i}", project_ref="AICC"
+        )
+        db.create_advisor_proposal(
+            db_path, kind="trend", title=f"s{i}", project_ref="BANK"
+        )
+
+    visible = db.list_advisor_proposals(db_path, exclude_projects=["BANK", "LEGAL"], limit=100)
+    assert len(visible) == 5
+    assert all(r["project_ref"] == "AICC" for r in visible)
+
+    page1 = db.list_advisor_proposals(db_path, exclude_projects=["BANK"], limit=2, offset=0)
+    page2 = db.list_advisor_proposals(db_path, exclude_projects=["BANK"], limit=2, offset=2)
+    assert len(page1) == 2 and len(page2) == 2
+    # Pages are disjoint and contain only visible rows — offset math is honest.
+    assert {r["id"] for r in page1}.isdisjoint({r["id"] for r in page2})
+    assert all(r["project_ref"] == "AICC" for r in page1 + page2)
+
+
+def test_list_owner_items_excludes_sensitive_keeps_unattributed(db_path: Path) -> None:
+    db.create_owner_item(db_path, title="bank task", project_ref="BANK")
+    db.create_owner_item(db_path, title="aicc task", project_ref="AICC")
+    db.create_owner_item(db_path, title="no project")  # project_ref IS NULL
+    rows = db.list_owner_items(db_path, exclude_projects=["BANK", "LEGAL"])
+    assert {r["title"] for r in rows} == {"aicc task", "no project"}
+
+
+def test_list_digest_items_excludes_sensitive_keeps_unattributed(db_path: Path) -> None:
+    db.create_digest_item(db_path, title="bank", project_ref="BANK")
+    db.create_digest_item(db_path, title="aicc", project_ref="AICC")
+    db.create_digest_item(db_path, title="ambient")  # project_ref IS NULL
+    rows = db.list_digest_items(db_path, exclude_projects=["BANK", "LEGAL"])
+    assert {r["title"] for r in rows} == {"aicc", "ambient"}
+
+
+def test_list_digest_items_for_day_excludes_sensitive(db_path: Path) -> None:
+    db.create_digest_item(db_path, title="bank", project_ref="BANK", day="2026-08-12", position=0)
+    db.create_digest_item(db_path, title="aicc", project_ref="AICC", day="2026-08-12", position=1)
+    rows = db.list_digest_items_for_day(db_path, "2026-08-12", exclude_projects=["BANK"])
+    assert {r["title"] for r in rows} == {"aicc"}
