@@ -675,4 +675,3 @@ def transition_proposal_atomic(
             db._proposal_event_from_spec(conn, proposal_id, event, now=now)
             updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
             return dict(updated)
-

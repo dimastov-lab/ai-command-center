@@ -562,4 +562,3 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (13, _SCHEMA_V13),
     (14, _SCHEMA_V14),
 ]
-

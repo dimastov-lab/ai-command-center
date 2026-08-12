@@ -501,4 +501,3 @@ def current_schema_version(db_path: Path) -> int:
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
-

@@ -448,4 +448,3 @@ def get_provider_attempts_for_runs(
     for row in rows:
         result[row["run_id"]].append(dict(row))
     return result
-

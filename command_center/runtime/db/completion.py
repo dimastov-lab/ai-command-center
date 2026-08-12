@@ -397,4 +397,3 @@ def list_validation_results(db_path: Path, run_id: str, *, attempt: int | None =
                 (run_id,),
             ).fetchall()
         return [dict(row) for row in rows]
-
