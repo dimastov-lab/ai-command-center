@@ -63,8 +63,17 @@ def _default_gh_hosts_path() -> Path:
     return Path.home() / ".config" / "gh" / "hosts.yml"
 
 
+# A top-level hosts.yml mapping key whose host is exactly ``github.com`` or a
+# subdomain of it. Anchored per line and per label so a look-alike host such as
+# ``evil-github.com:`` or ``github.com.evil.io:`` never matches
+# (CodeQL py/incomplete-url-substring-sanitization).
+_GH_HOSTS_KEY = re.compile(
+    r"^(?:[A-Za-z0-9-]+\.)*github\.com:", flags=re.MULTILINE
+)
+
+
 def _gh_appears_authenticated(hosts_path: Path) -> bool:
-    """Filesystem-only signal: a non-empty ``hosts.yml`` mentioning github.com.
+    """Filesystem-only signal: ``hosts.yml`` has a github.com host entry.
 
     Never proof of a valid token — only that ``gh auth login`` was completed at
     some point. A stale token still surfaces later as a per-operation error.
@@ -73,7 +82,7 @@ def _gh_appears_authenticated(hosts_path: Path) -> bool:
         content = hosts_path.read_text(encoding="utf-8")
     except OSError:
         return False
-    return "github.com" in content
+    return _GH_HOSTS_KEY.search(content) is not None
 
 
 def run_health_checks(

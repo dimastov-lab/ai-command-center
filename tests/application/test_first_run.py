@@ -98,6 +98,34 @@ class TestHealthChecks:
         network = {item.check_id: item for item in items}["network"]
         assert network.status is HealthStatus.WARNING
 
+    def test_gh_hosts_lookalike_host_does_not_count_as_authenticated(self, tmp_path):
+        # Spoof / look-alike hosts must not satisfy the anchored key match.
+        hosts = tmp_path / "hosts.yml"
+        hosts.write_text(
+            "evil-github.com:\n  user: mallory\n"
+            "github.com.evil.io:\n  user: mallory\n"
+            "notgithub.com:\n  user: mallory\n",
+            encoding="utf-8",
+        )
+        items = run_health_checks(
+            which=_which_factory(ALL_TOOLS),
+            network_probe=lambda: True,
+            gh_hosts_path=hosts,
+        )
+        gh = {item.check_id: item for item in items}["gh"]
+        assert gh.status is HealthStatus.WARNING
+
+    def test_gh_hosts_subdomain_of_github_counts(self, tmp_path):
+        hosts = tmp_path / "hosts.yml"
+        hosts.write_text("api.github.com:\n  user: octocat\n", encoding="utf-8")
+        items = run_health_checks(
+            which=_which_factory(ALL_TOOLS),
+            network_probe=lambda: True,
+            gh_hosts_path=hosts,
+        )
+        gh = {item.check_id: item for item in items}["gh"]
+        assert gh.status is HealthStatus.OK
+
 
 class TestWorkspaceValidation:
     def test_empty_input_is_rejected(self):
