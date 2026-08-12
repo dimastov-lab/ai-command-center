@@ -49,6 +49,7 @@ from command_center.ui import (
     integration_center,
     legacy_task_helpers,
     live_board,
+    master_backlog_panel,
     operator_dashboard,
     waves_panel,
     workspace_home_page,
@@ -199,6 +200,7 @@ NAV: dict[str, tuple[str, str]] = {
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
     "kanban": ("Kanban", ":material/view_kanban:"),
+    "master_backlog": ("Master Backlog", ":material/inventory:"),
     "task_deps": ("Зависимости задач", ":material/account_tree:"),
     "waves": ("Волны", ":material/waves:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
@@ -2100,6 +2102,9 @@ elif page_key == "chat":
 elif page_key == "waves":
     project_filter = project_selector.render_project_selector(tasks, key="waves_project_selector")
     waves_panel.render_waves_page(tasks, tasks_by_id, ROOT, project=project_filter)
+
+elif page_key == "master_backlog":
+    master_backlog_panel.render_master_backlog_page()
 
 elif page_key == "kanban":
     st.subheader("Kanban", anchor="kanban")
