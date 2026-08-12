@@ -17,6 +17,19 @@ from pydantic import BaseModel, Field
 from command_center.api.models import DigestItem, OwnerItem, Proposal, ProposalKind
 
 
+class TaskReorderRequest(BaseModel):
+    """POST body for setting a project's task priority order (VOYN-W2-TASKS).
+
+    ``order`` is the full list of task ids in the desired priority sequence
+    (highest priority first). The server validates it against the dependency
+    invariant before persisting, so an order that would out-rank a dependency —
+    or a set containing a cycle — is rejected with ``409`` and nothing is
+    written. ``project`` scopes the reorder to one project's namespace."""
+
+    project: str
+    order: list[str] = Field(default_factory=list)
+
+
 class ProposalCreate(BaseModel):
     """POST body for creating an advisor proposal. ``kind`` and ``project_ref``
     are required (a proposal is always classified and always belongs to a

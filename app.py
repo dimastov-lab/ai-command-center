@@ -61,6 +61,7 @@ from command_center.ui import (
     shell,
     sidebar,
     task_cards,
+    task_dependencies,
     tokens,
 )
 
@@ -198,6 +199,7 @@ NAV: dict[str, tuple[str, str]] = {
     "create": ("Создать задачу", ":material/add_task:"),
     "chat": ("Чат по проекту", ":material/forum:"),
     "kanban": ("Kanban", ":material/view_kanban:"),
+    "task_deps": ("Зависимости задач", ":material/account_tree:"),
     "waves": ("Волны", ":material/waves:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
     "execution_center": ("Live Execution Center", ":material/bolt:"),
@@ -1577,6 +1579,22 @@ if page_key == "dashboard":
 
 elif page_key == "command":
     operator_dashboard.render()
+
+
+# --------------------------------------------------------------------------
+# Task dependencies + priority order (VOYN-W2-TASKS)
+# --------------------------------------------------------------------------
+
+elif page_key == "task_deps":
+    content_area.page_header(
+        "Зависимости и приоритет",
+        "Граф зависимостей задач проекта и явный порядок приоритета. "
+        "Порядок нельзя выставить так, чтобы задача обгоняла свою зависимость.",
+    )
+    _deps_project = project_selector.render_project_selector(
+        tasks, key="task_deps_project_selector"
+    )
+    task_dependencies.render(_deps_project)
 
 
 # --------------------------------------------------------------------------

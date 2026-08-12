@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from command_center.api import models
+from command_center.api import models, schemas
 from command_center.api import wave1_schemas as w
 from command_center.digest import DigestService
 from command_center.digest import complete_owner_item as _complete_owner_item
@@ -42,6 +42,8 @@ from command_center.project_config import is_sensitive
 from command_center.runtime import db
 from command_center.runtime.db.core import current_schema_version, resolve_db_path
 from command_center.runtime.db.schema import SCHEMA_VERSION
+from command_center import task_ordering, tasks_repository
+from command_center.api import service as read_service
 from command_center.tasks_repository import create_task
 
 # Repo root is three levels up: <root>/command_center/api/wave1_service.py
@@ -220,6 +222,65 @@ def promote_proposal(proposal_id: str) -> w.PromoteResponse | None:
         raise_errors=False,
     )
     return w.PromoteResponse(proposal=_proposal_from_row(updated), task_id=task["id"])
+
+
+# --------------------------------------------------------------------------
+# Task priority order (VOYN-W2-TASKS)
+# --------------------------------------------------------------------------
+
+
+def reorder_tasks(project: str, order: list[str]) -> schemas.TaskGraph:
+    """Persist a new priority order for ``project``'s tasks, or reject it.
+
+    The invariant is enforced *inside the lock*, against the store as it is on
+    disk right now: the mutator re-validates ``order`` with
+    :func:`task_ordering.validated_order` (a task may never out-rank a
+    dependency, and a cyclic set is refused) before stamping ``priority_rank``,
+    so a concurrent edit that added a dependency cannot slip a now-illegal order
+    past a check made against a stale snapshot. A :class:`task_ordering.
+    ReorderError` propagates out unpersisted and the route maps it to ``409``.
+
+    Sensitive (BANK/LEGAL) projects are refused as "not found" — their tasks are
+    dropped from every read on this surface, so their order is not orderable
+    here. Returns the fresh graph so the client repaints from the committed
+    state rather than trusting its optimistic local order.
+    """
+    if is_sensitive(project):
+        raise TaskReorderRejected("dependency_order", "Проект недоступен.")
+
+    def _mutator(tasks: list[dict]) -> None:
+        scoped = {
+            str(t.get("id", "")): t
+            for t in tasks
+            if t.get("project") == project
+        }
+        if set(order) != set(scoped):
+            raise TaskReorderRejected(
+                task_ordering.CODE_UNKNOWN_TASK,
+                "Список задач изменился — обновите страницу и повторите.",
+            )
+        try:
+            legal = task_ordering.validated_order(order, scoped)
+        except task_ordering.ReorderError as exc:
+            raise TaskReorderRejected(exc.code, exc.message) from exc
+        for rank, task_id in enumerate(legal):
+            scoped[task_id]["priority_rank"] = rank
+
+    tasks_repository.mutate_tasks(ROOT, _mutator)
+    return read_service.task_graph(project)
+
+
+class TaskReorderRejected(Exception):
+    """Raised when a requested task order violates the dependency invariant.
+
+    Carries the ``code`` (``dependency_order`` / ``dependency_cycle`` /
+    ``unknown_task`` …) and the operator-facing ``message`` so the route can
+    return a ``409`` whose body names exactly why the reorder was refused."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 # --------------------------------------------------------------------------

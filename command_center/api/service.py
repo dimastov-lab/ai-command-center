@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from command_center import __version__, read_model
+from command_center import __version__, models, read_model, task_ordering
 from command_center.integration.collectors import collect_health
 from command_center.integration.registry import get_entry, load_entries
 from command_center.project_config import is_sensitive
@@ -179,7 +179,13 @@ def _safe_load_tasks() -> list[dict]:
     return [t for t in tasks if not is_sensitive(t.get("project") or "")]
 
 
-def _serialize_task(task: dict) -> schemas.Task:
+def _serialize_task(
+    task: dict, tasks_by_id: dict[str, dict] | None = None
+) -> schemas.Task:
+    depends_on = list(task.get("depends_on") or [])
+    unmet = (
+        models.unmet_dependencies(task, tasks_by_id) if tasks_by_id is not None else []
+    )
     return schemas.Task(
         id=str(task.get("id", "")),
         project=task.get("project", ""),
@@ -191,6 +197,9 @@ def _serialize_task(task: dict) -> schemas.Task:
         launch_status=task.get("launch_status"),
         created_at=task.get("created_at"),
         updated_at=task.get("updated_at"),
+        depends_on=depends_on,
+        blocked=bool(unmet),
+        blocked_by=list(unmet),
     )
 
 
@@ -210,22 +219,84 @@ def _task_counts(tasks: list[dict]) -> schemas.TaskCounts:
 def list_tasks(
     *, project: str | None = None, status: str | None = None
 ) -> schemas.TaskList:
-    tasks = _safe_load_tasks()
+    all_tasks = _safe_load_tasks()
+    # Blocked state is judged against the *whole* visible set, not the filtered
+    # view: a task whose dependency lives in another project is still blocked.
+    tasks_by_id = {str(t.get("id", "")): t for t in all_tasks}
+    tasks = all_tasks
     if project:
         tasks = [t for t in tasks if t.get("project") == project]
     if status:
         tasks = [t for t in tasks if (t.get("status") or "") == status]
     return schemas.TaskList(
-        tasks=[_serialize_task(t) for t in tasks],
+        tasks=[_serialize_task(t, tasks_by_id) for t in tasks],
         counts=_task_counts(tasks),
     )
 
 
 def get_task(task_id: str) -> schemas.Task | None:
-    for task in _safe_load_tasks():
+    all_tasks = _safe_load_tasks()
+    tasks_by_id = {str(t.get("id", "")): t for t in all_tasks}
+    for task in all_tasks:
         if str(task.get("id", "")) == task_id:
-            return _serialize_task(task)
+            return _serialize_task(task, tasks_by_id)
     return None
+
+
+def task_graph(project: str | None = None) -> schemas.TaskGraph:
+    """One project's tasks as a dependency-levelled graph in priority order.
+
+    The read the task-dependency UI consumes: dependency levels/state come from
+    the same ``ui.live_board.project_tree`` the board uses (so "blocked" and
+    "ready" mean exactly what they mean elsewhere), the priority order comes from
+    the persisted ``priority_rank`` healed to a legal sequence, and every
+    ``depends_on``/``blocks`` edge is surfaced so the client can draw the graph
+    without a second round trip. Sensitive projects are already dropped by
+    ``_safe_load_tasks``.
+    """
+    from command_center.ui import live_board
+
+    all_tasks = _safe_load_tasks()
+    tasks_by_id = {str(t.get("id", "")): t for t in all_tasks}
+    scoped = (
+        [t for t in all_tasks if t.get("project") == project]
+        if project
+        else all_tasks
+    )
+
+    order = task_ordering.default_order(scoped)
+    scoped_by_id = {str(t.get("id", "")): t for t in scoped}
+    ordered_tasks = [scoped_by_id[tid] for tid in order]
+
+    tree = live_board.project_tree(scoped, tasks_by_id)
+    node_by_id = {n.task_id: n for n in tree}
+    has_cycle = task_ordering.find_cycle(scoped) is not None
+
+    nodes: list[schemas.TaskGraphNode] = []
+    for rank, task in enumerate(ordered_tasks):
+        tid = str(task.get("id", ""))
+        tree_node = node_by_id.get(tid)
+        edges = models.derive_dependency_edges(task, scoped)
+        unmet = models.unmet_dependencies(task, tasks_by_id)
+        nodes.append(
+            schemas.TaskGraphNode(
+                id=tid,
+                project=task.get("project", ""),
+                title=task.get("title", ""),
+                status=task.get("status"),
+                priority=task.get("priority"),
+                level=tree_node.level if tree_node else 0,
+                state=tree_node.state if tree_node else live_board.NODE_WAITING,
+                rank=rank,
+                depends_on=list(task.get("depends_on") or []),
+                blocked=bool(unmet),
+                blocked_by=list(unmet),
+                blocks=list(edges.get("blocks") or []),
+            )
+        )
+    return schemas.TaskGraph(
+        project=project, nodes=nodes, order=order, has_cycle=has_cycle
+    )
 
 
 # --------------------------------------------------------------------------
