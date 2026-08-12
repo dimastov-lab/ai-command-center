@@ -73,3 +73,5 @@ runtime.db-wal
 .aider.chat.history.md
 .aider.input.history
 .aider.tags.cache.v4/
+data/integration_registry.json
+data/integration_registry.lock
