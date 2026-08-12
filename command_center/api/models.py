@@ -60,40 +60,92 @@ class Proposal(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Board — Motion / Vote / Decision
+# Board / Council — Motion / Vote / Decision
 # --------------------------------------------------------------------------
+
+#: What kind of voter cast a vote. ``ai`` board members vote today; ``human`` is
+#: the seam for external humans invited to the Board later (the identity wiring is
+#: out of scope, but the contract already carries the distinction).
+VoterKind = Literal["ai", "human"]
+
+#: A vote's choice. ``abstain`` counts toward quorum but toward neither side of
+#: the tally.
+VoteChoice = Literal["yes", "no", "abstain"]
+
+#: A decision's outcome. ``deferred`` is the tie outcome — quorum was met but
+#: neither side carried.
+DecisionOutcome = Literal["approved", "rejected", "deferred"]
 
 
 class Motion(BaseModel):
-    """A proposal put to the Board for a collective decision."""
+    """A proposal put to the Board (Council) for a collective decision.
+
+    ``proposed_by`` names who raised it; ``quorum`` is the number of votes
+    required before it may close and a decision be recorded. ``proposal_ref`` /
+    ``source_ref`` tie a motion back to the advisor proposal or operational
+    incident it was raised from (the event seam), so the Board assembles itself
+    from what actually happened rather than depending on every source to also
+    remember to POST."""
 
     id: str = ""
     title: str = ""
     body: str = ""
+    proposed_by: str = ""
+    quorum: int = 1
     project_ref: str | None = None
     proposal_ref: str | None = None
+    source_ref: str | None = None
     status: Literal["open", "decided", "withdrawn"] = "open"
+    opened_at: str | None = None
+    decided_at: str | None = None
     created_at: str | None = None
 
 
 class Vote(BaseModel):
-    """One board member's vote on a :class:`Motion`."""
+    """One board member's vote on a :class:`Motion`.
+
+    Every vote records the voter's ``role`` at the moment it was cast (the
+    roles-recorded invariant) and their ``voter_kind`` (ai/human), alongside the
+    ``choice`` and its ``rationale`` — the explainability of an individual vote."""
 
     id: str = ""
     motion_ref: str = ""
-    voter: str = ""
-    value: Literal["for", "against", "abstain"] = "abstain"
+    voter_id: str = ""
+    voter_kind: VoterKind = "ai"
+    role: str = ""
+    choice: VoteChoice = "abstain"
     rationale: str | None = None
     created_at: str | None = None
 
 
+class VoterRole(BaseModel):
+    """One entry in a :class:`Decision`'s frozen roll-call: who voted, in what
+    role, and how. This is the "roles of every voter" the acceptance requires the
+    decision to carry — a snapshot taken when the decision is recorded, immutable
+    thereafter."""
+
+    voter_id: str = ""
+    voter_kind: VoterKind = "ai"
+    role: str = ""
+    choice: VoteChoice = "abstain"
+
+
 class Decision(BaseModel):
-    """The resolved outcome of a :class:`Motion` once voting closes."""
+    """The resolved outcome of a :class:`Motion` once voting closes — an
+    immutable, ADR-style record.
+
+    It always carries the roll-call ``roles`` (every voter's role + choice), the
+    frozen ``tally`` (``{yes, no, abstain}`` counts), and a ``rationale`` that
+    explains *why* the motion was approved/rejected/deferred (explainability).
+    Once recorded it is source of truth and is never edited."""
 
     id: str = ""
     motion_ref: str = ""
-    outcome: Literal["approved", "rejected", "deferred"] = "deferred"
-    summary: str = ""
+    outcome: DecisionOutcome = "deferred"
+    tally: dict[str, int] = Field(default_factory=dict)
+    rationale: str = ""
+    roles: list[VoterRole] = Field(default_factory=list)
+    quorum: int = 1
     decided_at: str | None = None
 
 

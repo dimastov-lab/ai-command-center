@@ -161,6 +161,10 @@
       "memory",
       "runtime_package"
     ],
+    "command_center/runtime/db/council.py": [
+      "memory",
+      "runtime_package"
+    ],
     "command_center/runtime/db/core.py": [
       "memory",
       "runtime_package"
