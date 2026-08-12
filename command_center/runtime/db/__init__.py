@@ -148,6 +148,21 @@ from command_center.runtime.db.completion import (  # noqa: F401
     record_validation_result,
     update_completion,
 )
+from command_center.runtime.db.conflict import (  # noqa: F401
+    CONFLICT_KINDS,
+    CONFLICT_SEVERITIES,
+    CONFLICT_STATUSES,
+    CONFLICT_TRANSITIONS,
+    ConflictResolvedError,
+    InvalidConflictTransitionError,
+    _conflict_transition,
+    create_conflict,
+    get_conflict,
+    get_conflict_by_source_ref,
+    list_conflicts,
+    set_conflict_status,
+    update_conflict_fields,
+)
 from command_center.runtime.db.wave1 import (  # noqa: F401
     ADVISOR_PROPOSAL_KINDS,
     ADVISOR_PROPOSAL_STATUSES,

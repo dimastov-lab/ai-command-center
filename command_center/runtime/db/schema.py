@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -658,6 +658,47 @@ def _migration_17_add_owner_digest_project_ref(conn: sqlite3.Connection) -> None
         conn.execute("CREATE INDEX IF NOT EXISTS idx_digest_item_project ON digest_item(project_ref)")
 
 
+# Wave-2 Conflicts/Incidents engine (VOYN-W2-CONFLICT). One additive, standalone
+# table family, wholly distinct from every family above:
+#
+#   conflict -- one mutable current-state row per tracked conflict, guarded by a
+#               `version` compare-and-set column and an explicit status-transition
+#               allowlist (`conflict.CONFLICT_TRANSITIONS`, open → mitigating →
+#               resolved). `source_ref` records the opaque origin (e.g.
+#               `incident:<id>`); `owner` and `mitigation` are the two facts the
+#               *service* requires before a row may reach `resolved`. `project_ref`
+#               (nullable) is the redaction key: a BANK/LEGAL row is excluded in
+#               the SQL query so its `source_ref` never leaves the read surface.
+#
+# Statuses/kinds/severities are stored as their stable string *values* (never a
+# Python enum member name), so a column round-trips to exactly the Literal the
+# API contract (`api/models.py Conflict`) declares — the enum-name lesson carried
+# forward from the earlier migration renumbering.
+_SCHEMA_V18 = """
+CREATE TABLE IF NOT EXISTS conflict (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'sev3',
+    status TEXT NOT NULL DEFAULT 'open',
+    owner TEXT,
+    mitigation TEXT,
+    project_ref TEXT,
+    opened_at TEXT NOT NULL,
+    resolved_at TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conflict_status ON conflict(status);
+CREATE INDEX IF NOT EXISTS idx_conflict_kind ON conflict(kind);
+CREATE INDEX IF NOT EXISTS idx_conflict_owner ON conflict(owner);
+CREATE INDEX IF NOT EXISTS idx_conflict_project ON conflict(project_ref);
+CREATE INDEX IF NOT EXISTS idx_conflict_source_ref ON conflict(source_ref);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -684,4 +725,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (15, _SCHEMA_V15),
     (16, _migration_16_add_digest_day_and_position),
     (17, _migration_17_add_owner_digest_project_ref),
+    (18, _SCHEMA_V18),
 ]
