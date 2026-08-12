@@ -37,6 +37,7 @@ from command_center.events import (
     ProposalPromotedToTask,
     default_bus,
 )
+from command_center.models import SENSITIVE_PROJECT_IDS
 from command_center.project_config import is_sensitive
 from command_center.runtime import db
 from command_center.runtime.db.core import current_schema_version, resolve_db_path
@@ -51,6 +52,21 @@ class ProposalNotPromotableError(Exception):
     """Raised when a promote is requested on a proposal that is already in a
     terminal status (``converted``/``dismissed``). Surfaced as HTTP 409 so a
     double-submit never creates a second task."""
+
+
+class SensitiveProjectRefError(Exception):
+    """Raised when a manual write (``POST /proposals`` / ``POST /digest``) names
+    a BANK/LEGAL project. A sensitive row is redacted on every read anyway, so
+    the write is *rejected* (HTTP 400) rather than persisted — its title never
+    lands in the store in the first place. The advisor engine never trips this:
+    it drops sensitive candidates before it ever calls this service."""
+
+
+def _sensitive_projects() -> list[str]:
+    """The redaction exclusion list handed to the repository, in a stable order.
+    Same policy :func:`is_sensitive` enforces per-row, expressed as a set so it
+    can be applied inside the SQL query."""
+    return sorted(SENSITIVE_PROJECT_IDS)
 
 
 def _db_path() -> Path:
@@ -114,6 +130,10 @@ def _digest_from_row(row: dict) -> models.DigestItem:
 
 
 def create_proposal(payload: w.ProposalCreate) -> models.Proposal:
+    if is_sensitive(payload.project_ref):
+        raise SensitiveProjectRefError(
+            f"proposal for sensitive project {payload.project_ref!r} is rejected"
+        )
     row = db.create_advisor_proposal(
         _db_path(),
         kind=payload.kind,
@@ -141,12 +161,15 @@ def list_proposals(
         project=project,
         statuses=[status] if status else None,
         kind=kind,
+        exclude_projects=_sensitive_projects(),
         limit=limit,
         offset=offset,
     )
-    visible = [r for r in rows if not is_sensitive(r["project_ref"])]
+    # Redaction happens in the SQL query (``exclude_projects``), so ``limit``/
+    # ``offset`` page over visible rows only — no post-filter that would
+    # under-return a page when a sensitive row falls inside it (audit MED-2).
     return w.ProposalList(
-        proposals=[_proposal_from_row(r) for r in visible],
+        proposals=[_proposal_from_row(r) for r in rows],
         limit=limit,
         offset=offset,
     )
@@ -205,12 +228,17 @@ def promote_proposal(proposal_id: str) -> w.PromoteResponse | None:
 
 
 def create_owner_item(payload: w.OwnerItemCreate) -> models.OwnerItem:
+    if payload.project_ref and is_sensitive(payload.project_ref):
+        raise SensitiveProjectRefError(
+            f"owner item for sensitive project {payload.project_ref!r} is rejected"
+        )
     row = db.create_owner_item(
         _db_path(),
         title=payload.title,
         detail=payload.detail,
         due=payload.due,
         source_ref=payload.source_ref,
+        project_ref=payload.project_ref,
         done=payload.done,
     )
     default_bus().publish(
@@ -223,7 +251,10 @@ def create_owner_item(payload: w.OwnerItemCreate) -> models.OwnerItem:
 def list_owner_items(
     *, done: bool | None = None, limit: int = 100, offset: int = 0
 ) -> w.OwnerItemList:
-    rows = db.list_owner_items(_db_path(), done=done, limit=limit, offset=offset)
+    rows = db.list_owner_items(
+        _db_path(), done=done, exclude_projects=_sensitive_projects(),
+        limit=limit, offset=offset,
+    )
     return w.OwnerItemList(
         items=[_owner_item_from_row(r) for r in rows], limit=limit, offset=offset
     )
@@ -231,7 +262,11 @@ def list_owner_items(
 
 def get_owner_item(item_id: str) -> models.OwnerItem | None:
     row = db.get_owner_item(_db_path(), item_id)
-    return _owner_item_from_row(row) if row is not None else None
+    if row is None or is_sensitive(row.get("project_ref") or ""):
+        # A sensitive owner item reads as absent — the same drop-don't-mask
+        # policy proposals use; its title never leaves this surface.
+        return None
+    return _owner_item_from_row(row)
 
 
 # --------------------------------------------------------------------------
@@ -240,12 +275,17 @@ def get_owner_item(item_id: str) -> models.OwnerItem | None:
 
 
 def create_digest_item(payload: w.DigestItemCreate) -> models.DigestItem:
+    if payload.project_ref and is_sensitive(payload.project_ref):
+        raise SensitiveProjectRefError(
+            f"digest entry for sensitive project {payload.project_ref!r} is rejected"
+        )
     row = db.create_digest_item(
         _db_path(),
         title=payload.title,
         body=payload.body,
         category=payload.category,
         refs=payload.refs,
+        project_ref=payload.project_ref,
     )
     default_bus().publish(
         DigestReady(digest_id=row["id"], category=row.get("category")),
@@ -257,7 +297,10 @@ def create_digest_item(payload: w.DigestItemCreate) -> models.DigestItem:
 def list_digest_items(
     *, category: str | None = None, limit: int = 100, offset: int = 0
 ) -> w.DigestItemList:
-    rows = db.list_digest_items(_db_path(), category=category, limit=limit, offset=offset)
+    rows = db.list_digest_items(
+        _db_path(), category=category, exclude_projects=_sensitive_projects(),
+        limit=limit, offset=offset,
+    )
     return w.DigestItemList(
         items=[_digest_from_row(r) for r in rows], limit=limit, offset=offset
     )
@@ -265,7 +308,9 @@ def list_digest_items(
 
 def get_digest_item(item_id: str) -> models.DigestItem | None:
     row = db.get_digest_item(_db_path(), item_id)
-    return _digest_from_row(row) if row is not None else None
+    if row is None or is_sensitive(row.get("project_ref") or ""):
+        return None
+    return _digest_from_row(row)
 
 
 # --------------------------------------------------------------------------

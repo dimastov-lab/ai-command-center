@@ -53,7 +53,10 @@ def get_proposal(proposal_id: str) -> models.Proposal:
 
 @router.post("/proposals", response_model=models.Proposal, status_code=201)
 def create_proposal(payload: w.ProposalCreate) -> models.Proposal:
-    return service.create_proposal(payload)
+    try:
+        return service.create_proposal(payload)
+    except service.SensitiveProjectRefError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/proposals/{proposal_id}/promote", response_model=w.PromoteResponse)
@@ -126,7 +129,10 @@ def get_owner_item(item_id: str) -> models.OwnerItem:
 
 @router.post("/owner-items", response_model=models.OwnerItem, status_code=201)
 def create_owner_item(payload: w.OwnerItemCreate) -> models.OwnerItem:
-    return service.create_owner_item(payload)
+    try:
+        return service.create_owner_item(payload)
+    except service.SensitiveProjectRefError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/owner-items/{item_id}/complete", response_model=models.OwnerItem)
@@ -175,4 +181,7 @@ def get_digest_item(item_id: str) -> models.DigestItem:
 
 @router.post("/digest", response_model=models.DigestItem, status_code=201)
 def create_digest_item(payload: w.DigestItemCreate) -> models.DigestItem:
-    return service.create_digest_item(payload)
+    try:
+        return service.create_digest_item(payload)
+    except service.SensitiveProjectRefError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

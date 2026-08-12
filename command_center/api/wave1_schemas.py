@@ -31,22 +31,27 @@ class ProposalCreate(BaseModel):
 
 
 class OwnerItemCreate(BaseModel):
-    """POST body for creating a «Мой день» item."""
+    """POST body for creating a «Мой день» item. ``project_ref`` is optional —
+    when it names a BANK/LEGAL project the write is rejected (redaction), and
+    when set it lets the read path drop the row if that project is sensitive."""
 
     title: str
     detail: str | None = None
     due: str | None = None
     source_ref: str | None = None
+    project_ref: str | None = None
     done: bool = False
 
 
 class DigestItemCreate(BaseModel):
-    """POST body for creating a Дайджест entry."""
+    """POST body for creating a Дайджест entry. ``project_ref`` is optional —
+    when it names a BANK/LEGAL project the write is rejected (redaction)."""
 
     title: str
     body: str = ""
     category: str | None = None
     refs: list[str] = Field(default_factory=list)
+    project_ref: str | None = None
 
 
 class ProposalList(BaseModel):
