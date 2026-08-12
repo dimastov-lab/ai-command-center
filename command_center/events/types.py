@@ -128,6 +128,33 @@ class ModelAssigned(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class NetworkingFeedbackReceived(Event):
+    """Inbound networking feedback was captured and turned into a board task
+    (VOYN-W3-NET). ``task_id`` is the id returned by the existing tasks path;
+    ``message_id`` is the captured intake message. This is also the ``feedback``
+    signal the advisor can consume (reusing its collector concept) without this
+    layer touching advisor internals — a subscriber re-reads the entity by id."""
+
+    message_id: str = ""
+    task_id: str = ""
+    contact_id: str = ""
+    project_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkingContactInvited(Event):
+    """A networking contact was invited to the Council (VOYN-W3-NET). ``council_ref``
+    is the stable seam the Council engine consumes to resolve the invitation; this
+    event carries only routing facts, no external identity. The Council engine
+    subscribes here (or reads the invitation by id) — no auth is wired yet."""
+
+    invitation_id: str = ""
+    contact_id: str = ""
+    council_ref: str = ""
+    project_ref: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class IncidentOpened(Event):
     """An operational incident was opened. Part of the typed event vocabulary
     the Wave-1 services publish/consume; the Incident entity itself is persisted

@@ -30,6 +30,8 @@ from command_center.events.types import (
     ModelAssigned,
     ModelRegistered,
     ModelStatusChanged,
+    NetworkingContactInvited,
+    NetworkingFeedbackReceived,
     OwnerItemCreated,
     ProposalCreated,
     ProposalPromotedToTask,
@@ -52,4 +54,6 @@ __all__ = [
     "ModelRegistered",
     "ModelStatusChanged",
     "ModelAssigned",
+    "NetworkingFeedbackReceived",
+    "NetworkingContactInvited",
 ]
