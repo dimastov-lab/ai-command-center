@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -828,6 +828,71 @@ CREATE INDEX IF NOT EXISTS idx_model_event_model_id ON model_event(model_id);
 """
 
 
+# Wave-3 Marketplace baseline (VOYN-W3-MARKET): the catalogue of installable
+# modules/add-ons and its append-only install trail. Two additive tables,
+# wholly separate from every family above; the names never collide.
+#
+# Pre-assigned v21 (the sibling Wave-3 model-registry family took v20, the
+# council family v22, the networking family v23) so the parallel Wave-3 branches
+# integrate without renumbering each other; v20 and v21 now sit contiguously.
+#
+#   market_item        -- one mutable current-state row per listing, guarded by
+#                         a `lock_version` compare-and-set column and an explicit
+#                         status allowlist (`marketplace.MARKET_ITEM_TRANSITIONS`,
+#                         listed → installed; installed is terminal). The
+#                         package `version`, `publisher` and `provenance`
+#                         (where the listing came from) are plain descriptive
+#                         columns carried verbatim onto every install-log line.
+#   market_install_log -- append-only audit trail: one immutable row per install,
+#                         recording *who* (`actor`), *when* (`installed_at`) and
+#                         *what version* (`version`) of *which* listing was
+#                         installed, plus the `installer` implementation that did
+#                         it. This is the acceptance artefact of the install path
+#                         — a real, queryable record, never a placeholder.
+#
+# The CAS column is named `lock_version` (not `version`) precisely because
+# `version` is already the listing's semver-ish package string on this family —
+# the two must not share a column. Kinds/statuses are stored as their stable
+# string *values* (never a Python enum member name) so a column round-trips to
+# exactly the Literal the API contract (`api/models.py`) declares — the
+# enum-name lesson carried forward from the earlier migration renumbering.
+_SCHEMA_V21 = """
+CREATE TABLE IF NOT EXISTS market_item (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    publisher TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'listed',
+    provenance TEXT NOT NULL DEFAULT '',
+    lock_version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_item_kind ON market_item(kind);
+CREATE INDEX IF NOT EXISTS idx_market_item_status ON market_item(status);
+CREATE INDEX IF NOT EXISTS idx_market_item_publisher ON market_item(publisher);
+
+CREATE TABLE IF NOT EXISTS market_install_log (
+    id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES market_item(id) ON DELETE CASCADE,
+    actor TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    provenance TEXT NOT NULL DEFAULT '',
+    installer TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    installed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_install_log_item ON market_install_log(item_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -857,4 +922,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (18, _SCHEMA_V18),
     (19, _SCHEMA_V19),
     (20, _SCHEMA_V20),
+    (21, _SCHEMA_V21),
 ]

@@ -270,6 +270,62 @@ class ModelEvent(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Marketplace — MarketItem / MarketInstallLogEntry
+# --------------------------------------------------------------------------
+
+#: What a listing *is*. A closed set — a new kind is a schema decision.
+MarketItemKind = Literal["module", "domain_pack", "plugin"]
+
+#: A listing's lifecycle position. ``listed → installed`` is the only edge;
+#: this baseline wave has no un-install.
+MarketItemStatus = Literal["listed", "installed"]
+
+
+class MarketItem(BaseModel):
+    """One catalogue listing an operator can browse and, once, install.
+
+    ``provenance`` records where the listing came from (a publisher channel, a
+    signature reference, a source URL — free-form for this wave); it is carried
+    verbatim onto every install-log line so the trail attributes *what* was
+    installed to *where it came from*. ``status`` starts at ``listed`` and moves
+    to ``installed`` exactly once (the transition is enforced in the service and
+    the repository, never fabricated here).
+    """
+
+    id: str = ""
+    name: str = ""
+    kind: MarketItemKind = "module"
+    version: str = ""
+    publisher: str = ""
+    description: str = ""
+    status: MarketItemStatus = "listed"
+    provenance: str = ""
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class MarketInstallLogEntry(BaseModel):
+    """One append-only install-audit line: *who* installed *what version* of
+    *which* listing, *when*, and by which ``installer`` implementation.
+
+    This is the acceptance artefact of the install path — a real, queryable
+    record, not a placeholder. ``metadata`` carries any structured detail the
+    installer chose to attach (kept as plain strings for this wave).
+    """
+
+    id: str = ""
+    item_id: str = ""
+    actor: str = ""
+    version: str = ""
+    kind: MarketItemKind = "module"
+    provenance: str = ""
+    installer: str = ""
+    detail: str = ""
+    metadata: dict[str, str] = Field(default_factory=dict)
+    installed_at: str | None = None
+
+
+# --------------------------------------------------------------------------
 # «Мой день» — OwnerItem / DigestItem
 # --------------------------------------------------------------------------
 

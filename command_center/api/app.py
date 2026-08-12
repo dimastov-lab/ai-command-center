@@ -30,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from command_center.api import (
     audit_routes,
     conflict_routes,
+    marketplace_routes,
     model_registry_routes,
     schemas,
     service,
@@ -110,6 +111,7 @@ def create_app() -> FastAPI:
     app.include_router(wave1_routes.router)
     app.include_router(conflict_routes.router)
     app.include_router(audit_routes.router)
+    app.include_router(marketplace_routes.router)
     app.include_router(model_registry_routes.router)
     return app
 
