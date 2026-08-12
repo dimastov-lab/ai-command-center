@@ -25,10 +25,14 @@ SCOPED_PATHS = (
     "command_center/ui/integration_center.py",
     "command_center/api",
     "command_center/design",
+    "command_center/digest",
     "docs/INTEGRATION_CENTER.md",
     "tests/test_integration_registry.py",
     "tests/test_integration_collectors.py",
     "tests/test_integration_center_ui.py",
+    "tests/test_digest_service.py",
+    "tests/test_owner_autofill.py",
+    "tests/api/test_digest_ownerday_endpoints.py",
     "tests/architecture/test_integration_privacy_fitness.py",
 )
 

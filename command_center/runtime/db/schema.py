@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -604,6 +604,31 @@ CREATE INDEX IF NOT EXISTS idx_digest_item_created ON digest_item(created_at);
 """
 
 
+def _migration_16_add_digest_day_and_position(conn: sqlite3.Connection) -> None:
+    """Give ``digest_item`` an explicit build ``day`` and intra-build
+    ``position`` so the morning-digest engine (``command_center/digest``) can
+    build one deterministic, ordered rollup per calendar day and *rebuild* it
+    idempotently (delete the day, re-insert) without duplicating rows or leaning
+    on second-precision ``created_at`` (which ties within a build) for order.
+
+    ``day`` is the ``YYYY-MM-DD`` the entry belongs to; ``position`` is its rank
+    inside that day's digest (0-based, assembly order). Both are additive and
+    optional: a row written through the pre-existing ad-hoc ``POST /digest``
+    path keeps ``day = NULL`` / ``position = 0`` and is unaffected. Rows that
+    predate this migration read the same way.
+
+    Same idempotent check-then-``ALTER TABLE ADD COLUMN`` shape as the earlier
+    callable migrations, wrapped in one ``BEGIN IMMEDIATE`` transaction — safe to
+    re-run and safe under genuine concurrent first-application."""
+    with db.transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(digest_item)").fetchall()}
+        if "day" not in existing:
+            conn.execute("ALTER TABLE digest_item ADD COLUMN day TEXT")
+        if "position" not in existing:
+            conn.execute("ALTER TABLE digest_item ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_digest_item_day ON digest_item(day)")
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -628,4 +653,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (13, _SCHEMA_V13),
     (14, _SCHEMA_V14),
     (15, _SCHEMA_V15),
+    (16, _migration_16_add_digest_day_and_position),
 ]
