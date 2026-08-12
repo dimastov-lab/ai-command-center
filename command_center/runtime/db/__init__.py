@@ -206,6 +206,17 @@ from command_center.runtime.db.audit import (  # noqa: F401
     set_audit_finding_status,
     set_audit_run_status,
 )
+from command_center.runtime.db.marketplace import (  # noqa: F401
+    MARKET_ITEM_KINDS,
+    MARKET_ITEM_STATUSES,
+    MARKET_ITEM_TRANSITIONS,
+    InvalidMarketItemTransitionError,
+    create_market_item,
+    get_market_item,
+    install_market_item,
+    list_install_log,
+    list_market_items,
+)
 from command_center.runtime.db.model_registry import (  # noqa: F401
     MODEL_ACTIONS,
     MODEL_KINDS,

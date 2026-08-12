@@ -80,15 +80,19 @@ def test_upgrade_from_every_supported_historical_schema(
     path = tmp_path / f"runtime-v{historical_version}.db"
     current_migrations = list(db.MIGRATIONS)
     current_version = db.SCHEMA_VERSION
+    historical_migrations = [
+        migration for migration in current_migrations if migration[0] <= historical_version
+    ]
+    # Version numbers may be *reserved* with a gap (a sibling wave pre-assigns a
+    # number that lands only on merge — e.g. v20 is reserved while v21 ships), so
+    # the recorded schema version at a historical point is the highest migration
+    # actually present up to that point, not the parametrised number itself.
+    expected_recorded = max((m[0] for m in historical_migrations), default=0)
     with monkeypatch.context() as historical:
-        historical.setattr(
-            db,
-            "MIGRATIONS",
-            [migration for migration in current_migrations if migration[0] <= historical_version],
-        )
+        historical.setattr(db, "MIGRATIONS", historical_migrations)
         historical.setattr(db, "SCHEMA_VERSION", historical_version)
         db.migrate(path)
-        assert db.current_schema_version(path) == historical_version
+        assert db.current_schema_version(path) == expected_recorded
 
     # Pinned to the module constant, not a literal: hard-coding the number here
     # made this test fail on every schema addition for a reason unrelated to

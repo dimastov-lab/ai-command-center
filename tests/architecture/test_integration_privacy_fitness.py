@@ -30,6 +30,7 @@ SCOPED_PATHS = (
     "command_center/conflicts",
     "command_center/audit",
     "command_center/dispatch",
+    "command_center/marketplace",
     "command_center/task_ordering.py",
     "command_center/ui/task_dependencies.py",
     "command_center/events",
