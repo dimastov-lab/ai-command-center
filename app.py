@@ -49,6 +49,7 @@ from command_center.ui import (
     integration_center,
     legacy_task_helpers,
     live_board,
+    operator_dashboard,
     waves_panel,
     workspace_home_page,
     content_area,
@@ -184,6 +185,7 @@ IGNORED_FILE_NAMES = {".DS_Store", ".gitkeep"}
 
 NAV: dict[str, tuple[str, str]] = {
     "dashboard": ("Обзор", ":material/dashboard:"),
+    "command": ("Командный центр", ":material/space_dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
     "compliance": ("Compliance Dashboard", ":material/security:"),
@@ -1567,6 +1569,14 @@ if page_key == "dashboard":
         render_workspace_home_page(dashboard_api, tasks, tasks_by_id)
     else:
         render_home_dashboard(dashboard_api, tasks, task_counts)
+
+
+# --------------------------------------------------------------------------
+# Command Center — the tokens-styled dashboard over the /api/v1 surface
+# --------------------------------------------------------------------------
+
+elif page_key == "command":
+    operator_dashboard.render()
 
 
 # --------------------------------------------------------------------------
