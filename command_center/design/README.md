@@ -23,9 +23,10 @@ keeps the two themes and the two platforms in step: change a hue once in
 
 ## Token groups
 
-- **color** (theme-aware): `bg`, `surface`, `raise`, `hairline`, `text`,
+- **color** (theme-aware): `bg`, `surface`, `raise`, `hairline`, `line`, `text`,
   `text-2`, `text-3`, `accent`, `accent-2`, `ok`, `warn`, `crit`, `violet`,
-  `cyan`.
+  `cyan`. `hairline` is a translucent divider; `line` is the solid border the Qt
+  shell and the Streamlit board draw with.
 - **shadow** (theme-aware): `sh`, `sh-hi` — depth tiers, used instead of borders.
 - **typography**: `--font-sans`, `--font-mono`; sizes `--fs-*`; weights `--fw-*`;
   tracking `--tracking-*`.
