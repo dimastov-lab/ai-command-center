@@ -19,7 +19,7 @@ Endpoints consumed:
 
 * ``GET  /api/v1/dashboard``          -> :class:`schemas.DashboardResponse`
 * ``GET  /api/v1/advisor/proposals``  -> :class:`wave1_schemas.ProposalList`
-* ``GET  /api/v1/digest``             -> :class:`wave1_schemas.DigestItemList`
+* ``GET  /api/v1/digest/today``       -> :class:`wave1_schemas.DigestItemList`
 * ``GET  /api/v1/owner-items``        -> :class:`wave1_schemas.OwnerItemList`
 * ``POST /api/v1/proposals/{id}/promote`` -> :class:`wave1_schemas.PromoteResponse`
 """
@@ -86,9 +86,14 @@ class InProcessDashboardClient:
         return write_service.list_proposals(limit=_DASHBOARD_PAGE, offset=0)
 
     def digest(self) -> w.DigestItemList:
+        # Day-scoped: today's already-built digest in assembly order (backs
+        # ``GET /api/v1/digest/today``), not the whole unbounded digest table.
+        # The dashboard shows *today's* ordered feed; reading the full table
+        # surfaced stale entries and risked double-notifying on already-seen
+        # items (Wave-1 audit LOW-2).
         from command_center.api import wave1_service as write_service
 
-        return write_service.list_digest_items(limit=_DASHBOARD_PAGE, offset=0)
+        return write_service.list_digest_today()
 
     def owner_items(self) -> w.OwnerItemList:
         from command_center.api import wave1_service as write_service
