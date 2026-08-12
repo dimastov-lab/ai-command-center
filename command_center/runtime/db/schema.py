@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -699,6 +699,72 @@ CREATE INDEX IF NOT EXISTS idx_conflict_source_ref ON conflict(source_ref);
 """
 
 
+# Wave 2 "new engine" persistence (VOYN-W2-AUD): the Audit engine's two
+# table-families, standalone and additive, backing the automated-audit surface
+# (`command_center/audit` checks → `api/audit_service.py` → this repository).
+# Renumbered to v19 on integration: the sibling Wave-2 Conflicts engine landed
+# first and took v18, so this family moves to v19 — its content is unchanged and
+# version-agnostic, and the two families never collide.
+#
+#   audit_run     -- one mutable current-state row per audit pass over a project,
+#                    guarded by a `version` compare-and-set column and an explicit
+#                    status-transition allowlist (`audit.AUDIT_RUN_TRANSITIONS`).
+#                    `project_ref` is NOT NULL — a run always targets one project
+#                    so a sensitive (BANK/LEGAL) run is redacted in the SQL query.
+#   audit_finding -- one row per finding. `status` (open/ack/fixed) and `owner`
+#                    are BOTH NOT NULL: every finding always carries the two
+#                    triage axes, enforced at the persistence boundary so a
+#                    finding with no owner can never reach a stored row (the
+#                    acceptance invariant). `project_ref` mirrors the run's so
+#                    redaction pages over visible findings directly.
+#                    `promoted_task_id` only *records* a task the caller created
+#                    through `tasks_repository` — this layer executes nothing.
+#
+# Statuses/severities/categories are stored as their stable string *values*
+# (never a Python enum's member name), so a column round-trips to exactly the
+# Literal the API contract (`api/models.py`) declares — the enum-name lesson
+# carried forward from the earlier migration renumbering.
+_SCHEMA_V19 = """
+CREATE TABLE IF NOT EXISTS audit_run (
+    id TEXT PRIMARY KEY,
+    project_ref TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    checks_json TEXT NOT NULL DEFAULT '[]',
+    finding_count INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_run_project ON audit_run(project_ref);
+CREATE INDEX IF NOT EXISTS idx_audit_run_status ON audit_run(status);
+
+CREATE TABLE IF NOT EXISTS audit_finding (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES audit_run(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'info',
+    summary TEXT NOT NULL DEFAULT '',
+    file_path TEXT,
+    loc TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    owner TEXT NOT NULL,
+    project_ref TEXT,
+    promoted_task_id TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_finding_run ON audit_finding(run_id);
+CREATE INDEX IF NOT EXISTS idx_audit_finding_status ON audit_finding(status);
+CREATE INDEX IF NOT EXISTS idx_audit_finding_owner ON audit_finding(owner);
+CREATE INDEX IF NOT EXISTS idx_audit_finding_project ON audit_finding(project_ref);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -726,4 +792,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (16, _migration_16_add_digest_day_and_position),
     (17, _migration_17_add_owner_digest_project_ref),
     (18, _SCHEMA_V18),
+    (19, _SCHEMA_V19),
 ]

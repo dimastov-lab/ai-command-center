@@ -18,6 +18,52 @@
     "command_center/aml_store.py": [
       "memory"
     ],
+    "command_center/api/audit_routes.py": [
+      "audit"
+    ],
+    "command_center/api/audit_schemas.py": [
+      "audit"
+    ],
+    "command_center/api/audit_service.py": [
+      "audit"
+    ],
+    "command_center/audit/__init__.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/__init__.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/_ruff.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/base.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/code_quality.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/coverage.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/deps.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/lint.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/security.py": [
+      "audit"
+    ],
+    "command_center/audit/registry.py": [
+      "audit"
+    ],
+    "command_center/audit/runner.py": [
+      "audit",
+      "orchestration"
+    ],
+    "command_center/audit/types.py": [
+      "audit"
+    ],
     "command_center/case_store.py": [
       "memory"
     ],
@@ -81,6 +127,11 @@
       "runtime_package"
     ],
     "command_center/runtime/db/__init__.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/audit.py": [
+      "audit",
       "memory",
       "runtime_package"
     ],
