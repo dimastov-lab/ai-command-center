@@ -21,6 +21,9 @@ from command_center.events.bus import (
     default_bus,
 )
 from command_center.events.types import (
+    AuditFindingCreated,
+    AuditFindingPromotedToTask,
+    AuditRunCompleted,
     DigestReady,
     Event,
     IncidentOpened,
@@ -40,4 +43,7 @@ __all__ = [
     "OwnerItemCreated",
     "DigestReady",
     "IncidentOpened",
+    "AuditRunCompleted",
+    "AuditFindingCreated",
+    "AuditFindingPromotedToTask",
 ]

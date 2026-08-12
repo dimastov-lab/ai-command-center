@@ -185,6 +185,27 @@ from command_center.runtime.db.wave1 import (  # noqa: F401
     set_advisor_proposal_status,
     set_owner_item_done,
 )
+from command_center.runtime.db.audit import (  # noqa: F401
+    AUDIT_CATEGORIES,
+    AUDIT_FINDING_STATUSES,
+    AUDIT_FINDING_TRANSITIONS,
+    AUDIT_RUN_STATUSES,
+    AUDIT_RUN_TRANSITIONS,
+    AUDIT_SEVERITIES,
+    InvalidAuditFindingTransitionError,
+    InvalidAuditRunTransitionError,
+    _audit_finding_transition,
+    _decode_run_row,
+    create_audit_finding,
+    create_audit_run,
+    get_audit_finding,
+    get_audit_run,
+    list_audit_findings,
+    list_audit_runs,
+    promote_audit_finding,
+    set_audit_finding_status,
+    set_audit_run_status,
+)
 from command_center.runtime.db.proposal import (  # noqa: F401
     _PROPOSAL_AUTHORITY_FIELDS,
     _PROPOSAL_DECISION_FIELDS,

@@ -101,28 +101,60 @@ class Decision(BaseModel):
 # Audit — AuditRun / AuditFinding
 # --------------------------------------------------------------------------
 
+#: The check families an audit run selects from. Each is a pluggable collector
+#: behind the audit ``CheckRegistry`` — mirrors ``command_center.audit`` and the
+#: ``audit_finding.category`` column.
+AuditCategory = Literal["security", "coverage", "code-quality", "deps", "lint"]
+
+#: A finding's severity, ordered least→most urgent.
+AuditSeverity = Literal["info", "low", "medium", "high", "critical"]
+
+#: A finding's triage lifecycle. ``open`` is the initial state every finding is
+#: written in; ``ack`` (acknowledged) and ``fixed`` are the operator-driven moves.
+AuditFindingStatus = Literal["open", "ack", "fixed"]
+
+#: An audit run's execution lifecycle.
+AuditRunStatus = Literal["queued", "running", "completed", "failed"]
+
 
 class AuditRun(BaseModel):
-    """One execution of an automated audit over a scope."""
+    """One execution of an automated audit over a project.
 
-    id: str = ""
-    scope: str = ""
-    status: Literal["queued", "running", "completed", "failed"] = "queued"
+    ``checks`` records which check families ran on this pass; ``finding_count``
+    is the number of findings persisted. ``project_ref`` ties the run to a
+    ``models.PROJECT_IDS`` namespace so it can be redacted when that project is
+    sensitive. Routed entity: ``id`` is required — a response never carries an
+    empty id."""
+
+    id: str
+    project_ref: str
+    status: AuditRunStatus = "queued"
+    checks: list[str] = Field(default_factory=list)
+    finding_count: int = 0
     started_at: str | None = None
     completed_at: str | None = None
-    finding_count: int = 0
+    created_at: str | None = None
 
 
 class AuditFinding(BaseModel):
-    """A single finding produced by an :class:`AuditRun`."""
+    """A single finding produced by an :class:`AuditRun`.
 
-    id: str = ""
-    audit_run_ref: str = ""
-    severity: Literal["info", "low", "medium", "high", "critical"] = "info"
-    title: str = ""
-    detail: str = ""
+    Every finding *always* carries a ``status`` and an ``owner`` — the write
+    path refuses a finding with no owner, so the two triage axes can never be
+    missing on the surface (VOYN-W2-AUD acceptance). ``file_path``/``loc``
+    locate the finding in the tree; ``category`` says which check produced it."""
+
+    id: str
+    run_id: str
+    category: AuditCategory
+    severity: AuditSeverity = "info"
+    summary: str = ""
+    file_path: str | None = None
+    loc: str | None = None
+    status: AuditFindingStatus = "open"
+    owner: str
     project_ref: str | None = None
-    resolved: bool = False
+    created_at: str | None = None
 
 
 # --------------------------------------------------------------------------
