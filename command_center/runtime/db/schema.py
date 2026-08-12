@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -538,6 +538,72 @@ CREATE INDEX IF NOT EXISTS idx_provider_attempt_run_id
 """
 
 
+# Wave 1 "new engine" persistence (W1-DATA-EVENTS). Three additive, standalone
+# table families that back the Wave-1 product surfaces and are wholly distinct
+# from the autonomy `proposal` family above:
+#
+#   advisor_proposal -- Советник (the advisor inbox). One mutable current-state
+#                       row per suggestion, guarded by a `version` compare-and-
+#                       set column and an explicit status-transition allowlist
+#                       (`wave1.ADVISOR_PROPOSAL_TRANSITIONS`). `promoted_task_id`
+#                       only ever *records* a task the caller created through the
+#                       existing tasks path — this layer executes nothing itself.
+#   owner_item       -- «Мой день» (the owner's action list). `done` is 0/1.
+#   digest_item      -- Дайджест (a periodic rollup entry). `refs_json` is a
+#                       JSON array of opaque string references; the row is
+#                       write-once (no update path).
+#
+# Statuses/kinds are stored as their stable string *values* (never a Python
+# enum's member name), so a column round-trips to exactly the Literal the API
+# contract (`api/models.py`) declares — the enum-name lesson from the earlier
+# migration renumbering.
+_SCHEMA_V15 = """
+CREATE TABLE IF NOT EXISTS advisor_proposal (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    expected_gain TEXT,
+    effort TEXT,
+    project_ref TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new',
+    promoted_task_id TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_advisor_proposal_status ON advisor_proposal(status);
+CREATE INDEX IF NOT EXISTS idx_advisor_proposal_project ON advisor_proposal(project_ref);
+
+CREATE TABLE IF NOT EXISTS owner_item (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    detail TEXT,
+    due TEXT,
+    done INTEGER NOT NULL DEFAULT 0,
+    source_ref TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_owner_item_done ON owner_item(done);
+
+CREATE TABLE IF NOT EXISTS digest_item (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    category TEXT,
+    refs_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_digest_item_category ON digest_item(category);
+CREATE INDEX IF NOT EXISTS idx_digest_item_created ON digest_item(created_at);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -561,4 +627,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (12, _migration_12_add_executor_capability_fields),
     (13, _SCHEMA_V13),
     (14, _SCHEMA_V14),
+    (15, _SCHEMA_V15),
 ]

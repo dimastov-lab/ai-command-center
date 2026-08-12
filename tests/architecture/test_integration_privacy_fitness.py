@@ -23,6 +23,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCOPED_PATHS = (
     "command_center/integration",
     "command_center/ui/integration_center.py",
+    "command_center/api",
+    "command_center/design",
     "docs/INTEGRATION_CENTER.md",
     "tests/test_integration_registry.py",
     "tests/test_integration_collectors.py",

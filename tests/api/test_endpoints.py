@@ -7,6 +7,8 @@ real registry / database / git checkout is never touched. ``is_sensitive`` is
 left real on purpose — the redaction tests must exercise the genuine
 BANK/LEGAL policy, not a fake of it.
 
+All routes are versioned under ``/api/v1``.
+
 Fixtures use only generic project-namespace codes (``AICC``, ``BANK``) and
 invented ids/paths — no real project names or machine paths — so the public
 repo stays clean and the integration privacy fitness gate is unaffected.
@@ -48,7 +50,12 @@ _TASKS = [
      "task_type": "implementation"},
     {"id": "t2", "project": "AICC", "title": "Fix a thing", "status": "In Progress",
      "task_type": "bugfix", "launch_status": "Requires Attention"},
-    {"id": "t3", "project": "BANK", "title": "Secret task", "status": "Backlog"},
+    # A BANK task that DOES trigger an attention condition — the regression
+    # fixture for the redaction leak: an earlier no-attention Backlog task masked
+    # the bug because it never reached the attention feed anyway. This one must
+    # be dropped from the task list AND from dashboard attention.
+    {"id": "t3", "project": "BANK", "title": "Secret leaky task", "status": "In Progress",
+     "task_type": "bugfix", "launch_status": "Requires Attention"},
 ]
 
 _RUNS = [
@@ -96,7 +103,7 @@ def client(monkeypatch) -> TestClient:
 
 
 def test_health_ok(client: TestClient) -> None:
-    body = client.get("/api/health").json()
+    body = client.get("/api/v1/health").json()
     assert body["status"] == "ok"
     assert body["service"] == "ai-command-center-api"
     assert body["version"]
@@ -106,7 +113,7 @@ def test_health_ok(client: TestClient) -> None:
 
 
 def test_dashboard_shape_and_aggregates(client: TestClient) -> None:
-    r = client.get("/api/dashboard")
+    r = client.get("/api/v1/dashboard")
     assert r.status_code == 200
     body = r.json()
     assert set(body) == {"agents", "task_counts", "projects", "activity", "attention"}
@@ -114,12 +121,13 @@ def test_dashboard_shape_and_aggregates(client: TestClient) -> None:
     assert body["agents"]["running"] == 1
     assert body["agents"]["attention"] == 1
     assert body["agents"]["total"] == 2
-    assert body["task_counts"]["total"] == 3
+    # BANK task is sensitive and dropped, so only the two AICC tasks count.
+    assert body["task_counts"]["total"] == 2
     assert body["task_counts"]["done"] == 1
 
 
 def test_dashboard_activity_merges_runs_and_commits(client: TestClient) -> None:
-    body = client.get("/api/dashboard").json()
+    body = client.get("/api/v1/dashboard").json()
     kinds = {item["kind"] for item in body["activity"]}
     assert kinds == {"run", "commit"}
     # No sensitive project leaks into the activity feed.
@@ -127,18 +135,26 @@ def test_dashboard_activity_merges_runs_and_commits(client: TestClient) -> None:
 
 
 def test_dashboard_attention_lists_flagged_task_and_failed_run(client: TestClient) -> None:
-    body = client.get("/api/dashboard").json()
+    body = client.get("/api/v1/dashboard").json()
     task_titles = {a["title"] for a in body["attention"] if a["kind"] == "task"}
     assert "Fix a thing" in task_titles
     assert any(a["kind"] == "run" for a in body["attention"])
     assert all(a.get("project") != "BANK" for a in body["attention"])
 
 
+def test_dashboard_attention_never_leaks_flagged_sensitive_task(client: TestClient) -> None:
+    """Regression: a flagged BANK task must not reach the attention feed by its
+    title (the redaction-leak audit fix)."""
+    body = client.get("/api/v1/dashboard").json()
+    titles = {a["title"] for a in body["attention"]}
+    assert "Secret leaky task" not in titles
+
+
 # --- projects -------------------------------------------------------------
 
 
 def test_projects_list_with_health_and_progress(client: TestClient) -> None:
-    projects = client.get("/api/projects").json()
+    projects = client.get("/api/v1/projects").json()
     app_one = next(p for p in projects if p["id"] == "app-one")
     assert app_one["health"]["worktree_state"] == "ok"
     assert app_one["health"]["open_pr_count"] == 2
@@ -147,7 +163,7 @@ def test_projects_list_with_health_and_progress(client: TestClient) -> None:
 
 
 def test_projects_redacts_sensitive_project(client: TestClient) -> None:
-    projects = client.get("/api/projects").json()
+    projects = client.get("/api/v1/projects").json()
     secret = next(p for p in projects if p["id"] == "secret-one")
     assert secret["redacted"] is True
     assert secret["health"] is None
@@ -157,51 +173,58 @@ def test_projects_redacts_sensitive_project(client: TestClient) -> None:
 
 
 def test_project_by_id(client: TestClient) -> None:
-    body = client.get("/api/projects/app-one").json()
+    body = client.get("/api/v1/projects/app-one").json()
     assert body["id"] == "app-one"
     assert body["project_ref"] == "AICC"
 
 
 def test_project_not_found(client: TestClient) -> None:
-    assert client.get("/api/projects/nope").status_code == 404
+    assert client.get("/api/v1/projects/nope").status_code == 404
 
 
 # --- tasks ----------------------------------------------------------------
 
 
-def test_tasks_list_all_with_counts(client: TestClient) -> None:
-    body = client.get("/api/tasks").json()
-    assert len(body["tasks"]) == 3
-    assert body["counts"]["total"] == 3
+def test_tasks_list_excludes_sensitive_with_counts(client: TestClient) -> None:
+    body = client.get("/api/v1/tasks").json()
+    # The BANK task is dropped entirely — never listed, never counted.
+    assert {t["id"] for t in body["tasks"]} == {"t1", "t2"}
+    assert all(t["project"] != "BANK" for t in body["tasks"])
+    assert body["counts"]["total"] == 2
     assert body["counts"]["done"] == 1
 
 
 def test_tasks_filter_by_project(client: TestClient) -> None:
-    body = client.get("/api/tasks", params={"project": "AICC"}).json()
+    body = client.get("/api/v1/tasks", params={"project": "AICC"}).json()
     assert {t["id"] for t in body["tasks"]} == {"t1", "t2"}
     assert body["counts"]["total"] == 2
 
 
 def test_tasks_filter_by_status(client: TestClient) -> None:
-    body = client.get("/api/tasks", params={"status": "Done"}).json()
+    body = client.get("/api/v1/tasks", params={"status": "Done"}).json()
     assert {t["id"] for t in body["tasks"]} == {"t1"}
 
 
 def test_task_by_id(client: TestClient) -> None:
-    body = client.get("/api/tasks/t1").json()
+    body = client.get("/api/v1/tasks/t1").json()
     assert body["id"] == "t1"
     assert body["project"] == "AICC"
 
 
+def test_sensitive_task_detail_is_not_found(client: TestClient) -> None:
+    """A BANK task must read as absent on detail, not leak its title."""
+    assert client.get("/api/v1/tasks/t3").status_code == 404
+
+
 def test_task_not_found(client: TestClient) -> None:
-    assert client.get("/api/tasks/nope").status_code == 404
+    assert client.get("/api/v1/tasks/nope").status_code == 404
 
 
 # --- agents ---------------------------------------------------------------
 
 
 def test_agents_summary_excludes_sensitive_runs(client: TestClient) -> None:
-    body = client.get("/api/agents").json()
+    body = client.get("/api/v1/agents").json()
     assert body["available"] is True
     assert {a["run_id"] for a in body["agents"]} == {"r1", "r2"}
     assert body["summary"]["running"] == 1
@@ -215,7 +238,7 @@ def test_agents_degrades_to_stub_when_runtime_store_missing(monkeypatch) -> None
         raise RuntimeError("no runtime.db yet")
 
     monkeypatch.setattr(service, "list_unified_runs", _boom)
-    body = TestClient(create_app()).get("/api/agents").json()
+    body = TestClient(create_app()).get("/api/v1/agents").json()
     assert body["available"] is False
     assert body["agents"] == []
     assert body["summary"]["total"] == 0

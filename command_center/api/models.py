@@ -1,11 +1,14 @@
 """Typed skeletons for the "new engine" entities — contract only, no storage.
 
-Wave 0 stands up the API service and, alongside it, makes the *shape* of the
+Wave 0 stood up the API service and, alongside it, made the *shape* of the
 next wave's domain visible so both shells (and the eventual backend) agree on
-one contract before any of it is persisted. Nothing here is wired to a
-repository, a table, or a route yet; these are the field definitions and the
-docstrings that pin down what each entity means. Persistence, endpoints, and
-the authority-map writer for each will land in later increments.
+one contract before any of it is persisted. Wave 1 (W1-DATA-EVENTS) wires the
+first three — ``Proposal``, ``OwnerItem``, ``DigestItem`` — to a repository
+(``runtime/db/wave1.py``), a table family (schema v15) and versioned routes
+(``api/wave1_routes.py``); these serve as *response* models on that surface, so
+their identity/routing fields (``id``; ``Proposal.project_ref``) are required
+rather than defaulted. The remaining entities stay contract-only skeletons
+until their own increment lands.
 
 Grouping mirrors the product surfaces:
 
@@ -45,13 +48,13 @@ class Proposal(BaseModel):
     ``models.PROJECT_IDS`` namespace so it can be routed to the right board.
     """
 
-    id: str = ""
+    id: str
     kind: ProposalKind = "optimization"
     title: str = ""
     body: str = ""
     expected_gain: str | None = None
     effort: str | None = None
-    project_ref: str | None = None
+    project_ref: str
     status: Literal["new", "accepted", "dismissed", "converted"] = "new"
     created_at: str | None = None
 
@@ -164,18 +167,19 @@ class ModelEntry(BaseModel):
 class OwnerItem(BaseModel):
     """One item on the owner's day list — a thing only the owner can action."""
 
-    id: str = ""
+    id: str
     title: str = ""
     detail: str | None = None
     due: str | None = None
     done: bool = False
     source_ref: str | None = None
+    created_at: str | None = None
 
 
 class DigestItem(BaseModel):
     """One entry in a periodic digest (daily/weekly rollup)."""
 
-    id: str = ""
+    id: str
     title: str = ""
     body: str = ""
     category: str | None = None
