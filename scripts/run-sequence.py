@@ -113,10 +113,51 @@ def _wait_for_terminal(task_id: str, dry_run: bool = False) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+def _unknown_task_ids(task_ids: list[str]) -> list[str]:
+    """Ids not present in tasks.json, in input order."""
+    known = {t["id"] for t in tasks_repository.load_tasks(ROOT)}
+    return [tid for tid in task_ids if tid not in known]
+
+
+def show_status() -> int:
+    """Print the saved sequence state, if any (--status flag)."""
+    if not STATE_FILE.exists():
+        print("[SEQ] No sequence in progress (no state file).", flush=True)
+        return 0
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except json.JSONDecodeError:
+        print(f"[SEQ] State file is corrupt: {STATE_FILE}", file=sys.stderr)
+        return 1
+    task_ids = state.get("task_ids", [])
+    idx = state.get("current_index", 0)
+    print(f"[SEQ] Sequence: {len(task_ids)} tasks, next step {idx + 1}", flush=True)
+    for pos, tid in enumerate(task_ids):
+        info = state.get("steps", {}).get(tid)
+        if info:
+            marker = "skipped" if info.get("skipped") else "done"
+            print(f"  [{marker}] {tid}: {info.get('status')}", flush=True)
+        else:
+            pointer = "→" if pos == idx else " "
+            print(f"  [{pointer}] {tid}: pending", flush=True)
+    return 0
+
+
 def main(task_ids: list[str], dry_run: bool = False) -> int:
     if not task_ids:
-        print("Usage: run-sequence.py [--dry-run] TASK-ID [TASK-ID ...]", file=sys.stderr)
+        print("Usage: run-sequence.py [--dry-run|--status] TASK-ID [TASK-ID ...]", file=sys.stderr)
         return 1
+
+    # Fail before launching anything if any id is unknown — a typo mid-list
+    # must not launch the valid prefix and then die. Dry-run only warns, so
+    # hypothetical sequences can still be previewed.
+    unknown = _unknown_task_ids(task_ids)
+    if unknown:
+        if dry_run:
+            print(f"[DRY-RUN] Unknown task IDs (would refuse to start): {', '.join(unknown)}", flush=True)
+        else:
+            print(f"[SEQ] Unknown task IDs: {', '.join(unknown)} — nothing launched.", file=sys.stderr)
+            return 1
 
     if dry_run:
         print("[DRY-RUN] Running in dry-run mode — no tasks will be launched or state modified.", flush=True)
@@ -169,7 +210,10 @@ if __name__ == "__main__":
         description="Run a sequence of tasks with crash-resilient state tracking."
     )
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without modifying state or launching tasks")
-    parser.add_argument("task_ids", nargs="+", help="Task IDs to run in sequence")
+    parser.add_argument("--status", action="store_true", help="Show saved sequence progress and exit")
+    parser.add_argument("task_ids", nargs="*", help="Task IDs to run in sequence")
     args = parser.parse_args()
 
+    if args.status:
+        raise SystemExit(show_status())
     raise SystemExit(main(args.task_ids, dry_run=args.dry_run))

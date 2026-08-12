@@ -43,6 +43,25 @@ def inject_global_css() -> None:
 [data-testid="stVerticalBlockBorderWrapper"]:hover {
   box-shadow: 0 1px 3px rgba(0,0,0,0.08);
 }
+[data-testid="stCaptionContainer"],
+kbd[aria-label^="Shortcut"] {
+  opacity: 1 !important;
+}
+[data-testid="stCaptionContainer"] p,
+kbd[aria-label^="Shortcut"] {
+  color: inherit !important;
+}
+a[aria-label="Link to heading"] {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 24px;
+}
+button:focus-visible, a:focus-visible, [tabindex]:focus-visible {
+  outline: 3px solid currentColor !important;
+  outline-offset: 3px !important;
+}
 </style>
 """,
         unsafe_allow_html=True,

@@ -362,17 +362,30 @@ def test_sync_task_from_run_unknown_maps_to_requires_attention(tmp_path):
     assert task["launch_status"] == "Requires Attention"
 
 
-def test_sync_task_from_run_cancelled_maps_to_failed_launch_status(tmp_path):
-    """`models.LAUNCH_STATUSES` has no dedicated Cancelled value — this is
-    the documented simplification (see task_sync.py's module docstring)."""
+def test_sync_task_from_run_cancelled_gets_cancelled_status_and_closed_lane(tmp_path):
+    """An operator-stopped run is not a failure: launch status is "Cancelled"
+    and the task retires to the read-side "Closed" lane (AICC-IMP-006)."""
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)
     run = _make_run(db_path, state="CANCELLED", completed_at="2026-01-01T00:01:00")
-    task = _make_task()
+    task = _make_task(status="Next")
 
     task_sync.sync_task_from_run(task, run, db_path=db_path)
 
-    assert task["launch_status"] == "Failed"
+    assert task["launch_status"] == "Cancelled"
+    assert task["status"] == "Closed"
+
+
+def test_sync_task_from_run_cancelled_never_demotes_a_done_task(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="CANCELLED", completed_at="2026-01-01T00:01:00")
+    task = _make_task(status="Done")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["status"] == "Done"
+    assert task["launch_status"] == "Cancelled"
 
 
 def test_sync_task_from_run_blocked_maps_to_blocked_launch_status(tmp_path):
@@ -664,3 +677,20 @@ def test_reconcile_and_sync_recovers_stale_current_run_id_pointer(tmp_path):
     assert task["current_run_id"] == new_run["id"]
     assert task["launch_status"] == "Ready"
     assert task.get("failed_executors") == ["claude_code"]
+
+
+def test_sync_task_from_run_records_last_provider_id_on_completed_and_failed(tmp_path):
+    """Both terminal outcomes record which provider produced them (AICC-IMP-011),
+    so the board and failover history survive the run window's eviction."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+
+    run = _make_run(db_path, state="FAILED", completed_at="2026-01-01T00:01:00")
+    task = _make_task()
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+    assert task["last_provider_id"] == "claude_code"
+
+    run2 = _make_run(db_path, state="COMPLETED", task_id="task-2", provider_id="codex", completed_at="2026-01-01T00:02:00")
+    task2 = _make_task(id="task-2")
+    task_sync.sync_task_from_run(task2, run2, db_path=db_path)
+    assert task2["last_provider_id"] == "codex"
