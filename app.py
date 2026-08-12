@@ -46,6 +46,7 @@ from command_center.ui import (
     execution_strip,
     git_readers,
     home_dashboard,
+    integration_center,
     legacy_task_helpers,
     live_board,
     waves_panel,
@@ -202,6 +203,7 @@ NAV: dict[str, tuple[str, str]] = {
     "runs": ("Журнал запусков", ":material/history:"),
     "timeline": ("Таймлайн", ":material/timeline:"),
     "projects": ("Проекты", ":material/folder_open:"),
+    "integration": ("Integration Center", ":material/lan:"),
     "generated": ("Сгенерированные задачи", ":material/description:"),
     "reports": ("Отчёты", ":material/summarize:"),
     "context": ("Глобальный контекст", ":material/menu_book:"),
@@ -2870,6 +2872,16 @@ elif page_key == "projects":
 # --------------------------------------------------------------------------
 # Generated tasks browser (global)
 # --------------------------------------------------------------------------
+
+elif page_key == "integration":
+    # Integration Center (AICC-INT-001): registry list + health badges +
+    # per-project drill-down. Read-only — see docs/INTEGRATION_CENTER.md.
+    integration_center.render_integration_center(
+        tasks,
+        runs=runs_read.list_unified_runs(
+            get_execution_center_api().db_path, root=ROOT, limit=200
+        ),
+    )
 
 elif page_key == "generated":
     st.subheader("Сгенерированные задачи", anchor="generated-tasks")
