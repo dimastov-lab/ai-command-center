@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from command_center.advisor import api as advisor_api
 from command_center.advisor.schemas import AdvisorRunRequest, AdvisorRunResponse
-from command_center.api import models
+from command_center.api import models, schemas
 from command_center.api import wave1_schemas as w
 from command_center.api import wave1_service as service
 
@@ -68,6 +68,25 @@ def promote_proposal(proposal_id: str) -> w.PromoteResponse:
     if result is None:
         raise HTTPException(status_code=404, detail="proposal not found")
     return result
+
+
+# --------------------------------------------------------------------------
+# Task priority order (VOYN-W2-TASKS)
+# --------------------------------------------------------------------------
+
+
+@router.post("/tasks/reorder", response_model=schemas.TaskGraph)
+def reorder_tasks(payload: w.TaskReorderRequest) -> schemas.TaskGraph:
+    """Set a project's task priority order. A reorder that would place a task
+    above one of its dependencies (or that describes a cyclic set) is rejected
+    with ``409`` and nothing is persisted — the invariant is enforced in
+    ``wave1_service.reorder_tasks`` under the tasks lock."""
+    try:
+        return service.reorder_tasks(payload.project, payload.order)
+    except service.TaskReorderRejected as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": exc.message}
+        ) from exc
 
 
 # --------------------------------------------------------------------------

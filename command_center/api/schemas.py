@@ -137,6 +137,9 @@ class Task(BaseModel):
     launch_status: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    blocked: bool = False
+    blocked_by: list[str] = Field(default_factory=list)
 
 
 class TaskList(BaseModel):
@@ -145,6 +148,38 @@ class TaskList(BaseModel):
 
     tasks: list[Task]
     counts: TaskCounts
+
+
+class TaskGraphNode(BaseModel):
+    """One task in a project's dependency-levelled graph (``GET /tasks/graph``).
+
+    ``level`` is the dependency depth (level 0 depends on nothing still open);
+    ``state`` is the board's semantic state (done/running/blocked/ready/waiting);
+    ``rank`` is the task's position in the *priority order* the operator controls
+    — distinct from ``level``, which the dependency graph fixes."""
+
+    id: str
+    project: str
+    title: str
+    status: str | None = None
+    priority: str | None = None
+    level: int = 0
+    state: str = "waiting"
+    rank: int = 0
+    depends_on: list[str] = Field(default_factory=list)
+    blocked: bool = False
+    blocked_by: list[str] = Field(default_factory=list)
+    blocks: list[str] = Field(default_factory=list)
+
+
+class TaskGraph(BaseModel):
+    """``GET /api/tasks/graph`` — one project's tasks as a dependency graph plus
+    the current priority order (nodes are returned in priority-rank order)."""
+
+    project: str | None = None
+    nodes: list[TaskGraphNode] = Field(default_factory=list)
+    order: list[str] = Field(default_factory=list)
+    has_cycle: bool = False
 
 
 class Agent(BaseModel):

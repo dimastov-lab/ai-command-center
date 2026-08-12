@@ -68,6 +68,12 @@ def _build_read_router() -> APIRouter:
     ) -> schemas.TaskList:
         return service.list_tasks(project=project, status=status)
 
+    # Declared before ``/tasks/{task_id}`` so the literal ``graph`` segment is
+    # never captured as a task id by the parametrised route below.
+    @router.get("/tasks/graph", response_model=schemas.TaskGraph)
+    def tasks_graph(project: str | None = None) -> schemas.TaskGraph:
+        return service.task_graph(project=project)
+
     @router.get("/tasks/{task_id}", response_model=schemas.Task)
     def task(task_id: str) -> schemas.Task:
         found = service.get_task(task_id)
