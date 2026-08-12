@@ -134,12 +134,13 @@ def create_proposal(payload: w.ProposalCreate) -> models.Proposal:
 
 def list_proposals(
     *, project: str | None = None, status: str | None = None,
-    limit: int = 100, offset: int = 0,
+    kind: str | None = None, limit: int = 100, offset: int = 0,
 ) -> w.ProposalList:
     rows = db.list_advisor_proposals(
         _db_path(),
         project=project,
         statuses=[status] if status else None,
+        kind=kind,
         limit=limit,
         offset=offset,
     )
