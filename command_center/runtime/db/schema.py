@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1000,6 +1000,91 @@ CREATE INDEX IF NOT EXISTS idx_council_event_motion ON council_event(motion_id);
 """
 
 
+# Wave-3 Networking engine (VOYN-W3-NET): the networking feedback/invitation
+# loop's three additive, standalone tables, wholly distinct from every family
+# above (routes → service → repository → db).
+#
+#   contact               -- one row per person you network with. `project_ref`
+#                            (nullable) is the redaction key: a BANK/LEGAL contact
+#                            is excluded in the SQL query so its handle/name never
+#                            leaves the read surface (the Wave-1 exclude-in-SQL
+#                            pattern). Mutable row guarded by a `version`
+#                            compare-and-set column.
+#   message               -- one row per message exchanged with a contact.
+#                            `direction` is `inbound`/`outbound`; an inbound
+#                            `feedback`-kind message is the intake that the
+#                            service turns into an actionable board task.
+#                            Write-once (no update path). `project_ref` mirrors the
+#                            contact's for the same in-SQL redaction.
+#   networking_invitation -- one row per invitation of a contact to the Council.
+#                            `council_ref` is the stable seam the Council engine
+#                            consumes (no external identity/auth is wired here —
+#                            this is the boundary only). Mutable row moving through
+#                            an explicit status allowlist
+#                            (`networking.INVITATION_TRANSITIONS`, pending →
+#                            accepted/declined), guarded by a `version` column.
+#
+# Schema version is **23** — the last of the Wave-3 db chain, sitting directly
+# above the sibling models/market/council families (20/21/22) which landed first.
+# The migration driver applies any migration whose version exceeds the recorded
+# one in list order, so a fresh db applies 1..23 in sequence and an existing db
+# only runs 23.
+#
+# Statuses/directions are stored as their stable string *values* (never a Python
+# enum's member name), so a column round-trips to exactly the Literal the API
+# contract (`api/models.py`) declares — the enum-name lesson carried forward from
+# the earlier migration renumbering.
+_SCHEMA_V23 = """
+CREATE TABLE IF NOT EXISTS contact (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    handle TEXT NOT NULL DEFAULT '',
+    org TEXT,
+    note TEXT,
+    project_ref TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_contact_project ON contact(project_ref);
+CREATE INDEX IF NOT EXISTS idx_contact_handle ON contact(handle);
+
+CREATE TABLE IF NOT EXISTS message (
+    id TEXT PRIMARY KEY,
+    contact_id TEXT NOT NULL REFERENCES contact(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL DEFAULT 'inbound',
+    kind TEXT NOT NULL DEFAULT 'note',
+    body TEXT NOT NULL DEFAULT '',
+    project_ref TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_contact ON message(contact_id);
+CREATE INDEX IF NOT EXISTS idx_message_project ON message(project_ref);
+CREATE INDEX IF NOT EXISTS idx_message_kind ON message(kind);
+
+CREATE TABLE IF NOT EXISTS networking_invitation (
+    id TEXT PRIMARY KEY,
+    contact_id TEXT NOT NULL REFERENCES contact(id) ON DELETE CASCADE,
+    council_ref TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    note TEXT,
+    project_ref TEXT,
+    invited_at TEXT NOT NULL,
+    responded_at TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_networking_invitation_contact ON networking_invitation(contact_id);
+CREATE INDEX IF NOT EXISTS idx_networking_invitation_status ON networking_invitation(status);
+CREATE INDEX IF NOT EXISTS idx_networking_invitation_council_ref ON networking_invitation(council_ref);
+CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invitation(project_ref);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1031,4 +1116,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (20, _SCHEMA_V20),
     (21, _SCHEMA_V21),
     (22, _SCHEMA_V22),
+    (23, _SCHEMA_V23),
 ]

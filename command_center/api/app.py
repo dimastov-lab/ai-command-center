@@ -33,6 +33,7 @@ from command_center.api import (
     council_routes,
     marketplace_routes,
     model_registry_routes,
+    networking_routes,
     schemas,
     service,
     wave1_routes,
@@ -115,6 +116,7 @@ def create_app() -> FastAPI:
     app.include_router(council_routes.router)
     app.include_router(marketplace_routes.router)
     app.include_router(model_registry_routes.router)
+    app.include_router(networking_routes.router)
     return app
 
 

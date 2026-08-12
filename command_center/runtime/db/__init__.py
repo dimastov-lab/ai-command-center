@@ -260,6 +260,24 @@ from command_center.runtime.db.model_registry import (  # noqa: F401
     set_model_status,
     update_download_progress,
 )
+from command_center.runtime.db.networking import (  # noqa: F401
+    INVITATION_STATUSES,
+    INVITATION_TRANSITIONS,
+    MESSAGE_DIRECTIONS,
+    MESSAGE_KINDS,
+    InvalidInvitationTransitionError,
+    _UPDATABLE_CONTACT_FIELDS,
+    create_contact,
+    create_invitation,
+    create_message,
+    get_contact,
+    get_invitation,
+    list_contacts,
+    list_invitations,
+    list_messages,
+    set_invitation_status,
+    update_contact_fields,
+)
 from command_center.runtime.db.proposal import (  # noqa: F401
     _PROPOSAL_AUTHORITY_FIELDS,
     _PROPOSAL_DECISION_FIELDS,

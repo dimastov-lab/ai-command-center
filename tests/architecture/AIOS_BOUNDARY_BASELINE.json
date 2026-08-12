@@ -181,6 +181,10 @@
       "memory",
       "runtime_package"
     ],
+    "command_center/runtime/db/networking.py": [
+      "memory",
+      "runtime_package"
+    ],
     "command_center/runtime/db/proposal.py": [
       "memory",
       "runtime_package"

@@ -403,3 +403,55 @@ class DigestItem(BaseModel):
     category: str | None = None
     refs: list[str] = Field(default_factory=list)
     created_at: str | None = None
+
+
+# --------------------------------------------------------------------------
+# Networking — Contact / Message / Invitation (VOYN-W3-NET)
+# --------------------------------------------------------------------------
+
+MessageDirection = Literal["inbound", "outbound"]
+MessageKind = Literal["note", "feedback"]
+InvitationStatus = Literal["pending", "accepted", "declined"]
+
+
+class Contact(BaseModel):
+    """A person you network with. ``project_ref`` ties the contact to a
+    ``models.PROJECT_IDS`` namespace and is the redaction key — a BANK/LEGAL
+    contact is dropped from every read so its handle/name never leaves the
+    surface."""
+
+    id: str
+    display_name: str = ""
+    handle: str = ""
+    org: str | None = None
+    note: str | None = None
+    project_ref: str | None = None
+    created_at: str | None = None
+
+
+class Message(BaseModel):
+    """One message exchanged with a contact. ``kind`` distinguishes a plain
+    logged ``note`` from inbound ``feedback`` (the intake turned into a task)."""
+
+    id: str
+    contact_id: str = ""
+    direction: MessageDirection = "inbound"
+    kind: MessageKind = "note"
+    body: str = ""
+    project_ref: str | None = None
+    created_at: str | None = None
+
+
+class Invitation(BaseModel):
+    """An invitation of a networking contact to the Council. ``council_ref`` is
+    the stable seam the Council engine consumes; no external identity/auth is
+    wired here — this is the boundary only."""
+
+    id: str
+    contact_id: str = ""
+    council_ref: str = ""
+    status: InvitationStatus = "pending"
+    note: str | None = None
+    project_ref: str | None = None
+    invited_at: str | None = None
+    responded_at: str | None = None
