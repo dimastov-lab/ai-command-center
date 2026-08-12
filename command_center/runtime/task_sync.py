@@ -50,14 +50,14 @@ _LAUNCH_STATUS_BY_DISPLAY_STATUS: dict[str, str] = {
     session_view.STATUS_REQUIRES_ATTENTION: "Requires Attention",
     session_view.STATUS_BLOCKED: "Blocked",
     session_view.STATUS_INCOMPLETE: "Incomplete",
-    # `models.LAUNCH_STATUSES` has no dedicated "Cancelled" value — the
-    # closest existing one is "Failed" (the task did not finish its work),
-    # documented as a known simplification (see the plan's Limitations).
     session_view.STATUS_FAILED: "Failed",
-    session_view.STATUS_CANCELLED: "Failed",
+    # An operator-stopped run is not a failure: it gets its own launch status
+    # and moves the task to the "Closed" board lane (AICC-IMP-006, see
+    # `_apply_terminal_fields`), instead of masquerading as "Failed".
+    session_view.STATUS_CANCELLED: "Cancelled",
 }
 
-_TERMINAL_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review", "Failed", "Blocked", "Incomplete"})
+_TERMINAL_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review", "Failed", "Blocked", "Incomplete", "Cancelled"})
 
 # Launch statuses that mean "this run stranded the task; nothing will auto-
 # advance it." An executor-availability failure (AICC-DESKTOP-017) flips any of
@@ -129,6 +129,18 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
     live_status = session_view.live_git_status(run.get("repository_path"))
     task["branch"] = (live_status or {}).get("branch") or run.get("expected_branch") or task.get("branch")
     task["last_run_at"] = run.get("completed_at")
+    # Which provider actually produced this terminal outcome — recorded even
+    # for failures, so the board can show "last tried with X" and the failover
+    # logic's history survives the run row's eventual eviction from the window.
+    if run.get("provider_id"):
+        task["last_provider_id"] = run["provider_id"]
+
+    # An operator-cancelled run retires its task to the "Closed" lane
+    # (AICC-IMP-006): the operator explicitly stopped this work, so it must
+    # leave the planning lanes rather than look abandoned there. Never demotes
+    # a task already resolved as Done.
+    if status == session_view.STATUS_CANCELLED and task.get("status") != "Done":
+        task["status"] = "Closed"
 
     events = db.list_run_events(db_path, run["id"], after_seq=0, limit=1_000_000)
     parsed = report_parser.parse_report(reports.result_text(events)) if events else report_parser.empty_parsed_result()

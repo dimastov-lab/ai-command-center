@@ -232,6 +232,13 @@ def test_dashboard_css_has_visible_focus_reflow_and_theme_specific_contrast_toke
     assert "outline:3pxsolid" in body.replace(" ", "")
     assert "@media (max-width: 420px)" in body
     assert "--hx-green: #15803d" in body
+    assert '[data-testid="stCaptionContainer"] p' in body
+    assert 'kbd[aria-label^="Shortcut"]' in body
+    assert 'a[aria-label="Link to heading"]' in body
+    compact = body.replace(" ", "")
+    assert "opacity:1!important" in compact
+    assert "min-width:24px" in compact
+    assert "min-height:24px" in compact
 
 
 def _relative_luminance(hex_color: str) -> float:

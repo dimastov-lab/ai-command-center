@@ -55,5 +55,6 @@ LAUNCH_STATUS_COLORS: dict[str, str] = {
     "Running": TONE_ACTIVE,
     "Completed": TONE_SUCCESS,
     "Failed": TONE_DANGER,
+    "Cancelled": TONE_CANCELLED,
     "Requires Attention": TONE_WARNING,
 }
