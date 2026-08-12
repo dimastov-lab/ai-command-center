@@ -58,6 +58,10 @@ jobs:
         run: |
           $pkgRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
           $exe = (Get-ChildItem -Path $pkgRoot -Recurse -Filter "AI Command Center.exe" | Select-Object -First 1).FullName
+          # Unsigned build: SmartScreen blocks Start-Process on files carrying
+          # Mark-of-the-Web ("operation was canceled by the user"). A real user
+          # clicks "Run anyway" once; headless equivalent is Unblock-File.
+          Get-ChildItem -Path (Split-Path $exe) -Recurse -File | Unblock-File
           $env:QT_QPA_PLATFORM = "offscreen"
           $p = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 10
