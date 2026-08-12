@@ -129,6 +129,11 @@ def _apply_terminal_fields(task: dict, run: dict, *, status: str, db_path) -> No
     live_status = session_view.live_git_status(run.get("repository_path"))
     task["branch"] = (live_status or {}).get("branch") or run.get("expected_branch") or task.get("branch")
     task["last_run_at"] = run.get("completed_at")
+    # Which provider actually produced this terminal outcome — recorded even
+    # for failures, so the board can show "last tried with X" and the failover
+    # logic's history survives the run row's eventual eviction from the window.
+    if run.get("provider_id"):
+        task["last_provider_id"] = run["provider_id"]
 
     events = db.list_run_events(db_path, run["id"], after_seq=0, limit=1_000_000)
     parsed = report_parser.parse_report(reports.result_text(events)) if events else report_parser.empty_parsed_result()

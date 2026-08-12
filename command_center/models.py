@@ -255,6 +255,42 @@ def truncate_text(text: str, max_len: int) -> str:
     return text[: max_len - 1] + "…"
 
 
+def format_duration(seconds: int | float | None) -> str:
+    """Compact human duration for card-sized labels: ``45s``, ``3m 20s``,
+    ``2h 05m``, ``1d 4h``. ``None``/negative return ``"—"`` — same defensive
+    guard as `session_view.format_elapsed`, which stays the format for
+    ticking ``HH:MM:SS`` timers."""
+    if seconds is None or seconds < 0:
+        return "—"
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def format_age(iso_str: str | None, *, now: datetime | None = None) -> str:
+    """Age of an `iso_now()`-style timestamp as a compact duration. Timestamps
+    in this app are naive local time (see `iso_now`), so an aware input is
+    demoted to naive rather than converted. Missing/unparseable → ``"—"``."""
+    if not iso_str:
+        return "—"
+    try:
+        then = datetime.fromisoformat(iso_str)
+    except (ValueError, TypeError):
+        return "—"
+    if then.tzinfo is not None:
+        then = then.replace(tzinfo=None)
+    reference = now if now is not None else datetime.now()
+    return format_duration((reference - then).total_seconds())
+
+
 def derive_short_title(text: str, limit: int = 80) -> str:
     collapsed = " ".join(text.split())
     if len(collapsed) <= limit:

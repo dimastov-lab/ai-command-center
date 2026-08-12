@@ -291,3 +291,30 @@ def test_stage_progress_table_matches_mission_spec():
         "Merged": 100,
     }
     assert models.EXECUTION_STAGES == list(models.STAGE_PROGRESS.keys())
+
+
+def test_format_duration_scales_units():
+    assert models.format_duration(45) == "45s"
+    assert models.format_duration(200) == "3m 20s"
+    assert models.format_duration(7500) == "2h 05m"
+    assert models.format_duration(100800) == "1d 4h"
+
+
+def test_format_duration_guards_invalid():
+    assert models.format_duration(None) == "—"
+    assert models.format_duration(-1) == "—"
+    assert models.format_duration(0) == "0s"
+
+
+def test_format_age_from_iso_now_style_timestamp():
+    from datetime import datetime
+
+    now = datetime.fromisoformat("2026-08-12T12:00:00")
+    assert models.format_age("2026-08-12T11:59:15", now=now) == "45s"
+    assert models.format_age("2026-08-10T12:00:00", now=now) == "2d 0h"
+
+
+def test_format_age_guards_invalid():
+    assert models.format_age(None) == "—"
+    assert models.format_age("") == "—"
+    assert models.format_age("not-a-date") == "—"
