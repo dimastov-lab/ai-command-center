@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -893,6 +893,113 @@ CREATE INDEX IF NOT EXISTS idx_market_install_log_item ON market_install_log(ite
 """
 
 
+# Wave-3 Council / Board-of-Directors engine (VOYN-W3-COUNCIL): the persistence
+# tier behind the collective-decision surface (routes → service → repository →
+# db). Four additive, standalone tables, wholly distinct from every family above;
+# the names never collide.
+#
+#   motion          -- one mutable current-state row per motion put to the Board,
+#                      guarded by a `version` compare-and-set column and an
+#                      explicit status-transition allowlist
+#                      (`council.MOTION_TRANSITIONS`, open → decided / withdrawn).
+#                      `quorum` is the vote count required before it may close;
+#                      `proposed_by` names who raised it; `source_ref` records the
+#                      opaque origin an event-raised motion came from (e.g.
+#                      `proposal:<id>`, `incident:<id>`) and dedups redeliveries.
+#                      `project_ref` (nullable) is the redaction key.
+#   council_vote    -- one row per voter per motion. `UNIQUE(motion_id, voter_id)`
+#                      makes a second vote by the same voter a structural error
+#                      (surfaced as HTTP 409), so "one vote per voter" is enforced
+#                      at the persistence boundary, not merely in the service.
+#                      `role` records the voter's Board role at the moment of the
+#                      vote (roles-recorded invariant); `voter_kind` is ai|human.
+#                      Votes are append-only — no update path — so the record of
+#                      how each member voted cannot be rewritten after the fact.
+#   council_decision -- at most one immutable row per motion (PRIMARY KEY
+#                      `motion_id`), written once when quorum is met and the motion
+#                      closes. Carries the ADR-style record: `outcome`, the frozen
+#                      `tally_json`, the `roles_json` snapshot of every voter's
+#                      role + choice, and the `rationale` explaining the outcome.
+#                      There is no update path in the repository — once recorded a
+#                      decision is source of truth and cannot be edited.
+#   council_event   -- append-only journal / audit trail, ordered by a per-motion
+#                      monotonic `seq` (mirrors `run_event`/`proposal_event`):
+#                      every critical action (motion opened, vote cast, decision
+#                      recorded, motion withdrawn) is one row here, so a decision
+#                      always carries a full, replayable journal.
+#
+# Statuses/kinds/choices are stored as their stable string *values* (never a
+# Python enum's member name), so a column round-trips to exactly the Literal the
+# API contract (`api/models.py`) declares — the enum-name lesson carried forward
+# from the earlier migration renumbering.
+_SCHEMA_V22 = """
+CREATE TABLE IF NOT EXISTS motion (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    proposed_by TEXT NOT NULL,
+    quorum INTEGER NOT NULL DEFAULT 1,
+    project_ref TEXT,
+    proposal_ref TEXT,
+    source_ref TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    opened_at TEXT NOT NULL,
+    decided_at TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_motion_status ON motion(status);
+CREATE INDEX IF NOT EXISTS idx_motion_project ON motion(project_ref);
+CREATE INDEX IF NOT EXISTS idx_motion_source_ref ON motion(source_ref);
+
+CREATE TABLE IF NOT EXISTS council_vote (
+    id TEXT PRIMARY KEY,
+    motion_id TEXT NOT NULL REFERENCES motion(id) ON DELETE CASCADE,
+    voter_id TEXT NOT NULL,
+    voter_kind TEXT NOT NULL DEFAULT 'ai',
+    role TEXT NOT NULL,
+    choice TEXT NOT NULL,
+    rationale TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(motion_id, voter_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_council_vote_motion ON council_vote(motion_id);
+
+CREATE TABLE IF NOT EXISTS council_decision (
+    motion_id TEXT PRIMARY KEY REFERENCES motion(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    tally_json TEXT NOT NULL DEFAULT '{}',
+    roles_json TEXT NOT NULL DEFAULT '[]',
+    rationale TEXT NOT NULL DEFAULT '',
+    quorum INTEGER NOT NULL DEFAULT 1,
+    decided_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_council_decision_outcome ON council_decision(outcome);
+CREATE INDEX IF NOT EXISTS idx_council_decision_created ON council_decision(created_at);
+
+CREATE TABLE IF NOT EXISTS council_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    motion_id TEXT NOT NULL REFERENCES motion(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT,
+    role TEXT,
+    message TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(motion_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_council_event_motion ON council_event(motion_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -923,4 +1030,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (19, _SCHEMA_V19),
     (20, _SCHEMA_V20),
     (21, _SCHEMA_V21),
+    (22, _SCHEMA_V22),
 ]

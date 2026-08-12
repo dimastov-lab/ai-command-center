@@ -73,7 +73,18 @@ def test_migrate_is_idempotent(tmp_path):
     assert db.current_schema_version(path) == db.SCHEMA_VERSION
 
 
-@pytest.mark.parametrize("historical_version", range(1, db.SCHEMA_VERSION))
+# Parametrized over the *actual* recorded migration versions below the current
+# head — not a contiguous ``range`` — because the migration sequence may carry
+# reserved-version gaps: a version can be pre-assigned to a sibling engine that
+# lands on its own branch (e.g. council took v22 while models/market hold v20/v21
+# on theirs), so those numbers are not reachable heads on this branch. A historical
+# database only ever recorded a real migration version, so those are exactly the
+# ones that must upgrade cleanly; the gap fills in on merge without changing this
+# test.
+@pytest.mark.parametrize(
+    "historical_version",
+    [version for version, _ in db.MIGRATIONS if version < db.SCHEMA_VERSION],
+)
 def test_upgrade_from_every_supported_historical_schema(
     tmp_path, monkeypatch, historical_version
 ):
