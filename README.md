@@ -431,6 +431,20 @@ python -m compileall -q command_center scripts tests app.py
 pytest -q
 ```
 
+`./scripts/preflight.sh` (or `make preflight`) runs the first three — the fast, deterministic part
+of the CI Quality gates — in one command; run it before pushing.
+
+For a faster local pytest loop, `pytest-xdist` is in the dev dependency group. A few
+timing-sensitive subprocess tests (SIGTERM-grace escalation, process-tree teardown, concurrent
+registry writers) miss their deadlines when 8 workers saturate the CPU, so they carry a `serial`
+marker and run in a second, single-process phase:
+
+```bash
+pytest -q -n 8 -m "not serial" && pytest -q -m serial   # or: make test-fast
+```
+
+This is a local-only speedup; CI intentionally keeps its serial `pytest -q` run.
+
 `.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
 compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
 Python 3.14, plus a `windows-latest` job covering the automated half of the desktop leg. The workflow
