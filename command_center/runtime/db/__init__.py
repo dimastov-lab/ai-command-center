@@ -148,6 +148,26 @@ from command_center.runtime.db.completion import (  # noqa: F401
     record_validation_result,
     update_completion,
 )
+from command_center.runtime.db.wave1 import (  # noqa: F401
+    ADVISOR_PROPOSAL_KINDS,
+    ADVISOR_PROPOSAL_STATUSES,
+    ADVISOR_PROPOSAL_TRANSITIONS,
+    InvalidAdvisorProposalTransitionError,
+    _advisor_proposal_transition,
+    _decode_digest_row,
+    create_advisor_proposal,
+    create_digest_item,
+    create_owner_item,
+    get_advisor_proposal,
+    get_digest_item,
+    get_owner_item,
+    list_advisor_proposals,
+    list_digest_items,
+    list_owner_items,
+    promote_advisor_proposal,
+    set_advisor_proposal_status,
+    set_owner_item_done,
+)
 from command_center.runtime.db.proposal import (  # noqa: F401
     _PROPOSAL_AUTHORITY_FIELDS,
     _PROPOSAL_DECISION_FIELDS,

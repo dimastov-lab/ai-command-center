@@ -9,74 +9,92 @@ target above resolves directly; tests build their own isolated instance with
 ``create_app()`` and a :class:`fastapi.testclient.TestClient`.
 
 Controllers only: every handler is a one-liner that delegates to
-:mod:`command_center.api.service` and returns a typed
-:mod:`command_center.api.schemas` model. No business logic, no data access, no
-mutation lives here — this increment is entirely read-only and adds no writer,
-per ``docs/AUTHORITY_MAP.md``.
+:mod:`command_center.api.service` (read paths) or
+:mod:`command_center.api.wave1_service` (the Wave-1 write paths, mounted from
+:mod:`command_center.api.wave1_routes`) and returns a typed
+:mod:`command_center.api.schemas` / :mod:`command_center.api.models` model. No
+business logic, no data access and no mutation lives in this module.
+
+Versioning: **every** route is mounted under the ``/api/v1`` prefix. Pinning the
+version before any client consumes the contract keeps a future ``/api/v2`` a
+clean, additive move rather than a breaking rename of live paths.
 """
 
 from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from command_center.api import schemas, service
+from command_center.api import schemas, service, wave1_routes
+
+# All read-only endpoints hang off one versioned router; the Wave-1 write
+# endpoints live on their own router (also ``/api/v1``) and are included below.
+_API_PREFIX = "/api/v1"
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(
-        title="AI Command Center API",
-        version=service.get_health().version,
-        summary="Read-only backend for the desktop and mobile shells.",
-    )
+def _build_read_router() -> APIRouter:
+    router = APIRouter(prefix=_API_PREFIX)
 
-    # Dev-only CORS for a locally served frontend (opt-in via env, GET-only).
-    if os.environ.get("AICC_API_DEV") == "1":
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["http://localhost:5173"],
-            allow_methods=["GET"],
-            allow_headers=["*"],
-        )
-
-    @app.get("/api/health", response_model=schemas.HealthResponse)
+    @router.get("/health", response_model=schemas.HealthResponse)
     def health() -> schemas.HealthResponse:
         return service.get_health()
 
-    @app.get("/api/dashboard", response_model=schemas.DashboardResponse)
+    @router.get("/dashboard", response_model=schemas.DashboardResponse)
     def dashboard() -> schemas.DashboardResponse:
         return service.build_dashboard()
 
-    @app.get("/api/projects", response_model=list[schemas.Project])
+    @router.get("/projects", response_model=list[schemas.Project])
     def projects() -> list[schemas.Project]:
         return service.list_projects()
 
-    @app.get("/api/projects/{project_id}", response_model=schemas.Project)
+    @router.get("/projects/{project_id}", response_model=schemas.Project)
     def project(project_id: str) -> schemas.Project:
         found = service.get_project(project_id)
         if found is None:
             raise HTTPException(status_code=404, detail="project not found")
         return found
 
-    @app.get("/api/tasks", response_model=schemas.TaskList)
+    @router.get("/tasks", response_model=schemas.TaskList)
     def tasks(
         project: str | None = None, status: str | None = None
     ) -> schemas.TaskList:
         return service.list_tasks(project=project, status=status)
 
-    @app.get("/api/tasks/{task_id}", response_model=schemas.Task)
+    @router.get("/tasks/{task_id}", response_model=schemas.Task)
     def task(task_id: str) -> schemas.Task:
         found = service.get_task(task_id)
         if found is None:
             raise HTTPException(status_code=404, detail="task not found")
         return found
 
-    @app.get("/api/agents", response_model=schemas.AgentsResponse)
+    @router.get("/agents", response_model=schemas.AgentsResponse)
     def agents() -> schemas.AgentsResponse:
         return service.list_agents()
 
+    return router
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="AI Command Center API",
+        version=service.get_health().version,
+        summary="Backend for the desktop and mobile shells (v1).",
+    )
+
+    # Dev-only CORS for a locally served frontend (opt-in via env). Write verbs
+    # are needed now that the Wave-1 surface accepts POSTs.
+    if os.environ.get("AICC_API_DEV") == "1":
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["http://localhost:5173"],
+            allow_methods=["GET", "POST"],
+            allow_headers=["*"],
+        )
+
+    app.include_router(_build_read_router())
+    app.include_router(wave1_routes.router)
     return app
 
 

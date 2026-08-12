@@ -109,6 +109,10 @@
       "memory",
       "runtime_package"
     ],
+    "command_center/runtime/db/wave1.py": [
+      "memory",
+      "runtime_package"
+    ],
     "command_center/runtime/git_ops.py": [
       "runtime_package"
     ],

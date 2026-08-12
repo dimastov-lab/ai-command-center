@@ -16,9 +16,9 @@ this module, and no call into it, ever touches the developer's real data unless
 a real backing function actually runs.
 
 Redaction: BANK/LEGAL projects (``is_sensitive``) never get repository paths,
-health detail, run rows, or activity entries on this surface. Sensitive rows
-are dropped entirely rather than field-allowlisted, mirroring the strict policy
-already applied by ``command_center/webapi/serializers.py``.
+health detail, run rows, task rows, or activity entries on this surface.
+Sensitive rows are dropped entirely rather than field-allowlisted, mirroring the
+strict policy already applied by ``command_center/webapi/serializers.py``.
 """
 
 from __future__ import annotations
@@ -162,13 +162,21 @@ def get_project(project_id: str) -> schemas.Project | None:
 
 
 def _safe_load_tasks() -> list[dict]:
-    """The task list, or ``[]`` if the store cannot be read. ``load_tasks``
-    already returns ``[]`` for a missing/torn file in its read-only default, so
-    this only guards against an unexpected raise."""
+    """The task list, or ``[]`` if the store cannot be read, with BANK/LEGAL
+    tasks dropped entirely.
+
+    Redaction happens at this single load seam so *every* task consumer on the
+    surface — the list endpoint, its counts, task detail, the dashboard
+    attention feed and the per-project progress proxy — inherits it and none can
+    leak a sensitive task's title. Sensitive rows are dropped rather than
+    field-allowlisted, matching the policy already applied to projects, runs and
+    activity. ``load_tasks`` already returns ``[]`` for a missing/torn file in
+    its read-only default, so the guard only covers an unexpected raise."""
     try:
-        return load_tasks(ROOT)
+        tasks = load_tasks(ROOT)
     except Exception:  # pragma: no cover - defensive; load_tasks degrades itself
         return []
+    return [t for t in tasks if not is_sensitive(t.get("project") or "")]
 
 
 def _serialize_task(task: dict) -> schemas.Task:
