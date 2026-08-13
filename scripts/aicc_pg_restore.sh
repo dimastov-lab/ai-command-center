@@ -109,3 +109,25 @@ if [[ "$ROWS" -lt 1 ]]; then
     echo "restore produced no tables — treating as failure" >&2
     exit 4
 fi
+
+# `--no-owner --no-privileges` is what makes the archive portable between
+# clusters, but it also means the restored tables are owned by whoever ran this
+# script and carry no grants at all. Without the two commands below, aicc_app
+# and aicc_worker have no access to the restored database, and re-running them
+# is the only way to put ownership back where apply_table_grants expects it.
+# Printed rather than run: this script's credentials are a restore role, not
+# necessarily the superuser that bootstrap requires.
+cat <<NOTICE
+
+NOTE: the restored database has no roles or grants — pg_restore was run with
+--no-owner --no-privileges, so every table is owned by '${AICC_PG_USER}'.
+Before serving traffic from '${TARGET_DB}', re-assert the privilege matrix:
+
+  AICC_PG_DB=${TARGET_DB} AICC_PG_USER=<superuser> ... \\
+      python -m command_center.db bootstrap
+  # then, as the owner of the restored tables:
+  AICC_PG_DB=${TARGET_DB} AICC_PG_USER=${AICC_PG_USER} ... \\
+      python -m command_center.db upgrade
+
+For a drill this does not matter; for a real recovery it does.
+NOTICE

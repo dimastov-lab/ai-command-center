@@ -27,6 +27,7 @@ first request, so the fake — never the real class — is what gets cached.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Response
@@ -43,8 +44,41 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WEB_DIST = _REPO_ROOT / "web" / "dist"
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Open the PostgreSQL pool for the life of the process, when configured.
+
+    Without this the pool is only ever opened by `python -m command_center.db`,
+    so `/readyz` in a served process would report the database unreachable
+    forever and no replica would enter rotation.
+
+    Absence of `AICC_PG_HOST` means "this deployment has no server database"
+    (desktop, CLI, the test suite), not a misconfiguration: startup proceeds and
+    `/readyz` reports degraded. A host that *is* set but unusable is fatal here
+    on purpose — a bad DSN should stop the deploy, not surface as a 503 storm.
+    """
+    opened = False
+    if os.environ.get("AICC_PG_HOST"):
+        from command_center.db import pool
+
+        pool.open_pool()
+        opened = True
+    try:
+        yield
+    finally:
+        if opened:
+            from command_center.db import pool
+
+            pool.close_pool()
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="AI Command Center API", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title="AI Command Center API",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=_lifespan,
+    )
 
     if os.environ.get("AICC_WEB_DEV") == "1":
         app.add_middleware(

@@ -41,16 +41,37 @@ enforced by the database:
 | Role | May do | May not do |
 | --- | --- | --- |
 | `aicc_migrator` | Own the schema, run DDL | Nothing else runs as it |
-| `aicc_app` | `SELECT`/`INSERT`/`UPDATE` on every table | DDL, `DELETE`, `TRUNCATE` |
-| `aicc_worker` | Queue and execution tables only | Read or write proposals, council motions/votes, audit findings, provenance, marketplace, model registry |
+| `aicc_app` | `SELECT`/`INSERT`/`UPDATE` on every domain table | DDL, `DELETE`, `TRUNCATE`, and any write to `schema_migration` |
+| `aicc_worker` | Queue and execution tables only | Read or write proposals, council motions/votes, audit findings, provenance, marketplace, model registry; write `completion.review_*` |
 
 `aicc_worker` is deliberately the narrowest: execution hosts run agent
 processes against untrusted repository content, so a compromised worker
 credential must not be able to read or forge the governance record. Workers
 claim queue entries (`UPDATE`) but cannot enqueue them (`INSERT`).
 
+Two carve-outs are column- rather than table-level, because a table-level grant
+would have been too wide for the claim above:
+
+- `completion.review_verdict` / `review_run_id` / `review_summary` hold the
+  independent review's outcome. A worker writes the rest of its own completion
+  row, so without a column grant it could stamp `review_verdict = 'approved'`
+  on any run — forging exactly the decision the review gate exists to make.
+- `schema_migration` is read-only for both non-migrator roles. Write access
+  would let an injection foothold in the web layer rewrite a checksum, which is
+  the only guard against two environments reporting the same version for
+  different schemas.
+
 No role holds `DELETE` on any table. The schema is an append/update ledger;
 removing rows is an owner-level migration operation.
+
+`upgrade` re-strips `PUBLIC` of table, sequence and **function** privileges
+every time it runs. The function case is the one that matters: `PUBLIC` gets
+`EXECUTE` on every new function by default, so a migration adding a
+`SECURITY DEFINER` helper would otherwise hand a worker a route into the tables
+the matrix excludes. `ALTER DEFAULT PRIVILEGES` would be the tidier mechanism,
+but it was measured against PostgreSQL 15 and 17 and does not persist a
+revocation of that built-in default — so it would have been a control that
+silently does nothing.
 
 `tests/db/test_postgres_integration.py` connects **as each role** and asserts
 both halves of the matrix — what the role can do and what it must be refused.

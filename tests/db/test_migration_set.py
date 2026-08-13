@@ -67,3 +67,28 @@ def test_initial_migration_covers_the_declared_table_inventory() -> None:
     }
     # `schema_migration` is created by the runner itself, not by 0001.
     assert created == set(roles.ALL_TABLES) - {"schema_migration"}
+
+
+def test_duplicate_down_migration_is_rejected(tmp_path) -> None:
+    _write_pair(tmp_path, 1, "initial")
+    (tmp_path / "0001_other.down.sql").write_text("SELECT 1;", encoding="utf-8")
+    with pytest.raises(migrations.MigrationError, match="Duplicate down-migration"):
+        migrations.discover(tmp_path)
+
+
+def test_orphan_down_migration_is_rejected(tmp_path) -> None:
+    _write_pair(tmp_path, 1, "initial")
+    (tmp_path / "0002_stray.down.sql").write_text("SELECT 1;", encoding="utf-8")
+    with pytest.raises(migrations.MigrationError, match="no matching up-migration"):
+        migrations.discover(tmp_path)
+
+
+def test_expected_schema_version_tracks_the_migration_set() -> None:
+    """A hand-maintained constant here would eventually go un-bumped.
+
+    The failure mode is severe: the deploy migrates successfully, then every
+    replica reports schema_mismatch and 503s.
+    """
+    from command_center.db import health
+
+    assert health.EXPECTED_SCHEMA_VERSION == len(migrations.discover())

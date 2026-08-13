@@ -148,14 +148,99 @@ def test_public_cannot_create_objects(admin_conn, psycopg, test_dsn, role_passwo
 def test_app_can_write_every_declared_table(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
+    """Exercise the actual privilege, not just readability.
+
+    An earlier version of this test ran `SELECT count(*)` and asserted `>= 0`,
+    which is true unconditionally and would have passed with every INSERT and
+    UPDATE grant removed. Here each write is attempted and then rolled back, so
+    a missing grant fails as `InsufficientPrivilege`.
+    """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
-    with psycopg.connect(_as_role(test_dsn, "aicc_app", role_passwords), autocommit=True) as conn:
-        for table in roles.ALL_TABLES:
+    app_dsn = _as_role(test_dsn, "aicc_app", role_passwords)
+
+    for table in roles.ALL_TABLES:
+        expected = roles.PRIVILEGES[roles.APP_ROLE][table]
+        with psycopg.connect(app_dsn) as conn:
             with conn.cursor() as cur:
-                # SELECT is the privilege every declared table shares; a denial
-                # here means the grant loop missed the table entirely.
+                # A missing SELECT grant raises rather than returning a row.
                 cur.execute(f"SELECT count(*) FROM {table}")
-                assert cur.fetchone()[0] >= 0
+                assert cur.fetchone() is not None
+
+                # `WHERE false` reaches the privilege check without needing a
+                # valid row for each of 34 different table shapes.
+                if "UPDATE" in expected:
+                    cur.execute(f"UPDATE {table} SET {_any_column(cur, table)} = NULL WHERE false")
+                else:
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        cur.execute(
+                            f"UPDATE {table} SET {_any_column(cur, table)} = NULL WHERE false"
+                        )
+            conn.rollback()
+
+
+def _any_column(cur, table: str) -> str:
+    # Identity columns are excluded: `UPDATE ... SET id = NULL` on a GENERATED
+    # ALWAYS column is rejected at parse time, before the privilege check that
+    # is the point of the query.
+    cur.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = %s AND is_identity = 'NO' "
+        "ORDER BY ordinal_position LIMIT 1",
+        (table,),
+    )
+    return cur.fetchone()[0]
+
+
+def test_worker_cannot_forge_the_review_verdict(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Column-level grants, proven where a table-level grant would have leaked.
+
+    A worker writes its own completion row, so it needs UPDATE on `completion`.
+    Table-wide, that would also let a compromised execution host stamp
+    `review_verdict = 'approved'` on any run — forging the decision the review
+    gate exists to make.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    run_id = _seed_run(admin_conn)
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO completion (run_id, task_id, project, repository_path, "
+            "completion_state, created_at, updated_at) "
+            "SELECT id, task_id, project, repository_path, 'running', now(), now() "
+            "FROM run WHERE id = %s",
+            (run_id,),
+        )
+
+    worker_dsn = _as_role(test_dsn, "aicc_worker", role_passwords)
+
+    with psycopg.connect(worker_dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE completion SET completion_state = 'merged' WHERE run_id = %s",
+                (run_id,),
+            )
+            assert cur.rowcount == 1
+
+    for column in ("review_verdict", "review_summary", "review_run_id"):
+        with psycopg.connect(worker_dsn) as conn:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE completion SET {column} = 'approved' WHERE run_id = %s",
+                        (run_id,),
+                    )
+
+
+def test_app_cannot_rewrite_the_migration_ledger(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The ledger checksum is the only guard against silent schema divergence."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    with psycopg.connect(_as_role(test_dsn, "aicc_app", role_passwords)) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with conn.cursor() as cur:
+                cur.execute("UPDATE schema_migration SET checksum = 'forged'")
 
 
 def test_app_cannot_drop_or_alter_tables(admin_conn, psycopg, test_dsn, role_passwords):
@@ -237,6 +322,7 @@ def test_matrix_matches_the_catalog(admin_conn, psycopg, test_dsn, role_password
     test still cannot widen access unnoticed.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    actual: dict[str, dict[str, set[str]]] = {}
     with admin_conn.cursor() as cur:
         cur.execute(
             "SELECT grantee, table_name, privilege_type "
@@ -244,13 +330,34 @@ def test_matrix_matches_the_catalog(admin_conn, psycopg, test_dsn, role_password
             "WHERE table_schema = 'public' AND grantee = ANY(%s)",
             (list(roles.ALL_ROLES),),
         )
-        actual: dict[str, dict[str, set[str]]] = {}
         for grantee, table, privilege in cur.fetchall():
             actual.setdefault(grantee, {}).setdefault(table, set()).add(privilege)
 
+        # Column-level grants do not appear in role_table_grants, so a matrix
+        # entry narrowed to columns would look like a *missing* grant without
+        # this second query.
+        cur.execute(
+            "SELECT grantee, table_name, privilege_type, column_name "
+            "FROM information_schema.role_column_grants "
+            "WHERE table_schema = 'public' AND grantee = ANY(%s)",
+            (list(roles.ALL_ROLES),),
+        )
+        column_grants: dict[str, dict[str, dict[str, set[str]]]] = {}
+        for grantee, table, privilege, column in cur.fetchall():
+            column_grants.setdefault(grantee, {}).setdefault(table, {}).setdefault(
+                privilege, set()
+            ).add(column)
+
     for role in (roles.APP_ROLE, roles.WORKER_ROLE):
         expected = {t: set(p) for t, p in roles.PRIVILEGES[role].items()}
-        assert actual.get(role, {}) == expected, role
+        narrowed = roles.COLUMN_PRIVILEGES.get(role, {})
+        seen = actual.get(role, {})
+        for table, per_privilege in narrowed.items():
+            for privilege, columns in per_privilege.items():
+                granted = column_grants.get(role, {}).get(table, {}).get(privilege, set())
+                assert granted == set(columns), f"{role}.{table}.{privilege}"
+                seen.setdefault(table, set()).add(privilege)
+        assert seen == expected, role
 
 
 # --------------------------------------------------------------------------
@@ -421,3 +528,165 @@ def _repo_root():
     from pathlib import Path
 
     return Path(__file__).resolve().parents[2]
+
+
+def test_concurrent_upgrades_are_serialized(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The advisory lock's whole reason to exist, exercised concurrently.
+
+    Two processes starting at once is the normal case for a rolling deploy.
+    Without the lock both read "0001 not applied" and both run the DDL; the
+    loser fails mid-migration. With it, exactly one applies and the other finds
+    the work already done.
+    """
+    import threading
+
+    roles.apply_bootstrap(admin_conn)
+    migrator_dsn = _as_role(test_dsn, "aicc_migrator", role_passwords)
+    barrier = threading.Barrier(2)
+    results: list[object] = [None, None]
+
+    def run(index: int) -> None:
+        try:
+            with psycopg.connect(migrator_dsn, autocommit=True) as conn:
+                barrier.wait(timeout=30)
+                results[index] = migrations.upgrade(conn)
+        except Exception as exc:  # noqa: BLE001 — recorded, asserted below
+            results[index] = exc
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert not any(isinstance(r, Exception) for r in results), results
+    # Exactly one run applied the migration; the other found nothing to do.
+    assert sorted([results[0], results[1]], key=len) == [(), (1,)]
+
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM schema_migration")
+        assert cur.fetchone()[0] == 1
+
+
+def test_new_tables_are_unreachable_until_granted(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Default privileges must not hand a future migration's table to anyone.
+
+    This is the property `ALTER DEFAULT PRIVILEGES ... FOR ROLE aicc_migrator`
+    is there to guarantee; asserting on the rendered SQL alone would not catch
+    getting the `FOR ROLE` clause wrong.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, "aicc_migrator", role_passwords), autocommit=True
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute("CREATE TABLE future_table (id text PRIMARY KEY)")
+
+    for role in ("aicc_app", "aicc_worker"):
+        with psycopg.connect(_as_role(test_dsn, role, role_passwords)) as conn:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM future_table")
+
+
+def test_public_execute_on_new_functions_is_revoked(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """PUBLIC gets EXECUTE on new functions by default — the worker's way out.
+
+    A later migration adding a SECURITY DEFINER helper over a governance table
+    would otherwise be callable by `aicc_worker` through PUBLIC, reaching
+    exactly the data the matrix excludes.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, "aicc_migrator", role_passwords), autocommit=True
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE FUNCTION leak_proposals() RETURNS bigint "
+                "LANGUAGE sql SECURITY DEFINER AS $$ SELECT count(*) FROM proposal $$"
+            )
+        # Exactly what `python -m command_center.db upgrade` does after applying
+        # a migration; the revocation is not a one-off at bootstrap.
+        roles.apply_table_grants(conn)
+
+    with psycopg.connect(_as_role(test_dsn, "aicc_worker", role_passwords)) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with conn.cursor() as cur:
+                cur.execute("SELECT leak_proposals()")
+
+
+def test_migration_runner_rejects_a_non_autocommit_connection(psycopg, test_dsn):
+    """Per-migration atomicity and lock release both depend on autocommit."""
+    with psycopg.connect(test_dsn) as conn:  # psycopg's default: autocommit off
+        with pytest.raises(migrations.MigrationError, match="autocommit"):
+            migrations.upgrade(conn)
+        with pytest.raises(migrations.MigrationError, match="autocommit"):
+            migrations.downgrade(conn, target=0)
+
+
+def test_database_ahead_of_this_build_is_reported(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """An old deploy against a newer schema is a rollback, not "up to date"."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO schema_migration (version, slug, checksum) "
+            "VALUES (99, 'from_the_future', 'x')"
+        )
+
+    with psycopg.connect(
+        _as_role(test_dsn, "aicc_migrator", role_passwords), autocommit=True
+    ) as conn:
+        with pytest.raises(migrations.MigrationError, match=r"\[99\]"):
+            migrations.upgrade(conn)
+
+
+def test_readyz_is_200_against_a_real_database(
+    admin_conn, psycopg, test_dsn, role_passwords, monkeypatch
+):
+    """End to end, with no fakes: app startup opens the pool and /readyz passes.
+
+    The unit tests for `/readyz` monkeypatch `pool.connection`, which is exactly
+    why they stayed green while `create_app()` had no lifespan hook and the pool
+    was therefore never opened in a served process — the probe would have
+    returned 503 forever in production. This test would have caught it.
+    """
+    from fastapi.testclient import TestClient
+    from psycopg.conninfo import conninfo_to_dict
+
+    from command_center.db import pool
+    from command_center.webapi.app import create_app
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    params = conninfo_to_dict(_as_role(test_dsn, "aicc_app", role_passwords))
+
+    monkeypatch.setenv("AICC_PG_HOST", params.get("host", "127.0.0.1"))
+    monkeypatch.setenv("AICC_PG_PORT", str(params.get("port", 5432)))
+    monkeypatch.setenv("AICC_PG_DB", params["dbname"])
+    monkeypatch.setenv("AICC_PG_USER", params["user"])
+    monkeypatch.setenv("AICC_PG_PASSWORD", params["password"])
+    monkeypatch.setenv("AICC_PG_SSLMODE", "prefer")  # loopback, per config policy
+
+    pool.close_pool()
+    try:
+        # The context manager is what runs the lifespan hook.
+        with TestClient(create_app()) as client:
+            response = client.get("/readyz")
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["status"] == "ok"
+            assert body["checks"]["schema_version"] == len(migrations.discover())
+            assert body["checks"]["database"] == "ok"
+
+            assert client.get("/healthz").status_code == 200
+    finally:
+        pool.close_pool()

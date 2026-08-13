@@ -27,9 +27,13 @@ from command_center.db import migrations, pool
 
 __all__ = ["HealthReport", "check_liveness", "check_readiness"]
 
-# The schema version this build of the code is written against. Bumped in the
-# same commit that adds a migration.
-EXPECTED_SCHEMA_VERSION = 1
+# The schema version this build of the code is written against. Derived from the
+# migration set rather than hand-maintained: a constant someone must remember to
+# bump alongside a new migration is one that eventually is not bumped, and the
+# failure mode is severe — the deploy migrates successfully, then every replica
+# reports schema_mismatch and 503s, taking the service down *after* the
+# migration appeared to work.
+EXPECTED_SCHEMA_VERSION = len(migrations.discover())
 
 
 @dataclass(frozen=True, slots=True)

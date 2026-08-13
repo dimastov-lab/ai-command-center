@@ -15,8 +15,8 @@
 #
 # Usage: put the variables in an untracked `.env` beside this file, then
 #   docker compose -f docker-compose.server.yml up -d
+#   AICC_PG_USER=<superuser>   ... python -m command_center.db bootstrap
 #   AICC_PG_USER=aicc_migrator ... python -m command_center.db upgrade
-#   AICC_PG_USER=aicc_migrator ... python -m command_center.db provision
 
 services:
   postgres:

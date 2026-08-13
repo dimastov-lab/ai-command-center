@@ -20,7 +20,10 @@ Three roles, by what fails if each one is compromised:
   only the queue and execution tables. Governance data — proposals, council
   motions and votes, audit findings, provenance evidence, the marketplace and
   the model registry — is unreachable from a worker credential, so a
-  compromised execution host cannot read or forge the decision record.
+  compromised execution host cannot read or forge the decision record. The
+  independent review's verdict lives on `completion`, which a worker does write,
+  so the three `review_*` columns are carved out via column-level grants (see
+  COLUMN_PRIVILEGES) rather than left inside a table-wide UPDATE.
 
 `DELETE` is granted to no role on any table: this schema is an append/update
 ledger, and row removal is a migration-time operation performed by the owner.
@@ -36,6 +39,7 @@ __all__ = [
     "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
+    "COLUMN_PRIVILEGES",
     "apply_bootstrap",
     "apply_table_grants",
     "IDENTITY_SEQUENCES",
@@ -112,6 +116,47 @@ _APP_DML = frozenset({"SELECT", "INSERT", "UPDATE"})
 _WORKER_WRITE = frozenset({"SELECT", "INSERT", "UPDATE"})
 _READ = frozenset({"SELECT"})
 
+# Columns of `completion` that record the independent review's outcome. A
+# worker writes its own completion row, but table-level UPDATE would also let a
+# compromised execution host stamp `review_verdict = 'approved'` on any run —
+# forging exactly the decision the review gate exists to make. Granted per
+# column instead, so the verdict is writable only by the app.
+_REVIEW_COLUMNS = ("review_verdict", "review_run_id", "review_summary")
+
+_COMPLETION_COLUMNS = (
+    "run_id", "task_id", "session_id", "project", "repository_path", "branch",
+    "base_branch", "head_commit", "remote", "remote_branch", "pull_request_number",
+    "pull_request_url", "pull_request_state", "replaced_pull_request_number",
+    "replaced_pull_request_url", "merge_commit", "merge_mode", "merge_method",
+    "completion_state", "last_reason_code", "requires_human", "is_recoverable",
+    "recommended_action", "validation_summary", "policy_json", "last_checked_at",
+    "next_retry_at", "retry_count", "recovery_count", "version", "created_at",
+    "updated_at", *_REVIEW_COLUMNS,
+)
+
+_WORKER_COMPLETION_COLUMNS = tuple(
+    column for column in _COMPLETION_COLUMNS if column not in _REVIEW_COLUMNS
+)
+
+# role -> table -> privilege -> the columns it is limited to. A privilege listed
+# here is granted per column; anything not listed is granted table-wide.
+COLUMN_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, MappingProxyType[str, tuple[str, ...]]]] = (
+    MappingProxyType(
+        {
+            WORKER_ROLE: MappingProxyType(
+                {
+                    "completion": MappingProxyType(
+                        {
+                            "INSERT": _WORKER_COMPLETION_COLUMNS,
+                            "UPDATE": _WORKER_COMPLETION_COLUMNS,
+                        }
+                    )
+                }
+            )
+        }
+    )
+)
+
 # The queue and execution tables a worker legitimately writes while running a
 # job. Anything absent from this mapping is unreachable for `aicc_worker`.
 _WORKER_TABLES: dict[str, frozenset[str]] = {
@@ -135,7 +180,21 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
             # ownership rather than grants; it needs no row-level grants of its
             # own and receives none here.
             MIGRATOR_ROLE: MappingProxyType({}),
-            APP_ROLE: MappingProxyType({table: _APP_DML for table in ALL_TABLES}),
+            APP_ROLE: MappingProxyType(
+                {
+                    table: (
+                        # The ledger is read by the readiness probe and written
+                        # only by the migrator. Table-level write here would let
+                        # an injection foothold in the web layer rewrite a
+                        # checksum — defeating the one guard that stops two
+                        # environments reporting the same version for different
+                        # schemas — or fake a version so /readyz reports healthy
+                        # against an unmigrated database.
+                        _READ if table == "schema_migration" else _APP_DML
+                    )
+                    for table in ALL_TABLES
+                }
+            ),
             WORKER_ROLE: MappingProxyType(dict(_WORKER_TABLES)),
         }
     )
@@ -182,17 +241,12 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     statements.append(f"REVOKE ALL ON SCHEMA {schema} FROM PUBLIC;")
     statements.append(f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC;")
     statements.append(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM PUBLIC;")
+    statements.append(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;")
 
     statements.append(f"GRANT USAGE, CREATE ON SCHEMA {schema} TO {MIGRATOR_ROLE};")
     for role in (APP_ROLE, WORKER_ROLE):
         statements.append(f"GRANT USAGE ON SCHEMA {schema} TO {role};")
 
-    # Tables created by *future* migrations must not silently become readable:
-    # no default privileges are granted, so every new table has to be added to
-    # PRIVILEGES and granted explicitly.
-    statements.append(
-        f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} REVOKE ALL ON TABLES FROM PUBLIC;"
-    )
     return statements
 
 
@@ -206,6 +260,27 @@ def render_table_grants(schema: str = "public") -> list[str]:
     _require_identifier(schema)
     statements: list[str] = []
 
+    # Re-stripping PUBLIC here rather than only at bootstrap is what makes this
+    # cover objects created by *later* migrations: at bootstrap the schema is
+    # empty, so `ALL TABLES` matches nothing.
+    #
+    # FUNCTIONS is the one that matters. PUBLIC gets EXECUTE on every new
+    # function by default, so a migration adding a SECURITY DEFINER helper — a
+    # normal way to expose a governance query — would otherwise hand
+    # `aicc_worker` a route to precisely the tables this matrix excludes.
+    #
+    # `ALTER DEFAULT PRIVILEGES` would be the tidier mechanism, but it was
+    # tested against PostgreSQL 15 and 17 and does not persist a revocation of
+    # PUBLIC's built-in function default (no `pg_default_acl` row is stored and
+    # new functions still come out with the default ACL), so relying on it would
+    # have been a security control that silently does nothing. Re-asserting
+    # after every migration — which `command_center.db upgrade` already does —
+    # is verifiable, and `test_public_execute_on_new_functions_is_revoked`
+    # verifies it.
+    statements.append(f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM PUBLIC;")
+    statements.append(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM PUBLIC;")
+    statements.append(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;")
+
     for role in (APP_ROLE, WORKER_ROLE):
         statements.append(f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM {role};")
         statements.append(
@@ -215,8 +290,19 @@ def render_table_grants(schema: str = "public") -> list[str]:
     for role in (APP_ROLE, WORKER_ROLE):
         for table, privileges in sorted(PRIVILEGES[role].items()):
             _require_identifier(table)
-            granted = ", ".join(sorted(privileges))
-            statements.append(f"GRANT {granted} ON {schema}.{table} TO {role};")
+            columns = COLUMN_PRIVILEGES.get(role, {}).get(table, {})
+            table_wide = sorted(p for p in privileges if p not in columns)
+            if table_wide:
+                statements.append(
+                    f"GRANT {', '.join(table_wide)} ON {schema}.{table} TO {role};"
+                )
+            for privilege in sorted(p for p in privileges if p in columns):
+                for column in columns[privilege]:
+                    _require_identifier(column)
+                column_list = ", ".join(columns[privilege])
+                statements.append(
+                    f"GRANT {privilege} ({column_list}) ON {schema}.{table} TO {role};"
+                )
 
     # Identity columns draw from a sequence; INSERT alone is not enough. Granted
     # per sequence rather than schema-wide, so a role still cannot advance the

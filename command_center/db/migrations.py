@@ -109,7 +109,20 @@ def discover(sql_dir: Path | None = None) -> tuple[Migration, ...]:
                 raise MigrationError(f"Duplicate up-migration for version {version}.")
             ups[version] = (match["slug"], path)
         else:
+            # Validated as strictly as the up-migrations: an unnoticed duplicate
+            # here silently overwrites the other, and `downgrade` would then run
+            # the wrong file against a schema it does not match.
+            if version in downs:
+                raise MigrationError(f"Duplicate down-migration for version {version}.")
             downs[version] = path
+
+    orphans = sorted(set(downs) - set(ups))
+    if orphans:
+        raise MigrationError(
+            f"Down-migration(s) {orphans} have no matching up-migration; a stray "
+            "down file would otherwise be silently ignored, or paired with a "
+            "differently named up-migration of the same version."
+        )
 
     migrations: list[Migration] = []
     for version in sorted(ups):
@@ -119,6 +132,11 @@ def discover(sql_dir: Path | None = None) -> tuple[Migration, ...]:
             raise MigrationError(
                 f"Migration {version:04d}_{slug} has no down-migration. Every "
                 "migration must be reversible under test."
+            )
+        if down_path.name != f"{version:04d}_{slug}.down.sql":
+            raise MigrationError(
+                f"Migration {version:04d}_{slug} is paired with {down_path.name!r}; "
+                "the up- and down-migration slugs must match."
             )
         migrations.append(
             Migration(version=version, slug=slug, up_path=up_path, down_path=down_path)
@@ -159,12 +177,23 @@ def current_version(conn) -> int:
 
 def upgrade(conn, *, target: int | None = None, sql_dir: Path | None = None) -> tuple[int, ...]:
     """Apply every pending migration up to `target`. Returns versions applied."""
+    _require_autocommit(conn)
     migrations = discover(sql_dir)
     ceiling = migrations[-1].version if target is None else target
 
     with _advisory_lock(conn):
         ensure_ledger(conn)
         already = set(applied_versions(conn))
+        # A database ahead of this build is not "up to date" — it is a rollback
+        # that nobody noticed. Reporting it here stops an old deploy from
+        # running happily against a newer schema.
+        ahead = sorted(already - {m.version for m in migrations})
+        if ahead:
+            raise MigrationError(
+                f"Database has migration(s) {ahead} applied that this build does not "
+                "define. It was migrated by a newer deploy; roll the code forward "
+                "rather than migrating backwards."
+            )
         _verify_checksums(conn, migrations)
         applied: list[int] = []
         for migration in migrations:
@@ -185,6 +214,7 @@ def upgrade(conn, *, target: int | None = None, sql_dir: Path | None = None) -> 
 
 def downgrade(conn, *, target: int, sql_dir: Path | None = None) -> tuple[int, ...]:
     """Revert applied migrations down to (and including) version > `target`."""
+    _require_autocommit(conn)
     if target < 0:
         raise MigrationError(f"Downgrade target must be >= 0; got {target}.")
     migrations = {m.version: m for m in discover(sql_dir)}
@@ -232,6 +262,27 @@ def _verify_checksums(conn, migrations) -> None:
             )
 
 
+def _require_autocommit(conn) -> None:
+    """Reject a connection whose transaction mode would break the guarantees above.
+
+    On a non-autocommit connection psycopg opens an implicit transaction before
+    the first statement, which turns each `conn.transaction()` into a mere
+    SAVEPOINT: migrations would not be individually durable, nothing would be
+    committed unless the caller remembered to, and a failure outside the
+    `transaction()` block would leave the session in `InFailedSqlTransaction` —
+    where the unlock below also fails, masking the real error and leaking a
+    session-level lock that survives rollback. Every caller in this repository
+    already passes an autocommit connection; this makes that a contract instead
+    of a coincidence.
+    """
+    if not getattr(conn, "autocommit", False):
+        raise MigrationError(
+            "The migration runner requires an autocommit connection; per-migration "
+            "atomicity and advisory-lock release both depend on it. Open it with "
+            "psycopg.connect(dsn, autocommit=True) or use command_center.db.pool."
+        )
+
+
 class _advisory_lock:
     """Session-level advisory lock held for the duration of a migration run."""
 
@@ -240,9 +291,28 @@ class _advisory_lock:
 
     def __enter__(self):
         with self._conn.cursor() as cur:
+            # The pool applies the application's statement_timeout to every
+            # session. Under it, `pg_advisory_lock` — itself a statement — would
+            # be cancelled while waiting, so the second migrator in a rolling
+            # deploy would fail instead of queueing, and a CREATE INDEX or
+            # backfill would be killed mid-migration and fail identically on
+            # every retry. Migrations are the one workload that must be allowed
+            # to take as long as they take.
+            cur.execute("SET statement_timeout = 0")
             cur.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
         return self
 
     def __exit__(self, *exc_info) -> None:
-        with self._conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+        # A session-level advisory lock outlives both a rollback and the
+        # connection's return to the pool, so failing to release it here would
+        # deadlock every later migration on that connection. If the unlock
+        # itself fails while an exception is already propagating, let the
+        # original exception win — it is the one that explains what happened.
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+                cur.execute("RESET statement_timeout")
+        except Exception:  # noqa: BLE001
+            if exc_info[0] is None:
+                raise
+            _LOG.exception("failed to release the migration advisory lock")

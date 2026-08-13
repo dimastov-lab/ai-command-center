@@ -40,6 +40,14 @@ done
 
 [[ -n "$OUT_DIR" ]] || { echo "--out-dir is required" >&2; exit 2; }
 
+# Validated before use because the retention step feeds it to `tail -n +N` via
+# bash arithmetic, where a non-numeric value evaluates to 0 and would delete
+# every archive — including the one just written.
+if [[ -n "$KEEP" && ! "$KEEP" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--keep must be a positive integer; got '${KEEP}'" >&2
+    exit 2
+fi
+
 : "${AICC_PG_HOST:?AICC_PG_HOST is required}"
 : "${AICC_PG_DB:?AICC_PG_DB is required}"
 : "${AICC_PG_USER:?AICC_PG_USER is required}"
@@ -48,10 +56,13 @@ PGPORT_VALUE="${AICC_PG_PORT:-5432}"
 
 command -v pg_dump >/dev/null || { echo "pg_dump not found in PATH" >&2; exit 127; }
 
-mkdir -p "$OUT_DIR"
-# Backups routinely contain every row in the system; keep them unreadable to
-# other local accounts even if the parent directory is permissive.
-chmod 700 "$OUT_DIR"
+# Backups routinely contain every row in the system, so a directory this script
+# creates is owner-only. An existing directory is left alone: it may be an
+# operator-managed shared location whose permissions are a deliberate choice.
+if [[ ! -d "$OUT_DIR" ]]; then
+    mkdir -p "$OUT_DIR"
+    chmod 700 "$OUT_DIR"
+fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 ARCHIVE="${OUT_DIR}/aicc-${AICC_PG_DB}-${STAMP}.dump"
