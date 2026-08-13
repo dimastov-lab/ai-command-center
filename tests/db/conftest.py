@@ -131,3 +131,25 @@ def _override(dsn: str, **overrides: str) -> str:
     params = conninfo_to_dict(dsn)
     params.update(overrides)
     return make_conninfo(**params)
+
+
+@pytest.fixture
+def pg_connection_factory(admin_conn, psycopg, test_dsn):  # noqa: ARG001
+    """A `connection()`-shaped factory over a migrated throwaway database.
+
+    Shaped like `command_center.db.pool.connection` so the store under test
+    talks to the real seam rather than to a fixture-specific interface — a
+    store proved against a bespoke connection object is not proved against the
+    one it runs on.
+    """
+    from contextlib import contextmanager
+
+    from command_center.db import migrations
+
+    migrations.upgrade(admin_conn)
+
+    @contextmanager
+    def factory():
+        yield admin_conn
+
+    return factory

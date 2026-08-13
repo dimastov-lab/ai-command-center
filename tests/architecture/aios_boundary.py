@@ -81,6 +81,7 @@ import ast
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -235,12 +236,88 @@ NAME_SUBSTRING_SIGNATURES: dict[str, tuple[str, ...]] = {
 }
 
 #: Name categories that a path name alone cannot establish: they must be
-#: corroborated by behaviour in the same file (see `_persists_data`). Only
-#: `memory` is here, because only `memory` has tokens (`db`, `store`,
-#: `repository`, ...) that name what a file is *about* as readily as what it
-#: *is* — a package directory called `db/` says nothing about whether the code
-#: inside owns an engine.
-CORROBORATED_NAME_CATEGORIES = frozenset({"memory"})
+#: corroborated by behaviour in the same file (see `_CORROBORATION`).
+#:
+#: `memory` and `queue` qualify because their tokens (`db`, `store`,
+#: `repository`, `queue`, ...) name what a file is *about* as readily as what
+#: it *is* — a directory called `db/` says nothing about whether the code
+#: inside owns an engine — *and* because each has a behavioural substitute that
+#: keeps a home-grown engine detected. `orchestration`, `authz` and `audit` are
+#: deliberately absent: no equivalent substitute has been demonstrated for
+#: them, and corroborating a name without one is a straight loss of coverage.
+CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue"})
+
+# --- queue-engine behaviour (corroboration for the `queue` name signature) ---
+
+#: Operations that make something a queue *engine* rather than a table of queue
+#: rows. Storing and listing entries is what a repository does; handing work out
+#: exactly once — claiming, leasing, acking, retrying — is the engine.
+#: Two vocabularies, because there are two jobs with very different blast
+#: radii. Using one frozenset for both was a real defect: it forced the wide
+#: signal's precision requirement onto the narrow signal's coverage
+#: requirement, and the coverage lost was the whole point of the name rule.
+#:
+#: **Corroboration** — applied only to files that already carry a `queue` name
+#: token, of which this repository has three. A wide vocabulary is affordable
+#: here: a false positive can only land on a file someone already named after a
+#: queue, and the cost of a false negative is an undetected engine.
+QUEUE_CORROBORATION_TOKENS = frozenset(
+    {
+        "claim",
+        "claims",
+        "lease",
+        "leases",
+        "heartbeat",
+        "ack",
+        "nack",
+        "enqueue",
+        "dequeue",
+        "requeue",
+        "reserve",
+        "release",
+        "retry",
+        "redeliver",
+        "pop",
+        "push",
+        "next",
+        "backoff",
+        "inflight",
+        # The mainstream queue verbs, added after review demonstrated three
+        # engines that escaped without them: `poll`/`finish`, `take`/`settle`,
+        # `checkout`/`give_back`. These are what `java.util.concurrent`, the Go
+        # channel idiom and any worker pool call their operations, so a queue
+        # author reaches for them without thinking about this detector at all —
+        # missing them was a coverage gap, not an adversary outwitting us.
+        # Measured before adding: closes all three, and changes the
+        # classification of none of the three queue-named files in this
+        # repository.
+        "poll",
+        "peek",
+        "take",
+        "offer",
+        "drain",
+        "checkout",
+        "settle",
+        "complete",
+        "fail",
+        "fetch",
+    }
+)
+
+#: **Unconditional** — applied to every file regardless of name, so precision
+#: is the binding constraint. Measured, not guessed: a draft that used the wide
+#: vocabulary here flagged twelve modules across the tree — auth *claims*, a
+#: FastAPI *dispatch*, UI panels — because those are ordinary English words
+#: that queues do not own. What survives is specific enough to mean the
+#: mechanism rather than the word.
+QUEUE_ENGINE_TOKENS = frozenset({"dequeue", "requeue", "nack", "redeliver"})
+
+#: SQL markers, split the same way. `SKIP LOCKED` exists for exactly one
+#: purpose — letting concurrent consumers take different rows — so it is safe
+#: unconditionally. `FOR UPDATE` is plain row locking and only means "queue"
+#: alongside a queue name, so it corroborates but never classifies on its own.
+QUEUE_ENGINE_SQL_MARKERS = ("skip locked",)
+QUEUE_CORROBORATION_SQL_MARKERS = ("skip locked", "for update")
 
 # --- persistence behaviour (corroboration for the `memory` name signature) ---
 
@@ -564,6 +641,52 @@ def _opens_for_writing(node: ast.Call, *, mode_index: int = 1) -> bool:
     return False
 
 
+def _runs_queue_operations(
+    tree: ast.AST,
+    tokens: frozenset[str] = QUEUE_ENGINE_TOKENS,
+    sql_markers: tuple[str, ...] = QUEUE_ENGINE_SQL_MARKERS,
+) -> bool:
+    """Whether this file hands work out, rather than merely storing it.
+
+    Two signals, both structural: a **defined** function whose name carries a
+    work-handout verb, and SQL that only a handout path writes.
+
+    Deliberately *not* signals: `INSERT`, `SELECT ... ORDER BY`, `DELETE`. That
+    is a repository over queue rows, which a control plane is allowed to own;
+    the engine is whatever decides who gets the next one.
+
+    Acknowledged limits, stated because a reader auditing coverage will
+    otherwise assume they are covered: a *called* but not defined operation
+    (`engine.dequeue()`) and an operation bound by assignment
+    (`dequeue = lambda ...`) are not detected. Both were true of the previous
+    rule as well; neither is a regression, and closing them needs
+    cross-module resolution this single-file scanner does not have.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if set(_TOKEN_SPLIT.split(node.name.lower())) & tokens:
+                return True
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            lowered = node.value.lower()
+            if any(marker in lowered for marker in sql_markers):
+                return True
+    return False
+
+
+def _corroborates_queue_name(tree: ast.AST) -> bool:
+    """The wide vocabulary, affordable because the name already narrowed the set."""
+    return _runs_queue_operations(
+        tree, QUEUE_CORROBORATION_TOKENS, QUEUE_CORROBORATION_SQL_MARKERS
+    )
+
+
+#: Category -> the behaviour that has to corroborate its name signature.
+_CORROBORATION: dict[str, Callable[[ast.AST], bool]] = {
+    "memory": _persists_data,
+    "queue": _corroborates_queue_name,
+}
+
+
 def _name_categories(rel_path: str) -> set[str]:
     """Engine-named path segments (skipped for pure presentation layers)."""
     if _is_presentation(rel_path):
@@ -598,12 +721,21 @@ def classify_engine_categories(rel_path: str, tree: ast.AST) -> set[str]:
 
     name_cats = _name_categories(rel_path)
     categories |= name_cats - CORROBORATED_NAME_CATEGORIES
-    # A `memory` name is a question, not a verdict. It becomes a verdict only if
-    # the file also *behaves* like a store. A path segment on its own says where
-    # something lives, not what it does -- and a file whose name is its only
-    # engine signal is a file the gate would freeze for being called `db`.
-    if name_cats & CORROBORATED_NAME_CATEGORIES and _persists_data(tree):
-        categories |= name_cats & CORROBORATED_NAME_CATEGORIES
+    # A `memory` or `queue` name is a question, not a verdict. It becomes one
+    # only if the file also *behaves* like the thing it is named after: a path
+    # segment says where something lives, not what it does, and a file whose
+    # name is its only engine signal is a file the gate would freeze for being
+    # called `db` or `queue`.
+    for category in name_cats & CORROBORATED_NAME_CATEGORIES:
+        if _CORROBORATION[category](tree):
+            categories.add(category)
+    # Queue-engine behaviour classifies regardless of the filename. This is the
+    # half the old name-only rule missed entirely: it flagged an adapter called
+    # `queue_store.py` while a hand-rolled claim/lease loop in a file named
+    # anything else went unseen. Corroborating the name without adding this
+    # would have been a straight reduction in control.
+    if _runs_queue_operations(tree):
+        categories.add("queue")
     return categories
 
 

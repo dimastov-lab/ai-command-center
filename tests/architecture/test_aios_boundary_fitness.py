@@ -94,8 +94,12 @@ def test_scanner_semantics_are_stable():
     assert "runtime_package" in boundary.classify_engine_categories(
         "command_center/runtime/new_module.py", empty
     )
+    # A `queue` name is corroborated now: the name alone is a question, the
+    # work-handout behaviour is the answer.
+    handout = ast.parse("def dequeue(conn):\n    ...\n")
+    assert boundary.classify_engine_categories("command_center/retry_queue.py", empty) == set()
     assert "queue" in boundary.classify_engine_categories(
-        "command_center/retry_queue.py", empty
+        "command_center/retry_queue.py", handout
     )
     # Presentation layers are exempt from name signatures only...
     assert boundary.classify_engine_categories("command_center/ui/queue_panel_v2.py", empty) == set()
@@ -192,16 +196,16 @@ def test_a_file_backed_store_is_an_engine_even_with_no_driver():
     assert boundary.classify_engine_categories("command_center/db/config.py", reader) == set()
 
 
-def test_corroboration_applies_only_to_the_memory_category():
-    """The ruling loosened one signature, not the gate.
+def test_corroboration_leaves_the_uncorroborated_categories_alone():
+    """Two signatures are corroborated, not the gate.
 
-    `queue`, `orchestration`, `authz` and `audit` names still classify on the
-    name alone — those tokens name what a module *is*, and nothing in the
-    boundary ruling touched them.
+    `orchestration`, `authz` and `audit` names still classify on the name
+    alone: those tokens name what a module *is*, and unlike `memory` and
+    `queue` they have no behavioural substitute that could replace the name
+    without losing a home-grown engine.
     """
     empty = ast.parse("")
     for path, category in (
-        ("command_center/retry_queue.py", "queue"),
         ("command_center/task_scheduler.py", "orchestration"),
         ("command_center/rbac_rules.py", "authz"),
         ("command_center/audit_trail.py", "audit"),
@@ -272,3 +276,175 @@ def test_a_store_that_opens_its_own_file_as_an_attribute_is_still_an_engine():
         "        return handle.read()\n"
     )
     assert boundary.classify_engine_categories("command_center/db/config.py", reader) == set()
+
+
+def test_renaming_cannot_hide_queue_engine_behaviour():
+    """A queue engine is caught by what it does, whatever the file is called.
+
+    The old rule fired on a `queue` path token, so it flagged an adapter named
+    `queue_store.py` while a hand-rolled claim loop in a file named anything
+    else went unseen. Making the name signature semantic without this would
+    have been a straight reduction in control; behaviour now classifies
+    regardless of the filename, so the detector got stricter here, not looser.
+    """
+    innocuous_names = (
+        "command_center/helpers.py",
+        "command_center/portfolio_utils.py",
+        "command_center/db/entries.py",
+    )
+
+    skip_locked = ast.parse(
+        "def next_item(conn):\n"
+        "    return conn.execute(\n"
+        "        'SELECT id FROM work FOR UPDATE SKIP LOCKED LIMIT 1'\n"
+        "    ).fetchone()\n"
+    )
+    handout = ast.parse("def dequeue(conn):\n    ...\ndef requeue(conn):\n    ...\n")
+
+    for path in innocuous_names:
+        assert "queue" in boundary.classify_engine_categories(path, skip_locked), path
+        assert "queue" in boundary.classify_engine_categories(path, handout), path
+
+    # ...and the name still counts when the behaviour is there too, so the
+    # corroborated path cannot be used to launder an engine into a `queue` file.
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/retry_queue.py", handout
+    )
+
+
+def test_a_plain_repository_adapter_passes():
+    """Storing and listing rows is what a control-plane repository does.
+
+    `INSERT`, `SELECT ... ORDER BY`, `DELETE` over a table of queue rows is not
+    a queue engine — the engine is whatever decides who gets the next one. This
+    is the case the previous rule got wrong, and getting it wrong made the
+    boundary unimplementable: the domain half that the ruling requires to stay
+    in AICC could not be clean under any filename.
+    """
+    adapter = ast.parse(
+        "class PostgresQueueMirror:\n"
+        "    def replace_entries(self, conn, entries):\n"
+        "        conn.execute('DELETE FROM queue_entry')\n"
+        "        conn.executemany('INSERT INTO queue_entry (id) VALUES (%s)', entries)\n"
+        "    def list_entries(self, conn):\n"
+        "        return conn.execute(\n"
+        "            'SELECT id FROM queue_entry ORDER BY position ASC'\n"
+        "        ).fetchall()\n"
+    )
+
+    for path in ("command_center/queue_store.py", "command_center/db/queue_store.py"):
+        assert boundary.classify_engine_categories(path, adapter) == set(), path
+
+
+def test_a_queue_named_file_containing_a_real_engine_still_classifies():
+    """The regression this rule must not have.
+
+    Independent review built these three against the first attempt at a
+    semantic `queue` signature and all three escaped, while the old name-only
+    rule had caught them. A lease/claim/heartbeat loop in a file called
+    `task_queue.py` is the most probable shape of the thing the name signature
+    was protecting against.
+
+    The cause was one vocabulary doing two jobs: the narrow set needed for the
+    unconditional, tree-wide signal was also being used to corroborate a name,
+    where a wide set is affordable because the name has already narrowed the
+    candidates to a handful of files.
+    """
+    postgres_lease = ast.parse(
+        "def claim_next(conn, owner):\n"
+        "    row = conn.execute(\n"
+        "        'SELECT id FROM work ORDER BY priority FOR UPDATE LIMIT 1'\n"
+        "    ).fetchone()\n"
+        "    conn.execute('UPDATE work SET state = %s WHERE id = %s', ('leased', row[0]))\n"
+        "def heartbeat(conn, item_id):\n"
+        "    ...\n"
+        "def retry_failed(conn):\n"
+        "    ...\n"
+    )
+    in_memory = ast.parse(
+        "class Inflight:\n"
+        "    def push(self, item):\n        ...\n"
+        "    def pop_next(self):\n        ...\n"
+        "    def ack_done(self, item):\n        ...\n"
+    )
+    redis_engine = ast.parse(
+        "import redis\n"
+        "def complete(client, item):\n    ...\n"
+        "def retry(client, item):\n    ...\n"
+    )
+
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/task_queue.py", postgres_lease
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/queues/inflight.py", in_memory
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/work_queue.py", redis_engine
+    )
+
+
+def test_the_wide_vocabulary_stays_behind_the_name_gate():
+    """`claim`/`retry`/`next` are ordinary English, so they may only corroborate.
+
+    Applied unconditionally they flagged twelve unrelated modules — auth
+    claims, a FastAPI dispatch, UI panels. The wide set is safe *only* because
+    a queue-shaped filename has already narrowed the candidates.
+    """
+    ordinary = ast.parse(
+        "def claim(token):\n    ...\n"
+        "def retry(request):\n    ...\n"
+        "def next_page(cursor):\n    ...\n"
+    )
+
+    # Asserting `queue` specifically, not an empty set: `auth_tokens.py` carries
+    # an `authz` name token of its own, and conflating "did not become a queue"
+    # with "matched nothing" would make this test pass for the wrong reason.
+    for path in ("command_center/auth_tokens.py", "command_center/web_client.py"):
+        assert "queue" not in boundary.classify_engine_categories(path, ordinary), path
+
+
+def test_the_mainstream_queue_verbs_are_covered():
+    """Review found three engines that escaped the first vocabulary.
+
+    None of them was an evasion: `poll`/`take`/`checkout` are what
+    `java.util.concurrent`, the Go channel idiom and any worker pool call their
+    operations. A queue author writes them without thinking about this detector,
+    which is precisely why omitting them was a coverage gap rather than an
+    acceptable limit — and why the owner's constraint (do not reduce control
+    over hand-rolled queues) is not satisfied by a vocabulary that only covers
+    the words we happened to think of first.
+    """
+    polling = ast.parse(
+        "def poll(conn):\n"
+        "    row = conn.execute('SELECT id FROM work ORDER BY priority LIMIT 1').fetchone()\n"
+        "    conn.execute('UPDATE work SET state = %s', ('running',))\n"
+        "def finish(conn, item):\n    ...\n"
+        "def fail(conn, item):\n    ...\n"
+    )
+    handing_out = ast.parse(
+        "class DispatchBox:\n"
+        "    def submit(self, item):\n        ...\n"
+        "    def checkout(self):\n        ...\n"
+        "    def give_back(self, item):\n        ...\n"
+    )
+    redis_take = ast.parse(
+        "import redis\n"
+        "def take(client):\n    ...\n"
+        "def settle(client, item):\n    ...\n"
+    )
+
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/task_queue.py", polling
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/queues/dispatchbox.py", handing_out
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/work_queue.py", redis_take
+    )
+
+    # The widening stays behind the name gate: these verbs are ordinary English
+    # and must not classify a module that is not named like a queue.
+    for path in ("command_center/report_builder.py", "command_center/web_client.py"):
+        assert "queue" not in boundary.classify_engine_categories(path, polling), path
