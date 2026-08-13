@@ -72,7 +72,9 @@ def test_initial_migration_covers_the_declared_table_inventory() -> None:
 def test_duplicate_down_migration_is_rejected(tmp_path) -> None:
     _write_pair(tmp_path, 1, "initial")
     (tmp_path / "0001_other.down.sql").write_text("SELECT 1;", encoding="utf-8")
-    with pytest.raises(migrations.MigrationError, match="Duplicate down-migration"):
+    # Lower-cased since the message now comes from `aios-db`, which follows the
+    # library convention of lower-case exception text.
+    with pytest.raises(migrations.MigrationError, match="duplicate down-migration"):
         migrations.discover(tmp_path)
 
 

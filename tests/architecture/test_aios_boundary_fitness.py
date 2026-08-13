@@ -207,3 +207,26 @@ def test_corroboration_applies_only_to_the_memory_category():
         ("command_center/audit_trail.py", "audit"),
     ):
         assert category in boundary.classify_engine_categories(path, empty), path
+
+
+def test_the_second_public_distribution_is_confined_to_its_own_adapter():
+    """`aios_db` is allowed on the same terms as `aios_sdk`: one file, top-level only.
+
+    It is a published, independently versioned contract rather than Core
+    internals, so importing it is not a boundary crossing — but letting every
+    module import it would scatter the coupling that the adapter exists to keep
+    in one reviewed place.
+    """
+    top_level = ast.parse("import aios_db\n")
+    assert boundary.find_forbidden_aios_imports(top_level, boundary.DB_ADAPTER_PATH) == []
+    assert boundary.find_forbidden_aios_imports(top_level, "command_center/db/pool.py")
+    assert boundary.find_forbidden_aios_imports(top_level, boundary.SDK_ADAPTER_PATH)
+
+    # Private submodules are off limits even to the adapter: the contract is
+    # what the package exports at the top level, not what happens to be inside.
+    deep = ast.parse("from aios_db.migrations import MigrationRunner\n")
+    assert boundary.find_forbidden_aios_imports(deep, boundary.DB_ADAPTER_PATH)
+
+    # Core remains banned everywhere, including from the db adapter.
+    core = ast.parse("from aios.storage.sql import Database\n")
+    assert boundary.find_forbidden_aios_imports(core, boundary.DB_ADAPTER_PATH)

@@ -90,6 +90,18 @@ BASELINE_FILE = Path(__file__).resolve().parent / "AIOS_BOUNDARY_BASELINE.json"
 SDK_ALLOWED_TOP_LEVEL = "aios_sdk"
 #: The one production adapter allowed to import that public top-level package.
 SDK_ADAPTER_PATH = "command_center/application/aios_tasks.py"
+
+#: The second public AIOS distribution: universal PostgreSQL primitives
+#: (`aios-db`). Allowed for the same reason `aios_sdk` is — it is a published,
+#: independently versioned contract, not Core internals — and confined the same
+#: way, to one reviewed adapter module.
+DB_ALLOWED_TOP_LEVEL = "aios_db"
+DB_ADAPTER_PATH = "command_center/db/adapter.py"
+
+PUBLIC_AIOS_TOP_LEVELS: dict[str, str] = {
+    SDK_ALLOWED_TOP_LEVEL: SDK_ADAPTER_PATH,
+    DB_ALLOWED_TOP_LEVEL: DB_ADAPTER_PATH,
+}
 #: The banned core namespace.
 CORE_TOP_LEVEL = "aios"
 
@@ -303,11 +315,12 @@ def _is_forbidden_aios_module(name: str, rel_path: str) -> bool:
     top = _top_level(name)
     if top == CORE_TOP_LEVEL:
         return True
-    if top != SDK_ALLOWED_TOP_LEVEL:
+    adapter_path = PUBLIC_AIOS_TOP_LEVELS.get(top)
+    if adapter_path is None:
         return False
-    # Even the adapter cannot couple to generated/private SDK modules: every
-    # consumed symbol must be a documented top-level export.
-    return rel_path != SDK_ADAPTER_PATH or name != SDK_ALLOWED_TOP_LEVEL
+    # Even the adapter cannot couple to generated/private submodules of a public
+    # distribution: every consumed symbol must be a documented top-level export.
+    return rel_path != adapter_path or name != top
 
 
 def _literal_string(node: ast.AST) -> str | None:
