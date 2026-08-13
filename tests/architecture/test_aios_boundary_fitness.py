@@ -272,3 +272,26 @@ def test_a_store_that_opens_its_own_file_as_an_attribute_is_still_an_engine():
         "        return handle.read()\n"
     )
     assert boundary.classify_engine_categories("command_center/db/config.py", reader) == set()
+
+
+def test_the_migration_mirror_modules_are_not_engines():
+    """Pins the naming decision that resolved the `queue` false positive.
+
+    `command_center/queue_store.py` and `command_center/db/queue_store.py`
+    tripped the gate on the `queue` name token. The right resolution was the
+    name, not the detector: unlike `memory` — where a driver import or a
+    durable write can corroborate the name — `queue` has no behavioural
+    substitute, because the name signature exists precisely to catch a
+    hand-rolled queue that imports no framework. Corroborating it would leave
+    such an engine undetected, which the acceptance criterion forbids.
+
+    These modules are a mirror contract and a PostgreSQL adapter over a
+    connection they do not own. This test fails if either is renamed back into
+    a frozen category, which is what would silently reopen the question.
+    """
+    empty = ast.parse("")
+    for path in ("command_center/execution_mirror.py", "command_center/db/execution_mirror.py"):
+        assert boundary.classify_engine_categories(path, empty) == set(), path
+
+    # The signature itself must stay sharp: a real queue module still trips it.
+    assert "queue" in boundary.classify_engine_categories("command_center/retry_queue.py", empty)
