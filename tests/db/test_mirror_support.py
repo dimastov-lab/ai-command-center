@@ -165,10 +165,32 @@ def test_only_declared_json_columns_are_parsed() -> None:
 
 
 def test_unparseable_authority_text_compares_as_itself() -> None:
-    """It cannot have reached the mirror — `to_column` refuses it — so the row
-    has nothing equal to it and is reported as divergent, which is what an
-    unmirrorable row is."""
+    """`to_column` refuses such text, so no unparseable value reaches the
+    mirror and the row is reported divergent — which is what an unmirrorable
+    row is."""
     assert JSON_CODEC.comparable("refs_json", "not json") == "not json"
+
+
+def test_a_json_string_scalar_collides_with_unparseable_text() -> None:
+    """The counterexample to the flat version of the claim above, pinned.
+
+    A `jsonb` column may hold a JSON string scalar, which the driver returns as
+    a plain `str`; `comparable` sees two values and no provenance, so mirror
+    `"not json"` — valid `jsonb` — compares equal to authority text `not json`,
+    which is unmirrorable. A false clean, and the docstring used to deny it
+    could happen. Unreachable for every column mirrored today, all of which are
+    written by `json.dumps`; tracked as
+    `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`.
+
+    Asserted rather than described so the day it is fixed, this fails and says
+    so instead of quietly agreeing.
+    """
+    from_mirror = "not json"  # what psycopg returns for the jsonb value '"not json"'
+    from_authority = "not json"  # text that is not JSON at all
+
+    assert JSON_CODEC.comparable("refs_json", from_mirror) == JSON_CODEC.comparable(
+        "refs_json", from_authority
+    )
 
 
 # --- reconciliation ---------------------------------------------------------

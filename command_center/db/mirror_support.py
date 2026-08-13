@@ -173,10 +173,21 @@ class ColumnCodec:
         like JSON would make two rows agree on a column the target stores as
         text, which is a false clean rather than a false difference.
 
-        Unparseable text on the authority's side compares as itself. It cannot
-        have reached the mirror — `to_column` refuses it — so the mirror has
-        nothing equal to it, and the row is reported as divergent, which is
-        what an unmirrorable row is.
+        Unparseable text compares as itself, and the guarantee that follows is
+        narrower than it first appears. `to_column` refuses such text, so no
+        *unparseable* value reaches the mirror; but a `jsonb` column may hold a
+        JSON **string scalar**, which the driver returns as a plain `str`, and
+        this method cannot tell which side it is looking at. Mirror `"not
+        json"` — a perfectly valid `jsonb` string — therefore compares equal to
+        authority text `not json`, which is a false clean.
+
+        Unreachable for every column mirrored today: all of them are written by
+        `json.dumps`, which never emits a bare scalar here. Stated rather than
+        fixed because the fix belongs where the sides are distinguishable, not
+        in a method that sees two values and no provenance —
+        `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`. Found by independent
+        review, which produced the counterexample against the flat claim this
+        docstring used to make.
         """
         if isinstance(value, bool):
             return int(value)

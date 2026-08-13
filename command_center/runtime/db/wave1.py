@@ -656,6 +656,32 @@ def list_digest_items(
         return [_decode_digest_row(dict(row)) for row in rows]
 
 
+def list_digest_items_stored(db_path: Path) -> list[dict]:
+    """Every digest row in the shape SQLite **stores**, for reconciliation.
+
+    Every other reader here returns :func:`_decode_digest_row` output, which
+    pops ``refs_json`` and substitutes a decoded ``refs`` list — a view for
+    callers, and the right default for them. Reconciliation is not one of those
+    callers: it compares what the authority stores against what the mirror
+    stores, and fed a decoded row it sees ``refs_json`` missing on one side and
+    present on the other, so it reports **every** digest row as divergent.
+
+    That is the permanently-red cutover gate this migration keeps almost
+    building, reached from the direction nobody was watching: not a wrong
+    conversion, but a reconciliation pointed at the wrong shape. Independent
+    review found it by asking what an operator would actually call — there was
+    no answer, because until this function existed the only readers were
+    decoding ones (SRV-01B slice 4, second acceptance round).
+
+    Deliberately without ``exclude_projects``: redaction is a read-surface
+    policy, and a reconciliation that skipped redacted rows would certify a
+    cutover over a subset of the table while reporting it as the whole.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM digest_item ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
+
+
 def _decode_digest_row(row: dict) -> dict:
     """Return a copy of a digest row with ``refs_json`` decoded to a ``refs``
     list (the JSON column stays internal to the repository)."""

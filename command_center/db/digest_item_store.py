@@ -149,6 +149,14 @@ class PostgresDigestItemMirror:
 def divergence(authority_rows: list[dict], mirror: Any) -> list[dict]:
     """Rows where the SQLite authority and `mirror` disagree.
 
+    **Takes rows in the shape SQLite stores** — `runtime/db/wave1.py`'s
+    `list_digest_items_stored`, not its other readers. Worth saying here
+    because for this table alone that is not the shape the repository hands
+    out: every public reader returns `_decode_digest_row` output, which pops
+    `refs_json` and substitutes a decoded `refs`. Fed one of those, this
+    reports every row divergent on the one column the slice exists to migrate,
+    and the failure looks like a broken mirror rather than a wrong question.
+
     Passes the codec, which is what makes `refs_json` compare as a parsed value
     rather than as text — see `mirror_support.divergence` for the rest.
     """

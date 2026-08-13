@@ -180,6 +180,7 @@ from command_center.runtime.db.wave1 import (  # noqa: F401
     list_advisor_proposals,
     list_digest_items,
     list_digest_items_for_day,
+    list_digest_items_stored,
     list_owner_items,
     promote_advisor_proposal,
     set_advisor_proposal_status,

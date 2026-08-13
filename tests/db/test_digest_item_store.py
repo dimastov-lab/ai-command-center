@@ -301,6 +301,116 @@ def test_reconciliation_reports_agreement_and_every_shape_of_disagreement(
     assert {entry["id"] for entry in divergence([], mirror)} == {"same"}
 
 
+def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """The assertion the cutover is gated on, and the one this slice shipped
+    without.
+
+    Slices 2 and 3 each have it; slice 4 did not, and independent review found
+    that the omission hid a trap rather than a gap. The obvious ways to obtain
+    authority rows both break here: `create_digest_item` returns a decoded row,
+    and every public list reader decodes too. Reconciling against either
+    reports 100% divergence on `refs_json` — the permanently-red gate, reached
+    not through a wrong conversion but through a reconciliation pointed at the
+    wrong shape.
+
+    So this runs against `list_digest_items_stored`, which exists for exactly
+    this, and the next test pins why nothing else will do.
+    """
+    from command_center.db import digest_item_store
+
+    monkeypatch.setattr(
+        digest_item_store,
+        "PostgresDigestItemMirror",
+        lambda: PostgresDigestItemMirror(connection_factory=pg_connection_factory),
+    )
+    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory)
+
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    wave1.create_digest_item(
+        db_path, title="reconciles", refs=["task:1", "task:2"], day="2026-08-14", position=1
+    )
+    wave1.create_digest_item(db_path, title="no refs", day="2026-08-14", position=2)
+
+    assert divergence(wave1.list_digest_items_stored(db_path), mirror) == []
+
+
+def test_reconciling_against_a_decoded_reader_is_not_clean(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """The trap, pinned so it cannot be walked into twice.
+
+    A future reader of this suite will reach for `list_digest_items_for_day` —
+    it is the public reader, and it is what an operator wiring the cutover gate
+    would find first. It reports every row divergent, because
+    `_decode_digest_row` pops `refs_json`. The failure is loud, but it looks
+    like a broken mirror rather than a wrong question, and the tempting fix is
+    to loosen the comparison — which is the exact failure mode this table's
+    mirror exists to prevent.
+    """
+    from command_center.db import digest_item_store
+
+    monkeypatch.setattr(
+        digest_item_store,
+        "PostgresDigestItemMirror",
+        lambda: PostgresDigestItemMirror(connection_factory=pg_connection_factory),
+    )
+    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory)
+
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    wave1.create_digest_item(db_path, title="t", refs=["task:1"], day="2026-08-14")
+
+    decoded = wave1.list_digest_items_for_day(db_path, "2026-08-14")
+    assert "refs_json" not in decoded[0]  # the premise
+
+    reported = divergence(decoded, mirror)
+
+    assert [entry["fields"] for entry in reported] == [["refs_json"]]
+
+
+def test_sqlite_remains_the_authority_for_digest_items() -> None:
+    """Parity with slices 2 and 3, which this slice also shipped without.
+
+    Same limit as theirs, stated for the same reason: this greps code with
+    prose stripped, so it catches a direct read and not one added through a
+    helper — the indirection the write itself uses.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    def code_without_prose(function: object) -> str:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                if (
+                    node.body
+                    and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)
+                ):
+                    node.body.pop(0)
+        return ast.unparse(tree)
+
+    for function in (
+        wave1.create_digest_item,
+        wave1.delete_digest_items_for_day,
+        wave1.get_digest_item,
+        wave1.list_digest_items,
+        wave1.list_digest_items_for_day,
+        wave1.list_digest_items_stored,
+    ):
+        code = code_without_prose(function)
+        for marker in ("postgres", "digest_item_store", "list_records"):
+            assert marker not in code.lower(), f"{function.__name__}: {marker}"
+
+    assert "INSERT INTO digest_item" in inspect.getsource(wave1.create_digest_item)
+    assert "FROM digest_item" in inspect.getsource(wave1.list_digest_items_stored)
+
+
 def test_an_unreadable_mirror_is_reported_not_treated_as_agreement() -> None:
     class Broken:
         name = "postgres"
