@@ -38,7 +38,17 @@ All other product code, scripts, and tests consume AICC's owned
 `TasksGateway` contract instead. Detection is an AST walk, not a text grep —
 comments, docstrings and strings cannot trigger or evade it.
 
-The SDK itself is acquired from `aios-sdk.lock.json`: an accepted-main SHA,
+A second published AIOS distribution is allowed on identical terms: `aios_db`
+(universal PostgreSQL primitives) may be imported only by
+`command_center/db/adapter.py`, and only at the top level. The rule is the same
+because the reasoning is: these are versioned public contracts rather than Core
+internals, and confining each to one module keeps the coupling in a place a
+reviewer can see. Everything else in the repository reaches those primitives
+through that adapter.
+
+Each distribution is acquired from its own lock — `aios-sdk.lock.json` and
+`aios-db.lock.json` — through the same verified fetch (`--lock` selects which).
+For the SDK the inputs are an accepted-main SHA,
 Actions run/artifact identity, filename, API major, version, and SHA-256 are all
 immutable inputs. `scripts/fetch_aios_sdk_artifact.py` requires a dedicated
 CI artifact-read credential and prefers `AIOS_ARTIFACT_READONLY_TOKEN`

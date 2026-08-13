@@ -9,6 +9,26 @@ schema, migrations, roles, pooling, health probes, backup/restore. The runtime
 store still writes to SQLite until `VOYN-W0-AICC-SRV-01b` moves it onto this
 seam; both schemas exist in parallel until then.
 
+## Where the parts live
+
+The generic PostgreSQL machinery is **not** in this repository. Opening a pool
+and proving the open, taking an advisory lock and guaranteeing its release,
+executing migrations atomically and verifying their history — none of that is
+specific to these tables, so it belongs to AIOS Core and ships as the
+independently versioned `aios-db` library. It is consumed through exactly one
+module, `command_center/db/adapter.py`; the architecture-fitness gate fails if
+anything else imports `aios_db`.
+
+What this repository owns is the part only it can: the 33-table schema and its
+migrations, the `aicc_*` roles and their grants, the repositories, the
+backup/restore policy, and the composition that decides what "ready" means for
+this service. AIOS Core knows none of those.
+
+The wheel is pinned in `aios-db.lock.json` by release tag and SHA-256 and
+fetched by `scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json`, the
+same verified path the SDK uses. Upgrading it is a reviewed change to that lock,
+never a floating version range.
+
 ## Configuration
 
 Everything comes from the environment. There are no defaults for host,
@@ -118,7 +138,10 @@ Plain SQL files in `command_center/db/sql/`, `NNNN_slug.up.sql` with a matching
 - Each migration and its ledger row commit in one transaction, so an
   interrupted run leaves either the old schema or the new one.
 - A session-level advisory lock serialises concurrent runners, which is the
-  normal case during a rolling deploy.
+  normal case during a rolling deploy. Its key is derived from the name
+  `aicc:schema-migration` rather than being a hand-picked constant: advisory
+  locks share one flat key space per database, so a constant copied into a
+  second subsystem would serialise the two against each other silently.
 - An applied migration's checksum is verified on every run: editing a migration
   after it has been applied is rejected rather than silently producing two
   environments that report the same version for different schemas.
