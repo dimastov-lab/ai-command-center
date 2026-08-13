@@ -26,7 +26,7 @@ def _entry(entry_id: str, **overrides: object) -> dict:
         "state": "queued",
         "reason": None,
         "run_id": None,
-        "added_at": "2026-08-13T00:00:00Z",
+        "added_at": "2026-08-13T00:00:00",  # naive local, what `models.iso_now()` emits
         "evaluated_at": None,
         "launched_at": None,
     }
@@ -147,8 +147,8 @@ def test_the_mirror_round_trips_a_json_entry_unchanged(mirror: PostgresQueueMirr
         "full",
         reason="blocked",
         run_id="run-1",
-        evaluated_at="2026-08-13T01:00:00Z",
-        launched_at="2026-08-13T02:00:00Z",
+        evaluated_at="2026-08-13T01:00:00",
+        launched_at="2026-08-13T02:00:00",
     )
 
     mirror.replace_entries([entry])
@@ -190,20 +190,45 @@ def test_timestamps_come_back_normalised_not_as_datetimes(mirror: PostgresQueueM
     value = mirror.list_entries()[0]["added_at"]
 
     assert isinstance(value, str)
-    assert value == "2026-08-13T00:00:00Z"
+    assert value == "2026-08-13T00:00:00"
 
 
-def test_a_differently_spelled_instant_normalises_rather_than_round_trips(
-    mirror: PostgresQueueMirror,
-) -> None:
-    """Honest statement of the limit this slice inherits.
+def test_a_real_iso_now_timestamp_round_trips(mirror: PostgresQueueMirror) -> None:
+    """The test that would have caught the defect this file originally shipped.
 
-    `timestamptz` keeps the instant, not the spelling, so `+00:00` comes back
-    as `Z`. Every timestamped table in the remaining waves has this property,
-    and the divergence check has to compare instants for those columns rather
-    than strings. Asserting it here stops a later reader from assuming a
-    byte-exact round trip that the column type cannot provide.
+    The first version rendered UTC with a `Z` suffix and every test fabricated
+    `Z`-suffixed inputs to match, so the conversion was proved against data no
+    writer in this application emits. `models.iso_now()` returns *naive local
+    time*, and against that the mirror reported every entry as different —
+    which is the permanently-red cutover gate this module warns about, produced
+    by the code that warns about it.
     """
-    mirror.replace_entries([_entry("spelling", added_at="2026-08-13T00:00:00+00:00")])
+    from command_center import models
 
-    assert mirror.list_entries()[0]["added_at"] == "2026-08-13T00:00:00Z"
+    written = models.iso_now()
+    assert "+" not in written and not written.endswith("Z")  # guard the premise
+
+    mirror.replace_entries([_entry("real", added_at=written)])
+
+    assert mirror.list_entries()[0]["added_at"] == written
+
+
+def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
+    mirror: PostgresQueueMirror, pg_connection_factory
+) -> None:
+    """Naive text handed to `timestamptz` is stamped with the *session* zone.
+
+    Silently: no error, every row shifted by the gap between the writing
+    machine and the server. The zone is attached on the way in instead.
+    """
+    from datetime import datetime
+
+    written = "2026-08-13T12:00:00"
+    expected = datetime.fromisoformat(written).astimezone()
+
+    mirror.replace_entries([_entry("tz", added_at=written)])
+
+    with pg_connection_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT added_at FROM queue_entry WHERE id = 'tz'")
+            assert cur.fetchone()[0] == expected

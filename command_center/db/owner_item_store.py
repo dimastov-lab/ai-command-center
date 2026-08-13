@@ -25,7 +25,7 @@ satisfy is one someone eventually satisfies by loosening the comparison.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 __all__ = ["OWNER_ITEM_COLUMNS", "PostgresOwnerItemMirror", "divergence"]
@@ -105,7 +105,36 @@ def _to_column_value(name: str, value: Any) -> Any:
     if name == "done":
         # SQLite stores 0/1; the column is boolean and psycopg will not coerce.
         return None if value is None else bool(value)
+    if name in _TIMESTAMP_COLUMNS and isinstance(value, str) and value:
+        return _to_instant(value)
     return value
+
+
+def _to_instant(value: str) -> Any:
+    """Attach the writer's zone to a naive timestamp before it reaches `timestamptz`.
+
+    This is the conversion the first version of this module got wrong, and the
+    failure was silent in both directions. `models.iso_now()` returns *naive
+    local time* — its own docstring says every timestamp in this application is
+    "local time on the machine that wrote them, never assumed to be UTC". A
+    naive string handed to `timestamptz` does not error: PostgreSQL stamps it
+    with the *session* time zone, so every mirrored row is offset by the gap
+    between the writing machine and the server. On a UTC+3 laptop against a UTC
+    server that is a three-hour error in every row, discovered only when reads
+    switch.
+
+    Interpreting the string in the local zone is the only reading consistent
+    with what the authority means by it. The mirror runs in the writer's own
+    process, so "local" is the same zone that produced the string.
+
+    The limit is inherent to the naive format, not to this code, and is stated
+    rather than hidden: a mirror running in a different zone than the writer
+    would attach the wrong one. Fixing that properly means making the authority
+    timezone-aware, which is a migration of `data/tasks.json` and every existing
+    record — a separate task, recorded in the central backlog.
+    """
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.astimezone()
 
 
 def _to_sqlite_shape(name: str, value: Any) -> Any:
@@ -117,10 +146,14 @@ def _to_sqlite_shape(name: str, value: Any) -> Any:
     if name == "done":
         return None if value is None else int(bool(value))
     if name in _TIMESTAMP_COLUMNS and isinstance(value, datetime):
-        # `timestamptz` keeps the instant, not the spelling: a row written as
-        # `+00:00` comes back as `Z`. This is a normalisation, so divergence
-        # over timestamp columns is an instant comparison, not a string one.
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        # Rendered back into exactly what `models.iso_now()` produces: naive
+        # local time, second precision, no offset. An earlier version rendered
+        # UTC with a `Z` suffix, which no writer in this application emits — so
+        # `divergence` reported every single row as different, which is the
+        # permanently-red cutover gate this module's docstring warns about.
+        # The tests did not catch it because they fabricated `Z`-suffixed
+        # timestamps: the conversion was proved against invented data.
+        return value.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
     return value
 
 

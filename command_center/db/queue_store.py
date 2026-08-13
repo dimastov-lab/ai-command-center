@@ -26,7 +26,7 @@ table would reorder the queue silently, and silently is the problem.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 __all__ = ["PostgresQueueMirror", "QUEUE_ENTRY_COLUMNS"]
@@ -79,7 +79,8 @@ class PostgresQueueMirror:
         columns = (*QUEUE_ENTRY_COLUMNS, "position")
         placeholders = ", ".join(["%s"] * len(columns))
         rows = [
-            tuple(entry.get(column) for column in QUEUE_ENTRY_COLUMNS) + (index,)
+            tuple(_to_column_value(column, entry.get(column)) for column in QUEUE_ENTRY_COLUMNS)
+            + (index,)
             for index, entry in enumerate(entries)
         ]
         with self._connection() as conn:
@@ -111,6 +112,31 @@ class PostgresQueueMirror:
         ]
 
 
+#: Queue columns PostgreSQL stores as `timestamptz` while the JSON store holds
+#: naive local-time strings.
+_TIMESTAMP_COLUMNS = frozenset({"added_at", "evaluated_at", "launched_at"})
+
+
+def _to_column_value(name: str, value: Any) -> Any:
+    """Attach the writer's zone to a naive timestamp before it reaches `timestamptz`.
+
+    Without this PostgreSQL stamps a naive string with the *session* time zone,
+    silently shifting every mirrored row by the gap between the writing machine
+    and the server — no error, just wrong data discovered when reads switch.
+    The mirror runs in the writer's own process, so the local zone is the one
+    that produced the string.
+
+    The limit is inherent to the naive format rather than to this code: a
+    mirror running in a different zone than the writer would attach the wrong
+    one. Making the authority timezone-aware is a migration of every existing
+    record and is recorded as its own task.
+    """
+    if name in _TIMESTAMP_COLUMNS and isinstance(value, str) and value:
+        parsed = datetime.fromisoformat(value)
+        return parsed if parsed.tzinfo is not None else parsed.astimezone()
+    return value
+
+
 def _as_json_value(value: Any) -> Any:
     """Render a column back into the shape the JSON queue holds.
 
@@ -120,14 +146,19 @@ def _as_json_value(value: Any) -> Any:
     gate that is permanently red, which someone eventually "fixes" by loosening
     the comparison instead of the conversion.
 
-    Normalised to UTC with a `Z` suffix, matching what the application writes.
-    This is a *normalisation*, not a round trip: `timestamptz` stores an
-    instant, so an input that spelled the same instant differently
-    (`+00:00`, a non-UTC offset, sub-second precision) comes back in this one
-    canonical spelling. The divergence check must therefore compare instants
-    for these columns rather than strings — recorded here because the next
-    slice inherits the same problem on every timestamped table.
+    Rendered back into exactly what `models.iso_now()` produces: naive local
+    time at second precision, no offset.
+
+    The first version of this function normalised to UTC with a `Z` suffix,
+    "matching what the application writes". It does not: `iso_now`'s own
+    docstring says every timestamp here is "local time on the machine that
+    wrote them, never assumed to be UTC". So the mirror rendered a shape no
+    writer emits, and `queue_divergence` would have reported **every**
+    timestamped entry as different — the permanently-red cutover gate this
+    docstring warns about, produced by the code that warns about it. The tests
+    missed it because they fabricated `Z`-suffixed timestamps, proving the
+    conversion against invented data rather than against `iso_now`.
     """
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return value.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
     return value

@@ -35,8 +35,8 @@ def _row(item_id: str, **overrides: object) -> dict:
         "done": 0,
         "source_ref": None,
         "version": 0,
-        "created_at": "2026-08-13T00:00:00Z",
-        "updated_at": "2026-08-13T00:00:00Z",
+        "created_at": "2026-08-13T00:00:00",  # naive local, exactly what `models.iso_now()` emits
+        "updated_at": "2026-08-13T00:00:00",
         "project_ref": None,
     }
     row.update(overrides)  # type: ignore[arg-type]
@@ -99,7 +99,7 @@ def test_the_boolean_and_timestamp_gaps_round_trip(mirror: PostgresOwnerItemMirr
     stored = mirror.list_records()[0]
 
     assert stored["done"] == 1 and isinstance(stored["done"], int)
-    assert stored["created_at"] == "2026-08-13T00:00:00Z"
+    assert stored["created_at"] == "2026-08-13T00:00:00"
     assert isinstance(stored["created_at"], str)
 
 
@@ -210,12 +210,80 @@ def test_the_authoritative_write_happens_before_the_mirror(tmp_path, monkeypatch
 
     class Recording:
         def upsert(self, record: dict) -> None:
-            # By now the authoritative row must already be readable.
-            observed.append("mirror")
-            assert wave1.get_owner_item(db_path, record["id"]) is not None
+            # Recorded, not asserted. `_mirror_owner_item` swallows every
+            # `Exception`, and `AssertionError` is one — an assertion in here
+            # is caught, logged at DEBUG and lost, so the test would pass
+            # whatever it claimed. Independent review proved that by inverting
+            # this condition and watching the test still pass. The observation
+            # has to escape the swallowing frame to mean anything.
+            observed.append(wave1.get_owner_item(db_path, record["id"]) is not None)
 
     monkeypatch.setattr(owner_item_store, "PostgresOwnerItemMirror", lambda: Recording())
 
     wave1.create_owner_item(db_path, title="ordered")
 
-    assert observed == ["mirror"]
+    assert observed == [True], "the authoritative row must be readable before the mirror runs"
+
+
+def test_a_real_iso_now_timestamp_round_trips(mirror: PostgresOwnerItemMirror) -> None:
+    """The test that would have caught the blocker: use what the app writes.
+
+    `models.iso_now()` returns *naive local time* — no offset, second
+    precision. The first version of this mirror rendered UTC with a `Z` suffix
+    and the tests fabricated `Z`-suffixed inputs to match, so the conversion was
+    proved against data no writer in this application emits. Against real
+    output, `divergence` would have reported every row as different — the
+    permanently-red gate the module docstring warns about.
+    """
+    from command_center import models
+
+    written = models.iso_now()
+    assert "+" not in written and not written.endswith("Z")  # guard the premise
+
+    mirror.upsert(_row("real", created_at=written, updated_at=written))
+
+    stored = mirror.list_records()[0]
+    assert stored["created_at"] == written
+    assert stored["updated_at"] == written
+
+
+def test_reconciliation_is_clean_for_a_row_the_application_actually_wrote(
+    mirror: PostgresOwnerItemMirror, tmp_path
+) -> None:
+    """End to end against the authority, not against a fixture's idea of it.
+
+    A row created through `wave1.create_owner_item` and mirrored must reconcile
+    with zero divergence. This is the assertion the cutover is gated on, so it
+    has to run on a row the real writer produced.
+    """
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    created = wave1.create_owner_item(db_path, title="reconciles", detail="d")
+
+    mirror.upsert(created)
+
+    assert divergence([created], mirror) == []
+
+
+def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
+    mirror: PostgresOwnerItemMirror, pg_connection_factory
+) -> None:
+    """Naive text handed to `timestamptz` is stamped with the *session* zone.
+
+    That is silent: no error, every row shifted by the gap between the writing
+    machine and the server. The zone is attached on the way in instead, so the
+    stored instant is the one the writer meant regardless of the server's
+    `TimeZone`.
+    """
+    from datetime import datetime
+
+    written = "2026-08-13T12:00:00"
+    expected = datetime.fromisoformat(written).astimezone()
+
+    mirror.upsert(_row("tz", created_at=written, updated_at=written))
+
+    with pg_connection_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT created_at FROM owner_item WHERE id = 'tz'")
+            stored = cur.fetchone()[0]
+    assert stored == expected
