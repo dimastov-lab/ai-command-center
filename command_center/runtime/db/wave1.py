@@ -19,11 +19,14 @@ do for the other table-family modules.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 
 def _exclude_projects_clause(
@@ -352,7 +355,30 @@ def create_owner_item(
                 f"INSERT INTO owner_item ({columns}) VALUES ({placeholders})",
                 record,
             )
+    _mirror_owner_item(record)
     return record
+
+
+def _mirror_owner_item(record: dict) -> None:
+    """Best-effort dual-write of one owner item into PostgreSQL (SRV-01B slice 2).
+
+    Called *after* the authoritative SQLite commit, and deliberately silent on
+    failure. Both follow from the same rule as the queue's mirror: during
+    dual-write the mirror is not load-bearing, so letting it raise would mean a
+    migration step could take down the table it is migrating. Writing it first
+    would allow the opposite and worse state — a mirror ahead of the system of
+    record, which no reconciliation would flag as wrong.
+
+    The mirror's health is reported by `owner_item_store.divergence`, not by
+    exceptions raised here. Imported lazily so the desktop and CLI entry points
+    keep working on a machine with no PostgreSQL client library.
+    """
+    try:
+        from command_center.db.owner_item_store import PostgresOwnerItemMirror
+
+        PostgresOwnerItemMirror().upsert(record)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        _LOG.debug("Could not mirror owner_item into PostgreSQL", exc_info=True)
 
 
 def get_owner_item(db_path: Path, item_id: str) -> dict | None:
@@ -431,7 +457,9 @@ def set_owner_item_done(
             updated = conn.execute(
                 "SELECT * FROM owner_item WHERE id = ?", (item_id,)
             ).fetchone()
-            return dict(updated)
+            result = dict(updated)
+    _mirror_owner_item(result)
+    return result
 
 
 # --------------------------------------------------------------------------
