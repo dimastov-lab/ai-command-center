@@ -186,7 +186,6 @@ def _mirror_message(record: dict) -> None:
         _LOG.debug("Could not mirror message into PostgreSQL", exc_info=True)
 
 
-
 def get_contact(db_path: Path, contact_id: str) -> dict | None:
     with db.connect(db_path) as conn:
         row = conn.execute("SELECT * FROM contact WHERE id = ?", (contact_id,)).fetchone()

@@ -85,10 +85,22 @@ _MESSAGE_CODEC = ColumnCodec(timestamps=frozenset({"created_at"}))
 class _TableMirror:
     """The upsert/list half both tables share.
 
-    Extracted at the point three slices established the shape and a fourth
-    would have copied it verbatim — the same rule that produced
-    `mirror_support`. The table name and its columns are the only difference
-    between these two mirrors, so they are the only things a subclass supplies.
+    A **new base for the two tables added here**, not an extraction: the four
+    earlier mirrors still hand-roll their own `_connection`, `upsert` and
+    `list_records`, and this commit moves none of them. An earlier version of
+    this docstring claimed the `mirror_support` precedent, and independent
+    review pointed out that the precedent runs the other way — `mirror_support`
+    moved its existing callers onto it in the same slice, which is why the
+    migration ended up with one shape for the conversion instead of two.
+
+    It stands because the two tables here are written together and would
+    otherwise carry a fourth and fifth copy between them. Folding the four
+    earlier stores onto it is `VOYN-W0-AICC-MIRROR-STORE-BASE-CONSOLIDATION`,
+    and until that closes there are two shapes for the same thing — recorded
+    rather than left for someone to notice.
+
+    The table name and its columns are the only difference between these two
+    mirrors, so they are the only things a subclass supplies.
     """
 
     name = "postgres"

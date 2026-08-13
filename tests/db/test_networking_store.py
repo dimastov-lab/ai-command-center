@@ -246,8 +246,19 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
 ) -> None:
     """The assertion the cutover is gated on, driven through the real hooks.
 
-    Covers both tables and the update path, so a store that failed on any one
-    of the three writes cannot pass it.
+    The first version of this test claimed a store failing on any one of the
+    writes could not pass it, and that was false: `contact` was written twice —
+    create, then update — and the update is a whole-row upsert that repairs a
+    failed create, so a store raising only on the first write left this green.
+    Independent review proved it with a store that raises once. Same shape as
+    the masked middle write found in slice 4, and the second time an e2e here
+    has claimed reach it did not have.
+
+    Fixed by making the claim true rather than by narrowing it. `quiet` is
+    created and never updated, so no later write repairs it: a failure on any
+    single mirror write now leaves a divergence somewhere in the four
+    assertions below. The per-path coverage test remains the one that says
+    *which* write was lost.
     """
     from command_center.db import networking_store
 
@@ -267,6 +278,11 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
     db_path = tmp_path / "runtime.db"
     net_db.db.migrate(db_path)
 
+    # Written once and never touched again: nothing downstream can repair a
+    # lost mirror write for this row, which is what makes the claim above true.
+    quiet = net_db.create_contact(db_path, display_name="quiet", handle="@quiet")
+    net_db.create_message(db_path, contact_id=quiet["id"], body="only message")
+
     created = net_db.create_contact(db_path, display_name="reconciles", org="acme")
     net_db.update_contact_fields(
         db_path, created["id"], expected_version=0, fields={"note": "spoke on Tuesday"}
@@ -275,6 +291,8 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
 
     assert contact_divergence(net_db.list_contacts(db_path), contacts) == []
     assert message_divergence(net_db.list_messages(db_path), messages) == []
+    assert len(net_db.list_contacts(db_path)) == 2
+    assert len(net_db.list_messages(db_path)) == 2
 
 
 def test_every_write_path_mirrors_after_the_authoritative_commit(tmp_path, monkeypatch) -> None:
