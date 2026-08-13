@@ -523,6 +523,17 @@ def _persists_data(tree: ast.AST) -> bool:
             continue
         if func.attr in PATH_WRITE_ATTRS:
             return True
+        # `Path.open` reached as an attribute -- `self._path.open("a")`,
+        # `Path(x).open("w")`. Checked before the receiver is resolved, because
+        # a store that owns its file typically holds it on `self` and never
+        # names a module at the call site. Missing this let an append-only
+        # JSONL store in a directory called `db/` classify as no engine at all,
+        # which is the exact loosening the corroboration rule must not cause.
+        # Still mode-gated: a read-only `.open()` is not persistence.
+        # `Path.open` takes the mode as its *first* positional argument, unlike
+        # the builtin, where it is the second.
+        if func.attr == "open" and _opens_for_writing(node, mode_index=0):
+            return True
         base = func.value
         if not isinstance(base, ast.Name):
             continue
@@ -536,8 +547,16 @@ def _persists_data(tree: ast.AST) -> bool:
     return False
 
 
-def _opens_for_writing(node: ast.Call) -> bool:
-    mode_nodes = list(node.args[1:2]) + [kw.value for kw in node.keywords if kw.arg == "mode"]
+def _opens_for_writing(node: ast.Call, *, mode_index: int = 1) -> bool:
+    """Whether an `open` call asks for a writable mode.
+
+    `mode_index` differs by call form: the builtin `open(file, mode)` carries it
+    second, `Path.open(mode)` first. Getting that wrong silently answers "not a
+    write" for every attribute-form open, which is how an append-only store
+    escaped this check once already.
+    """
+    mode_nodes = list(node.args[mode_index : mode_index + 1])
+    mode_nodes += [kw.value for kw in node.keywords if kw.arg == "mode"]
     for mode in mode_nodes:
         literal = _literal_string(mode)
         if literal and set(literal) & _WRITE_MODE_CHARS:

@@ -230,3 +230,45 @@ def test_the_second_public_distribution_is_confined_to_its_own_adapter():
     # Core remains banned everywhere, including from the db adapter.
     core = ast.parse("from aios.storage.sql import Database\n")
     assert boundary.find_forbidden_aios_imports(core, boundary.DB_ADAPTER_PATH)
+
+
+def test_a_store_that_opens_its_own_file_as_an_attribute_is_still_an_engine():
+    """The reviewer's escape: `self._path.open("a")` instead of `open(path, "a")`.
+
+    A store that owns its file usually holds it on `self` and never names a
+    module at the call site, so checking only the builtin `open` let an
+    append-only JSONL store in a directory called `db/` classify as no engine at
+    all — while the old name-only rule had blocked it. That is the loosening the
+    corroboration rule exists to avoid, and the docstring claimed it could not
+    happen, which is worse than the gap itself.
+    """
+    attribute_open = ast.parse(
+        "from pathlib import Path\n"
+        "class EventStore:\n"
+        "    def __init__(self, path):\n"
+        "        self._path = path\n"
+        "    def append(self, record):\n"
+        "        with self._path.open('a', encoding='utf-8') as fh:\n"
+        "            fh.write(record + '\\n')\n"
+    )
+    assert "memory" in boundary.classify_engine_categories(
+        "command_center/db/eventstore.py", attribute_open
+    )
+
+    constructed = ast.parse(
+        "from pathlib import Path\n"
+        "def save(root, data):\n"
+        "    with Path(root, 'tasks.json').open('w') as handle:\n"
+        "        handle.write(data)\n"
+    )
+    assert "memory" in boundary.classify_engine_categories(
+        "command_center/task_store.py", constructed
+    )
+
+    # Reading is still not persisting, in either form.
+    reader = ast.parse(
+        "def load(path):\n"
+        "    with path.open('r') as handle:\n"
+        "        return handle.read()\n"
+    )
+    assert boundary.classify_engine_categories("command_center/db/config.py", reader) == set()
