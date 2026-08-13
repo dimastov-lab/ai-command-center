@@ -334,3 +334,71 @@ def test_a_plain_repository_adapter_passes():
 
     for path in ("command_center/queue_store.py", "command_center/db/queue_store.py"):
         assert boundary.classify_engine_categories(path, adapter) == set(), path
+
+
+def test_a_queue_named_file_containing_a_real_engine_still_classifies():
+    """The regression this rule must not have.
+
+    Independent review built these three against the first attempt at a
+    semantic `queue` signature and all three escaped, while the old name-only
+    rule had caught them. A lease/claim/heartbeat loop in a file called
+    `task_queue.py` is the most probable shape of the thing the name signature
+    was protecting against.
+
+    The cause was one vocabulary doing two jobs: the narrow set needed for the
+    unconditional, tree-wide signal was also being used to corroborate a name,
+    where a wide set is affordable because the name has already narrowed the
+    candidates to a handful of files.
+    """
+    postgres_lease = ast.parse(
+        "def claim_next(conn, owner):\n"
+        "    row = conn.execute(\n"
+        "        'SELECT id FROM work ORDER BY priority FOR UPDATE LIMIT 1'\n"
+        "    ).fetchone()\n"
+        "    conn.execute('UPDATE work SET state = %s WHERE id = %s', ('leased', row[0]))\n"
+        "def heartbeat(conn, item_id):\n"
+        "    ...\n"
+        "def retry_failed(conn):\n"
+        "    ...\n"
+    )
+    in_memory = ast.parse(
+        "class Inflight:\n"
+        "    def push(self, item):\n        ...\n"
+        "    def pop_next(self):\n        ...\n"
+        "    def ack_done(self, item):\n        ...\n"
+    )
+    redis_engine = ast.parse(
+        "import redis\n"
+        "def complete(client, item):\n    ...\n"
+        "def retry(client, item):\n    ...\n"
+    )
+
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/task_queue.py", postgres_lease
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/queues/inflight.py", in_memory
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/work_queue.py", redis_engine
+    )
+
+
+def test_the_wide_vocabulary_stays_behind_the_name_gate():
+    """`claim`/`retry`/`next` are ordinary English, so they may only corroborate.
+
+    Applied unconditionally they flagged twelve unrelated modules — auth
+    claims, a FastAPI dispatch, UI panels. The wide set is safe *only* because
+    a queue-shaped filename has already narrowed the candidates.
+    """
+    ordinary = ast.parse(
+        "def claim(token):\n    ...\n"
+        "def retry(request):\n    ...\n"
+        "def next_page(cursor):\n    ...\n"
+    )
+
+    # Asserting `queue` specifically, not an empty set: `auth_tokens.py` carries
+    # an `authz` name token of its own, and conflating "did not become a queue"
+    # with "matched nothing" would make this test pass for the wrong reason.
+    for path in ("command_center/auth_tokens.py", "command_center/web_client.py"):
+        assert "queue" not in boundary.classify_engine_categories(path, ordinary), path

@@ -74,11 +74,22 @@ def test_this_slice_does_not_move_authority_away_from_json() -> None:
     ), "the authoritative JSON write must precede any mirror write"
 
 
-def test_the_postgres_mirror_is_never_read_on_the_queue_read_path() -> None:
+def test_the_read_path_reads_the_authority_and_no_mirror() -> None:
     """`load_queue` is the read path. It must read the authority, not a mirror
-    — otherwise authority has moved by accident rather than by decision."""
-    assert "read_json" in inspect.getsource(execution_queue.load_queue)
-    assert "postgres" not in inspect.getsource(execution_queue.load_queue).lower()
+    — otherwise authority has moved by accident rather than by decision.
+
+    Asserting the absence of `"postgres"` would have been theatre: mirrors are
+    reached through the `QueueMirror` protocol, so a `load_queue` that started
+    reading `mirror.list_entries()` would contain no such substring and the
+    test would stay green while authority moved. The assertion is therefore on
+    the *shape* of the read — one call, to the JSON store — and on the absence
+    of any mirror vocabulary at all.
+    """
+    source = inspect.getsource(execution_queue.load_queue)
+
+    assert "read_json" in source
+    for mirror_marker in ("mirror", "list_entries", "runtime_db", "postgres", "queue_store"):
+        assert mirror_marker not in source.lower(), mirror_marker
 
 
 # --- behaviour against a real PostgreSQL ------------------------------------

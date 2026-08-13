@@ -236,11 +236,15 @@ NAME_SUBSTRING_SIGNATURES: dict[str, tuple[str, ...]] = {
 }
 
 #: Name categories that a path name alone cannot establish: they must be
-#: corroborated by behaviour in the same file (see `_persists_data`). Only
-#: `memory` is here, because only `memory` has tokens (`db`, `store`,
-#: `repository`, ...) that name what a file is *about* as readily as what it
-#: *is* — a package directory called `db/` says nothing about whether the code
-#: inside owns an engine.
+#: corroborated by behaviour in the same file (see `_CORROBORATION`).
+#:
+#: `memory` and `queue` qualify because their tokens (`db`, `store`,
+#: `repository`, `queue`, ...) name what a file is *about* as readily as what
+#: it *is* — a directory called `db/` says nothing about whether the code
+#: inside owns an engine — *and* because each has a behavioural substitute that
+#: keeps a home-grown engine detected. `orchestration`, `authz` and `audit` are
+#: deliberately absent: no equivalent substitute has been demonstrated for
+#: them, and corroborating a name without one is a straight loss of coverage.
 CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue"})
 
 # --- queue-engine behaviour (corroboration for the `queue` name signature) ---
@@ -248,19 +252,53 @@ CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue"})
 #: Operations that make something a queue *engine* rather than a table of queue
 #: rows. Storing and listing entries is what a repository does; handing work out
 #: exactly once — claiming, leasing, acking, retrying — is the engine.
-#: Kept deliberately narrow, and measured rather than guessed. A first draft
-#: included `claim`, `dispatch` and `ack`; run against this repository it
-#: flagged twelve modules — auth *claims*, a FastAPI *dispatch*, UI panels —
-#: because those words are ordinary English that queues do not own. A signature
-#: that fires on a word rather than on a mechanism is the same defect as the
-#: name signature it replaces, only harder to see.
-QUEUE_OPERATION_TOKENS = frozenset({"dequeue", "requeue", "nack", "redeliver"})
+#: Two vocabularies, because there are two jobs with very different blast
+#: radii. Using one frozenset for both was a real defect: it forced the wide
+#: signal's precision requirement onto the narrow signal's coverage
+#: requirement, and the coverage lost was the whole point of the name rule.
+#:
+#: **Corroboration** — applied only to files that already carry a `queue` name
+#: token, of which this repository has three. A wide vocabulary is affordable
+#: here: a false positive can only land on a file someone already named after a
+#: queue, and the cost of a false negative is an undetected engine.
+QUEUE_CORROBORATION_TOKENS = frozenset(
+    {
+        "claim",
+        "claims",
+        "lease",
+        "leases",
+        "heartbeat",
+        "ack",
+        "nack",
+        "enqueue",
+        "dequeue",
+        "requeue",
+        "reserve",
+        "release",
+        "retry",
+        "redeliver",
+        "pop",
+        "push",
+        "next",
+        "backoff",
+        "inflight",
+    }
+)
 
-#: SQL that essentially only a work-handout path writes: `SKIP LOCKED` exists
-#: for exactly one purpose — letting concurrent consumers take different rows.
-#: `FOR UPDATE` alone is deliberately excluded: plain row locking is not a
-#: queue, and including it flagged unrelated modules.
-QUEUE_SQL_MARKERS = ("skip locked",)
+#: **Unconditional** — applied to every file regardless of name, so precision
+#: is the binding constraint. Measured, not guessed: a draft that used the wide
+#: vocabulary here flagged twelve modules across the tree — auth *claims*, a
+#: FastAPI *dispatch*, UI panels — because those are ordinary English words
+#: that queues do not own. What survives is specific enough to mean the
+#: mechanism rather than the word.
+QUEUE_ENGINE_TOKENS = frozenset({"dequeue", "requeue", "nack", "redeliver"})
+
+#: SQL markers, split the same way. `SKIP LOCKED` exists for exactly one
+#: purpose — letting concurrent consumers take different rows — so it is safe
+#: unconditionally. `FOR UPDATE` is plain row locking and only means "queue"
+#: alongside a queue name, so it corroborates but never classifies on its own.
+QUEUE_ENGINE_SQL_MARKERS = ("skip locked",)
+QUEUE_CORROBORATION_SQL_MARKERS = ("skip locked", "for update")
 
 # --- persistence behaviour (corroboration for the `memory` name signature) ---
 
@@ -584,39 +622,49 @@ def _opens_for_writing(node: ast.Call, *, mode_index: int = 1) -> bool:
     return False
 
 
-def _runs_queue_operations(tree: ast.AST) -> bool:
+def _runs_queue_operations(
+    tree: ast.AST,
+    tokens: frozenset[str] = QUEUE_ENGINE_TOKENS,
+    sql_markers: tuple[str, ...] = QUEUE_ENGINE_SQL_MARKERS,
+) -> bool:
     """Whether this file hands work out, rather than merely storing it.
 
-    Detected from behaviour and **independent of the filename**, which is the
-    point: the previous rule fired on a `queue` path token, so a hand-rolled
-    queue in a file called anything else went unseen while a plain adapter
-    named `queue_store.py` was flagged. Both halves of that were wrong, and the
-    second one is the dangerous half.
-
-    Two signals, both structural: a function defined or called whose name
-    carries a work-handout verb (`claim`, `lease`, `dequeue`, `ack`, ...), and
-    SQL that only a handout path writes — `SKIP LOCKED` exists solely so
-    concurrent consumers take different rows.
+    Two signals, both structural: a **defined** function whose name carries a
+    work-handout verb, and SQL that only a handout path writes.
 
     Deliberately *not* signals: `INSERT`, `SELECT ... ORDER BY`, `DELETE`. That
-    is a repository over queue rows, which is what a control plane is allowed
-    to own; the engine is whatever decides who gets the next one.
+    is a repository over queue rows, which a control plane is allowed to own;
+    the engine is whatever decides who gets the next one.
+
+    Acknowledged limits, stated because a reader auditing coverage will
+    otherwise assume they are covered: a *called* but not defined operation
+    (`engine.dequeue()`) and an operation bound by assignment
+    (`dequeue = lambda ...`) are not detected. Both were true of the previous
+    rule as well; neither is a regression, and closing them needs
+    cross-module resolution this single-file scanner does not have.
     """
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if set(_TOKEN_SPLIT.split(node.name.lower())) & QUEUE_OPERATION_TOKENS:
+            if set(_TOKEN_SPLIT.split(node.name.lower())) & tokens:
                 return True
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             lowered = node.value.lower()
-            if any(marker in lowered for marker in QUEUE_SQL_MARKERS):
+            if any(marker in lowered for marker in sql_markers):
                 return True
     return False
 
 
+def _corroborates_queue_name(tree: ast.AST) -> bool:
+    """The wide vocabulary, affordable because the name already narrowed the set."""
+    return _runs_queue_operations(
+        tree, QUEUE_CORROBORATION_TOKENS, QUEUE_CORROBORATION_SQL_MARKERS
+    )
+
+
 #: Category -> the behaviour that has to corroborate its name signature.
 _CORROBORATION: dict[str, Callable[[ast.AST], bool]] = {
-    "memory": lambda tree: _persists_data(tree),
-    "queue": _runs_queue_operations,
+    "memory": _persists_data,
+    "queue": _corroborates_queue_name,
 }
 
 
