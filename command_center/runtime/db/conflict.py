@@ -181,9 +181,8 @@ def _mirror_conflict(record: dict) -> None:
     wrong.
 
     Every mutating path calls this with the row as it now stands, not with the
-    fields that changed. A conflict's `resolved_at` is cleared on a reopen, so a
-    mirror updated field-by-field would keep a resolution the authority has
-    withdrawn.
+    fields that changed: `update_conflict_fields` touches two columns, and the
+    mirror has no other source for the rest.
 
     The mirror's health is reported by `conflict_store.divergence`, not by
     exceptions raised here. Imported lazily so the desktop and CLI entry points
@@ -344,7 +343,8 @@ def _conflict_transition(
 
     Checks the caller's ``version`` first (a stale writer always loses as a stale
     writer), then refuses an illegal status edge, stamps ``resolved_at`` when the
-    move is into ``resolved`` (and clears it on a reopen), bumps ``version`` and
+    move is into ``resolved`` (the clearing branch below is unreachable while
+    ``resolved`` is terminal — see the comment on it), bumps ``version`` and
     sets ``updated_at``. Returns the updated row dict."""
     row = conn.execute(
         "SELECT status, version FROM conflict WHERE id = ?", (conflict_id,)
@@ -367,6 +367,14 @@ def _conflict_transition(
     if new_status == "resolved":
         fields["resolved_at"] = now
     elif row["status"] == "resolved":
+        # Unreachable while `resolved` is terminal: the allowlist check above
+        # rejects every edge out of it, so no call reaches here with a resolved
+        # row. Left in place as the correct behaviour if `resolved -> open` is
+        # ever opened, and labelled because reading it as live behaviour is
+        # exactly the mistake SRV-01B slice 3 made — its acceptance story was
+        # built on this branch, and independent review had to disprove it.
+        # Whoever opens that edge owns `test_a_resolved_conflict_is_terminal`
+        # and the PostgreSQL mirror's assumptions along with it.
         fields["resolved_at"] = None
     set_clause = ", ".join(f"{key} = :{key}" for key in fields)
     params = dict(fields)
@@ -400,8 +408,7 @@ def set_conflict_status(
                 conn, conflict_id, expected_version=expected_version,
                 new_status=status, now=now,
             )
-    # After the commit, and with the whole row: a resolve sets `resolved_at`
-    # and a reopen clears it again, so the mirror has to carry the current
-    # value rather than the fields this call happened to touch.
+    # After the commit, and with the whole row rather than the fields this call
+    # happened to touch.
     _mirror_conflict(record)
     return record

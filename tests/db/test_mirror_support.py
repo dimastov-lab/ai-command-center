@@ -89,9 +89,9 @@ def test_flags_and_timestamps_round_trip_through_their_column_types() -> None:
 
 
 def test_a_null_stays_null_in_both_directions() -> None:
-    """`resolved_at` alternates between a timestamp and NULL as a conflict
-    resolves and reopens, and `bool(None)` is `False` — a flag converted
-    without this check would turn "unknown" into "no"."""
+    """`resolved_at` is NULL until a conflict resolves, and `bool(None)` is
+    `False` — a flag converted without this check would turn "unknown" into
+    "no"."""
     for name in ("done", "created_at"):
         assert CODEC.to_column(name, None) is None
         assert CODEC.to_authority(name, None) is None
@@ -107,9 +107,22 @@ def test_columns_the_table_did_not_name_pass_through_untouched() -> None:
 
 
 def test_an_empty_timestamp_is_not_parsed() -> None:
-    """`datetime.fromisoformat("")` raises, and this runs on a write path that
-    swallows exceptions — a parse error here would be a silently unmirrored
-    row rather than a visible failure."""
+    """Pass-through, and the reason is narrower than it first looks.
+
+    An earlier version of this docstring said the guard prevents a silently
+    unmirrored row, since `datetime.fromisoformat("")` raises on a write path
+    that swallows exceptions. Independent review disproved it by execution:
+    PostgreSQL then rejects `""` for `timestamptz` and *that* is swallowed too,
+    so the guard moves the failure between layers rather than removing it.
+
+    What the guard actually buys is that the codec invents no rule for data no
+    writer produces — every mirrored timestamp column is written by
+    `models.iso_now()`, which never emits `""`. Mapping `""` to `NULL` here
+    would be a guess about a case that does not exist, and guessing at absent
+    cases is how the wrong conversion reached `main` in slice 1. The real gap —
+    that any unmirrorable value is lost silently — is
+    `VOYN-W0-AICC-MIRROR-SILENT-DROP`.
+    """
     assert CODEC.to_column("created_at", "") == ""
 
 

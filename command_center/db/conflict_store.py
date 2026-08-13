@@ -12,14 +12,30 @@ not switched, and the cutover waits on reconciliation plus the rollback and
 backup/restore drills.
 
 What is new here is `resolved_at`: a **nullable** `timestamptz`, and the first
-one mirrored. It is not decoration — the row alternates between a timestamp and
-`NULL` as a conflict resolves and reopens (`_conflict_transition` clears it on a
-reopen), so a mirror that only ever wrote timestamps forward would keep a stale
-resolved date on a reopened conflict and report a resolution that was undone.
-The upsert therefore writes every column on every write rather than the ones
-that changed, and the reconciliation compares `None` on both sides. Nullable
-timestamps are the common case in what remains: of the 75 `TEXT` -> `timestamptz`
-columns in the accepted map, most are optional lifecycle stamps like this one.
+one mirrored. A conflict is created with it `NULL` and acquires a value when it
+resolves, so both states are real and the reconciliation has to compare `None`
+against `None` without calling it a difference. Nullable timestamps are the
+common case in what remains: of the 75 `TEXT` -> `timestamptz` columns in the
+accepted map, most are optional lifecycle stamps like this one.
+
+An earlier version of this docstring justified the whole-row upsert by saying
+`resolved_at` returns to `NULL` when a conflict reopens. **That is false**, and
+independent review caught it: `CONFLICT_TRANSITIONS["resolved"]` is empty, so
+`resolved` is terminal and the clearing branch in `_conflict_transition` cannot
+be reached. The claim was written from reading that branch instead of the
+allowlist above it, and the test offered as its evidence upserted two
+hand-built dicts — a sequence the authority cannot produce. It is recorded here
+rather than quietly deleted because "proved against data the writer cannot
+emit" is the same defect class that put a wrong timestamp conversion into
+`main` two slices ago.
+
+The whole-row upsert stands on reasons that survive checking. `update_conflict_
+fields` changes two columns and mirrors the whole row, because the mirror has no
+other source for the columns it did not touch. The backfill runs more than once
+by design. And if `resolved -> open` is ever added to the allowlist, a
+field-by-field mirror would keep a resolution the authority had withdrawn —
+which is a reason to write whole rows now, not a description of what happens
+today.
 
 Deliberately *not* mirrored: `conflict` has no `jsonb` column, and the first
 table that does needs its own slice. `text` -> `jsonb` -> `text` does not
@@ -87,10 +103,10 @@ class PostgresConflictMirror:
     def upsert(self, record: dict) -> None:
         """Write `record`, replacing any existing row with the same id.
 
-        Every column is written, including the ones the caller did not change.
-        A partial update would leave `resolved_at` set on a conflict that has
-        been reopened — the mirror would then report a resolution the authority
-        has withdrawn, and reconciliation would be the only thing that noticed.
+        Every column is written, including the ones the caller did not change:
+        `update_conflict_fields` changes two and mirrors the whole row, and the
+        mirror has no other source for the rest. See the module docstring for
+        why this is *not* justified by conflicts reopening — they cannot.
         """
         values = [_CODEC.to_column(name, record.get(name)) for name in CONFLICT_COLUMNS]
         assignments = ", ".join(
