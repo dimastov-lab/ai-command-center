@@ -81,6 +81,7 @@ import ast
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -240,7 +241,26 @@ NAME_SUBSTRING_SIGNATURES: dict[str, tuple[str, ...]] = {
 #: `repository`, ...) that name what a file is *about* as readily as what it
 #: *is* — a package directory called `db/` says nothing about whether the code
 #: inside owns an engine.
-CORROBORATED_NAME_CATEGORIES = frozenset({"memory"})
+CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue"})
+
+# --- queue-engine behaviour (corroboration for the `queue` name signature) ---
+
+#: Operations that make something a queue *engine* rather than a table of queue
+#: rows. Storing and listing entries is what a repository does; handing work out
+#: exactly once — claiming, leasing, acking, retrying — is the engine.
+#: Kept deliberately narrow, and measured rather than guessed. A first draft
+#: included `claim`, `dispatch` and `ack`; run against this repository it
+#: flagged twelve modules — auth *claims*, a FastAPI *dispatch*, UI panels —
+#: because those words are ordinary English that queues do not own. A signature
+#: that fires on a word rather than on a mechanism is the same defect as the
+#: name signature it replaces, only harder to see.
+QUEUE_OPERATION_TOKENS = frozenset({"dequeue", "requeue", "nack", "redeliver"})
+
+#: SQL that essentially only a work-handout path writes: `SKIP LOCKED` exists
+#: for exactly one purpose — letting concurrent consumers take different rows.
+#: `FOR UPDATE` alone is deliberately excluded: plain row locking is not a
+#: queue, and including it flagged unrelated modules.
+QUEUE_SQL_MARKERS = ("skip locked",)
 
 # --- persistence behaviour (corroboration for the `memory` name signature) ---
 
@@ -564,6 +584,42 @@ def _opens_for_writing(node: ast.Call, *, mode_index: int = 1) -> bool:
     return False
 
 
+def _runs_queue_operations(tree: ast.AST) -> bool:
+    """Whether this file hands work out, rather than merely storing it.
+
+    Detected from behaviour and **independent of the filename**, which is the
+    point: the previous rule fired on a `queue` path token, so a hand-rolled
+    queue in a file called anything else went unseen while a plain adapter
+    named `queue_store.py` was flagged. Both halves of that were wrong, and the
+    second one is the dangerous half.
+
+    Two signals, both structural: a function defined or called whose name
+    carries a work-handout verb (`claim`, `lease`, `dequeue`, `ack`, ...), and
+    SQL that only a handout path writes — `SKIP LOCKED` exists solely so
+    concurrent consumers take different rows.
+
+    Deliberately *not* signals: `INSERT`, `SELECT ... ORDER BY`, `DELETE`. That
+    is a repository over queue rows, which is what a control plane is allowed
+    to own; the engine is whatever decides who gets the next one.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if set(_TOKEN_SPLIT.split(node.name.lower())) & QUEUE_OPERATION_TOKENS:
+                return True
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            lowered = node.value.lower()
+            if any(marker in lowered for marker in QUEUE_SQL_MARKERS):
+                return True
+    return False
+
+
+#: Category -> the behaviour that has to corroborate its name signature.
+_CORROBORATION: dict[str, Callable[[ast.AST], bool]] = {
+    "memory": lambda tree: _persists_data(tree),
+    "queue": _runs_queue_operations,
+}
+
+
 def _name_categories(rel_path: str) -> set[str]:
     """Engine-named path segments (skipped for pure presentation layers)."""
     if _is_presentation(rel_path):
@@ -598,12 +654,21 @@ def classify_engine_categories(rel_path: str, tree: ast.AST) -> set[str]:
 
     name_cats = _name_categories(rel_path)
     categories |= name_cats - CORROBORATED_NAME_CATEGORIES
-    # A `memory` name is a question, not a verdict. It becomes a verdict only if
-    # the file also *behaves* like a store. A path segment on its own says where
-    # something lives, not what it does -- and a file whose name is its only
-    # engine signal is a file the gate would freeze for being called `db`.
-    if name_cats & CORROBORATED_NAME_CATEGORIES and _persists_data(tree):
-        categories |= name_cats & CORROBORATED_NAME_CATEGORIES
+    # A `memory` or `queue` name is a question, not a verdict. It becomes one
+    # only if the file also *behaves* like the thing it is named after: a path
+    # segment says where something lives, not what it does, and a file whose
+    # name is its only engine signal is a file the gate would freeze for being
+    # called `db` or `queue`.
+    for category in name_cats & CORROBORATED_NAME_CATEGORIES:
+        if _CORROBORATION[category](tree):
+            categories.add(category)
+    # Queue-engine behaviour classifies regardless of the filename. This is the
+    # half the old name-only rule missed entirely: it flagged an adapter called
+    # `queue_store.py` while a hand-rolled claim/lease loop in a file named
+    # anything else went unseen. Corroborating the name without adding this
+    # would have been a straight reduction in control.
+    if _runs_queue_operations(tree):
+        categories.add("queue")
     return categories
 
 

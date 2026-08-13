@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from command_center import execution_mirror, execution_queue
-from command_center.db.execution_mirror import QUEUE_ENTRY_COLUMNS, PostgresQueueMirror
+from command_center import execution_queue, queue_store
+from command_center.db.queue_store import QUEUE_ENTRY_COLUMNS, PostgresQueueMirror
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -40,7 +40,7 @@ def _entry(entry_id: str, **overrides: object) -> dict:
 def test_the_postgres_mirror_satisfies_the_shared_contract() -> None:
     # Structural, not nominal: the divergence check must be able to take any
     # mirror, so conformance is the property that matters, not inheritance.
-    assert isinstance(PostgresQueueMirror(connection_factory=lambda: None), execution_mirror.QueueMirror)
+    assert isinstance(PostgresQueueMirror(connection_factory=lambda: None), queue_store.QueueMirror)
     assert PostgresQueueMirror.name == "postgres"
 
 
@@ -145,7 +145,7 @@ def test_the_mirror_round_trips_a_json_entry_unchanged(mirror: PostgresQueueMirr
     assert mirror.list_entries() == [entry]
 
 
-def test_importing_the_mirror_needs_no_postgresql_client(tmp_path: Path) -> None:
+def test_importing_the_queue_store_needs_no_postgresql_client(tmp_path: Path) -> None:
     """`command_center.db` promises that importing it pulls in neither
     `aios_db` nor `psycopg`, so the desktop and CLI entry points keep working on
     a machine with no client library. A module-level pool import here would
@@ -155,7 +155,7 @@ def test_importing_the_mirror_needs_no_postgresql_client(tmp_path: Path) -> None
 
     probe = (
         "import sys;"
-        "import command_center.db.execution_mirror as qs;"
+        "import command_center.db.queue_store as qs;"
         "assert 'aios_db' not in sys.modules, sorted(m for m in sys.modules if 'aios' in m);"
         "assert 'psycopg' not in sys.modules;"
         "qs.PostgresQueueMirror()"

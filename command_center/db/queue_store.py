@@ -8,7 +8,7 @@ modules touch.
 
 This is a *mirror*, not the authority. `execution_queue.json` keeps that role
 until reconciliation shows a clean session and the rollback and backup/restore
-drills have run; nothing here decides otherwise, and `test_execution_mirror.py`
+drills have run; nothing here decides otherwise, and `test_queue_store.py`
 asserts as much rather than leaving it to the docstring.
 
 Two properties are carried over from the SQLite mirror because they are what
