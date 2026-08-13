@@ -27,9 +27,10 @@ first request, so the fake — never the real class — is what gets cached.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -43,8 +44,41 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WEB_DIST = _REPO_ROOT / "web" / "dist"
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Open the PostgreSQL pool for the life of the process, when configured.
+
+    Without this the pool is only ever opened by `python -m command_center.db`,
+    so `/readyz` in a served process would report the database unreachable
+    forever and no replica would enter rotation.
+
+    Absence of `AICC_PG_HOST` means "this deployment has no server database"
+    (desktop, CLI, the test suite), not a misconfiguration: startup proceeds and
+    `/readyz` reports degraded. A host that *is* set but unusable is fatal here
+    on purpose — a bad DSN should stop the deploy, not surface as a 503 storm.
+    """
+    opened = False
+    if os.environ.get("AICC_PG_HOST"):
+        from command_center.db import pool
+
+        pool.open_pool()
+        opened = True
+    try:
+        yield
+    finally:
+        if opened:
+            from command_center.db import pool
+
+            pool.close_pool()
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="AI Command Center API", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title="AI Command Center API",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=_lifespan,
+    )
 
     if os.environ.get("AICC_WEB_DEV") == "1":
         app.add_middleware(
@@ -76,6 +110,29 @@ def create_app() -> FastAPI:
             app.state.execution_center_api = api
         snapshot = build_workspace_home_snapshot(execution_center_api=api)
         return serialize_execution(snapshot)
+
+    # Liveness and readiness probes (VOYN-W0-AICC-SRV-01a). Registered before
+    # the SPA mount so they are not shadowed by the catch-all static handler,
+    # and outside `/api` because orchestrators and load balancers expect them
+    # at the root. `command_center.db.health` is imported inside the handlers:
+    # it reaches `psycopg` only when a probe actually runs, so the desktop and
+    # CLI entry points — which have no PostgreSQL client installed — can still
+    # import this module.
+    @app.get("/healthz")
+    def healthz() -> dict:
+        """Is the process alive? Never touches the database (see health.py)."""
+        from command_center.db.health import check_liveness
+
+        return check_liveness().to_dict()
+
+    @app.get("/readyz")
+    def readyz(response: Response) -> dict:
+        """Should this process receive traffic? 503 when the database is not usable."""
+        from command_center.db.health import check_readiness
+
+        report = check_readiness()
+        response.status_code = 200 if report.ok else 503
+        return report.to_dict()
 
     # Agent-dispatch policy layer (VOYN-W2-AGENT): `/api/v1/dispatch/*`.
     # Registered before the SPA mount so its routes resolve ahead of the
