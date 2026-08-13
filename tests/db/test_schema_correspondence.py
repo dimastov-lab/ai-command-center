@@ -51,23 +51,41 @@ def sqlite_schema() -> dict:
                 if name == SQLITE_LEDGER:
                     continue
                 columns, primary_key = {}, []
-                for _, column, _type, notnull, _default, pk in conn.execute(
+                for _, column, ctype, notnull, _default, pk in conn.execute(
                     f'PRAGMA table_info("{name}")'
                 ):
-                    columns[column] = {"notnull": bool(notnull), "pk": pk}
+                    columns[column] = {"notnull": bool(notnull), "pk": pk, "type": ctype}
                     if pk:
                         primary_key.append((pk, column))
                 tables[name] = {
                     "columns": columns,
                     "pk": [c for _, c in sorted(primary_key)],
                 }
-            indexes = defaultdict(int)
-            for (_name, table) in conn.execute(
+            shapes, uniques = set(), 0
+            for index, table in conn.execute(
                 "SELECT name, tbl_name FROM sqlite_master WHERE type='index' "
                 "AND name NOT LIKE 'sqlite_%'"
-            ):
-                indexes[table] += 1
-            return {"tables": tables, "indexes": dict(indexes)}
+            ).fetchall():
+                cols = tuple(
+                    row[2] for row in conn.execute(f'PRAGMA index_info("{index}")')
+                )
+                shapes.add((table, cols))
+            for table in tables:
+                for row in conn.execute(f'PRAGMA index_list("{table}")'):
+                    if row[3] == "u":
+                        uniques += 1
+            checks = sum(
+                sql.upper().count("CHECK (")
+                for (sql,) in conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"
+                )
+            )
+            return {
+                "tables": tables,
+                "index_shapes": shapes,
+                "unique_constraints": uniques,
+                "check_constraints": checks,
+            }
         finally:
             conn.close()
 
@@ -78,12 +96,17 @@ def postgres_schema(admin_conn) -> dict:
     admin_conn.execute(INITIAL_MIGRATION.read_text(encoding="utf-8"))
 
     tables: dict[str, dict] = {}
-    for table, column, nullable in admin_conn.execute(
-        "SELECT table_name, column_name, is_nullable FROM information_schema.columns "
+    for table, column, nullable, data_type, default in admin_conn.execute(
+        "SELECT table_name, column_name, is_nullable, data_type, column_default "
+        "FROM information_schema.columns "
         "WHERE table_schema='public' ORDER BY table_name, ordinal_position"
     ).fetchall():
         tables.setdefault(table, {"columns": {}, "pk": [], "fks": set()})
-        tables[table]["columns"][column] = {"notnull": nullable == "NO"}
+        tables[table]["columns"][column] = {
+            "notnull": nullable == "NO",
+            "type": data_type,
+            "default": default,
+        }
     for table, column in admin_conn.execute(
         "SELECT tc.table_name, kcu.column_name FROM information_schema.table_constraints tc "
         "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name "
@@ -98,12 +121,33 @@ def postgres_schema(admin_conn) -> dict:
         "WHERE tc.table_schema='public' AND tc.constraint_type='FOREIGN KEY'"
     ).fetchall():
         tables[table]["fks"].add(referenced)
-    indexes: dict[str, int] = defaultdict(int)
-    for (table,) in admin_conn.execute(
-        "SELECT tablename FROM pg_indexes WHERE schemaname='public'"
-    ).fetchall():
-        indexes[table] += 1
-    return {"tables": tables, "indexes": dict(indexes)}
+    # Index shapes by (table, ordered columns), so a named index that lost its
+    # composite form is visible even though the per-table count is unchanged.
+    shapes = {
+        (table, tuple(columns))
+        for table, columns in admin_conn.execute(
+            "SELECT t.relname, array_agg(a.attname ORDER BY k.ord) "
+            "FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "JOIN pg_class t ON t.oid = i.indrelid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+            "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
+            "WHERE n.nspname = 'public' GROUP BY c.oid, t.relname"
+        ).fetchall()
+    }
+    counts = admin_conn.execute(
+        "SELECT contype, count(*) FROM pg_constraint con "
+        "JOIN pg_namespace n ON n.oid = con.connamespace "
+        "WHERE n.nspname = 'public' AND contype IN ('u', 'c') GROUP BY contype"
+    ).fetchall()
+    by_type = {t: n for t, n in counts}
+    return {
+        "tables": tables,
+        "index_shapes": shapes,
+        "unique_constraints": by_type.get("u", 0),
+        "check_constraints": by_type.get("c", 0),
+    }
 
 
 def test_every_runtime_table_has_a_postgres_target(sqlite_schema, postgres_schema) -> None:
@@ -121,11 +165,19 @@ def test_every_runtime_table_has_a_postgres_target(sqlite_schema, postgres_schem
 
 
 def test_the_domain_table_count_is_the_live_one_not_the_early_survey(
-    sqlite_schema, postgres_schema
+    sqlite_schema,
 ) -> None:
-    # 33, not the 16 recorded before waves W1-W3. Asserted so the number cannot
-    # be quoted from memory again.
+    """33, not the 16 recorded before waves W1-W3.
+
+    Deliberately depends on the SQLite fixture alone. Pinning it behind the
+    PostgreSQL fixture would let the number silently stop being defended on any
+    machine without a database — which is exactly the condition under which the
+    stale 16 survived long enough to reach a plan.
+    """
     assert len(sqlite_schema["tables"]) == 33
+
+
+def test_the_postgres_target_carries_the_same_count(postgres_schema) -> None:
     assert len(postgres_schema["tables"]) == 33
 
 
@@ -159,20 +211,89 @@ def test_primary_keys_agree(sqlite_schema, postgres_schema) -> None:
     assert without_key == [], "PostgreSQL table without a primary key"
 
 
-def test_postgres_covers_every_sqlite_index(sqlite_schema, postgres_schema) -> None:
-    """Per table, PostgreSQL must not have fewer indexes than SQLite.
+def test_every_sqlite_index_keeps_its_column_set(sqlite_schema, postgres_schema) -> None:
+    """Compared by column set, not by count.
 
-    A count rather than a shape comparison on purpose: the two engines spell
-    indexes differently, and an exact match would fail on cosmetics. Fewer,
-    though, means a query pattern the runtime relies on lost its index in the
-    move — a performance regression that no functional test would catch.
+    A count comparison looked sufficient and was not: SQLite's `sqlite_master`
+    scan omits the autoindexes behind PRIMARY KEY and UNIQUE, while PostgreSQL's
+    `pg_indexes` includes them. That is the whole of the apparent 62 -> 102
+    growth (62 named + 33 PK + 7 UNIQUE), and it left every table with a slot of
+    pure accounting slack — a table could lose its only real index and still
+    satisfy `sqlite_count <= postgres_count`.
+
+    Matching the (table, ordered columns) of each named index closes that: an
+    index replaced by two narrower ones, or dropped outright, fails here.
     """
-    thinner = {
-        table: (count, postgres_schema["indexes"].get(table, 0))
-        for table, count in sqlite_schema["indexes"].items()
-        if count > postgres_schema["indexes"].get(table, 0)
+    lost = sorted(sqlite_schema["index_shapes"] - postgres_schema["index_shapes"])
+    assert lost == [], "SQLite index column sets with no PostgreSQL counterpart"
+
+
+def test_constraint_parity(sqlite_schema, postgres_schema) -> None:
+    """UNIQUE and CHECK counts must match.
+
+    The two CHECKs are import preconditions (`attempt_number >= 1`,
+    `max_attempts >= 1`): a source row violating one must fail the insert rather
+    than pass silently, so losing the constraint in the move would turn a loud
+    rejection into corrupt data.
+    """
+    assert postgres_schema["unique_constraints"] == sqlite_schema["unique_constraints"]
+    assert postgres_schema["check_constraints"] == sqlite_schema["check_constraints"]
+
+
+def test_no_postgres_only_required_column(sqlite_schema, postgres_schema) -> None:
+    """The reverse direction of the column check.
+
+    A NOT NULL column that exists only in PostgreSQL has no source value, so the
+    import fails on the first row. Checking only SQLite -> PostgreSQL would miss
+    it entirely.
+    """
+    orphan_required = {
+        table: sorted(
+            name
+            for name, spec in postgres_schema["tables"][table]["columns"].items()
+            if spec["notnull"]
+            and spec["default"] is None
+            and name not in sqlite_columns["columns"]
+        )
+        for table, sqlite_columns in sqlite_schema["tables"].items()
+        if any(
+            spec["notnull"] and spec["default"] is None
+            and name not in sqlite_columns["columns"]
+            for name, spec in postgres_schema["tables"][table]["columns"].items()
+        )
     }
-    assert thinner == {}, "tables with fewer indexes in PostgreSQL than in SQLite"
+    assert orphan_required == {}, "PostgreSQL requires columns the SQLite source cannot supply"
+
+
+def test_the_columns_needing_value_conversion_are_the_documented_ones(
+    sqlite_schema, postgres_schema
+) -> None:
+    """The map's headline hazard, pinned.
+
+    114 of 395 columns change type, and 75 of them are `TEXT` -> `timestamptz`.
+    `command_center/models.py:iso_now` writes naive local time with no offset, so
+    those strings are reinterpreted under the importer's session time zone —
+    a silent, unrecoverable shift. The count is asserted so the migration cannot
+    be planned against a smaller number than the one that exists.
+    """
+    conversions: dict[str, int] = defaultdict(int)
+    for table, spec in postgres_schema["tables"].items():
+        source = sqlite_schema["tables"][table]["columns"]
+        for name, column in spec["columns"].items():
+            declared = (source.get(name, {}).get("type") or "").upper()
+            target = column["type"]
+            if not declared:
+                continue
+            if target == "timestamp with time zone" and declared.startswith("TEXT"):
+                conversions["timestamptz"] += 1
+            elif target == "jsonb" and declared.startswith("TEXT"):
+                conversions["jsonb"] += 1
+            elif target == "boolean" and declared.startswith("INT"):
+                conversions["boolean"] += 1
+
+    assert conversions["timestamptz"] == 75
+    assert conversions["jsonb"] == 22
+    assert conversions["boolean"] == 8
 
 
 def test_the_migration_order_is_derivable_and_acyclic(postgres_schema) -> None:
@@ -193,8 +314,10 @@ def test_the_migration_order_is_derivable_and_acyclic(postgres_schema) -> None:
         waves.append(wave)
         placed |= set(wave)
 
-    # Five waves at the time of writing; asserted loosely so adding a table does
-    # not fail the suite, but a table that suddenly depends on nothing (or on
-    # everything) shows up as a shape change.
-    assert waves[0], "the first wave must contain the tables with no dependencies"
-    assert sum(len(w) for w in waves) == len(postgres_schema["tables"])
+    # The previous version asserted `waves[0]` truthy and that the waves sum to
+    # the table count — both tautologies given the loop above, so the documented
+    # five-wave shape was in fact unpinned. The sizes are pinned instead: a table
+    # that changes wave has changed its dependency position, which is a planning
+    # fact the map states and therefore has to defend.
+    assert [len(w) for w in waves] == [11, 9, 1, 10, 2]
+    assert waves[2] == ["run"], "wave 3 is the bottleneck ten wave-4 tables depend on"
