@@ -29,6 +29,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from command_center.db.mirror_support import ColumnCodec, render_authority_timestamp
+
 __all__ = ["PostgresQueueMirror", "QUEUE_ENTRY_COLUMNS"]
 
 #: The queue entry's own columns, in schema order. `position` is deliberately
@@ -79,7 +81,7 @@ class PostgresQueueMirror:
         columns = (*QUEUE_ENTRY_COLUMNS, "position")
         placeholders = ", ".join(["%s"] * len(columns))
         rows = [
-            tuple(_to_column_value(column, entry.get(column)) for column in QUEUE_ENTRY_COLUMNS)
+            tuple(_CODEC.to_column(column, entry.get(column)) for column in QUEUE_ENTRY_COLUMNS)
             + (index,)
             for index, entry in enumerate(entries)
         ]
@@ -114,61 +116,26 @@ class PostgresQueueMirror:
 
 #: Queue columns PostgreSQL stores as `timestamptz` while the JSON store holds
 #: naive local-time strings.
-_TIMESTAMP_COLUMNS = frozenset({"added_at", "evaluated_at", "launched_at"})
-
-
-def _to_column_value(name: str, value: Any) -> Any:
-    """Attach the writer's zone to a naive timestamp before it reaches `timestamptz`.
-
-    Without this PostgreSQL stamps a naive string with the *session* time zone,
-    silently shifting every mirrored row by the gap between the writing machine
-    and the server — no error, just wrong data discovered when reads switch.
-    The mirror runs in the writer's own process, so the local zone is the one
-    that produced the string.
-
-    The limit is inherent to the naive format rather than to this code: a
-    mirror running in a different zone than the writer would attach the wrong
-    one. Making the authority timezone-aware is a migration of every existing
-    record — tracked as `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`.
-
-    And the reconciliation cannot catch a violation of it: the outbound render
-    converts back through the same zone, so a mirror running in the wrong one
-    reproduces the original wall clock and `divergence` reports agreement it
-    never verified. Independent review demonstrated this — the same row
-    mirrored from an MSK and a UTC process stored instants three hours apart
-    and both reconciled clean. Until the authority is timezone-aware
-    (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS), the mirror must run in the writer's
-    process, and that is an operational constraint rather than something the
-    gate enforces.
-    """
-    if name in _TIMESTAMP_COLUMNS and isinstance(value, str) and value:
-        parsed = datetime.fromisoformat(value)
-        return parsed if parsed.tzinfo is not None else parsed.astimezone()
-    return value
+#:
+#: The conversion itself moved to `mirror_support` at slice 3, when a third
+#: table would have made a third copy of it. What it does and why it is not
+#: obvious is documented there, along with the reason it was written wrong the
+#: first time in both directions: the inbound conversion left a naive string
+#: for PostgreSQL to stamp with the *session* zone, and the outbound render
+#: emitted UTC with a `Z` suffix, which no writer in this application produces
+#: — so `queue_divergence` would have called every timestamped entry different.
+_CODEC = ColumnCodec(timestamps=frozenset({"added_at", "evaluated_at", "launched_at"}))
 
 
 def _as_json_value(value: Any) -> Any:
     """Render a column back into the shape the JSON queue holds.
 
-    The timestamp columns are `timestamptz`; the JSON store holds ISO-8601
-    strings. Without this the mirror returns `datetime` objects and the
-    divergence check reports every timestamped entry as different — a cutover
-    gate that is permanently red, which someone eventually "fixes" by loosening
-    the comparison instead of the conversion.
-
-    Rendered back into exactly what `models.iso_now()` produces: naive local
-    time at second precision, no offset.
-
-    The first version of this function normalised to UTC with a `Z` suffix,
-    "matching what the application writes". It does not: `iso_now`'s own
-    docstring says every timestamp here is "local time on the machine that
-    wrote them, never assumed to be UTC". So the mirror rendered a shape no
-    writer emits, and `queue_divergence` would have reported **every**
-    timestamped entry as different — the permanently-red cutover gate this
-    docstring warns about, produced by the code that warns about it. The tests
-    missed it because they fabricated `Z`-suffixed timestamps, proving the
-    conversion against invented data rather than against `iso_now`.
+    Column-name-independent, unlike the row stores': every `datetime` this
+    mirror reads back comes from one of the three timestamp columns, and the
+    JSON queue holds them as the naive local strings `models.iso_now()` writes.
+    So the renderer is called directly rather than through the codec, which
+    would need a column name this function has no reason to know.
     """
     if isinstance(value, datetime):
-        return value.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+        return render_authority_timestamp(value)
     return value

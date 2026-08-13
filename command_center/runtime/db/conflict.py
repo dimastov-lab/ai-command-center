@@ -32,11 +32,14 @@ do for the other table-family modules.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 #: The conflict kinds (mirrors ``api.models.ConflictKind``). Validated at the
 #: persistence boundary so a malformed kind can never reach a stored row.
@@ -162,7 +165,35 @@ def create_conflict(
                 f"INSERT INTO conflict ({columns}) VALUES ({placeholders})",
                 record,
             )
+    _mirror_conflict(record)
     return record
+
+
+def _mirror_conflict(record: dict) -> None:
+    """Best-effort dual-write of one conflict into PostgreSQL (SRV-01B slice 3).
+
+    Called *after* the authoritative SQLite commit, and deliberately silent on
+    failure — the same rule slice 2 established for `owner_item`, for the same
+    two reasons. During dual-write the mirror is not load-bearing, so letting it
+    raise would mean a migration step could take down the table it is
+    migrating; and writing it first would allow the opposite and worse state, a
+    mirror ahead of the system of record, which no reconciliation flags as
+    wrong.
+
+    Every mutating path calls this with the row as it now stands, not with the
+    fields that changed: `update_conflict_fields` touches two columns, and the
+    mirror has no other source for the rest.
+
+    The mirror's health is reported by `conflict_store.divergence`, not by
+    exceptions raised here. Imported lazily so the desktop and CLI entry points
+    keep working on a machine with no PostgreSQL client library.
+    """
+    try:
+        from command_center.db.conflict_store import PostgresConflictMirror
+
+        PostgresConflictMirror().upsert(record)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        _LOG.debug("Could not mirror conflict into PostgreSQL", exc_info=True)
 
 
 def get_conflict(db_path: Path, conflict_id: str) -> dict | None:
@@ -291,7 +322,13 @@ def update_conflict_fields(
             updated = conn.execute(
                 "SELECT * FROM conflict WHERE id = ?", (conflict_id,)
             ).fetchone()
-            return dict(updated)
+            record = dict(updated)
+    # Outside the `with`, so the mirror runs only once SQLite has committed.
+    # Mirroring inside the transaction would publish a row a rollback then
+    # discards — a mirror ahead of the system of record, which reconciliation
+    # reports but nothing else would.
+    _mirror_conflict(record)
+    return record
 
 
 def _conflict_transition(
@@ -306,7 +343,8 @@ def _conflict_transition(
 
     Checks the caller's ``version`` first (a stale writer always loses as a stale
     writer), then refuses an illegal status edge, stamps ``resolved_at`` when the
-    move is into ``resolved`` (and clears it on a reopen), bumps ``version`` and
+    move is into ``resolved`` (the clearing branch below is unreachable while
+    ``resolved`` is terminal — see the comment on it), bumps ``version`` and
     sets ``updated_at``. Returns the updated row dict."""
     row = conn.execute(
         "SELECT status, version FROM conflict WHERE id = ?", (conflict_id,)
@@ -329,6 +367,14 @@ def _conflict_transition(
     if new_status == "resolved":
         fields["resolved_at"] = now
     elif row["status"] == "resolved":
+        # Unreachable while `resolved` is terminal: the allowlist check above
+        # rejects every edge out of it, so no call reaches here with a resolved
+        # row. Left in place as the correct behaviour if `resolved -> open` is
+        # ever opened, and labelled because reading it as live behaviour is
+        # exactly the mistake SRV-01B slice 3 made — its acceptance story was
+        # built on this branch, and independent review had to disprove it.
+        # Whoever opens that edge owns `test_a_resolved_conflict_is_terminal`
+        # and the PostgreSQL mirror's assumptions along with it.
         fields["resolved_at"] = None
     set_clause = ", ".join(f"{key} = :{key}" for key in fields)
     params = dict(fields)
@@ -358,7 +404,11 @@ def set_conflict_status(
     now = db.iso_now()
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            return db._conflict_transition(
+            record = db._conflict_transition(
                 conn, conflict_id, expected_version=expected_version,
                 new_status=status, now=now,
             )
+    # After the commit, and with the whole row rather than the fields this call
+    # happened to touch.
+    _mirror_conflict(record)
+    return record
