@@ -19,6 +19,7 @@ test is defending.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import tempfile
 from collections import defaultdict
@@ -31,6 +32,11 @@ INITIAL_MIGRATION = REPO_ROOT / "command_center" / "db" / "sql" / "0001_initial.
 
 #: The bookkeeping table; not a domain table on either side.
 SQLITE_LEDGER = "schema_version"
+
+#: `CHECK` as a keyword introducing a constraint, not as a substring of an
+#: identifier. SQLite exposes no pragma for CHECK constraints, so the DDL text
+#: is the only source, and a loose match reads `checks_json` as a constraint.
+_CHECK_KEYWORD = re.compile(r"\bCHECK\s*\(", re.IGNORECASE)
 
 
 @pytest.fixture(scope="session")
@@ -61,7 +67,7 @@ def sqlite_schema() -> dict:
                     "columns": columns,
                     "pk": [c for _, c in sorted(primary_key)],
                 }
-            shapes, uniques = set(), 0
+            shapes, unique_shapes = set(), set()
             for index, table in conn.execute(
                 "SELECT name, tbl_name FROM sqlite_master WHERE type='index' "
                 "AND name NOT LIKE 'sqlite_%'"
@@ -71,20 +77,40 @@ def sqlite_schema() -> dict:
                 )
                 shapes.add((table, cols))
             for table in tables:
-                for row in conn.execute(f'PRAGMA index_list("{table}")'):
-                    if row[3] == "u":
-                        uniques += 1
-            checks = sum(
-                sql.upper().count("CHECK (")
-                for (sql,) in conn.execute(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"
-                )
-            )
+                for row in conn.execute(f'PRAGMA index_list("{table}")').fetchall():
+                    if row[3] != "u":
+                        continue
+                    unique_shapes.add(
+                        (
+                            table,
+                            tuple(
+                                r[2] for r in conn.execute(f'PRAGMA index_info("{row[1]}")')
+                            ),
+                        )
+                    )
+            # CHECK constraints: SQLite exposes no pragma for them, so the column
+            # they guard is recovered from the DDL text. Crude, and deliberately
+            # so — it fails in the safe direction, since a spelling this misses
+            # simply diverges from the PostgreSQL set and the test says so.
+            check_shapes = set()
+            for table, sql in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"
+            ).fetchall():
+                for line in sql.splitlines():
+                    # The keyword followed by its parenthesis, not the substring:
+                    # `checks_json` and `last_checked_at` both contain "check"
+                    # and are column names, not constraints. Matching loosely
+                    # invented two constraints that do not exist.
+                    if not _CHECK_KEYWORD.search(line):
+                        continue
+                    column = line.strip().split()[0].strip('"')
+                    if column in tables.get(table, {}).get("columns", {}):
+                        check_shapes.add((table, (column,)))
             return {
                 "tables": tables,
                 "index_shapes": shapes,
-                "unique_constraints": uniques,
-                "check_constraints": checks,
+                "unique_shapes": unique_shapes,
+                "check_shapes": check_shapes,
             }
         finally:
             conn.close()
@@ -121,8 +147,14 @@ def postgres_schema(admin_conn) -> dict:
         "WHERE tc.table_schema='public' AND tc.constraint_type='FOREIGN KEY'"
     ).fetchall():
         tables[table]["fks"].add(referenced)
-    # Index shapes by (table, ordered columns), so a named index that lost its
-    # composite form is visible even though the per-table count is unchanged.
+    # Index shapes by (table, ordered columns). `indisprimary`/`indisunique` are
+    # excluded: a constraint index can share a column set with a deliberate
+    # secondary index (`provider_attempt_pkey` and `idx_provider_attempt_run_id`
+    # both cover `(run_id, attempt_number)`), and a set collapses the duplicate —
+    # so dropping the secondary index would leave the shape present and the
+    # check silent. Counting only non-constraint indexes removes that shadow.
+    # `indpred IS NULL` keeps a partial index from standing in for a full one on
+    # the same columns.
     shapes = {
         (table, tuple(columns))
         for table, columns in admin_conn.execute(
@@ -133,20 +165,51 @@ def postgres_schema(admin_conn) -> dict:
             "JOIN pg_namespace n ON n.oid = t.relnamespace "
             "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
             "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
-            "WHERE n.nspname = 'public' GROUP BY c.oid, t.relname"
+            "WHERE n.nspname = 'public' AND NOT i.indisprimary AND NOT i.indisunique "
+            "AND i.indpred IS NULL "
+            "GROUP BY c.oid, t.relname"
         ).fetchall()
     }
-    counts = admin_conn.execute(
-        "SELECT contype, count(*) FROM pg_constraint con "
-        "JOIN pg_namespace n ON n.oid = con.connamespace "
-        "WHERE n.nspname = 'public' AND contype IN ('u', 'c') GROUP BY contype"
-    ).fetchall()
-    by_type = {t: n for t, n in counts}
+    # Constraints by the columns they cover, not by how many there are: a UNIQUE
+    # moving from (a, b) to (a, c) leaves the count at 7 and changes what the
+    # database actually guarantees.
+    unique_shapes = {
+        (table, tuple(columns))
+        for table, columns in admin_conn.execute(
+            "SELECT t.relname, array_agg(a.attname ORDER BY k.ord) "
+            "FROM pg_constraint con "
+            "JOIN pg_class t ON t.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = con.connamespace "
+            "JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+            "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
+            "WHERE n.nspname = 'public' AND con.contype = 'u' GROUP BY con.oid, t.relname"
+        ).fetchall()
+    }
+    check_shapes = {
+        (table, tuple(columns))
+        for table, columns in admin_conn.execute(
+            "SELECT t.relname, array_agg(a.attname ORDER BY k.ord) "
+            "FROM pg_constraint con "
+            "JOIN pg_class t ON t.oid = con.conrelid "
+            "JOIN pg_namespace n ON n.oid = con.connamespace "
+            "JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+            "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
+            "WHERE n.nspname = 'public' AND con.contype = 'c' GROUP BY con.oid, t.relname"
+        ).fetchall()
+    }
+    identity = {
+        (table, column)
+        for table, column in admin_conn.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND is_identity = 'YES'"
+        ).fetchall()
+    }
     return {
         "tables": tables,
         "index_shapes": shapes,
-        "unique_constraints": by_type.get("u", 0),
-        "check_constraints": by_type.get("c", 0),
+        "unique_shapes": unique_shapes,
+        "check_shapes": check_shapes,
+        "identity_columns": identity,
     }
 
 
@@ -236,8 +299,8 @@ def test_constraint_parity(sqlite_schema, postgres_schema) -> None:
     than pass silently, so losing the constraint in the move would turn a loud
     rejection into corrupt data.
     """
-    assert postgres_schema["unique_constraints"] == sqlite_schema["unique_constraints"]
-    assert postgres_schema["check_constraints"] == sqlite_schema["check_constraints"]
+    assert sorted(sqlite_schema["unique_shapes"] - postgres_schema["unique_shapes"]) == []
+    assert sorted(sqlite_schema["check_shapes"] - postgres_schema["check_shapes"]) == []
 
 
 def test_no_postgres_only_required_column(sqlite_schema, postgres_schema) -> None:
@@ -247,22 +310,51 @@ def test_no_postgres_only_required_column(sqlite_schema, postgres_schema) -> Non
     import fails on the first row. Checking only SQLite -> PostgreSQL would miss
     it entirely.
     """
+    identity = postgres_schema["identity_columns"]
+
+    def needs_a_source(table: str, name: str, spec: dict, source: dict) -> bool:
+        # A default supplies the value; so does GENERATED ALWAYS AS IDENTITY,
+        # which reports no `column_default` at all and would otherwise read as a
+        # column nothing can fill.
+        return (
+            spec["notnull"]
+            and spec["default"] is None
+            and (table, name) not in identity
+            and name not in source
+        )
+
     orphan_required = {
         table: sorted(
             name
             for name, spec in postgres_schema["tables"][table]["columns"].items()
-            if spec["notnull"]
-            and spec["default"] is None
-            and name not in sqlite_columns["columns"]
+            if needs_a_source(table, name, spec, sqlite_columns["columns"])
         )
         for table, sqlite_columns in sqlite_schema["tables"].items()
         if any(
-            spec["notnull"] and spec["default"] is None
-            and name not in sqlite_columns["columns"]
+            needs_a_source(table, name, spec, sqlite_columns["columns"])
             for name, spec in postgres_schema["tables"][table]["columns"].items()
         )
     }
     assert orphan_required == {}, "PostgreSQL requires columns the SQLite source cannot supply"
+
+
+def test_identity_columns_are_the_documented_seven(postgres_schema) -> None:
+    """`GENERATED ALWAYS AS IDENTITY` changes how the import must be written.
+
+    An explicit `INSERT` of these ids is rejected without `OVERRIDING SYSTEM
+    VALUE`, and the sequence has to be restarted past `max(id)` afterwards or the
+    first ordinary insert collides on the primary key. Neither obligation is
+    visible in a type table, so the set is pinned here.
+    """
+    assert postgres_schema["identity_columns"] == {
+        ("run_event", "id"),
+        ("completion_event", "id"),
+        ("completion_validation", "id"),
+        ("proposal_event", "id"),
+        ("proposal_evidence", "id"),
+        ("council_event", "id"),
+        ("model_event", "id"),
+    }
 
 
 def test_the_columns_needing_value_conversion_are_the_documented_ones(
