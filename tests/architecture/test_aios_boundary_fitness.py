@@ -402,3 +402,49 @@ def test_the_wide_vocabulary_stays_behind_the_name_gate():
     # with "matched nothing" would make this test pass for the wrong reason.
     for path in ("command_center/auth_tokens.py", "command_center/web_client.py"):
         assert "queue" not in boundary.classify_engine_categories(path, ordinary), path
+
+
+def test_the_mainstream_queue_verbs_are_covered():
+    """Review found three engines that escaped the first vocabulary.
+
+    None of them was an evasion: `poll`/`take`/`checkout` are what
+    `java.util.concurrent`, the Go channel idiom and any worker pool call their
+    operations. A queue author writes them without thinking about this detector,
+    which is precisely why omitting them was a coverage gap rather than an
+    acceptable limit — and why the owner's constraint (do not reduce control
+    over hand-rolled queues) is not satisfied by a vocabulary that only covers
+    the words we happened to think of first.
+    """
+    polling = ast.parse(
+        "def poll(conn):\n"
+        "    row = conn.execute('SELECT id FROM work ORDER BY priority LIMIT 1').fetchone()\n"
+        "    conn.execute('UPDATE work SET state = %s', ('running',))\n"
+        "def finish(conn, item):\n    ...\n"
+        "def fail(conn, item):\n    ...\n"
+    )
+    handing_out = ast.parse(
+        "class DispatchBox:\n"
+        "    def submit(self, item):\n        ...\n"
+        "    def checkout(self):\n        ...\n"
+        "    def give_back(self, item):\n        ...\n"
+    )
+    redis_take = ast.parse(
+        "import redis\n"
+        "def take(client):\n    ...\n"
+        "def settle(client, item):\n    ...\n"
+    )
+
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/task_queue.py", polling
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/queues/dispatchbox.py", handing_out
+    )
+    assert "queue" in boundary.classify_engine_categories(
+        "command_center/work_queue.py", redis_take
+    )
+
+    # The widening stays behind the name gate: these verbs are ordinary English
+    # and must not classify a module that is not named like a queue.
+    for path in ("command_center/report_builder.py", "command_center/web_client.py"):
+        assert "queue" not in boundary.classify_engine_categories(path, polling), path

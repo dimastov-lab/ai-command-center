@@ -282,6 +282,25 @@ QUEUE_CORROBORATION_TOKENS = frozenset(
         "next",
         "backoff",
         "inflight",
+        # The mainstream queue verbs, added after review demonstrated three
+        # engines that escaped without them: `poll`/`finish`, `take`/`settle`,
+        # `checkout`/`give_back`. These are what `java.util.concurrent`, the Go
+        # channel idiom and any worker pool call their operations, so a queue
+        # author reaches for them without thinking about this detector at all —
+        # missing them was a coverage gap, not an adversary outwitting us.
+        # Measured before adding: closes all three, and changes the
+        # classification of none of the three queue-named files in this
+        # repository.
+        "poll",
+        "peek",
+        "take",
+        "offer",
+        "drain",
+        "checkout",
+        "settle",
+        "complete",
+        "fail",
+        "fetch",
     }
 )
 
