@@ -21,6 +21,7 @@ promise `command_center.db.__init__` makes to the desktop and CLI entry points.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable
@@ -95,34 +96,66 @@ class ColumnCodec:
     and one restatement is subtly different from the others.
 
     Columns not named here pass through untouched, which is correct for every
-    remaining class the three mirrored tables contain — including the two the
-    map calls out as deliberately `text` on both sides (`owner_item.due`,
-    `digest_item.day`: free user input, not dates). `jsonb` is *not* handled and
-    must not be added by pattern-matching on this class: the map requires a
-    parse check on the way in, and a text -> `jsonb` -> text round trip does not
-    preserve the source bytes, so it needs its own comparison rule rather than
-    another entry in a frozenset.
+    remaining class the mirrored tables contain — including the two the map
+    calls out as deliberately `text` on both sides (`owner_item.due`,
+    `digest_item.day`: free user input, not dates).
+
+    `json_values` is the exception that proves why the other two are simple.
+    A `timestamptz` renders back to the authority's exact string; `jsonb` does
+    **not**, and this was measured rather than assumed: `{"b": 1, "a": 2}` sent
+    through PostgreSQL 17.6 comes back `{"a": 2, "b": 1}`. Key order and
+    separators are the database's, so a text comparison would report every
+    object-valued row as different — the permanently-red gate this migration
+    keeps almost building. Those columns are therefore compared as *parsed
+    values* (see `comparable`), which is the only comparison that means
+    anything for them.
     """
 
     #: Columns PostgreSQL declares `timestamptz` while the authority stores text.
     timestamps: frozenset[str] = field(default_factory=frozenset)
     #: Columns PostgreSQL declares `boolean` while the authority stores 0/1.
     flags: frozenset[str] = field(default_factory=frozenset)
+    #: Columns PostgreSQL declares `jsonb` while the authority stores JSON text.
+    json_values: frozenset[str] = field(default_factory=frozenset)
 
     def to_column(self, name: str, value: Any) -> Any:
-        """The authority's shape -> the PostgreSQL column's type."""
+        """The authority's shape -> the PostgreSQL column's type.
+
+        JSON columns keep their **text**, deliberately. psycopg adapts neither
+        `dict` nor `list` to `jsonb` — a `list` is sent as a PostgreSQL array
+        and `dict` raises outright, both verified against 17.6 — so the store
+        casts the text with `%s::jsonb` instead. That keeps this module free of
+        a driver import, which `command_center.db.__init__` promises to every
+        importer, and it means the value PostgreSQL parses is the value the
+        authority stored rather than a re-serialisation of it.
+
+        The parse still happens here, and its only purpose is to fail loudly:
+        the accepted map requires unparseable text to break the insert rather
+        than reach `jsonb`, and a `ValueError` raised here names the column,
+        while the same rejection from PostgreSQL arrives as a driver error
+        about a statement.
+        """
         if name in self.flags:
             # psycopg will not coerce SQLite's 0/1 into a boolean column.
             return None if value is None else bool(value)
         if name in self.timestamps and isinstance(value, str) and value:
             return to_instant(value)
+        if name in self.json_values and isinstance(value, str) and value:
+            try:
+                json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{name} is not valid JSON: {exc}") from exc
+            return value
         return value
 
     def to_authority(self, name: str, value: Any) -> Any:
         """The PostgreSQL column's type -> the shape the authority's row has.
 
         Rendered back rather than compared loosely, so `divergence` compares
-        rows directly and has no translation step of its own to be wrong about.
+        rows directly and has no translation step of its own to be wrong about
+        — with `jsonb` the one exception, because there is no such shape to
+        render back to. It is returned parsed, exactly as the driver hands it
+        over, and `comparable` parses the authority's side to meet it.
         """
         if name in self.flags:
             return None if value is None else int(bool(value))
@@ -130,11 +163,36 @@ class ColumnCodec:
             return render_authority_timestamp(value)
         return value
 
+    def comparable(self, name: str, value: Any) -> Any:
+        """One column's value reduced to what a comparison should look at.
+
+        Two reductions, and they are not symmetric by accident. Booleans are
+        normalised unconditionally — `True` and `1` mean the same thing in
+        every table this reconciles. JSON is normalised only for the columns a
+        table declared as `jsonb`, because parsing a string that merely looks
+        like JSON would make two rows agree on a column the target stores as
+        text, which is a false clean rather than a false difference.
+
+        Unparseable text on the authority's side compares as itself. It cannot
+        have reached the mirror — `to_column` refuses it — so the mirror has
+        nothing equal to it, and the row is reported as divergent, which is
+        what an unmirrorable row is.
+        """
+        if isinstance(value, bool):
+            return int(value)
+        if name in self.json_values and isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
 
 def divergence(
     authority_rows: Iterable[dict],
     mirror: Any,
     columns: Iterable[str],
+    codec: ColumnCodec | None = None,
 ) -> list[dict]:
     """Rows where the authority and `mirror` disagree.
 
@@ -148,6 +206,13 @@ def divergence(
     because the cutover is gated on a session with no divergence and an absent
     store has nothing to disagree with: returning `[]` would let the migration
     advance on the strength of a store nobody wrote.
+
+    `codec` supplies the per-column comparison. Omitting it compares by value
+    with booleans normalised, which is right for every table whose columns the
+    target stores in a shape the authority can be rendered back into; a table
+    with a `jsonb` column must pass its codec, because there is no such shape
+    for `jsonb` and a text comparison would report every object-valued row as
+    different.
 
     Never raises. This runs on a read path during dual-write, and a check that
     can break what it checks is worse than no check.
@@ -166,6 +231,7 @@ def divergence(
         ]
 
     names = tuple(columns)
+    compare = codec.comparable if codec is not None else _comparable
     mirrored = {row.get("id"): row for row in mirror_rows}
     differences: list[dict] = []
     for row in authority_rows:
@@ -178,7 +244,7 @@ def divergence(
         fields = sorted(
             name
             for name in names
-            if _comparable(row.get(name)) != _comparable(counterpart.get(name))
+            if compare(name, row.get(name)) != compare(name, counterpart.get(name))
         )
         if fields:
             differences.append(
@@ -191,13 +257,13 @@ def divergence(
     return differences
 
 
-def _comparable(value: Any) -> Any:
-    """Compare 0/1 and False/True as equal; everything else by value.
+def _comparable(_name: str, value: Any) -> Any:
+    """The comparison for a table that passed no codec: booleans only.
 
     SQLite hands back the integers it stores, so a correctly round-tripped
-    boolean would otherwise read as a difference on every row. Unconditional
-    rather than a per-table hook: `True` and `1` mean the same thing in every
-    table this reconciles, and a hook is a place for one table to disagree.
+    boolean would otherwise read as a difference on every row. The column name
+    is accepted and ignored so this and `ColumnCodec.comparable` are the same
+    shape — the caller should not have two ways to compare.
     """
     if isinstance(value, bool):
         return int(value)

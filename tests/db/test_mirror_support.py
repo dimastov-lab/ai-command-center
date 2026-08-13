@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from command_center.db.mirror_support import (
     MIRROR_UNAVAILABLE,
     ColumnCodec,
@@ -124,6 +126,49 @@ def test_an_empty_timestamp_is_not_parsed() -> None:
     `VOYN-W0-AICC-MIRROR-SILENT-DROP`.
     """
     assert CODEC.to_column("created_at", "") == ""
+
+
+# --- the jsonb rule ---------------------------------------------------------
+
+
+JSON_CODEC = ColumnCodec(json_values=frozenset({"refs_json"}))
+
+
+def test_json_columns_keep_their_text_on_the_way_in() -> None:
+    """The store casts with `%s::jsonb`, so the codec hands over the
+    authority's own text rather than a re-serialisation of it — and stays free
+    of the driver import `command_center.db.__init__` forbids."""
+    assert JSON_CODEC.to_column("refs_json", '["a"]') == '["a"]'
+
+
+def test_unparseable_json_raises_and_names_the_column() -> None:
+    """The map requires unparseable text to break the insert rather than reach
+    `jsonb`. Refused here, where the error can say which column — the same
+    rejection from PostgreSQL arrives as a driver error about a statement."""
+    with pytest.raises(ValueError, match="refs_json"):
+        JSON_CODEC.to_column("refs_json", "not json")
+
+
+def test_json_columns_are_compared_as_parsed_values() -> None:
+    """`jsonb` is not byte-stable — PostgreSQL returns `{"b":1,"a":2}` with its
+    own key order — so text comparison would report every object-valued row as
+    different."""
+    assert JSON_CODEC.comparable("refs_json", '{"b": 1, "a": 2}') == {"a": 2, "b": 1}
+    assert JSON_CODEC.comparable("refs_json", {"a": 2, "b": 1}) == {"a": 2, "b": 1}
+
+
+def test_only_declared_json_columns_are_parsed() -> None:
+    """Parsing a column the target stores as text would make two rows agree on
+    a value that differs — a false clean, which is worse than a false
+    difference because nothing follows up on it."""
+    assert JSON_CODEC.comparable("title", '{"a": 1}') == '{"a": 1}'
+
+
+def test_unparseable_authority_text_compares_as_itself() -> None:
+    """It cannot have reached the mirror — `to_column` refuses it — so the row
+    has nothing equal to it and is reported as divergent, which is what an
+    unmirrorable row is."""
+    assert JSON_CODEC.comparable("refs_json", "not json") == "not json"
 
 
 # --- reconciliation ---------------------------------------------------------

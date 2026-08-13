@@ -524,7 +524,47 @@ def create_digest_item(
                 f"INSERT INTO digest_item ({columns}) VALUES ({placeholders})",
                 record,
             )
+    # `record`, not the return value. `_decode_digest_row` pops `refs_json` and
+    # replaces it with a decoded `refs` list, so mirroring what this function
+    # returns would write the column's default on every row and leave the
+    # mirror agreeing with nothing.
+    _mirror_digest_item(record)
     return _decode_digest_row(record)
+
+
+def _mirror_digest_item(record: dict) -> None:
+    """Best-effort dual-write of one digest item into PostgreSQL (SRV-01B slice 4).
+
+    After the authoritative commit and silent on failure, for the reasons
+    slices 2 and 3 established: during dual-write the mirror is not
+    load-bearing, so letting it raise would mean a migration step could take
+    down the table it is migrating, and writing it first would allow a mirror
+    ahead of the system of record — the one state no reconciliation flags.
+    """
+    try:
+        from command_center.db.digest_item_store import PostgresDigestItemMirror
+
+        PostgresDigestItemMirror().upsert(record)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        _LOG.debug("Could not mirror digest_item into PostgreSQL", exc_info=True)
+
+
+def _mirror_digest_day_deletion(day: str) -> None:
+    """Best-effort mirror of a whole-day digest deletion.
+
+    The digest engine rebuilds a day by deleting it and re-inserting, so
+    without this the mirror keeps every superseded row and reconciliation
+    reports it permanently ahead of the authority. Mirrored as the same
+    predicate rather than as the ids removed: deriving ids would mean reading
+    the authority before the delete, which is an extra query and a race with
+    the rebuild this is following.
+    """
+    try:
+        from command_center.db.digest_item_store import PostgresDigestItemMirror
+
+        PostgresDigestItemMirror().delete_day(day)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        _LOG.debug("Could not mirror digest_item day deletion into PostgreSQL", exc_info=True)
 
 
 def delete_digest_items_for_day(db_path: Path, day: str) -> int:
@@ -537,7 +577,11 @@ def delete_digest_items_for_day(db_path: Path, day: str) -> int:
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             cur = conn.execute("DELETE FROM digest_item WHERE day = ?", (day,))
-            return cur.rowcount
+            removed = cur.rowcount
+    # Outside the `with`: the mirror follows the committed delete, never a
+    # delete a rollback could still discard.
+    _mirror_digest_day_deletion(day)
+    return removed
 
 
 def list_digest_items_for_day(
