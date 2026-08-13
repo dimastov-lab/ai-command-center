@@ -145,7 +145,6 @@
       "runtime_package"
     ],
     "command_center/runtime/db/__init__.py": [
-      "memory",
       "runtime_package"
     ],
     "command_center/runtime/db/audit.py": [
@@ -154,7 +153,6 @@
       "runtime_package"
     ],
     "command_center/runtime/db/completion.py": [
-      "memory",
       "runtime_package"
     ],
     "command_center/runtime/db/conflict.py": [
@@ -170,11 +168,9 @@
       "runtime_package"
     ],
     "command_center/runtime/db/execution.py": [
-      "memory",
       "runtime_package"
     ],
     "command_center/runtime/db/marketplace.py": [
-      "memory",
       "runtime_package"
     ],
     "command_center/runtime/db/model_registry.py": [
@@ -182,7 +178,6 @@
       "runtime_package"
     ],
     "command_center/runtime/db/networking.py": [
-      "memory",
       "runtime_package"
     ],
     "command_center/runtime/db/proposal.py": [
@@ -191,7 +186,6 @@
     ],
     "command_center/runtime/db/provenance.py": [
       "audit",
-      "memory",
       "runtime_package"
     ],
     "command_center/runtime/db/schema.py": [

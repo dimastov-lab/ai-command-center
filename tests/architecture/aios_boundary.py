@@ -44,6 +44,30 @@ Engine signatures (deliberately structural, never a grep over comments):
   engines don't count as engines; presentation layers still fall under the
   import/call signatures, so an engine can't hide there.
 
+  The ``memory`` name tokens (``db``, ``database``, ``store``, ``storage``,
+  ``repository``, ``persistence``, ``memory``) are **corroborated**: they
+  classify only when the same file also *behaves* like a store -- see
+  :func:`_persists_data`. Those tokens name what a file is about as readily as
+  what it is; a package directory called ``db/`` says where code lives, not
+  whether the code inside owns an engine. Under a name-only rule a
+  docstring-only ``__init__.py`` and a module that renders SQL text were
+  violations, which made it impossible for the control plane to keep any
+  database-adjacent module at all -- a gate policing names rather than
+  behaviour. Every other category still classifies on the name alone: nothing
+  loosened for queue, orchestration, authz or audit.
+
+  Strictness is not reduced for a real engine. A file that owns persistence
+  imports a driver (statically, aliased, or via ``importlib`` with a literal
+  name), calls into a driver it bound itself, or writes durably to disk -- and a
+  JSON/JSONL store with no driver at all is still caught by that last clause.
+  What no longer counts is executing SQL on a connection someone else opened:
+  that is delegation, and the engine is wherever the driver is.
+
+  Acknowledged limit, stated rather than papered over: a driver reached through
+  a *non-literal* dynamic import (``__import__(name_from_config)``) is beyond
+  static analysis and is not detected. Literal ``importlib``/``__import__`` and
+  aliases are.
+
 Baseline maintenance (a reviewed change, never a casual one — see
 ``docs/AIOS_BOUNDARY.md``):
 
@@ -99,6 +123,10 @@ DB_DRIVER_MODULES = frozenset(
         "sqlite3",
         "sqlalchemy",
         "psycopg",
+        # The pool package is a separate distribution from `psycopg` and was not
+        # listed, so a file could open a PostgreSQL connection pool without the
+        # gate seeing a driver at all.
+        "psycopg_pool",
         "psycopg2",
         "asyncpg",
         "aiosqlite",
@@ -193,6 +221,34 @@ NAME_TOKEN_SIGNATURES: dict[str, frozenset[str]] = {
 NAME_SUBSTRING_SIGNATURES: dict[str, tuple[str, ...]] = {
     "audit": ("activity_log", "audit_log", "event_log"),
 }
+
+#: Name categories that a path name alone cannot establish: they must be
+#: corroborated by behaviour in the same file (see `_persists_data`). Only
+#: `memory` is here, because only `memory` has tokens (`db`, `store`,
+#: `repository`, ...) that name what a file is *about* as readily as what it
+#: *is* — a package directory called `db/` says nothing about whether the code
+#: inside owns an engine.
+CORROBORATED_NAME_CATEGORIES = frozenset({"memory"})
+
+# --- persistence behaviour (corroboration for the `memory` name signature) ---
+
+#: ``<module>.<attr>`` calls that put bytes somewhere durable.
+DURABLE_WRITE_CALLS: dict[str, frozenset[str]] = {
+    "os": frozenset({"replace", "rename", "fdopen", "write", "link", "symlink"}),
+    "shutil": frozenset({"copyfile", "copy", "copy2", "copyfileobj", "move", "copytree"}),
+    "json": frozenset({"dump"}),
+    "pickle": frozenset({"dump"}),
+    "csv": frozenset({"writer", "DictWriter"}),
+    "tempfile": frozenset({"mkstemp", "NamedTemporaryFile", "TemporaryFile"}),
+}
+
+#: ``pathlib.Path`` write methods. Matched on the attribute name alone: the name
+#: is distinctive enough that a false positive would have to be a deliberate
+#: imitation, and requiring the receiver to resolve to a `Path` would miss
+#: every `self._file.write_text(...)`.
+PATH_WRITE_ATTRS = frozenset({"write_text", "write_bytes"})
+
+_WRITE_MODE_CHARS = frozenset("wax+")
 
 _TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
 
@@ -328,6 +384,43 @@ def find_forbidden_aios_imports(
 # ---------------------------------------------------------------------------
 
 
+def _dynamic_import_target(node: ast.AST) -> str | None:
+    """The literal module name of an ``import_module``/``__import__`` call.
+
+    A driver reached through ``importlib`` is the same driver; only a
+    non-literal argument is genuinely beyond static analysis.
+    """
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+    func = node.func
+    is_dynamic = (isinstance(func, ast.Name) and func.id == "__import__") or (
+        isinstance(func, ast.Attribute) and func.attr == "import_module"
+    )
+    return _literal_string(node.args[0]) if is_dynamic else None
+
+
+def _module_bindings(tree: ast.AST) -> dict[str, str]:
+    """Local name -> top-level module it is bound to.
+
+    Covers ``import x``, ``import x as y`` and ``y = importlib.import_module("x")``,
+    so a call site can be attributed to the module it actually reaches rather
+    than to whatever the variable happens to be called.
+    """
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bindings[alias.asname or _top_level(alias.name)] = _top_level(alias.name)
+        elif isinstance(node, ast.Assign):
+            target = _dynamic_import_target(node.value)
+            if target is None:
+                continue
+            for assigned in node.targets:
+                if isinstance(assigned, ast.Name):
+                    bindings[assigned.id] = _top_level(target)
+    return bindings
+
+
 def _import_categories(tree: ast.AST) -> tuple[set[str], set[str]]:
     """(categories, local aliases of ``subprocess``/``os``) from import nodes."""
     categories: set[str] = set()
@@ -341,6 +434,11 @@ def _import_categories(tree: ast.AST) -> tuple[set[str], set[str]]:
                         categories.add(category)
                 if top in {"subprocess", "os"}:
                     spawn_capable_aliases.add(alias.asname or _top_level(alias.name))
+        elif (dynamic := _dynamic_import_target(node)) is not None:
+            top = _top_level(dynamic)
+            for category, modules in IMPORT_SIGNATURES.items():
+                if top in modules:
+                    categories.add(category)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             top = _top_level(node.module)
             for category, modules in IMPORT_SIGNATURES.items():
@@ -376,6 +474,64 @@ def _call_categories(tree: ast.AST, spawn_capable_aliases: set[str]) -> set[str]
     return categories
 
 
+def _persists_data(tree: ast.AST) -> bool:
+    """Whether this file actually keeps state somewhere durable.
+
+    This is the corroboration the ``memory`` *name* signature needs (see the
+    module docstring). Three shapes count, and they are the three ways a file
+    can own persistence rather than merely be handed a connection:
+
+    * it imports a database driver -- statically, under an alias, or through
+      ``importlib`` with a literal name (checked in :func:`_import_categories`);
+    * it calls into a driver it bound itself -- ``pg.connect(...)``,
+      ``sqlite3.connect(...)``, ``importlib.import_module("psycopg").connect()``;
+    * it writes durably to the filesystem -- an atomic temp-file swap, an
+      append, a copy. A JSON/JSONL store is a persistence engine even though it
+      never imports a driver, and treating "driver" as the whole definition
+      would let one out of the gate entirely.
+
+    What deliberately does *not* count is executing SQL on a connection someone
+    else opened. That is delegation, not ownership: the engine is where the
+    driver is. Counting it would flag the SQL-rendering and grant modules that
+    the boundary ruling requires to stay in the control plane, while catching no
+    engine that the driver rule misses.
+    """
+    bindings = _module_bindings(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            # `open(path, "w")` and friends; a read-only open is not persistence.
+            if func.id == "open" and _opens_for_writing(node):
+                return True
+            continue
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr in PATH_WRITE_ATTRS:
+            return True
+        base = func.value
+        if not isinstance(base, ast.Name):
+            continue
+        module = bindings.get(base.id)
+        if module is None:
+            continue
+        if module in DB_DRIVER_MODULES:
+            return True
+        if func.attr in DURABLE_WRITE_CALLS.get(module, frozenset()):
+            return True
+    return False
+
+
+def _opens_for_writing(node: ast.Call) -> bool:
+    mode_nodes = list(node.args[1:2]) + [kw.value for kw in node.keywords if kw.arg == "mode"]
+    for mode in mode_nodes:
+        literal = _literal_string(mode)
+        if literal and set(literal) & _WRITE_MODE_CHARS:
+            return True
+    return False
+
+
 def _name_categories(rel_path: str) -> set[str]:
     """Engine-named path segments (skipped for pure presentation layers)."""
     if _is_presentation(rel_path):
@@ -407,7 +563,15 @@ def classify_engine_categories(rel_path: str, tree: ast.AST) -> set[str]:
     import_cats, spawn_aliases = _import_categories(tree)
     categories |= import_cats
     categories |= _call_categories(tree, spawn_aliases)
-    categories |= _name_categories(rel_path)
+
+    name_cats = _name_categories(rel_path)
+    categories |= name_cats - CORROBORATED_NAME_CATEGORIES
+    # A `memory` name is a question, not a verdict. It becomes a verdict only if
+    # the file also *behaves* like a store. A path segment on its own says where
+    # something lives, not what it does -- and a file whose name is its only
+    # engine signal is a file the gate would freeze for being called `db`.
+    if name_cats & CORROBORATED_NAME_CATEGORIES and _persists_data(tree):
+        categories |= name_cats & CORROBORATED_NAME_CATEGORIES
     return categories
 
 

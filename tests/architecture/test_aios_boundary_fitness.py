@@ -103,3 +103,107 @@ def test_scanner_semantics_are_stable():
     assert "memory" in boundary.classify_engine_categories(
         "command_center/ui/some_panel.py", db_engine
     )
+
+
+def test_a_memory_name_alone_is_not_an_engine_signature():
+    """`db`/`store`/`repository` name a file's subject as readily as its nature.
+
+    A package directory called `db/` says where code lives, not whether the code
+    inside owns an engine. Under a name-only rule the control plane could not
+    keep *any* database-adjacent module — not even a docstring-only `__init__`
+    or a module that renders SQL text — which is the opposite of a boundary: it
+    stops describing what the code does and starts policing what it is called.
+    """
+    docstring_only = ast.parse('"""Package docstring."""\n__all__ = ["config"]\n')
+    assert boundary.classify_engine_categories("command_center/db/__init__.py", docstring_only) == set()
+
+    # Rendering SQL and executing it on a connection the caller opened is
+    # delegation, not ownership: the engine is wherever the driver is.
+    sql_renderer = ast.parse(
+        "def render():\n"
+        "    return ['CREATE ROLE app']\n"
+        "def apply(conn):\n"
+        "    with conn.cursor() as cur:\n"
+        "        cur.execute(render()[0])\n"
+    )
+    assert boundary.classify_engine_categories("command_center/db/roles.py", sql_renderer) == set()
+
+    # The same file with a driver of its own is an engine again.
+    with_driver = ast.parse("import psycopg\ndef connect(dsn):\n    return psycopg.connect(dsn)\n")
+    assert "memory" in boundary.classify_engine_categories("command_center/db/pool.py", with_driver)
+
+
+def test_a_driver_is_detected_however_it_is_imported():
+    """Alias and `importlib` are not hiding places."""
+    aliased = ast.parse("import psycopg as pg\ndef go(dsn):\n    return pg.connect(dsn)\n")
+    assert "memory" in boundary.classify_engine_categories("command_center/helper.py", aliased)
+
+    dynamic = ast.parse(
+        "import importlib\n"
+        "driver = importlib.import_module('sqlite3')\n"
+        "def go(path):\n"
+        "    return driver.connect(path)\n"
+    )
+    assert "memory" in boundary.classify_engine_categories("command_center/helper.py", dynamic)
+
+    underscore = ast.parse("__import__('psycopg2')\n")
+    assert "memory" in boundary.classify_engine_categories("command_center/helper.py", underscore)
+
+    # The connection *pool* package is its own distribution; a file that opens a
+    # pool owns an engine just as much as one that opens a connection.
+    pooled = ast.parse("from psycopg_pool import ConnectionPool\n")
+    assert "memory" in boundary.classify_engine_categories("command_center/helper.py", pooled)
+
+
+def test_a_file_backed_store_is_an_engine_even_with_no_driver():
+    """JSON/JSONL persistence is persistence.
+
+    If "engine" meant "imports a driver", the atomic-write JSON stores this
+    repository actually runs on would drop out of the frozen inventory — the
+    gate would get quieter while the code got no safer.
+    """
+    atomic_write = ast.parse(
+        "import json\nimport os\n"
+        "def save(path, data):\n"
+        "    with open(path + '.tmp', 'w') as handle:\n"
+        "        json.dump(data, handle)\n"
+        "    os.replace(path + '.tmp', path)\n"
+    )
+    assert "memory" in boundary.classify_engine_categories(
+        "command_center/storage.py", atomic_write
+    )
+
+    appender = ast.parse(
+        "from pathlib import Path\n"
+        "def record(path, line):\n"
+        "    Path(path).write_text(line)\n"
+    )
+    assert "memory" in boundary.classify_engine_categories(
+        "command_center/tasks_repository.py", appender
+    )
+
+    # Reading is not persisting: a module that only loads a store is not one.
+    reader = ast.parse(
+        "import json\n"
+        "def load(path):\n"
+        "    with open(path) as handle:\n"
+        "        return json.load(handle)\n"
+    )
+    assert boundary.classify_engine_categories("command_center/db/config.py", reader) == set()
+
+
+def test_corroboration_applies_only_to_the_memory_category():
+    """The ruling loosened one signature, not the gate.
+
+    `queue`, `orchestration`, `authz` and `audit` names still classify on the
+    name alone — those tokens name what a module *is*, and nothing in the
+    boundary ruling touched them.
+    """
+    empty = ast.parse("")
+    for path, category in (
+        ("command_center/retry_queue.py", "queue"),
+        ("command_center/task_scheduler.py", "orchestration"),
+        ("command_center/rbac_rules.py", "authz"),
+        ("command_center/audit_trail.py", "audit"),
+    ):
+        assert category in boundary.classify_engine_categories(path, empty), path
