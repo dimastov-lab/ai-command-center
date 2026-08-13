@@ -129,7 +129,17 @@ def _to_column_value(name: str, value: Any) -> Any:
     The limit is inherent to the naive format rather than to this code: a
     mirror running in a different zone than the writer would attach the wrong
     one. Making the authority timezone-aware is a migration of every existing
-    record and is recorded as its own task.
+    record — tracked as `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`.
+
+    And the reconciliation cannot catch a violation of it: the outbound render
+    converts back through the same zone, so a mirror running in the wrong one
+    reproduces the original wall clock and `divergence` reports agreement it
+    never verified. Independent review demonstrated this — the same row
+    mirrored from an MSK and a UTC process stored instants three hours apart
+    and both reconciled clean. Until the authority is timezone-aware
+    (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS), the mirror must run in the writer's
+    process, and that is an operational constraint rather than something the
+    gate enforces.
     """
     if name in _TIMESTAMP_COLUMNS and isinstance(value, str) and value:
         parsed = datetime.fromisoformat(value)

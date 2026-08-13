@@ -131,7 +131,17 @@ def _to_instant(value: str) -> Any:
     rather than hidden: a mirror running in a different zone than the writer
     would attach the wrong one. Fixing that properly means making the authority
     timezone-aware, which is a migration of `data/tasks.json` and every existing
-    record — a separate task, recorded in the central backlog.
+    record — tracked as `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`.
+
+    And the reconciliation cannot catch a violation of it: the outbound render
+    converts back through the same zone, so a mirror running in the wrong one
+    reproduces the original wall clock and `divergence` reports agreement it
+    never verified. Independent review demonstrated this — the same row
+    mirrored from an MSK and a UTC process stored instants three hours apart
+    and both reconciled clean. Until the authority is timezone-aware
+    (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS), the mirror must run in the writer's
+    process, and that is an operational constraint rather than something the
+    gate enforces.
     """
     parsed = datetime.fromisoformat(value)
     return parsed if parsed.tzinfo is not None else parsed.astimezone()
