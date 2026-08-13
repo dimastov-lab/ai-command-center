@@ -30,7 +30,8 @@ emit" is the same defect class that put a wrong timestamp conversion into
 `main` two slices ago.
 
 The whole-row upsert stands on reasons that survive checking. `update_conflict_
-fields` changes two columns and mirrors the whole row, because the mirror has no
+fields` changes at most four columns — the one or two the caller named, plus
+`updated_at` and `version` — and mirrors the whole row, because the mirror has no
 other source for the columns it did not touch. The backfill runs more than once
 by design. And if `resolved -> open` is ever added to the allowlist, a
 field-by-field mirror would keep a resolution the authority had withdrawn —
@@ -104,7 +105,7 @@ class PostgresConflictMirror:
         """Write `record`, replacing any existing row with the same id.
 
         Every column is written, including the ones the caller did not change:
-        `update_conflict_fields` changes two and mirrors the whole row, and the
+        `update_conflict_fields` changes a handful and mirrors the whole row, and the
         mirror has no other source for the rest. See the module docstring for
         why this is *not* justified by conflicts reopening — they cannot.
         """

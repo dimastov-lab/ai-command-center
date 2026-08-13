@@ -200,9 +200,9 @@ def test_an_upsert_replaces_columns_the_caller_did_not_change(
 ) -> None:
     """Whole-row replacement, stated as a property of `upsert` and nothing more.
 
-    This is what makes `update_conflict_fields` safe to mirror: it changes two
-    columns and hands over the whole row, and the mirror has no other source
-    for the rest. The rows below are hand-built, so this proves the store's
+    This is what makes `update_conflict_fields` safe to mirror: it changes only
+    the caller's fields plus `updated_at` and `version`, and hands over the
+    whole row, because the mirror has no other source for the rest. The rows below are hand-built, so this proves the store's
     behaviour — not the authority's, which is
     `test_reconciliation_is_clean_for_rows_the_application_actually_wrote`.
     """

@@ -181,7 +181,8 @@ def _mirror_conflict(record: dict) -> None:
     wrong.
 
     Every mutating path calls this with the row as it now stands, not with the
-    fields that changed: `update_conflict_fields` touches two columns, and the
+    fields that changed: `update_conflict_fields` touches the caller's one or
+    two fields plus `updated_at` and `version`, and the
     mirror has no other source for the rest.
 
     The mirror's health is reported by `conflict_store.divergence`, not by

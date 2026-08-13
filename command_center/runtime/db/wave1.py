@@ -524,7 +524,47 @@ def create_digest_item(
                 f"INSERT INTO digest_item ({columns}) VALUES ({placeholders})",
                 record,
             )
+    # `record`, not the return value. `_decode_digest_row` pops `refs_json` and
+    # replaces it with a decoded `refs` list, so mirroring what this function
+    # returns would write the column's default on every row and leave the
+    # mirror agreeing with nothing.
+    _mirror_digest_item(record)
     return _decode_digest_row(record)
+
+
+def _mirror_digest_item(record: dict) -> None:
+    """Best-effort dual-write of one digest item into PostgreSQL (SRV-01B slice 4).
+
+    After the authoritative commit and silent on failure, for the reasons
+    slices 2 and 3 established: during dual-write the mirror is not
+    load-bearing, so letting it raise would mean a migration step could take
+    down the table it is migrating, and writing it first would allow a mirror
+    ahead of the system of record — the one state no reconciliation flags.
+    """
+    try:
+        from command_center.db.digest_item_store import PostgresDigestItemMirror
+
+        PostgresDigestItemMirror().upsert(record)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        _LOG.debug("Could not mirror digest_item into PostgreSQL", exc_info=True)
+
+
+def _mirror_digest_day_deletion(day: str) -> None:
+    """Best-effort mirror of a whole-day digest deletion.
+
+    The digest engine rebuilds a day by deleting it and re-inserting, so
+    without this the mirror keeps every superseded row and reconciliation
+    reports it permanently ahead of the authority. Mirrored as the same
+    predicate rather than as the ids removed: deriving ids would mean reading
+    the authority before the delete, which is an extra query and a race with
+    the rebuild this is following.
+    """
+    try:
+        from command_center.db.digest_item_store import PostgresDigestItemMirror
+
+        PostgresDigestItemMirror().delete_day(day)
+    except Exception:  # noqa: BLE001 — the mirror must never break the real write
+        _LOG.debug("Could not mirror digest_item day deletion into PostgreSQL", exc_info=True)
 
 
 def delete_digest_items_for_day(db_path: Path, day: str) -> int:
@@ -537,7 +577,11 @@ def delete_digest_items_for_day(db_path: Path, day: str) -> int:
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             cur = conn.execute("DELETE FROM digest_item WHERE day = ?", (day,))
-            return cur.rowcount
+            removed = cur.rowcount
+    # Outside the `with`: the mirror follows the committed delete, never a
+    # delete a rollback could still discard.
+    _mirror_digest_day_deletion(day)
+    return removed
 
 
 def list_digest_items_for_day(
@@ -610,6 +654,32 @@ def list_digest_items(
             params,
         ).fetchall()
         return [_decode_digest_row(dict(row)) for row in rows]
+
+
+def list_digest_items_stored(db_path: Path) -> list[dict]:
+    """Every digest row in the shape SQLite **stores**, for reconciliation.
+
+    Every other reader here returns :func:`_decode_digest_row` output, which
+    pops ``refs_json`` and substitutes a decoded ``refs`` list — a view for
+    callers, and the right default for them. Reconciliation is not one of those
+    callers: it compares what the authority stores against what the mirror
+    stores, and fed a decoded row it sees ``refs_json`` missing on one side and
+    present on the other, so it reports **every** digest row as divergent.
+
+    That is the permanently-red cutover gate this migration keeps almost
+    building, reached from the direction nobody was watching: not a wrong
+    conversion, but a reconciliation pointed at the wrong shape. Independent
+    review found it by asking what an operator would actually call — there was
+    no answer, because until this function existed the only readers were
+    decoding ones (SRV-01B slice 4, second acceptance round).
+
+    Deliberately without ``exclude_projects``: redaction is a read-surface
+    policy, and a reconciliation that skipped redacted rows would certify a
+    cutover over a subset of the table while reporting it as the whole.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM digest_item ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
 
 
 def _decode_digest_row(row: dict) -> dict:
