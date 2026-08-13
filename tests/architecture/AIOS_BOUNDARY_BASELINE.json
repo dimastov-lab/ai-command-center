@@ -84,6 +84,30 @@
       "audit",
       "orchestration"
     ],
+    "command_center/db/__init__.py": [
+      "memory"
+    ],
+    "command_center/db/__main__.py": [
+      "memory"
+    ],
+    "command_center/db/cli.py": [
+      "memory"
+    ],
+    "command_center/db/config.py": [
+      "memory"
+    ],
+    "command_center/db/health.py": [
+      "memory"
+    ],
+    "command_center/db/migrations.py": [
+      "memory"
+    ],
+    "command_center/db/pool.py": [
+      "memory"
+    ],
+    "command_center/db/roles.py": [
+      "memory"
+    ],
     "command_center/dispatch/__init__.py": [
       "orchestration"
     ],
@@ -161,11 +185,11 @@
       "memory",
       "runtime_package"
     ],
-    "command_center/runtime/db/council.py": [
+    "command_center/runtime/db/core.py": [
       "memory",
       "runtime_package"
     ],
-    "command_center/runtime/db/core.py": [
+    "command_center/runtime/db/council.py": [
       "memory",
       "runtime_package"
     ],

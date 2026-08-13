@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -76,6 +76,29 @@ def create_app() -> FastAPI:
             app.state.execution_center_api = api
         snapshot = build_workspace_home_snapshot(execution_center_api=api)
         return serialize_execution(snapshot)
+
+    # Liveness and readiness probes (VOYN-W0-AICC-SRV-01a). Registered before
+    # the SPA mount so they are not shadowed by the catch-all static handler,
+    # and outside `/api` because orchestrators and load balancers expect them
+    # at the root. `command_center.db.health` is imported inside the handlers:
+    # it reaches `psycopg` only when a probe actually runs, so the desktop and
+    # CLI entry points — which have no PostgreSQL client installed — can still
+    # import this module.
+    @app.get("/healthz")
+    def healthz() -> dict:
+        """Is the process alive? Never touches the database (see health.py)."""
+        from command_center.db.health import check_liveness
+
+        return check_liveness().to_dict()
+
+    @app.get("/readyz")
+    def readyz(response: Response) -> dict:
+        """Should this process receive traffic? 503 when the database is not usable."""
+        from command_center.db.health import check_readiness
+
+        report = check_readiness()
+        response.status_code = 200 if report.ok else 503
+        return report.to_dict()
 
     # Agent-dispatch policy layer (VOYN-W2-AGENT): `/api/v1/dispatch/*`.
     # Registered before the SPA mount so its routes resolve ahead of the

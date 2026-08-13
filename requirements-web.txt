@@ -1,2 +1,7 @@
 fastapi>=0.110,<1.0
 uvicorn>=0.27,<1.0
+# PostgreSQL driver and pool for the server deployment (VOYN-W0-AICC-SRV-01a).
+# `[binary]` ships the libpq build, so no system libpq/pg_config is needed on
+# CI runners or in the deploy image. Major-band caps match the house style.
+psycopg[binary]>=3.2,<4.0
+psycopg-pool>=3.2,<4.0
