@@ -84,6 +84,9 @@
       "audit",
       "orchestration"
     ],
+    "command_center/db/audit_store.py": [
+      "audit"
+    ],
     "command_center/dispatch/__init__.py": [
       "orchestration"
     ],
@@ -159,11 +162,11 @@
       "memory",
       "runtime_package"
     ],
-    "command_center/runtime/db/council.py": [
+    "command_center/runtime/db/core.py": [
       "memory",
       "runtime_package"
     ],
-    "command_center/runtime/db/core.py": [
+    "command_center/runtime/db/council.py": [
       "memory",
       "runtime_package"
     ],

@@ -146,7 +146,24 @@ def create_advisor_proposal(
                 f"INSERT INTO advisor_proposal ({columns}) VALUES ({placeholders})",
                 record,
             )
+    _mirror_advisor_proposal(record)
     return record
+
+
+def _mirror_advisor_proposal(record: dict) -> None:
+    """Best-effort dual-write of one advisor proposal into PostgreSQL (slice 8).
+
+    After the authoritative commit and silent on failure. The simplest mirror
+    in the migration: no foreign key, no JSON column, nothing to convert but
+    two timestamps.
+    """
+    try:
+        from command_center.db.advisor_store import PostgresAdvisorProposalMirror
+
+        PostgresAdvisorProposalMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror advisor_proposal into PostgreSQL", exc_info=True)
+
 
 
 def get_advisor_proposal(db_path: Path, proposal_id: str) -> dict | None:
@@ -269,10 +286,12 @@ def set_advisor_proposal_status(
     now = db.iso_now()
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            return db._advisor_proposal_transition(
+            record = db._advisor_proposal_transition(
                 conn, proposal_id, expected_version=expected_version,
                 new_status=status, extra_fields=None, now=now,
             )
+    _mirror_advisor_proposal(record)
+    return record
 
 
 def promote_advisor_proposal(
@@ -291,11 +310,13 @@ def promote_advisor_proposal(
     now = db.iso_now()
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            return db._advisor_proposal_transition(
+            record = db._advisor_proposal_transition(
                 conn, proposal_id, expected_version=expected_version,
                 new_status="converted", extra_fields={"promoted_task_id": task_id},
                 now=now,
             )
+    _mirror_advisor_proposal(record)
+    return record
 
 
 # --------------------------------------------------------------------------

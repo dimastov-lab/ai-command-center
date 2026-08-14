@@ -123,9 +123,14 @@ class PostgresModelEventMirror(PostgresTableMirror):
 #: Rows where the SQLite authority and a mirror disagree on `model_entry`.
 entry_divergence = divergence_against(MODEL_ENTRY)
 
-#: Rows where the SQLite authority and a mirror disagree on `model_event`.
-#:
-#: Takes rows in the shape SQLite stores — `runtime/db/model_registry.py`'s
-#: `list_model_events_stored`, not `list_model_events`, which pops
-#: `metadata_json` in favour of a decoded `metadata` and drops the row id.
-event_divergence = divergence_against(MODEL_EVENT)
+event_divergence = divergence_against(
+    MODEL_EVENT,
+    """Rows where the SQLite authority and a mirror disagree on `model_event`.
+
+    **Takes rows in the shape SQLite stores** — `runtime/db/model_registry.py`'s
+    `list_model_events_stored`, not `list_model_events`, which pops
+    `metadata_json` in favour of a decoded `metadata` and drops the row id.
+    Fed the decoded reader this reports every event divergent, and the failure
+    looks like a broken mirror rather than a wrong question.
+    """,
+)

@@ -33,10 +33,13 @@ do for the other table-family modules.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Allowlists (mirror ``api.models`` Literals; validated at the boundary)
@@ -152,7 +155,38 @@ def create_market_item(
                 f"INSERT INTO market_item ({columns}) VALUES ({placeholders})",
                 record,
             )
+    _mirror_market_item(record)
     return record
+
+
+def _mirror_market_item(record: dict) -> None:
+    """Best-effort dual-write of one market item into PostgreSQL (SRV-01B slice 8).
+
+    After the authoritative commit and silent on failure. Parent of the install
+    log's foreign key, so a lost write here costs every later log entry for the
+    item — the compounding slice 5 measured.
+    """
+    try:
+        from command_center.db.marketplace_store import PostgresMarketItemMirror
+
+        PostgresMarketItemMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror market_item into PostgreSQL", exc_info=True)
+
+
+def _mirror_install_log(record: dict) -> None:
+    """Best-effort dual-write of one install-log entry into PostgreSQL (slice 8).
+
+    Runs after its item's mirror write, because the authority's own foreign key
+    orders them that way and the hooks inherit that order.
+    """
+    try:
+        from command_center.db.marketplace_store import PostgresInstallLogMirror
+
+        PostgresInstallLogMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror market_install_log into PostgreSQL", exc_info=True)
+
 
 
 def get_market_item(db_path: Path, item_id: str) -> dict | None:
@@ -283,7 +317,12 @@ def install_market_item(
             item_row = conn.execute(
                 "SELECT * FROM market_item WHERE id = ?", (item_id,)
             ).fetchone()
-            return dict(item_row), dict(log_record)
+            item_record = dict(item_row)
+    # Item before log, both after the commit: the log's foreign key would
+    # refuse a child whose parent is not mirrored yet.
+    _mirror_market_item(item_record)
+    _mirror_install_log(log_record)
+    return item_record, dict(log_record)
 
 
 def list_install_log(

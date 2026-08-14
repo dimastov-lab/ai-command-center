@@ -44,11 +44,14 @@ from command_center.db.table_mirror import MirroredTable, PostgresTableMirror, d
 
 __all__ = [
     "CONTACT_COLUMNS",
+    "INVITATION_COLUMNS",
     "MESSAGE_COLUMNS",
     "MIRROR_UNAVAILABLE",
     "PostgresContactMirror",
+    "PostgresInvitationMirror",
     "PostgresMessageMirror",
     "contact_divergence",
+    "invitation_divergence",
     "message_divergence",
 ]
 
@@ -76,6 +79,24 @@ MESSAGE_COLUMNS: tuple[str, ...] = (
     "created_at",
 )
 
+#: Slice 5 mirrored the parent and one child; slice 8 completes the family with
+#: the second child. Nothing new in shape — a foreign key to `contact` (slice
+#: 5) and a nullable lifecycle timestamp (slice 3) — which is why it was left
+#: out of the slice that worked the foreign key out and picked up by the batch.
+INVITATION_COLUMNS: tuple[str, ...] = (
+    "id",
+    "contact_id",
+    "council_ref",
+    "status",
+    "note",
+    "project_ref",
+    "invited_at",
+    "responded_at",
+    "version",
+    "created_at",
+    "updated_at",
+)
+
 CONTACT = MirroredTable(
     table="contact",
     columns=CONTACT_COLUMNS,
@@ -87,6 +108,17 @@ MESSAGE = MirroredTable(
     table="message",
     columns=MESSAGE_COLUMNS,
     codec=ColumnCodec(timestamps=frozenset({"created_at"})),
+)
+
+
+#: `responded_at` is the nullable one: an invitation is created pending and
+#: acquires it when answered, so reconciliation compares `None` on both sides.
+INVITATION = MirroredTable(
+    table="networking_invitation",
+    columns=INVITATION_COLUMNS,
+    codec=ColumnCodec(
+        timestamps=frozenset({"invited_at", "responded_at", "created_at", "updated_at"})
+    ),
 )
 
 
@@ -108,8 +140,22 @@ class PostgresMessageMirror(PostgresTableMirror):
     spec = MESSAGE
 
 
+class PostgresInvitationMirror(PostgresTableMirror):
+    """The `networking_invitation` table — the family's second FK child.
+
+    Same refusal as `message` when its `contact` is absent from the mirror, and
+    the same reason for not inventing the parent.
+    """
+
+    spec = INVITATION
+
+
 #: Rows where the SQLite authority and a mirror disagree on `contact`.
 contact_divergence = divergence_against(CONTACT)
+
+#: Rows where the SQLite authority and a mirror disagree on
+#: `networking_invitation`.
+invitation_divergence = divergence_against(INVITATION)
 
 #: Rows where the SQLite authority and a mirror disagree on `message`.
 #:
