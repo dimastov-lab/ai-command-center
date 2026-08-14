@@ -11,6 +11,7 @@ here.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,7 +31,7 @@ def _write_suite(directory: Path, *, green: bool) -> Path:
     return path
 
 
-def _run(script: Path, *args: str) -> subprocess.CompletedProcess:
+def _run(script: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
     """Run a tool and keep its stderr with its stdout in the failure message.
 
     The first version asserted only on stdout, so when the tool did not run at
@@ -40,7 +41,11 @@ def _run(script: Path, *args: str) -> subprocess.CompletedProcess:
     round to find out why.
     """
     completed = subprocess.run(
-        [sys.executable, str(script), *args], cwd=ROOT, capture_output=True, text=True
+        [sys.executable, str(script), *args],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
     )
     assert completed.stdout or completed.returncode == 0, (
         f"{script.name} produced no stdout (exit {completed.returncode}); stderr:\n"
@@ -150,3 +155,46 @@ def test_the_sweep_leaves_the_tree_untouched(tmp_path) -> None:
     _run(SLICE_CHECKS, "sweep", "command_center/runtime/db/completion.py", "--suite", str(suite))
 
     assert target.read_text(encoding="utf-8") == before
+
+
+def test_measure_emits_a_line_check_can_read_back(tmp_path) -> None:
+    """The documented workflow is measure, paste, check — so it must round-trip.
+
+    `measure` used to omit `0 skipped` while `check`'s pattern required it, so
+    on any suite with no skips the tool produced a line its own reader called
+    unparseable. Fails closed, so it was safe — and useless, which is how a
+    gate stops being run.
+    """
+    suite = _write_suite(tmp_path / "green", green=True)
+    measured = _run(EVIDENCE, "measure", str(suite))
+    assert measured.returncode == 0, measured.stdout
+
+    message = tmp_path / "message.txt"
+    message.write_text(f"fix: something\n\n{measured.stdout.strip()}\n", encoding="utf-8")
+
+    checked = _run(EVIDENCE, "check", "--message-file", str(message), str(suite))
+    assert checked.returncode == 0, checked.stdout
+    assert "[ok]" in checked.stdout
+
+
+def test_the_line_records_which_configuration_measured_it(tmp_path) -> None:
+    """Two honest runs of one tree differ by whether a database was reachable.
+
+    The warning about that went to stderr, which nobody pastes into a commit
+    message, so the two lines were indistinguishable in the place they are
+    read. The configuration now travels with the numbers.
+
+    Both configurations are set explicitly rather than inherited. The first
+    version asserted `serverless` and inherited whatever the developer had
+    exported — so it passed on a laptop with no database and failed on one with
+    it, which is the very ambiguity the feature exists to remove.
+    """
+    suite = _write_suite(tmp_path / "green", green=True)
+
+    serverless = {k: v for k, v in os.environ.items() if k != "AICC_TEST_PG_ADMIN_DSN"}
+    measured = _run(EVIDENCE, "measure", str(suite), env=serverless)
+    assert "(serverless)" in measured.stdout, measured.stdout
+
+    with_database = {**os.environ, "AICC_TEST_PG_ADMIN_DSN": "host=127.0.0.1 dbname=irrelevant"}
+    measured = _run(EVIDENCE, "measure", str(suite), env=with_database)
+    assert "(with PostgreSQL)" in measured.stdout, measured.stdout

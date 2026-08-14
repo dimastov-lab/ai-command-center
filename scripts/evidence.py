@@ -76,7 +76,18 @@ def _pytest_command(paths: list[str], extra: list[str]) -> list[str]:
     already running is exactly the right one.
     """
     if shutil.which("uv"):
-        return ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", *paths, "-q", *extra]
+        # `pytest` is in the `--with` set deliberately. Without it uv resolves
+        # pytest from PATH, the console script re-pins `sys.prefix`, and the
+        # extra never reaches the interpreter that runs the tests — review
+        # measured exactly that: `HAS psycopg_pool: False` under the form this
+        # tool used, `True` once pytest is resolved alongside it. The docstring
+        # claimed a benefit the command did not deliver.
+        return [
+            "uv", "run",
+            "--with", "psycopg-pool>=3.2,<4",
+            "--with", "pytest",
+            "pytest", *paths, "-q", *extra,
+        ]
     return [sys.executable, "-m", "pytest", *paths, "-q", *extra]
 
 
@@ -122,7 +133,13 @@ def _ruff() -> str:
         return "unavailable"
     if completed.returncode == 0:
         return "clean"
-    if "No module named" in completed.stderr or "error: unrecognized" in completed.stderr:
+    # Ruff writes its findings to stdout and its own failures to stderr, and it
+    # exits 2 when it could not run at all. The first version matched two
+    # literal strings, which only covered the `python -m ruff` wording: review
+    # made `uv run` fail to spawn and made ruff reject a config, and both were
+    # reported as "**ruff NOT clean**" — a false statement in the one line this
+    # tool exists to keep true.
+    if completed.returncode != 1 or completed.stderr.strip().startswith(("error", "ruff failed")):
         return "unavailable"
     return "dirty"
 
@@ -130,19 +147,26 @@ def _ruff() -> str:
 def _evidence_line(paths: list[str], counts: dict[str, int], ruff_state: str) -> str:
     scope = ", ".join(f"`{path}`" for path in paths)
     failed = counts.get("failed", 0) + counts.get("errors", 0) + counts.get("error", 0)
-    parts = [f"{counts['passed']} passed"]
-    if counts["skipped"]:
-        parts.append(f"{counts['skipped']} skipped")
+    # Always both terms, even at zero. The first version omitted `0 skipped`
+    # while `check`'s pattern required it, so the documented
+    # measure -> paste -> check workflow could not round-trip on a suite with
+    # no skips: the tool produced a line its own reader called unparseable.
+    parts = [f"{counts['passed']} passed", f"{counts['skipped']} skipped"]
     if failed:
         # Stated, never omitted. An evidence line that quietly drops failures
         # is worse than no evidence line, because it reads like a clean run.
         parts.append(f"**{failed} FAILED**")
     suffix = {
-        "clean": "; ruff clean.",
-        "dirty": "; **ruff NOT clean**.",
-        "unavailable": "; ruff not run here.",
+        "clean": "; ruff clean",
+        "dirty": "; **ruff NOT clean**",
+        "unavailable": "; ruff not run here",
     }[ruff_state]
-    return f"Evidence: {scope} " + " / ".join(parts) + suffix
+    # The configuration, in the line rather than in a stderr warning nobody
+    # pastes. Two honest runs of one tree differ by whether a database was
+    # reachable, and the lines were previously indistinguishable — which is the
+    # hazard this tool's own docstring names.
+    database = "with PostgreSQL" if os.environ.get("AICC_TEST_PG_ADMIN_DSN") else "serverless"
+    return f"Evidence: {scope} " + " / ".join(parts) + f"{suffix} ({database})."
 
 
 def _head_message() -> str:
@@ -205,6 +229,15 @@ def main(argv: list[str] | None = None) -> int:
         # to check either, which is itself worth stopping for.
         print(f"no `Evidence: ... N passed / M skipped` line found in the message\n{line}")
         return 1
+
+    if len(claims) > 1:
+        # Several `Evidence:` lines mean several measurements, and this run
+        # measured one suite. Comparing all of them against it reports a false
+        # mismatch for every line that is not the one being measured.
+        print(
+            f"{len(claims)} `Evidence:` lines found; this run measured one suite "
+            "— compare them one at a time rather than trusting the verdict below."
+        )
 
     mismatched = False
     for claim in claims:
