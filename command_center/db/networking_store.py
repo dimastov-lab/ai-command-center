@@ -108,6 +108,7 @@ MESSAGE = MirroredTable(
     table="message",
     columns=MESSAGE_COLUMNS,
     codec=ColumnCodec(timestamps=frozenset({"created_at"})),
+    references={"contact_id": "contact"},
 )
 
 
@@ -119,6 +120,7 @@ INVITATION = MirroredTable(
     codec=ColumnCodec(
         timestamps=frozenset({"invited_at", "responded_at", "created_at", "updated_at"})
     ),
+    references={"contact_id": "contact"},
 )
 
 

@@ -80,6 +80,7 @@ INSTALL_LOG = MirroredTable(
         timestamps=frozenset({"installed_at", "created_at"}),
         json_values=frozenset({"metadata_json"}),
     ),
+    references={"item_id": "market_item"},
 )
 
 

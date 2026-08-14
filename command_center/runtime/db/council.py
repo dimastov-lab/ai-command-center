@@ -48,6 +48,7 @@ do for the other table-family modules.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
@@ -55,6 +56,8 @@ from typing import Any, Iterable
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
 from command_center.runtime.db.wave1 import _exclude_projects_clause
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Allowlists (mirror ``api.models`` Literals; validated at the boundary)
@@ -181,7 +184,7 @@ def create_motion(
                 f"INSERT INTO motion ({columns}) VALUES ({placeholders})",
                 record,
             )
-            _append_event(
+            event = _append_event(
                 conn,
                 record["id"],
                 event_type="motion_opened",
@@ -190,7 +193,68 @@ def create_motion(
                 metadata={"quorum": int(quorum), "source_ref": source_ref},
                 now=now,
             )
+    # Motion then journal, both after the commit: the journal's foreign key
+    # would refuse a row whose motion is not mirrored yet.
+    _mirror_motion(record)
+    _mirror_council_event(event)
     return dict(record)
+
+def _mirror_motion(record: dict) -> None:
+    """Best-effort dual-write of one motion into PostgreSQL (SRV-01B slice 9).
+
+    After the authoritative commit and silent on failure, as every mirror since
+    slice 2. Parent of three foreign keys, so a swallowed failure here costs
+    every vote, decision and event that follows for that motion — the
+    compounding slice 5 measured.
+    """
+    try:
+        from command_center.db.council_store import PostgresMotionMirror
+
+        PostgresMotionMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror motion into PostgreSQL", exc_info=True)
+
+
+def _mirror_vote(record: dict) -> None:
+    """Best-effort dual-write of one vote into PostgreSQL (slice 9)."""
+    try:
+        from command_center.db.council_store import PostgresCouncilVoteMirror
+
+        PostgresCouncilVoteMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror council_vote into PostgreSQL", exc_info=True)
+
+
+def _mirror_decision(record: dict) -> None:
+    """Best-effort dual-write of one decision into PostgreSQL (slice 9).
+
+    Takes the **stored** record: `_decode_decision_row` pops `tally_json` and
+    `roles_json`, and mirroring the decoded shape would write both columns'
+    defaults on every row.
+    """
+    try:
+        from command_center.db.council_store import PostgresCouncilDecisionMirror
+
+        PostgresCouncilDecisionMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror council_decision into PostgreSQL", exc_info=True)
+
+
+def _mirror_council_event(record: dict) -> None:
+    """Best-effort dual-write of one journal row into PostgreSQL (slice 9).
+
+    Takes the stored record for two reasons at once: the decoded row drops
+    `metadata_json`, and it has no `id` — which an identity column refuses to
+    take as `None`.
+    """
+    try:
+        from command_center.db.council_store import PostgresCouncilEventMirror
+
+        PostgresCouncilEventMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror council_event into PostgreSQL", exc_info=True)
+
+
 
 
 def get_motion(db_path: Path, motion_id: str) -> dict | None:
@@ -353,7 +417,7 @@ def cast_vote(
                 raise DoubleVoteError(
                     f"voter {voter_id!r} has already voted on motion {motion_id!r}"
                 ) from exc
-            _append_event(
+            event = _append_event(
                 conn,
                 motion_id,
                 event_type="vote_cast",
@@ -363,6 +427,12 @@ def cast_vote(
                 metadata={"choice": choice, "voter_kind": voter_kind},
                 now=now,
             )
+    # Vote then journal, both after the commit. The foreign keys require the
+    # motion to be mirrored first; on the happy path `create_motion` did that,
+    # and when its own mirror failed these two are refused as well — silently,
+    # like every mirror failure, and visible only to reconciliation.
+    _mirror_vote(record)
+    _mirror_council_event(event)
     return dict(record)
 
 
@@ -484,7 +554,7 @@ def record_decision(
                 raise db.LostUpdateError(
                     f"motion {motion_id!r} decide affected {cur.rowcount} rows"
                 )
-            _append_event(
+            event = _append_event(
                 conn,
                 motion_id,
                 event_type="decision_recorded",
@@ -493,6 +563,14 @@ def record_decision(
                 metadata={"outcome": outcome, "tally": tally},
                 now=now,
             )
+            motion_row = dict(
+                conn.execute("SELECT * FROM motion WHERE id = ?", (motion_id,)).fetchone()
+            )
+    # The motion first: this path moves it to `decided`, so the mirrored parent
+    # must carry that before its children arrive.
+    _mirror_motion(motion_row)
+    _mirror_decision(record)
+    _mirror_council_event(event)
     return _decode_decision_row(record)
 
 
@@ -557,7 +635,7 @@ def _append_event(
     role: str | None = None,
     message: str | None = None,
     metadata: dict | None = None,
-) -> None:
+) -> dict:
     """Append one journal row inside an already-open transaction, assigning the
     next per-motion ``seq``. The journal is append-only — this is the only writer,
     and there is no update/delete path."""
@@ -566,21 +644,29 @@ def _append_event(
         (motion_id,),
     ).fetchone()
     seq = int(row["s"]) + 1
-    conn.execute(
+    record = {
+        "motion_id": motion_id,
+        "seq": seq,
+        "event_type": event_type,
+        "actor": actor,
+        "role": role,
+        "message": message,
+        "metadata_json": json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+        "created_at": now,
+    }
+    cur = conn.execute(
         "INSERT INTO council_event "
         "(motion_id, seq, event_type, actor, role, message, metadata_json, created_at) "
         "VALUES (:motion_id, :seq, :event_type, :actor, :role, :message, :metadata_json, :created_at)",
-        {
-            "motion_id": motion_id,
-            "seq": seq,
-            "event_type": event_type,
-            "actor": actor,
-            "role": role,
-            "message": message,
-            "metadata_json": json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
-            "created_at": now,
-        },
+        record,
     )
+    # SQLite mints the id and the mirror needs *this* one: `council_event.id` is
+    # `GENERATED ALWAYS AS IDENTITY` in the target, which refuses a non-DEFAULT
+    # value without `OVERRIDING SYSTEM VALUE`, and reconciliation pairs rows by
+    # id. Returned as the **stored** shape, not the decoded one — the decoded
+    # row has no `metadata_json` and no id.
+    record["id"] = cur.lastrowid
+    return record
 
 
 def list_events(db_path: Path, motion_id: str) -> list[dict]:
@@ -623,7 +709,7 @@ def withdraw_motion(
                 "version = version + 1 WHERE id = :motion_id AND version = :expected_version",
                 {"now": now, "motion_id": motion_id, "expected_version": expected_version},
             )
-            _append_event(
+            event = _append_event(
                 conn,
                 motion_id,
                 event_type="motion_withdrawn",
@@ -634,12 +720,42 @@ def withdraw_motion(
             updated = conn.execute(
                 "SELECT * FROM motion WHERE id = ?", (motion_id,)
             ).fetchone()
-            return dict(updated)
+            record = dict(updated)
+    _mirror_motion(record)
+    _mirror_council_event(event)
+    return record
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+def list_decisions_stored(db_path: Path) -> list[dict]:
+    """Every decision in the shape SQLite **stores**, for reconciliation.
+
+    :func:`get_decision`, :func:`list_decisions` and :func:`record_decision` all
+    return :func:`_decode_decision_row` output, which pops ``tally_json`` and
+    ``roles_json`` in favour of decoded ``tally``/``roles``. Reconciliation
+    compares stored against stored, so fed a decoded row it reports every
+    decision divergent on both JSON columns.
+
+    Ordered by ``motion_id`` — this table's actual primary key.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM council_decision ORDER BY motion_id").fetchall()
+        return [dict(row) for row in rows]
+
+
+def list_events_stored(db_path: Path) -> list[dict]:
+    """Every journal row in the shape SQLite **stores**, for reconciliation.
+
+    :func:`list_events` decodes ``metadata_json`` away and the journal's id is a
+    storage detail there; reconciliation needs both, and pairs rows by id.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM council_event ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
 
 
 def _decode_decision_row(row: dict) -> dict:

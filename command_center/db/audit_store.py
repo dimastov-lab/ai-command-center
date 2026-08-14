@@ -102,6 +102,7 @@ AUDIT_FINDING = MirroredTable(
     table="audit_finding",
     columns=AUDIT_FINDING_COLUMNS,
     codec=ColumnCodec(timestamps=frozenset({"created_at", "updated_at"})),
+    references={"run_id": "audit_run"},
 )
 
 

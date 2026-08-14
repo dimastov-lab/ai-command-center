@@ -100,6 +100,7 @@ MODEL_EVENT = MirroredTable(
         json_values=frozenset({"metadata_json"}),
     ),
     identity=True,
+    references={"model_id": "model_entry"},
 )
 
 
