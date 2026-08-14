@@ -31,8 +31,6 @@ plus the rollback and backup/restore drills.
 
 from __future__ import annotations
 
-from typing import Any
-
 from command_center.db.mirror_support import MIRROR_UNAVAILABLE, ColumnCodec
 from command_center.db.table_mirror import MirroredTable, PostgresTableMirror, divergence_against
 
@@ -87,8 +85,9 @@ class PostgresDigestItemMirror(PostgresTableMirror):
         self.delete_where("day", day)
 
 
-def divergence(authority_rows: Any, mirror: Any) -> list[dict]:
-    """Rows where the SQLite authority and `mirror` disagree.
+divergence = divergence_against(
+    DIGEST_ITEM,
+    """Rows where the SQLite authority and a mirror disagree.
 
     **Takes rows in the shape SQLite stores** — `runtime/db/wave1.py`'s
     `list_digest_items_stored`, not its other readers. Worth saying here
@@ -100,5 +99,5 @@ def divergence(authority_rows: Any, mirror: Any) -> list[dict]:
 
     Passes the codec, which is what makes `refs_json` compare as a parsed value
     rather than as text — see `mirror_support.divergence` for the rest.
-    """
-    return divergence_against(DIGEST_ITEM)(authority_rows, mirror)
+    """,
+)

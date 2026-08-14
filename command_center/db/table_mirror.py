@@ -62,6 +62,19 @@ class PostgresTableMirror:
     #: Subclasses declare this; it is the only thing that differs between them.
     spec: MirroredTable
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Refuse a subclass that declares no table, at import rather than in use.
+
+        Without this the omission surfaces as `AttributeError: 'X' object has
+        no attribute 'spec'` on the first mirrored write — late, swallowed by
+        the dual-write hook, and naming the subclass rather than the mistake.
+        Slice 7's acceptance called it a footgun for the batch that follows,
+        where declarations arrive several at a time; this is that batch.
+        """
+        super().__init_subclass__(**kwargs)
+        if not isinstance(getattr(cls, "spec", None), MirroredTable):
+            raise TypeError(f"{cls.__name__} must declare `spec = MirroredTable(...)`")
+
     def __init__(self, connection_factory: Any = None) -> None:
         # Injectable so tests can supply a connection without a process-wide
         # pool, and so this module never reaches for global state of its own.
@@ -193,15 +206,30 @@ class PostgresTableMirror:
         ]
 
 
-def divergence_against(spec: MirroredTable) -> Any:
+def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
     """Build the reconciliation for one declared table.
 
     Bound to the table's own codec, which is what makes a `jsonb` column
     compare as a parsed value rather than as text — see
     `mirror_support.divergence` for what each reported shape means.
+
+    `doc` becomes the returned function's `__doc__`, and that is not cosmetic.
+    Slice 7 replaced five module-level functions with closures and the runtime
+    docstrings went with them: the text survived in the source as `#:`
+    comments, but `help(event_divergence)` went silent — and that particular
+    docstring is what closed slice 4's rejection, because it warns the operator
+    that reconciliation takes the *stored* reader. The warning has to be
+    readable where the mistake is made, which is a REPL at cutover time, not a
+    source file.
     """
 
     def divergence(authority_rows: Iterable[dict], mirror: Any) -> list[dict]:
         return mirror_support.divergence(authority_rows, mirror, spec.columns, spec.codec)
 
+    divergence.__name__ = f"{spec.table}_divergence"
+    divergence.__qualname__ = divergence.__name__
+    divergence.__doc__ = doc or (
+        f"Rows where the SQLite authority and a mirror disagree on `{spec.table}` — "
+        "see `mirror_support.divergence` for what each reported shape means."
+    )
     return divergence

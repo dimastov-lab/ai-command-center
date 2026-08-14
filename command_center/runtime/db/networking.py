@@ -427,7 +427,25 @@ def create_invitation(
             conn.execute(
                 f"INSERT INTO networking_invitation ({columns}) VALUES ({placeholders})", record
             )
+    _mirror_invitation(record)
     return record
+
+
+def _mirror_invitation(record: dict) -> None:
+    """Best-effort dual-write of one invitation into PostgreSQL (SRV-01B slice 8).
+
+    After the authoritative commit and silent on failure, like every mirror
+    since slice 2. Same foreign-key consequence as `message`: a lost `contact`
+    write makes this one fail too, and both failures are swallowed, so the hole
+    is visible only to reconciliation.
+    """
+    try:
+        from command_center.db.networking_store import PostgresInvitationMirror
+
+        PostgresInvitationMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror networking_invitation into PostgreSQL", exc_info=True)
+
 
 
 def get_invitation(db_path: Path, invitation_id: str) -> dict | None:
@@ -526,4 +544,7 @@ def set_invitation_status(
             updated = conn.execute(
                 "SELECT * FROM networking_invitation WHERE id = ?", (invitation_id,)
             ).fetchone()
-            return dict(updated)
+            record = dict(updated)
+    # Outside the `with`: the mirror follows the committed row.
+    _mirror_invitation(record)
+    return record
