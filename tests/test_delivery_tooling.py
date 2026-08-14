@@ -200,19 +200,41 @@ def test_the_line_records_which_configuration_measured_it(tmp_path) -> None:
     assert "(PostgreSQL requested)" in measured.stdout, measured.stdout
 
 
-def test_a_missing_ruff_is_never_reported_as_a_dirty_tree(tmp_path) -> None:
+def test_a_missing_ruff_is_never_reported_as_a_dirty_tree() -> None:
     """The third state has to hold on both branches, and twice it did not.
 
-    The first discriminator matched two literal strings that only cover
-    `python -m ruff`'s wording; the second traded that away for `uv run`'s.
-    Each time, "ruff could not run" printed as "**ruff NOT clean**" on the
-    other path — a false statement in the one line this tool exists to keep
-    true. This pins the direction that matters on the branch CI uses.
+    Exercised through `_ruff()` with a synthesised result rather than by
+    stripping `PATH`. The first version did the latter and review showed it
+    proved nothing: CI installs ruff into the very interpreter that runs
+    pytest, so the fallback branch is never taken there, and the assertion
+    passed with the fix reverted. Worse, on a host where ruff is importable and
+    the tree is dirty it failed for a reason unrelated to its own claim.
+
+    The discriminator is the thing under test, so the test calls it directly.
     """
-    suite = _write_suite(tmp_path / "green", green=True)
-    without_ruff = {
-        k: v for k, v in os.environ.items() if k not in {"PATH", "AICC_TEST_PG_ADMIN_DSN"}
+    import importlib.util
+    import subprocess
+
+    spec = importlib.util.spec_from_file_location("evidence_under_test", EVIDENCE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    shapes = {
+        "missing under `python -m ruff`": subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="/usr/bin/python3: No module named ruff\n"
+        ),
+        "missing under `uv run`": subprocess.CompletedProcess(
+            [], 2, stdout="", stderr="error: Failed to spawn: `ruff`\n"
+        ),
+        "misconfigured": subprocess.CompletedProcess(
+            [], 2, stdout="", stderr="ruff failed\n  Cause: Unknown rule selector\n"
+        ),
+        "killed": subprocess.CompletedProcess([], -9, stdout="", stderr=""),
     }
-    without_ruff["PATH"] = "/usr/bin:/bin"
-    measured = _run(EVIDENCE, "measure", str(suite), env=without_ruff)
-    assert "ruff NOT clean" not in measured.stdout, measured.stdout
+    for name, completed in shapes.items():
+        assert module._classify_ruff(completed) == "unavailable", name
+
+    # And the direction that must never be lost: real findings stay `dirty`.
+    dirty = subprocess.CompletedProcess([], 1, stdout="F401 unused import\n", stderr="")
+    assert module._classify_ruff(dirty) == "dirty"
+    assert module._classify_ruff(subprocess.CompletedProcess([], 0, stdout="", stderr="")) == "clean"

@@ -84,6 +84,13 @@ def _pytest_command(paths: list[str], extra: list[str]) -> list[str]:
         # claimed a benefit the command did not deliver.
         return [
             "uv", "run",
+            # `psycopg` as well as the pool: review set the DSN with the driver
+            # absent and every PostgreSQL-backed test skipped **silently** — 393
+            # passed / 260 skipped, exit 0, no FAILED term — under a line saying
+            # `PostgreSQL requested`. The pinned extra was the pool, while every
+            # skip named the driver, so the tool's own command could not reach a
+            # database it claimed to have requested.
+            "--with", "psycopg[binary]>=3.2,<4",
             "--with", "psycopg-pool>=3.2,<4",
             "--with", "pytest",
             "pytest", *paths, "-q", *extra,
@@ -131,6 +138,18 @@ def _ruff() -> str:
         )
     except OSError:
         return "unavailable"
+    return _classify_ruff(completed)
+
+
+def _classify_ruff(completed: "subprocess.CompletedProcess[str]") -> str:
+    """The decision itself, separated from the act of running ruff.
+
+    It lives apart from `_ruff` so a test can hand it the four shapes that
+    matter without depending on whether the host happens to have ruff on it.
+    The test that used to cover this stripped `PATH` and asserted the result
+    was not `dirty` — which passes on a host where ruff is importable anyway,
+    proving nothing about the branch it names.
+    """
     if completed.returncode == 0:
         return "clean"
     # Ruff writes its findings to stdout and its own failures to stderr, and it
@@ -176,12 +195,15 @@ def _evidence_line(paths: list[str], counts: dict[str, int], ruff_state: str) ->
     # pastes. Two honest runs of one tree differ by whether a database was
     # reachable, and the lines were previously indistinguishable.
     #
-    # It reports what was *requested*, not what the run achieved: the DSN can
-    # point at nothing. Review probed that and found the difference only ever
-    # observable next to a `FAILED` term in the same line — a DSN pointing at a
-    # closed port fails the tests rather than skipping them — so the marker
-    # cannot pose as a clean PostgreSQL run. `requested` is in the wording for
-    # the same reason.
+    # It reports what was *requested*, not what the run achieved, and the
+    # earlier version of this comment claimed that difference could never pose
+    # as a clean run. That was false and review broke it: with the DSN set and
+    # the driver absent, every database-backed test **skips silently** — no
+    # FAILED term, exit 0 — under a line reading `PostgreSQL requested`. The
+    # command above now pins the driver, so the tool's own path cannot produce
+    # that shape; a DSN pointing at a closed port still fails loudly. What the
+    # word `requested` cannot promise is that the database was reached, and it
+    # is chosen precisely because it does not promise it.
     database = (
         "PostgreSQL requested" if os.environ.get("AICC_TEST_PG_ADMIN_DSN") else "serverless"
     )
