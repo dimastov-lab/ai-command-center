@@ -36,10 +36,13 @@ do for the other table-family modules.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 #: A message's direction relative to the operator.
 MESSAGE_DIRECTIONS: frozenset[str] = frozenset({"inbound", "outbound"})
@@ -143,7 +146,44 @@ def create_contact(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(f"INSERT INTO contact ({columns}) VALUES ({placeholders})", record)
+    _mirror_contact(record)
     return record
+
+
+def _mirror_contact(record: dict) -> None:
+    """Best-effort dual-write of one contact into PostgreSQL (SRV-01B slice 5).
+
+    After the authoritative commit and silent on failure, as in slices 2-4.
+    What is new is the consequence: ``contact`` is a foreign-key parent, so a
+    swallowed failure here does not cost one row. Every later ``message`` write
+    for this contact is refused by the target as well, and swallowed in turn,
+    so one dropped parent becomes a growing hole that only reconciliation
+    shows. Tracked as ``VOYN-W0-AICC-MIRROR-SILENT-DROP``, which this table
+    gives a multiplier rather than a new cause.
+    """
+    try:
+        from command_center.db.networking_store import PostgresContactMirror
+
+        PostgresContactMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror contact into PostgreSQL", exc_info=True)
+
+
+def _mirror_message(record: dict) -> None:
+    """Best-effort dual-write of one message into PostgreSQL (SRV-01B slice 5).
+
+    Runs after the authoritative commit, and after its contact's mirror write
+    for the same reason the authority is ordered that way: the foreign key.
+    No ordering logic of its own is needed or wanted - a mirror that created a
+    missing parent to make this land would write a row the authority never
+    had, which is the one state no reconciliation flags as wrong.
+    """
+    try:
+        from command_center.db.networking_store import PostgresMessageMirror
+
+        PostgresMessageMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror message into PostgreSQL", exc_info=True)
 
 
 def get_contact(db_path: Path, contact_id: str) -> dict | None:
@@ -226,7 +266,11 @@ def update_contact_fields(
                     f"contact {contact_id!r} update affected {cur.rowcount} rows"
                 )
             updated = conn.execute("SELECT * FROM contact WHERE id = ?", (contact_id,)).fetchone()
-            return dict(updated)
+            record = dict(updated)
+    # Outside the `with`: the mirror follows the committed row, never one a
+    # rollback could still discard.
+    _mirror_contact(record)
+    return record
 
 
 # --------------------------------------------------------------------------
@@ -279,6 +323,7 @@ def create_message(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(f"INSERT INTO message ({columns}) VALUES ({placeholders})", record)
+    _mirror_message(record)
     return record
 
 
