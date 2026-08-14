@@ -368,6 +368,12 @@ def create_run(
                     VALUES ({", ".join(f":{name}" for name in insert_columns)})""",
                 record,
             )
+            # The stored row, not `record`: the insert names only the columns
+            # this database has, so `record` is missing everything the schema
+            # defaults. See `_mirror_run`.
+            stored_run = dict(
+                conn.execute("SELECT * FROM run WHERE id = ?", (record["id"],)).fetchone()
+            )
             provenance_table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
             ).fetchone()
@@ -408,7 +414,31 @@ def create_run(
                         now,
                     ),
                 )
+    _mirror_run(stored_run)
     return record
+
+
+def _mirror_run(record: dict) -> None:
+    """Best-effort dual-write of one run into PostgreSQL (SRV-01B slice 11).
+
+    Takes the row as **stored**, never the record a caller assembled:
+    `create_run` builds its column list from `PRAGMA table_info(run)`, so its
+    record omits whatever it never set — measured as three columns today
+    (`failure_reason`, `first_output_at`, `pre_run_head`), all nullable, so
+    mirroring the record would happen to work. What it omits depends on the
+    caller's optional arguments and on that database's schema, so "complete
+    enough" is a property of today's callers, not of this code. The stored row
+    is the row.
+
+    After the authoritative commit and silent on failure, as every mirror since
+    slice 2.
+    """
+    try:
+        from command_center.db.run_store import PostgresRunMirror
+
+        PostgresRunMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror run into PostgreSQL", exc_info=True)
 
 
 def get_run(db_path: Path, run_id: str) -> dict | None:
@@ -570,7 +600,9 @@ def update_run_state(
                 # transaction), but never silently succeed if it happens.
                 raise db.LostUpdateError(f"Run {run_id!r} update affected {cur.rowcount} rows")
             updated = conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
-            return dict(updated)
+            stored_run = dict(updated)
+    _mirror_run(stored_run)
+    return stored_run
 
 
 def set_run_result_fields(
@@ -621,7 +653,9 @@ def update_run_fields(db_path: Path, run_id: str, *, expected_version: int, fiel
             if cur.rowcount != 1:
                 raise db.LostUpdateError(f"Run {run_id!r} update affected {cur.rowcount} rows")
             updated = conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone()
-            return dict(updated)
+            stored_run = dict(updated)
+    _mirror_run(stored_run)
+    return stored_run
 
 
 # --------------------------------------------------------------------------
