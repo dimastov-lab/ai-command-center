@@ -20,35 +20,25 @@ at it?" needs neither and catches the same omission at the moment it is made.
 from __future__ import annotations
 
 import ast
-import importlib
-import pkgutil
 from pathlib import Path
 
 import pytest
 
-from command_center.db.table_mirror import PostgresTableMirror
+from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
 AUTHORITY = ROOT / "command_center/runtime/db"
 
 
 def _mirrored_tables() -> dict[str, object]:
-    """Every declared mirror, keyed by table — discovered, not listed."""
-    import command_center.db as db_package
+    """Every declared mirror's module, keyed by table — shared with the contract.
 
-    found: dict[str, object] = {}
-    for module_info in pkgutil.iter_modules(db_package.__path__):
-        if not module_info.name.endswith("_store"):
-            continue
-        module = importlib.import_module(f"command_center.db.{module_info.name}")
-        for attribute in vars(module).values():
-            if (
-                isinstance(attribute, type)
-                and issubclass(attribute, PostgresTableMirror)
-                and attribute is not PostgresTableMirror
-            ):
-                found[attribute.spec.table] = module
-    return dict(sorted(found.items()))
+    Both suites used to carry their own `command_center/db/*_store.py` scan.
+    Slice 9's acceptance defeated that rule by putting a mirror in a file with
+    another name, so the rule now lives once, in `mirror_discovery`, and is
+    about what a class is rather than where it sits.
+    """
+    return {table: module for table, (_mirror, module) in mirror_classes().items()}
 
 
 MIRRORED = _mirrored_tables()
@@ -130,13 +120,25 @@ def test_the_reconciliation_points_at_the_stored_reader(table: str) -> None:
         pytest.skip(f"{table}: nothing to warn about")
 
     module = MIRRORED[table]
-    docs = [
-        (getattr(value, "__doc__", "") or "")
+    # This table's own reconciliation, not any of the module's. The first
+    # version searched every `*divergence` attribute in the module and accepted
+    # a match anywhere in it: slice 9's acceptance moved `list_events_stored`
+    # out of `event_divergence`'s docstring and parked it in the motion's, and
+    # the gate stayed green — while the operator who opens `help(event_
+    # divergence)` reads nothing. `divergence_against` names each closure
+    # `<table>_divergence`, so the right one is findable.
+    own = [
+        value
         for name, value in vars(module).items()
-        if name.endswith("divergence") or name == "divergence"
+        if getattr(value, "__name__", None) == f"{table}_divergence"
     ]
-    assert any(reader in doc for doc in docs for reader in stored), (
-        f"{table}: readers {sorted(decoding)} decode, and no reconciliation docstring in "
-        f"{module.__name__} names one of {sorted(stored)}. The warning has to be readable "
-        "where the mistake is made."
+    assert own, (
+        f"{table}: no reconciliation named `{table}_divergence` in {module.__name__} — "
+        "build it with `divergence_against`, which names the closure after its table."
+    )
+    doc = getattr(own[0], "__doc__", "") or ""
+    assert any(reader in doc for reader in stored), (
+        f"{table}: readers {sorted(decoding)} decode, and `{table}_divergence`'s own docstring "
+        f"names none of {sorted(stored)}. The warning has to be readable where the mistake is "
+        "made, which is `help()` at cutover time."
     )

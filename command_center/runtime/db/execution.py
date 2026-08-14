@@ -11,12 +11,16 @@ they did against the single module.
 
 from __future__ import annotations
 
+import logging
+
 import json
 from pathlib import Path
 from typing import Any, Iterable
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Task
@@ -49,7 +53,50 @@ def create_task(
                    VALUES (:id, :project, :title, :task_type, :legacy_task_id, :created_at, :updated_at)""",
                 record,
             )
+    _mirror_task(record)
     return record
+
+def _mirror_task(record: dict) -> None:
+    """Best-effort dual-write of one task into PostgreSQL (SRV-01B slice 10).
+
+    After the authoritative commit and silent on failure, as every mirror since
+    slice 2. Root of the family's foreign keys, so a swallowed failure here
+    costs every session, run and event that follows for that task.
+    """
+    try:
+        from command_center.db.execution_store import PostgresTaskMirror
+
+        PostgresTaskMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror task into PostgreSQL", exc_info=True)
+
+
+def _mirror_task_deletion(task_id: str) -> None:
+    """Mirror the deletion of one task, cascade included.
+
+    The authority deletes a single row and lets `ON DELETE CASCADE` remove
+    everything hanging off it; the target declares the same cascades, so the
+    mirror deletes the same single row. Removing the children explicitly would
+    give the mirror its own opinion about what a task's removal implies.
+    """
+    try:
+        from command_center.db.execution_store import PostgresTaskMirror
+
+        PostgresTaskMirror().delete_task(task_id)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror task deletion into PostgreSQL", exc_info=True)
+
+
+def _mirror_session(record: dict) -> None:
+    """Best-effort dual-write of one session into PostgreSQL (slice 10)."""
+    try:
+        from command_center.db.execution_store import PostgresSessionMirror
+
+        PostgresSessionMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror session into PostgreSQL", exc_info=True)
+
+
 
 
 def delete_task(db_path: Path, task_id: str) -> bool:
@@ -66,7 +113,12 @@ def delete_task(db_path: Path, task_id: str) -> bool:
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             cur = conn.execute("DELETE FROM task WHERE id = ?", (task_id,))
-            return cur.rowcount > 0
+            removed = cur.rowcount > 0
+    # After the commit, and only when a row actually went: mirroring a delete
+    # that removed nothing would be a no-op here but a lie in the log.
+    if removed:
+        _mirror_task_deletion(task_id)
+    return removed
 
 
 def get_task(db_path: Path, task_id: str) -> dict | None:
@@ -117,6 +169,7 @@ def create_session(
                    VALUES (:id, :task_id, :project, :repository_path, :legacy_run_id, :created_at, :updated_at)""",
                 record,
             )
+    _mirror_session(record)
     return record
 
 
