@@ -680,12 +680,68 @@ def append_run_event(db_path: Path, run_id: str, event_type: str, payload: dict)
                 (run_id,),
             ).fetchone()
             seq = row["next_seq"]
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO run_event (run_id, seq, event_type, payload_json, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
                 (run_id, seq, event_type, payload_json, now),
             )
-            return seq
+            stored_event = {
+                "id": cur.lastrowid,
+                "run_id": run_id,
+                "seq": seq,
+                "event_type": event_type,
+                "payload_json": payload_json,
+                "created_at": now,
+            }
+    _mirror_run_event(stored_event)
+    return seq
+
+def _mirror_run_event(record: dict) -> None:
+    """Best-effort dual-write of one journal row into PostgreSQL (slice 12).
+
+    Takes the stored record, which carries the id SQLite minted: the target's
+    `run_event.id` is `GENERATED ALWAYS AS IDENTITY` and refuses a non-DEFAULT
+    value without `OVERRIDING SYSTEM VALUE`, and reconciliation pairs rows by
+    id.
+    """
+    try:
+        from command_center.db.run_children_store import PostgresRunEventMirror
+
+        PostgresRunEventMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror run_event into PostgreSQL", exc_info=True)
+
+
+def _mirror_report(record: dict) -> None:
+    """Best-effort dual-write of one report row into PostgreSQL (slice 12)."""
+    try:
+        from command_center.db.run_children_store import PostgresReportMirror
+
+        PostgresReportMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror report into PostgreSQL", exc_info=True)
+
+
+
+
+def list_run_events_stored(db_path: Path, run_id: str) -> list[dict]:
+    """Every journal row for one run in the shape SQLite **stores**.
+
+    :func:`list_run_events` selects an explicit column list that omits `id` —
+    reasonably, since callers address the journal by `(run_id, seq)`. But
+    reconciliation pairs rows by the table's key, so fed those rows it sees
+    `None` on every one of them and reports the whole journal divergent.
+
+    That is a third variant of the same family: slice 4 found readers that
+    *decode* a column away, and this one *projects* it away. The fitness gate
+    was extended in the same slice to catch the second variant, because the
+    first one taught that memory is not a mechanism.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM run_event WHERE run_id = ? ORDER BY seq ASC", (run_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def list_run_events(
@@ -777,7 +833,9 @@ def create_report(db_path: Path, run_id: str, path: str) -> dict:
                 "INSERT INTO report (run_id, path, created_at) VALUES (?, ?, ?)",
                 (run_id, path, now),
             )
-    return {"run_id": run_id, "path": path, "created_at": now}
+    record = {"run_id": run_id, "path": path, "created_at": now}
+    _mirror_report(record)
+    return record
 
 
 def get_report(db_path: Path, run_id: str) -> dict | None:

@@ -45,11 +45,29 @@ MIRRORED = _mirrored_tables()
 
 
 def _returns_decoded(function: ast.FunctionDef) -> bool:
-    """True when every row this function returns passes through a `_decode_*`."""
+    """True when this reader hands back something other than the stored row.
+
+    Two ways that happens, and the second cost a slice to notice:
+
+    * **decoding** — the row passes through a `_decode_*` helper that pops a
+      column (slice 4's trap, on `digest_item`, `model_event`, `audit_run`);
+    * **projecting** — the reader selects an explicit column list rather than
+      `*`, so a column the mirror needs is simply absent. `list_run_events`
+      does this with `id`, and reconciliation pairing rows by key then sees
+      `None` on every row. The first version of this gate looked only for
+      decoders and passed it.
+    """
     for node in ast.walk(function):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id.startswith("_decode"):
                 return True
+    for node in ast.walk(function):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            statement = " ".join(node.value.split())
+            if statement.upper().startswith("SELECT ") and " FROM " in statement.upper():
+                selected = statement[len("SELECT ") : statement.upper().index(" FROM ")]
+                if "*" not in selected and "COUNT(" not in selected.upper():
+                    return True
     return False
 
 
