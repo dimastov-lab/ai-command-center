@@ -52,6 +52,23 @@ class MirroredTable:
     codec: ColumnCodec = field(default_factory=ColumnCodec)
     #: True when the primary key is `GENERATED ALWAYS AS IDENTITY`.
     identity: bool = False
+    #: The column the primary key is on. Not always `id`:
+    #: `council_decision` is keyed by `motion_id` and carries an `id` column
+    #: that is *not* unique, so `ON CONFLICT (id)` would name a constraint the
+    #: table does not have. Found by reading the schema before writing the
+    #: mirror rather than by watching the insert fail — and it would have failed
+    #: silently, since the dual-write hook swallows.
+    key: str = "id"
+    #: Tables this one references, as `{column: parent table}`.
+    #:
+    #: Declared rather than inferred, and it earns its place twice. It records
+    #: the ordering a dual-write must follow — parent before child, because the
+    #: target refuses a child whose parent is absent — which until now lived
+    #: only in a hook's comment. And it lets `tests/db/test_mirror_contract.py`
+    #: build a valid parent row for any table automatically, so the shared
+    #: contract can exercise a foreign-keyed table without knowing anything
+    #: about its family.
+    references: dict[str, str] = field(default_factory=dict)
 
 
 class PostgresTableMirror:
@@ -98,7 +115,11 @@ class PostgresTableMirror:
     # --- writes ------------------------------------------------------------
 
     def upsert(self, record: dict) -> None:
-        """Write `record`, replacing any existing row with the same id.
+        """Write `record`, replacing any existing row with the same key.
+
+        The key is the table's own primary key, which is not always `id` — see
+        `MirroredTable.key`, and `test_the_declared_key_is_the_tables_primary_key`
+        for the check that the declaration matches the schema.
 
         `upsert` rather than `insert`, because the backfill runs more than once
         by design — once per operator, once after a rollback and re-advance —
@@ -121,7 +142,7 @@ class PostgresTableMirror:
             "%s::jsonb" if name in spec.codec.json_values else "%s" for name in spec.columns
         )
         assignments = ", ".join(
-            f"{name} = EXCLUDED.{name}" for name in spec.columns if name != "id"
+            f"{name} = EXCLUDED.{name}" for name in spec.columns if name != spec.key
         )
         overriding = "OVERRIDING SYSTEM VALUE " if spec.identity else ""
         with self._connection() as conn:
@@ -129,7 +150,7 @@ class PostgresTableMirror:
                 cur.execute(
                     f"INSERT INTO {spec.table} ({', '.join(spec.columns)}) "
                     f"{overriding}VALUES ({placeholders}) "
-                    f"ON CONFLICT (id) DO UPDATE SET {assignments}",
+                    f"ON CONFLICT ({spec.key}) DO UPDATE SET {assignments}",
                     values,
                 )
 
@@ -195,7 +216,9 @@ class PostgresTableMirror:
         spec = self.spec
         with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT {', '.join(spec.columns)} FROM {spec.table} ORDER BY id")
+                cur.execute(
+                    f"SELECT {', '.join(spec.columns)} FROM {spec.table} ORDER BY {spec.key}"
+                )
                 rows = cur.fetchall()
         return [
             {
@@ -224,7 +247,9 @@ def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
     """
 
     def divergence(authority_rows: Iterable[dict], mirror: Any) -> list[dict]:
-        return mirror_support.divergence(authority_rows, mirror, spec.columns, spec.codec)
+        return mirror_support.divergence(
+            authority_rows, mirror, spec.columns, spec.codec, key=spec.key
+        )
 
     divergence.__name__ = f"{spec.table}_divergence"
     divergence.__qualname__ = divergence.__name__

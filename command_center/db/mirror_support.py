@@ -204,6 +204,8 @@ def divergence(
     mirror: Any,
     columns: Iterable[str],
     codec: ColumnCodec | None = None,
+    *,
+    key: str = "id",
 ) -> list[dict]:
     """Rows where the authority and `mirror` disagree.
 
@@ -243,13 +245,17 @@ def divergence(
 
     names = tuple(columns)
     compare = codec.comparable if codec is not None else _comparable
-    mirrored = {row.get("id"): row for row in mirror_rows}
+    # Rows are matched by the table's own primary key, which is not always
+    # `id`: `council_decision` is keyed by `motion_id` and its `id` column is
+    # not unique, so pairing on `id` there would compare unrelated rows or
+    # collapse several into one.
+    mirrored = {row.get(key): row for row in mirror_rows}
     differences: list[dict] = []
     for row in authority_rows:
-        counterpart = mirrored.pop(row.get("id"), None)
+        counterpart = mirrored.pop(row.get(key), None)
         if counterpart is None:
             differences.append(
-                {"id": row.get("id"), "fields": ["*"], "authority": row, "mirror": None}
+                {"id": row.get(key), "fields": ["*"], "authority": row, "mirror": None}
             )
             continue
         fields = sorted(
@@ -259,7 +265,7 @@ def divergence(
         )
         if fields:
             differences.append(
-                {"id": row.get("id"), "fields": fields, "authority": row, "mirror": counterpart}
+                {"id": row.get(key), "fields": fields, "authority": row, "mirror": counterpart}
             )
     for leftover_id, leftover in mirrored.items():
         differences.append(
