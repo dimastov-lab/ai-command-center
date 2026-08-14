@@ -10,15 +10,24 @@ import pytest
 
 from command_center.db.config import ConfigError, load_config
 
-_STRONG_PASSWORD = "PWj9uQmATha71AQIK7MWIl2C"
-"""A fixture password generated independently, never derived from a real one.
+_STRONG_PASSWORD = "fixture-Not-A-Real-Password-7Xq2"
+"""A fixture password that is obviously not one, and derived from nothing.
 
-The previous value shared its whole 16-character tail with a password in
-actual use on a developer machine — independent acceptance spotted the
-overlap. A test constant that is a real secret with a few characters changed
-is a real secret: it leaks the shape, the alphabet and most of the material,
-and it invites the next person to edit rather than regenerate. This one comes
-from `secrets.choice` over `[A-Za-z0-9]` and means nothing anywhere.
+The original shared its whole 16-character tail with a password in actual use
+on a developer machine — independent acceptance spotted the overlap. A test
+constant that is a real secret with a few characters changed is a real secret:
+it leaks the shape, the alphabet and most of the material, and it invites the
+next person to edit rather than regenerate.
+
+My first replacement was 24 random characters, and the repository's secret scan
+flagged it — correctly. A high-entropy string in a source file is
+indistinguishable from a leaked credential to anything but a human, and
+answering that by widening the scanner's baseline would train the baseline to
+absorb exactly what it exists to catch.
+
+So the shape is neither a real secret nor a random one: it reads as a fixture
+at a glance, it satisfies the strength rule this test exercises, and it is
+stable, so the baseline does not churn whenever someone touches this line.
 """
 
 
