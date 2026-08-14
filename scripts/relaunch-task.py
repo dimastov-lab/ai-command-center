@@ -126,6 +126,16 @@ def _supervise(api: runtime_api.ExecutionCenterAPI, run_id: str) -> int:
                 last_stage = stage
 
             if state in run_db.TERMINAL_STATES:
+                # A terminal row is necessary but not sufficient: the
+                # supervisor commits it *before* appending `process_exited`,
+                # auto-committing the agent's work and writing the run report,
+                # all on a daemon thread that this process's exit would kill
+                # without joining. Wait for the supervisor's own finalization
+                # signal, then re-sync the task from the settled row.
+                run = api.supervisor.wait_for_run(run_id, timeout=60.0) or run
+                state = run.get("state", state)
+                if task_sync.sync_task_from_run(task, run, db_path=RUN_DB):
+                    tasks_repository.upsert_tasks(ROOT, tasks)
                 print(f"\nПрогон завершён: state={state}  stage={stage}  progress={progress}%")
                 return 0 if state == "COMPLETED" else 1
         elif run is None:
