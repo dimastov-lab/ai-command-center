@@ -18,6 +18,7 @@ rewrites the row `start_provider_attempt` wrote.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from command_center.db.execution_store import PostgresSessionMirror, PostgresTaskMirror
@@ -214,6 +215,7 @@ def test_a_mirror_failure_cannot_break_a_provenance_write(tmp_path, monkeypatch)
         (provenance_store, "PostgresRunProvenanceMirror"),
         (provenance_store, "PostgresProvenanceEvidenceMirror"),
         (provenance_store, "PostgresProviderAttemptMirror"),
+        (provenance_store, "PostgresRunProviderRouteMirror"),
     ):
         monkeypatch.setattr(module, name, lambda: Exploding())
 
@@ -232,3 +234,53 @@ def test_a_mirror_failure_cannot_break_a_provenance_write(tmp_path, monkeypatch)
     )
     assert attempt["outcome"] == "started"
     assert prov_db.get_run_provenance(db_path, run["id"])["branch"] == "feat/x"
+
+
+def test_a_schema_without_the_provenance_tables_still_creates_runs(
+    tmp_path, monkeypatch
+) -> None:
+    """The guard the mirror's read-back nearly undid.
+
+    `create_run` writes `run_provenance` and `run_provider_route` only when
+    `sqlite_master` says they exist, so that a database migrated only part-way
+    — what the historical-schema tests build — can still create runs. Slice 13
+    read both rows back for the mirror, and the review found the read-back
+    unguarded: on such a database the `SELECT` raised inside the authoritative
+    transaction and destroyed the very write the guards above it exist to
+    protect.
+
+    It is the worst place in the family for a mirror to raise. Every other
+    mirror failure is swallowed by a hook — that is what the test above
+    asserts — but this one happens *before* any hook, while the transaction is
+    still open, so "best effort" silently became "the run is lost".
+
+    Reproduced by dropping the two tables rather than by building an old
+    schema: both live in `0001_initial.up.sql`, so no migration version omits
+    them, and the condition the guards anticipate has to be constructed.
+    """
+    from command_center.db import execution_store, provenance_store, run_store
+
+    class Silent:
+        def upsert(self, record: dict) -> None:
+            pass
+
+    for module, name in (
+        (execution_store, "PostgresTaskMirror"),
+        (execution_store, "PostgresSessionMirror"),
+        (run_store, "PostgresRunMirror"),
+        (provenance_store, "PostgresRunProvenanceMirror"),
+        (provenance_store, "PostgresRunProviderRouteMirror"),
+    ):
+        monkeypatch.setattr(module, name, lambda: Silent())
+
+    db_path = tmp_path / "runtime.db"
+    exec_db.db.migrate(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TABLE provider_attempt")
+        conn.execute("DROP TABLE run_provider_route")
+        conn.execute("DROP TABLE provenance_evidence")
+        conn.execute("DROP TABLE run_provenance")
+
+    run = _launch(db_path, provider_id="claude", provider_route=["claude"])
+
+    assert exec_db.get_run(db_path, run["id"])["prompt"] == "p"

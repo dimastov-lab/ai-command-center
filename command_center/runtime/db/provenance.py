@@ -11,11 +11,9 @@ they did against the single module.
 
 from __future__ import annotations
 
-import logging
-
 import json
+import logging
 from pathlib import Path
-
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
@@ -166,6 +164,7 @@ def update_run_provenance(db_path: Path, run_id: str, *, fields: dict) -> dict:
     _mirror("PostgresRunProvenanceMirror", record, "run_provenance")
     return record
 
+
 def _mirror(mirror_name: str, record: dict, table: str) -> None:
     """Best-effort dual-write of one provenance row into PostgreSQL (slice 13).
 
@@ -180,8 +179,6 @@ def _mirror(mirror_name: str, record: dict, table: str) -> None:
         getattr(provenance_store, mirror_name)().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
         _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
-
-
 
 
 def set_run_provenance_once(

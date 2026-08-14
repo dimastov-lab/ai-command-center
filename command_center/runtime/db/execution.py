@@ -419,12 +419,30 @@ def create_run(
             # needs, and assembling it from the arguments would make the
             # mirror's correctness a property of this function's parameter
             # list rather than of the table.
-            stored_provenance = conn.execute(
-                "SELECT * FROM run_provenance WHERE run_id = ?", (record["id"],)
-            ).fetchone()
-            stored_route = conn.execute(
-                "SELECT * FROM run_provider_route WHERE run_id = ?", (record["id"],)
-            ).fetchone()
+            #
+            # Guarded by the same `sqlite_master` results as the inserts above,
+            # and for the same reason. On a database migrated only part-way —
+            # what the historical-schema tests build — these tables do not
+            # exist, and an unguarded `SELECT` raises *inside* the
+            # authoritative transaction: the run itself is lost to a read the
+            # mirror asked for, in the one place the swallow-everything hook
+            # cannot help, because the raise happens before any hook is
+            # reached. The guards above exist precisely to keep `create_run`
+            # working against such a schema; the read-back has to honour them.
+            stored_provenance = (
+                conn.execute(
+                    "SELECT * FROM run_provenance WHERE run_id = ?", (record["id"],)
+                ).fetchone()
+                if provenance_table is not None
+                else None
+            )
+            stored_route = (
+                conn.execute(
+                    "SELECT * FROM run_provider_route WHERE run_id = ?", (record["id"],)
+                ).fetchone()
+                if provider_route_table is not None
+                else None
+            )
     # Parent first: the target refuses a child whose run is not mirrored.
     _mirror_run(stored_run)
     if stored_provenance is not None:
