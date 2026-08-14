@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import pkgutil
 import subprocess
 import sys
@@ -72,8 +73,18 @@ class _Cursor:
         self._log.append({"sql": " ".join(sql.split()), "params": _renderable(params)})
 
     def fetchone(self):  # noqa: ANN201 - shaped for the callers below
-        # `resync_identity` reads a sequence name and then a `setval` result.
-        return ("public.seq",) if len(self._log) % 2 == 1 else (1,)
+        """Answer by what was asked, not by how many times.
+
+        The first version replied on call parity — a sequence name on odd
+        calls, an integer on even ones. That happens to fit `resync_identity`
+        today and would silently mis-answer the moment a mirror issues any
+        other read, which is exactly the sort of quiet wrongness this tool is
+        supposed to expose in *other* code.
+        """
+        sql = self._log[-1]["sql"] if self._log else ""
+        if "pg_get_serial_sequence" in sql:
+            return (f"public.{'unknown'}_id_seq",)
+        return (1,)
 
     def fetchall(self):  # noqa: ANN201
         return []
@@ -135,7 +146,7 @@ def _sample(spec: object) -> dict:
 def collect_statements() -> dict[str, list[dict]]:
     """Every statement every declared mirror would send, keyed by table."""
     sys.path.insert(0, str(ROOT))
-    from command_center.db.table_mirror import PostgresTableMirror
+    from command_center.db.table_mirror import MirroredTable, PostgresTableMirror
 
     import command_center.db as db_package
 
@@ -145,12 +156,14 @@ def collect_statements() -> dict[str, list[dict]]:
             continue
         module = importlib.import_module(f"command_center.db.{module_info.name}")
         for attribute in vars(module).values():
+            # `isinstance(spec, object)` was the original guard and is always
+            # true — it read like a check and was not one. The real question is
+            # whether the class declares a table.
             if (
                 isinstance(attribute, type)
                 and issubclass(attribute, PostgresTableMirror)
                 and attribute is not PostgresTableMirror
-                and isinstance(getattr(attribute, "spec", None), object)
-                and hasattr(attribute, "spec")
+                and isinstance(getattr(attribute, "spec", None), MirroredTable)
             ):
                 log: list[dict] = []
                 mirror = attribute(connection_factory=lambda log=log: _Connection(log))
@@ -164,6 +177,12 @@ def collect_statements() -> dict[str, list[dict]]:
                 for extra in ("delete_day",):
                     if hasattr(mirror, extra):
                         getattr(mirror, extra)("2026-08-14")
+                if spec.table in out:
+                    raise SystemExit(
+                        f"two mirrors declare `{spec.table}`: {attribute.__name__} and an "
+                        "earlier one. A table with two mirrors has two opinions about its "
+                        "statements, and this tool would have reported only the last."
+                    )
                 out[spec.table] = log
     return dict(sorted(out.items()))
 
@@ -246,7 +265,11 @@ def cmd_statements(args: argparse.Namespace) -> int:
             for entry in current[table]:
                 print(f"  {table}\n    {entry['sql']}\n      {entry['params']}")
             print()
-    return 1 if changed else 0
+    # New tables set the exit code too. They were reported and then ignored by
+    # it, so the exact scenario this printing exists for — a slice whose tables
+    # are all new — still exited 0, and a `&& git push` would have run. A
+    # non-zero exit here means "read this", not "something is broken".
+    return 1 if (changed or added) else 0
 
 
 # --- test counts -------------------------------------------------------------
@@ -263,7 +286,11 @@ def cmd_counts(args: argparse.Namespace) -> int:
     )
     total = sum(1 for line in collected.stdout.splitlines() if "::" in line)
 
-    env_without_dsn = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
+    # Copy the real environment and remove the one variable under test, rather
+    # than constructing a minimal one: a hand-built env drops whatever the
+    # interpreter needs on this machine (SYSTEMROOT on Windows, VIRTUAL_ENV
+    # here) and the resulting failure looks like a test result.
+    env_without_dsn = {k: v for k, v in os.environ.items() if k != "AICC_TEST_PG_ADMIN_DSN"}
     serverless = subprocess.run(
         [sys.executable, "-m", "pytest", *args.paths, "-q"],
         cwd=ROOT,
@@ -275,7 +302,13 @@ def cmd_counts(args: argparse.Namespace) -> int:
     tail = serverless.stdout.strip().splitlines()[-1] if serverless.stdout.strip() else ""
     print(f"collected: {total}")
     print(f"without a database: {tail}")
-    print("→ the PG-backed count is the 'skipped' number; the rest need no server.")
+    print(
+        "→ the PG-backed count is the 'skipped' number and the rest need no server —"
+        " true only while the PostgreSQL fixtures are the only thing that skips."
+    )
+    if "error" in tail.lower() or not tail:
+        print("!! the serverless run did not report a summary; the split above is unusable")
+        return 1
     return 0
 
 

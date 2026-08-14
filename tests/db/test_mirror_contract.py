@@ -8,9 +8,10 @@ shipped a wrong test count, one shipped without a reconciliation entry point,
 and each omission was found by review rather than by the suite.
 
 So the contract is **discovered, not declared**: every `PostgresTableMirror`
-subclass in `command_center/db/*_store.py` is enrolled automatically. A new
-table cannot opt out of these checks by forgetting them, and a slice that adds
-a table now writes only what is *specific* to it.
+subclass anywhere in `command_center/db/` is enrolled automatically — by what
+the class is, not by what its file is called. A new table cannot opt out of
+these checks by forgetting them, and a slice that adds a table now writes only
+what is *specific* to it.
 
 Two things make that possible and both live in the declaration:
 `MirroredTable.columns` says what the row is, and `MirroredTable.references`
@@ -24,9 +25,7 @@ the real writer, and anything a table does that the others do not.
 
 from __future__ import annotations
 
-import importlib
 import json
-import pkgutil
 import re
 from pathlib import Path
 
@@ -37,6 +36,8 @@ from command_center.db.table_mirror import MirroredTable, PostgresTableMirror
 from command_center.db.table_mirror import divergence_against
 from command_center.runtime.db import core as runtime_core
 
+from tests.db.mirror_discovery import mirror_classes
+
 ROOT = Path(__file__).resolve().parents[2]
 DDL = (ROOT / "command_center/db/sql/0001_initial.up.sql").read_text(encoding="utf-8")
 
@@ -45,22 +46,17 @@ SAMPLE_TIMESTAMP = "2026-08-14T00:00:00"
 
 
 def _discover() -> list[tuple[str, type[PostgresTableMirror]]]:
-    """Every declared mirror, found rather than listed."""
-    import command_center.db as db_package
+    """Every declared mirror, found rather than listed.
 
-    found: dict[str, type[PostgresTableMirror]] = {}
-    for module_info in pkgutil.iter_modules(db_package.__path__):
-        if not module_info.name.endswith("_store"):
-            continue
-        module = importlib.import_module(f"command_center.db.{module_info.name}")
-        for attribute in vars(module).values():
-            if (
-                isinstance(attribute, type)
-                and issubclass(attribute, PostgresTableMirror)
-                and attribute is not PostgresTableMirror
-            ):
-                found[attribute.spec.table] = attribute
-    return sorted(found.items())
+    Membership is decided by what a class *is*, not by what its file is called
+    — see `mirror_discovery`, which both this suite and the stored-reader
+    fitness gate now share. The earlier rule read `command_center/db/*_store.py`
+    in each of them, and slice 9's acceptance used it to relocate the very
+    defect that slice had just fixed: a mirror declared elsewhere in the package
+    with a deliberately wrong key was collected by nothing and passed
+    everything.
+    """
+    return [(table, mirror) for table, (mirror, _module) in mirror_classes().items()]
 
 
 MIRRORS = _discover()
@@ -181,6 +177,27 @@ def test_the_declared_key_is_the_tables_primary_key(table: str, mirror) -> None:
         f"{table}: declared key {mirror.spec.key!r}, schema says {declared}. "
         "A wrong key means `ON CONFLICT` names a constraint the table lacks, and the "
         "dual-write hook swallows the raise — the mirror stays empty and silent."
+    )
+
+
+@pytest.mark.parametrize(("table", "mirror"), MIRRORS, ids=IDS)
+def test_the_declared_identity_matches_the_schema(table: str, mirror) -> None:
+    """The third declaration field, checked like the other two.
+
+    `identity` decides whether the statement carries `OVERRIDING SYSTEM VALUE`,
+    which is what lets a mirror keep the authority's own id — the only id that
+    makes a row identifiable on both sides. A wrong value fails loudly against
+    a real PostgreSQL, so slice 9's acceptance called this non-blocking; it also
+    observed that `identity` was the one declaration field with no check in the
+    half that needs no server, which is the half that runs everywhere and the
+    one where slice 9's blocking defect survived.
+    """
+    body = DDL.split(f"CREATE TABLE {table} (", 1)[1].split(");", 1)[0]
+    declared = "GENERATED ALWAYS AS IDENTITY" in body
+    assert mirror.spec.identity == declared, (
+        f"{table}: declared identity={mirror.spec.identity}, schema says {declared}. "
+        "Without `OVERRIDING SYSTEM VALUE` PostgreSQL refuses the authority's own id; "
+        "with it on a table that has none, the statement is invalid."
     )
 
 
