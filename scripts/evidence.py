@@ -18,9 +18,15 @@ found before a reviewer finds it:
     uv run python scripts/evidence.py check --message-from-head tests/db
     -> claims 527 passed / 40 skipped, measured 609 passed / 44 skipped  [MISMATCH]
 
-`check` exits non-zero on a mismatch, so it can gate a push. It deliberately
-does **not** rewrite the message: a wrong number is often the visible end of a
-wrong belief, and silently correcting it would hide the part worth reading.
+`check` exits non-zero on a mismatch, so it can gate a push — and it fails
+**closed**: a red suite, or a message whose claim it cannot parse, is also a
+non-zero exit. The first version returned 0 in both cases, which independent
+acceptance demonstrated in three shapes; a gate that passes when it cannot tell
+is not a gate, and it is the exact defect class this tool was written to end.
+
+It deliberately does **not** rewrite the message: a wrong number is often the
+visible end of a wrong belief, and silently correcting it would hide the part
+worth reading.
 
 Deliberately not a pytest plugin and not part of the required suite. This
 measures what a *claim* says against what a run says; a suite that measured its
@@ -42,9 +48,16 @@ ROOT = Path(__file__).resolve().parents[1]
 #: summary line, whatever order it puts the terms in.
 _SUMMARY = re.compile(r"(?P<count>\d+) (?P<outcome>passed|failed|skipped|errors?|xfailed)")
 
-#: How an evidence sentence in this repository states a measurement. Matches
-#: "609 passed / 44 skipped" and "609 passed, 44 skipped" alike.
-_CLAIM = re.compile(r"(?P<passed>\d+)\s+passed\s*[/,]\s*(?P<skipped>\d+)\s+skipped")
+#: How an evidence sentence in this repository states a measurement. Anchored
+#: to the `Evidence:` line rather than matching anywhere in the text: a message
+#: that *discusses* counts — a fenced example, a quoted failure, a correction
+#: describing what a number used to be — would otherwise be compared against
+#: one measured suite and report mismatches that are not claims at all. A gate
+#: that always fires is a gate people learn to skip.
+_CLAIM = re.compile(
+    r"^Evidence:[^\n]*?(?P<passed>\d+)\s+passed\s*[/,]\s*(?P<skipped>\d+)\s+skipped",
+    re.MULTILINE,
+)
 
 
 def _run_pytest(paths: list[str], extra: list[str]) -> dict[str, int]:
@@ -123,17 +136,31 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     counts = _run_pytest(args.paths, [])
-    line = _evidence_line(args.paths, counts, _ruff())
+    ruff_clean = _ruff()
+    line = _evidence_line(args.paths, counts, ruff_clean)
+    # A failing suite or a dirty `ruff` is a non-zero exit whatever the claim
+    # says. The first version compared only the numbers, so a red suite whose
+    # `passed`/`skipped` happened to match its claim exited 0 and reported
+    # `[ok]` — the tool agreeing with a sentence while the thing it describes
+    # was on fire.
+    healthy = counts["_returncode"] == 0 and ruff_clean
 
     if args.command == "measure":
         print(line)
-        return 0
+        return 0 if healthy else 1
 
-    message = _head_message() if args.message_from_head else args.message_file.read_text()
+    message = (
+        _head_message()
+        if args.message_from_head
+        else args.message_file.read_text(encoding="utf-8")
+    )
     claims = list(_CLAIM.finditer(message))
     if not claims:
-        print(f"no `N passed / M skipped` claim found in the message\n{line}")
-        return 0
+        # Non-zero, because "I could not find the claim" is not "the claim is
+        # right". A message with no `Evidence:` line has nothing for a reviewer
+        # to check either, which is itself worth stopping for.
+        print(f"no `Evidence: ... N passed / M skipped` line found in the message\n{line}")
+        return 1
 
     mismatched = False
     for claim in claims:
@@ -146,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             f"measured {measured[0]} passed / {measured[1]} skipped  [{verdict}]"
         )
     print(line)
-    return 1 if mismatched else 0
+    return 1 if (mismatched or not healthy) else 0
 
 
 if __name__ == "__main__":

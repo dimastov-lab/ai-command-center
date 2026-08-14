@@ -352,7 +352,26 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         print(f"{args.module}: no `_mirror...(` call sites found")
         return 1
 
-    print(f"{args.module}: {len(sites)} hook call sites, suite {args.suite}")
+    # A green baseline first, and the sweep refuses to run without one.
+    # Without it `caught = returncode != 0` cannot tell "the perturbation was
+    # noticed" from "the suite was already red", so a broken suite reports
+    # every hook as covered — independent acceptance produced `4/4 caught`
+    # from a suite that touches none of this code. A probe that cannot fail is
+    # the defect this whole file exists to find, in the file itself.
+    baseline = subprocess.run(
+        ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", args.suite, "-q"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if baseline.returncode != 0:
+        tail = [line for line in baseline.stdout.splitlines() if line.startswith("FAILED")]
+        print(f"{args.suite} is already failing — a sweep against a red suite proves nothing:")
+        for line in tail[:5]:
+            print(f"  {line[:140]}")
+        return 1
+
+    print(f"{args.module}: {len(sites)} hook call sites, suite {args.suite} (baseline green)")
     unnoticed: list[str] = []
     try:
         for number, line in sites:
