@@ -146,6 +146,7 @@ from command_center.runtime.db.completion import (  # noqa: F401
     get_completion_by_task,
     get_completions_for_runs,
     list_completion_events,
+    list_completion_events_stored,
     list_completions,
     list_validation_results,
     record_validation_result,
