@@ -52,13 +52,22 @@ class MirroredTable:
     codec: ColumnCodec = field(default_factory=ColumnCodec)
     #: True when the primary key is `GENERATED ALWAYS AS IDENTITY`.
     identity: bool = False
-    #: The column the primary key is on. Not always `id`:
-    #: `council_decision` is keyed by `motion_id` and carries an `id` column
-    #: that is *not* unique, so `ON CONFLICT (id)` would name a constraint the
-    #: table does not have. Found by reading the schema before writing the
-    #: mirror rather than by watching the insert fail — and it would have failed
-    #: silently, since the dual-write hook swallows.
-    key: str = "id"
+    #: The primary key: one column, or several.
+    #:
+    #: Not always `id` — `council_decision` is keyed by `motion_id` and carries
+    #: an `id` column that is *not* unique, so `ON CONFLICT (id)` would name a
+    #: constraint the table does not have. And not always one column:
+    #: `provider_attempt` is keyed by `(run_id, attempt_number)`, which is the
+    #: last shape in this schema the machinery had not met. Both were found by
+    #: reading the DDL before writing the mirror, because both fail the same
+    #: silent way — the statement raises, the dual-write hook swallows it, and
+    #: the table simply never mirrors.
+    key: str | tuple[str, ...] = "id"
+
+    @property
+    def key_columns(self) -> tuple[str, ...]:
+        """The key as a tuple, whatever it was declared as."""
+        return (self.key,) if isinstance(self.key, str) else tuple(self.key)
     #: Tables this one references, as `{column: parent table}`.
     #:
     #: Declared rather than inferred, and it earns its place twice. It records
@@ -141,8 +150,9 @@ class PostgresTableMirror:
         placeholders = ", ".join(
             "%s::jsonb" if name in spec.codec.json_values else "%s" for name in spec.columns
         )
+        keys = spec.key_columns
         assignments = ", ".join(
-            f"{name} = EXCLUDED.{name}" for name in spec.columns if name != spec.key
+            f"{name} = EXCLUDED.{name}" for name in spec.columns if name not in keys
         )
         overriding = "OVERRIDING SYSTEM VALUE " if spec.identity else ""
         with self._connection() as conn:
@@ -150,7 +160,7 @@ class PostgresTableMirror:
                 cur.execute(
                     f"INSERT INTO {spec.table} ({', '.join(spec.columns)}) "
                     f"{overriding}VALUES ({placeholders}) "
-                    f"ON CONFLICT ({spec.key}) DO UPDATE SET {assignments}",
+                    f"ON CONFLICT ({', '.join(keys)}) DO UPDATE SET {assignments}",
                     values,
                 )
 
@@ -217,7 +227,8 @@ class PostgresTableMirror:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT {', '.join(spec.columns)} FROM {spec.table} ORDER BY {spec.key}"
+                    f"SELECT {', '.join(spec.columns)} FROM {spec.table} "
+                    f"ORDER BY {', '.join(spec.key_columns)}"
                 )
                 rows = cur.fetchall()
         return [
@@ -248,7 +259,7 @@ def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
 
     def divergence(authority_rows: Iterable[dict], mirror: Any) -> list[dict]:
         return mirror_support.divergence(
-            authority_rows, mirror, spec.columns, spec.codec, key=spec.key
+            authority_rows, mirror, spec.columns, spec.codec, key=spec.key_columns
         )
 
     divergence.__name__ = f"{spec.table}_divergence"

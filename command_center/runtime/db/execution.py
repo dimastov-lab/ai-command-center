@@ -414,8 +414,79 @@ def create_run(
                         now,
                     ),
                 )
+            # Read both children back inside the transaction, for the same
+            # reason `stored_run` is read back: the row is what the mirror
+            # needs, and assembling it from the arguments would make the
+            # mirror's correctness a property of this function's parameter
+            # list rather than of the table.
+            #
+            # Guarded by the same `sqlite_master` results as the inserts above,
+            # and for the same reason. On a database migrated only part-way —
+            # what the historical-schema tests build — these tables do not
+            # exist, and an unguarded `SELECT` raises *inside* the
+            # authoritative transaction: the run itself is lost to a read the
+            # mirror asked for, in the one place the swallow-everything hook
+            # cannot help, because the raise happens before any hook is
+            # reached. The guards above exist precisely to keep `create_run`
+            # working against such a schema; the read-back has to honour them.
+            stored_provenance = (
+                conn.execute(
+                    "SELECT * FROM run_provenance WHERE run_id = ?", (record["id"],)
+                ).fetchone()
+                if provenance_table is not None
+                else None
+            )
+            stored_route = (
+                conn.execute(
+                    "SELECT * FROM run_provider_route WHERE run_id = ?", (record["id"],)
+                ).fetchone()
+                if provider_route_table is not None
+                else None
+            )
+    # Parent first: the target refuses a child whose run is not mirrored.
     _mirror_run(stored_run)
+    if stored_provenance is not None:
+        _mirror_run_provenance(dict(stored_provenance))
+    if stored_route is not None:
+        _mirror_run_provider_route(dict(stored_route))
     return record
+
+
+def _mirror_run_provenance(record: dict) -> None:
+    """Best-effort dual-write of one `run_provenance` row (SRV-01B slice 13).
+
+    This hook exists because acceptance found the table had four write sites
+    and only two hooks. `update_run_provenance` and `set_run_provenance_once`
+    were mirrored; the row's *creation*, here in `create_run`, was not — and
+    the family's own suite could not see it, because its first reconciliation
+    ran after an update whose whole-row upsert repaired the missing row before
+    anything looked at it. A staged check is only as good as its first stage.
+    """
+    try:
+        from command_center.db.provenance_store import PostgresRunProvenanceMirror
+
+        PostgresRunProvenanceMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror run_provenance into PostgreSQL", exc_info=True)
+
+
+def _mirror_run_provider_route(record: dict) -> None:
+    """Best-effort dual-write of one `run_provider_route` row (SRV-01B slice 13).
+
+    Slice 13 declared this mirror, gave it a reconciliation and later a
+    stored-shape reader, and never called it from anywhere: the table's only
+    writer is `create_run`, which mirrored the run and neither child. A mirror
+    nothing writes to is indistinguishable from one that does not exist — the
+    slice's own words, landing on one of the four tables it shipped. The
+    contract now asserts every declared mirror has a caller, so the next such
+    declaration says so at import time rather than at cutover.
+    """
+    try:
+        from command_center.db.provenance_store import PostgresRunProviderRouteMirror
+
+        PostgresRunProviderRouteMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror run_provider_route into PostgreSQL", exc_info=True)
 
 
 def _mirror_run(record: dict) -> None:

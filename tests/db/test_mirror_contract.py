@@ -25,6 +25,7 @@ the real writer, and anything a table does that the others do not.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -152,18 +153,20 @@ def test_the_mirror_satisfies_the_row_oriented_contract(table: str, mirror) -> N
 def test_the_declared_key_is_the_tables_primary_key(table: str, mirror) -> None:
     """The declaration must name the key the database actually has.
 
-    `council_decision` is why: it is keyed by `motion_id` and carries an `id`
-    column that is *not* unique, so a mirror left on the `id` default emits
-    `ON CONFLICT (id)` — a constraint the table does not have. PostgreSQL
-    raises `InvalidColumnReference`, the dual-write hook swallows it, and the
-    table simply never mirrors. Nothing else in this suite notices: independent
-    review flipped `key="motion_id"` back to `"id"` and the whole `tests/db`
-    run stayed green without a database, because every check that would have
-    failed needs one, and none of the ones that do fail says *declaration*.
+    `council_decision` is why the check exists: it is keyed by `motion_id` and
+    carries an `id` column that is *not* unique, so a mirror left on the `id`
+    default emits `ON CONFLICT (id)` — a constraint the table does not have.
+    PostgreSQL raises `InvalidColumnReference`, the dual-write hook swallows it,
+    and the table simply never mirrors. Nothing else in the suite notices:
+    slice 9's acceptance flipped that declaration back to `"id"` and the whole
+    `tests/db` run stayed green without a database, because every check that
+    would have failed needs one and none of those says *declaration*.
 
-    So the check is here, in the half that needs no PostgreSQL, and it is the
-    reason this module can claim the declaration is verified rather than
-    trusted.
+    Two more tables have since surprised this migration the same way — `report`
+    is keyed by `run_id`, and `provider_attempt` by `(run_id, attempt_number)`,
+    the first composite key in the schema. Hence `key_columns` rather than a
+    single name: the check compares whatever was declared against whatever the
+    DDL declares, in either shape.
     """
     body = DDL.split(f"CREATE TABLE {table} (", 1)[1].split(");", 1)[0]
     composite = re.search(r"^\s*PRIMARY KEY \(([^)]+)\)", body, re.MULTILINE)
@@ -173,7 +176,7 @@ def test_the_declared_key_is_the_tables_primary_key(table: str, mirror) -> None:
         inline = re.search(r"^\s*(\w+)\s+.*PRIMARY KEY", body, re.MULTILINE)
         assert inline, f"{table}: no primary key found in the accepted schema"
         declared = (inline.group(1),)
-    assert (mirror.spec.key,) == declared, (
+    assert mirror.spec.key_columns == declared, (
         f"{table}: declared key {mirror.spec.key!r}, schema says {declared}. "
         "A wrong key means `ON CONFLICT` names a constraint the table lacks, and the "
         "dual-write hook swallows the raise — the mirror stays empty and silent."
@@ -198,6 +201,72 @@ def test_the_declared_identity_matches_the_schema(table: str, mirror) -> None:
         f"{table}: declared identity={mirror.spec.identity}, schema says {declared}. "
         "Without `OVERRIDING SYSTEM VALUE` PostgreSQL refuses the authority's own id; "
         "with it on a table that has none, the statement is invalid."
+    )
+
+
+@pytest.mark.parametrize(("table", "mirror"), MIRRORS, ids=IDS)
+def test_every_declared_mirror_has_a_caller(table: str, mirror) -> None:
+    """A mirror nothing writes to is indistinguishable from one that does not exist.
+
+    Slice 13 declared `PostgresRunProviderRouteMirror`, gave it a
+    reconciliation and a stored-shape reader, and never called it: the table's
+    only writer is `create_run`, which mirrored the run and neither child.
+    Every other check in this file passed, because every other check asks
+    whether the mirror is *correct*, and a mirror with no caller is perfectly
+    correct about nothing.
+
+    The perturbation sweep could not find it either — it works by removing
+    hooks and seeing what fails, and there was no hook to remove. That is the
+    shape of the gap: the sweep asks the question of hooks that exist, this
+    asks it of tables that are declared.
+
+    Deliberately a source scan rather than a runtime check. The dual-write is
+    swallowed and lazily imported, so "was it called" has no runtime witness
+    short of running every authority path with a recording mirror in place.
+    """
+    authority = ROOT / "command_center/runtime/db"
+    trees = {
+        path: ast.parse(path.read_text(encoding="utf-8"))
+        for path in sorted(authority.glob("*.py"))
+    }
+
+    # Functions that name this mirror class — the hooks. Naming it is not
+    # enough: the first version of this check looked only for the name, and
+    # removing the *call* while leaving the hook definition kept it green,
+    # which is a weaker guarantee than its own docstring claimed.
+    hooks: set[str] = set()
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and mirror.__name__ in ast.dump(node):
+                hooks.add(node.name)
+
+    called: set[str] = set()
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                called.add(node.func.id)
+
+    assert hooks, (
+        f"{table}: {mirror.__name__} is declared but named nowhere in "
+        "command_center/runtime/db — nothing writes to this mirror, so it will be "
+        "empty at cutover and reconciliation will report every row missing."
+    )
+    # Reachable means called inside the package *or* re-exported by its facade.
+    # Requiring an internal call was wrong and the suite said so: three of the
+    # writers that mirror — `start_provider_attempt`, `finish_provider_attempt`,
+    # `create_provenance_evidence` — are public entry points called from the
+    # services above this layer, not internal hooks. A rule that fails them
+    # would be trained out of the suite within a slice.
+    exported = {
+        alias.name
+        for node in ast.walk(ast.parse((authority / "__init__.py").read_text(encoding="utf-8")))
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert hooks & (called | exported), (
+        f"{table}: {mirror.__name__} is named only inside {sorted(hooks)}, and none of "
+        "those is called inside command_center/runtime/db or re-exported by its facade. "
+        "A hook nobody reaches mirrors nothing, and the failure is silent by design."
     )
 
 
