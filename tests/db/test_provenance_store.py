@@ -284,3 +284,43 @@ def test_a_schema_without_the_provenance_tables_still_creates_runs(
     run = _launch(db_path, provider_id="claude", provider_route=["claude"])
 
     assert exec_db.get_run(db_path, run["id"])["prompt"] == "p"
+
+
+def test_the_backfill_mirrors_the_rows_it_creates(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """`backfill_run_provenance` is a write path, so it is a mirror path.
+
+    It exists because acceptance deleted the mirroring loop from it and no
+    test noticed — the half of a fix that is green by absence. The function is
+    not obscure: `migrate()` calls it on every upgrade past schema 13, so a
+    database that gains provenance rows this way would hand the mirror a
+    permanent deficit that only reconciliation would ever report.
+
+    Driven through the real writer rather than a hand-built row, and the
+    premise is asserted before the claim: a run whose provenance row was
+    deleted is genuinely absent from both sides first, so the reconciliation
+    below cannot pass by comparing nothing with nothing.
+    """
+    _patch(monkeypatch, pg_connection_factory)
+    provenance = PostgresRunProvenanceMirror(connection_factory=pg_connection_factory)
+
+    db_path = tmp_path / "runtime.db"
+    exec_db.db.migrate(db_path)
+    run = _launch(db_path)
+
+    # Remove the row `create_run` wrote, on both sides, so the backfill has
+    # something to do and the mirror has nothing to hide behind.
+    with exec_db.db.connect(db_path) as conn:
+        with exec_db.db.transaction(conn):
+            conn.execute("DELETE FROM run_provenance WHERE run_id = ?", (run["id"],))
+    provenance.delete_where("run_id", run["id"])
+    assert prov_db.get_run_provenance(db_path, run["id"]) is None
+    assert provenance.list_records() == []
+
+    inserted = prov_db.backfill_run_provenance(db_path)
+
+    assert inserted == 1, "the backfill had nothing to do, so this proves nothing"
+    stored = prov_db.get_run_provenance(db_path, run["id"])
+    assert stored is not None
+    assert run_provenance_divergence([stored], provenance) == []

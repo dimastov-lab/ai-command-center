@@ -223,50 +223,108 @@ def test_every_declared_mirror_has_a_caller(table: str, mirror) -> None:
     Deliberately a source scan rather than a runtime check. The dual-write is
     swallowed and lazily imported, so "was it called" has no runtime witness
     short of running every authority path with a recording mirror in place.
+
+    **What it does not catch, stated because acceptance built it:** a call site
+    that exists but can never run — `if stored_route is not None and False:`.
+    A source scan sees a call and cannot see reachability, and no amount of
+    tightening changes that. What catches it is the family's staged
+    reconciliation, which drives the real writer and finds the row missing on
+    the target; measured, that perturbation fails
+    `test_the_provenance_family_reconciles_after_every_write` at stage zero.
+    The two checks are complementary, and this docstring says so rather than
+    letting the reader assume this one covers the case.
     """
-    authority = ROOT / "command_center/runtime/db"
-    trees = {
-        path: ast.parse(path.read_text(encoding="utf-8"))
-        for path in sorted(authority.glob("*.py"))
-    }
+    package = ROOT / "command_center"
+    authority = package / "runtime/db"
 
-    # Functions that name this mirror class — the hooks. Naming it is not
-    # enough: the first version of this check looked only for the name, and
-    # removing the *call* while leaving the hook definition kept it green,
-    # which is a weaker guarantee than its own docstring claimed.
+    def _docstring_nodes(tree: ast.AST) -> set[int]:
+        """Every node that *is* a docstring, by identity.
+
+        Excluding docstrings by hand rather than by node shape: the class name
+        legitimately appears as a plain string in code — the three families
+        mirror through one helper that takes it as an argument, and in
+        `create_proposal_atomic` that string sits inside a tuple inside a
+        `list.append(...)`. An earlier version looked only at a call's direct
+        arguments and therefore reported `proposal_evidence` as unwritten,
+        which it is not. The question is "does the code name it", and the only
+        strings that do not count are the ones the parser marks as docstrings.
+        """
+        marked: set[int] = set()
+        for holder in ast.walk(tree):
+            if not isinstance(
+                holder, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                continue
+            body = getattr(holder, "body", None)
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                marked.add(id(body[0].value))
+        return marked
+
+    def names_the_mirror(node: ast.AST, docstrings: set[int]) -> bool:
+        """True when the *code* names the class — docstrings do not count.
+
+        The first version asked `mirror.__name__ in ast.dump(node)`, and
+        `ast.dump` renders string constants, so a hook whose body was `return
+        None` and whose docstring mentioned the class passed. Acceptance proved
+        it on the very table the check exists for.
+        """
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and child.id == mirror.__name__:
+                return True
+            if isinstance(child, ast.Attribute) and child.attr == mirror.__name__:
+                return True
+            if isinstance(child, ast.alias) and child.name == mirror.__name__:
+                return True
+            if (
+                isinstance(child, ast.Constant)
+                and child.value == mirror.__name__
+                and id(child) not in docstrings
+            ):
+                return True
+        return False
+
     hooks: set[str] = set()
-    for tree in trees.values():
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and mirror.__name__ in ast.dump(node):
-                hooks.add(node.name)
-
-    called: set[str] = set()
-    for tree in trees.values():
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                called.add(node.func.id)
-
+    for path in sorted(authority.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = _docstring_nodes(tree)
+        hooks |= {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and names_the_mirror(node, docstrings)
+        }
     assert hooks, (
-        f"{table}: {mirror.__name__} is declared but named nowhere in "
+        f"{table}: {mirror.__name__} is named by no code in "
         "command_center/runtime/db — nothing writes to this mirror, so it will be "
         "empty at cutover and reconciliation will report every row missing."
     )
-    # Reachable means called inside the package *or* re-exported by its facade.
-    # Requiring an internal call was wrong and the suite said so: three of the
-    # writers that mirror — `start_provider_attempt`, `finish_provider_attempt`,
-    # `create_provenance_evidence` — are public entry points called from the
-    # services above this layer, not internal hooks. A rule that fails them
-    # would be trained out of the suite within a slice.
-    exported = {
-        alias.name
-        for node in ast.walk(ast.parse((authority / "__init__.py").read_text(encoding="utf-8")))
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
-    }
-    assert hooks & (called | exported), (
+
+    # Reachable means *called*, anywhere under `command_center/`. Two earlier
+    # rules were both wrong in opposite directions: requiring a call inside
+    # `runtime/db` failed three legitimate public writers
+    # (`start_provider_attempt`, `finish_provider_attempt`,
+    # `create_provenance_evidence`) that the services above this layer call;
+    # accepting any name re-exported by the facade passed a hook with no
+    # callers at all, because the facade re-exports 252 names. Searching the
+    # whole application for a call site covers the public writers without the
+    # escape hatch.
+    called: set[str] = set()
+    for path in sorted(package.rglob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    called.add(node.func.id)
+                elif isinstance(node.func, ast.Attribute):
+                    called.add(node.func.attr)
+
+    assert hooks & called, (
         f"{table}: {mirror.__name__} is named only inside {sorted(hooks)}, and none of "
-        "those is called inside command_center/runtime/db or re-exported by its facade. "
-        "A hook nobody reaches mirrors nothing, and the failure is silent by design."
+        "those is called anywhere in command_center/. A hook nobody calls mirrors "
+        "nothing, and the failure is silent by design."
     )
 
 
