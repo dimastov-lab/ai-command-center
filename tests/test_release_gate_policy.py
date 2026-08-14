@@ -82,8 +82,38 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
     assert set(boundary["jobs"]) == {"boundary-fitness"}
     assert {job_id: job["name"] for job_id, job in jobs.items()} == EXPECTED_CONTEXTS
 
+    # The exact trigger set, and it is a security statement rather than
+    # bookkeeping: every entry here is a context in which these gates run with
+    # the repository's own token, so a trigger added without review is a new
+    # way to reach that token. This test caught `merge_group` being added and
+    # made the addition deliberate, which is the whole point of pinning it.
+    #
+    # `merge_group` is admitted because the merge queue is where the required
+    # gates must run once the queue is enabled: a workflow that does not
+    # subscribe to it never reports there and every queue entry times out.
+    #
+    # **What is NOT true, and was written here before independent acceptance
+    # corrected it: that the queue "never runs a fork's code".** The queue ref
+    # (`gh-readonly-queue/<base>`) is created in this repository, but it
+    # carries the pull request's own commits — a fork's commits included. And
+    # because the event is a base-repository event rather than a
+    # fork-originated one, **secrets are passed**, where the `pull_request`
+    # path gives a fork an empty secret and a read-only token.
+    #
+    # That matters concretely here: `ci.yml` runs
+    # `scripts/fetch_aios_sdk_artifact.py` — a script from the checked-out
+    # tree — with `AIOS_ARTIFACT_READ_TOKEN` in its environment. Enabling the
+    # queue therefore makes that credential reachable from code a fork
+    # authored, which is a decision about fork policy and not a formality.
+    # The trigger is added here; the queue stays off until that decision is
+    # made and recorded (`VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`).
     for workflow in (ci, boundary):
-        assert set(workflow["on"]) == {"pull_request", "push", "workflow_dispatch"}
+        assert set(workflow["on"]) == {
+            "pull_request",
+            "merge_group",
+            "push",
+            "workflow_dispatch",
+        }
         assert set(workflow["on"]["pull_request"]["types"]) == {
             "opened",
             "synchronize",

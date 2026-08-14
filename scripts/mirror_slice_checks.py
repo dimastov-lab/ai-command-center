@@ -34,6 +34,8 @@ import importlib
 import json
 import os
 import pkgutil
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -312,6 +314,101 @@ def cmd_counts(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# --- perturbation sweep --------------------------------------------------------
+
+
+def _pytest_command(suite: str) -> list[str]:
+    """`uv` when it is there, this interpreter when it is not — see
+    `scripts/evidence.py` for why the hard-coded form was a defect."""
+    if shutil.which("uv"):
+        return ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", suite, "-q"]
+    return [sys.executable, "-m", "pytest", suite, "-q"]
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Drop one mirror hook at a time and ask whether anything notices.
+
+    This is the check that found what no suite had: three slices in a row
+    shipped mirrors and dual-write hooks with **no test that ran a hook**, and
+    the sweep measured it rather than suspecting it — 0 of 5, 0 of 4 and 0 of
+    11 hooks noticed. It also found a mirror written by nothing at all, which
+    the sweep alone cannot see (there is no hook to remove) and which the
+    contract now checks separately.
+
+    The question is asked of the whole suite, not of the slice's own test file.
+    The first version asked the narrower question and reported a hook as
+    uncovered when the covering test simply lived in another family's module —
+    a false alarm sends the writer hunting a defect that is not there, which
+    costs as much as missing one.
+
+    A call site that cannot be commented out on a single line is reported as
+    NOT PERTURBED rather than skipped. An unmeasured site must not read as a
+    measured one.
+    """
+    target = Path(args.module)
+    if not target.is_absolute():
+        target = ROOT / target
+    original = target.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+
+    sites = [
+        (number, line)
+        for number, line in enumerate(lines, start=1)
+        if re.match(r"^\s*_mirror\w*\(", line)
+    ]
+    if not sites:
+        print(f"{args.module}: no `_mirror...(` call sites found")
+        return 1
+
+    # A green baseline first, and the sweep refuses to run without one.
+    # Without it `caught = returncode != 0` cannot tell "the perturbation was
+    # noticed" from "the suite was already red", so a broken suite reports
+    # every hook as covered — independent acceptance produced `4/4 caught`
+    # from a suite that touches none of this code. A probe that cannot fail is
+    # the defect this whole file exists to find, in the file itself.
+    baseline = subprocess.run(
+        _pytest_command(args.suite), cwd=ROOT, capture_output=True, text=True
+    )
+    if baseline.returncode != 0:
+        tail = [line for line in baseline.stdout.splitlines() if line.startswith("FAILED")]
+        print(f"{args.suite} is already failing — a sweep against a red suite proves nothing:")
+        for line in tail[:5]:
+            print(f"  {line[:140]}")
+        return 1
+
+    print(f"{args.module}: {len(sites)} hook call sites, suite {args.suite} (baseline green)")
+    unnoticed: list[str] = []
+    try:
+        for number, line in sites:
+            if not line.rstrip().endswith(")"):
+                print(f"  {number:>5}  NOT PERTURBED (multi-line call): {line.strip()}")
+                continue
+            patched = list(lines)
+            indent = len(line) - len(line.lstrip())
+            patched[number - 1] = " " * indent + "pass  # perturbed by the sweep\n"
+            target.write_text("".join(patched), encoding="utf-8")
+            result = subprocess.run(
+                _pytest_command(args.suite), cwd=ROOT, capture_output=True, text=True
+            )
+            caught = result.returncode != 0
+            named = [entry for entry in result.stdout.splitlines() if entry.startswith("FAILED")]
+            print(f"  {number:>5}  {'caught' if caught else 'UNNOTICED'}: {line.strip()}")
+            if caught and named:
+                print(f"         {named[0][:140]}")
+            if not caught:
+                unnoticed.append(f"{args.module}:{number} {line.strip()}")
+    finally:
+        # Restored even on Ctrl-C: a probe that can leave the tree perturbed is
+        # a probe that will one day be blamed for a real failure.
+        target.write_text(original, encoding="utf-8")
+
+    print(f"{len(sites) - len(unnoticed)}/{len(sites)} caught")
+    for entry in unnoticed:
+        print(f"  UNNOTICED {entry}")
+    return 1 if unnoticed else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -325,6 +422,11 @@ def main() -> int:
     counts = sub.add_parser("counts", help="PG-backed vs serverless test split")
     counts.add_argument("paths", nargs="+")
     counts.set_defaults(func=cmd_counts)
+
+    sweep = sub.add_parser("sweep", help="drop each mirror hook and see what notices")
+    sweep.add_argument("module", help="authority module, e.g. command_center/runtime/db/proposal.py")
+    sweep.add_argument("--suite", default="tests/db", help="suite to re-run per perturbation")
+    sweep.set_defaults(func=cmd_sweep)
 
     args = parser.parse_args()
     return args.func(args)
