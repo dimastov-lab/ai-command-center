@@ -58,6 +58,11 @@ from command_center.runtime.api import ExecutionCenterAPI  # noqa: E402
 
 _POLL_INTERVAL_SECONDS = 0.2
 _DEFAULT_CANCEL_GRACE_SECONDS = 10.0
+# Diagnostic ceiling for the post-terminal finalization wait (see
+# `_await_finalization`). Generous relative to the work it covers — an event
+# append, `git commit`, and one report write — so that hitting it means
+# "finalization is wedged", never "finalization was merely slow".
+_FINALIZATION_TIMEOUT_SECONDS = 60.0
 
 _EXIT_CODE_BY_STATE = {
     "COMPLETED": 0,
@@ -76,11 +81,44 @@ def _print_event(event: dict) -> None:
     print(f"[{event['seq']:>5}] {event['event_type']}: {json.dumps(event['payload'], ensure_ascii=False)[:300]}")
 
 
+def _await_finalization(api: ExecutionCenterAPI, run_id: str) -> dict:
+    """A terminal `state` on the run row is *necessary but not sufficient* for
+    this CLI to exit.
+
+    `Supervisor._supervise` commits the terminal row first and only afterwards
+    appends the `process_exited` lifecycle event, auto-commits the agent's work
+    and persists the run report — all on a **daemon** thread. Interpreter
+    shutdown does not join daemon threads, so returning the moment the row
+    turns terminal truncates finalization whenever the poll tick lands inside
+    that window (measured at ~2.5 ms median, 41 ms max, against a 200 ms poll
+    interval: roughly one run in a hundred). The visible symptom is a
+    COMPLETED run with no `process_exited` event, no auto-commit and no report.
+
+    So wait on the supervisor's own finalization signal instead — the same
+    `done_event` that `Supervisor.cancel()` already waits on before returning,
+    which is why the Ctrl+C path never had this defect."""
+    started = time.monotonic()
+    final = api.supervisor.wait_for_run(run_id, timeout=_FINALIZATION_TIMEOUT_SECONDS)
+    waited = time.monotonic() - started
+    if waited >= _FINALIZATION_TIMEOUT_SECONDS:
+        # Diagnostic, not a retry: say loudly which guarantee was lost rather
+        # than exiting as if the run had finalized cleanly.
+        print(
+            f"WARNING: run {run_id} reached a terminal state but its supervisor did not "
+            f"finish finalizing within {_FINALIZATION_TIMEOUT_SECONDS:.0f}s — the "
+            "process_exited event, the auto-commit of the agent's work and the run "
+            "report may all be missing.",
+            file=sys.stderr,
+        )
+    return final or api.get_run(run_id)
+
+
 def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
-    """Block until `run` reaches a terminal state, printing new events as
-    they're persisted. Ctrl+C triggers confirmed cancellation and waits for
-    it to finish before this function (and the process) exits — it never
-    just kills this CLI process and abandons the child."""
+    """Block until `run` reaches a terminal state *and its supervisor has
+    finished finalizing it*, printing new events as they're persisted. Ctrl+C
+    triggers confirmed cancellation and waits for it to finish before this
+    function (and the process) exits — it never just kills this CLI process and
+    abandons the child."""
     run_id = run["id"]
     after_seq = 0
 
@@ -91,6 +129,13 @@ def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
                 _print_event(event)
                 after_seq = event["seq"]
             if current["state"] in db.TERMINAL_STATES:
+                current = _await_finalization(api, run_id)
+                # Drain again: `process_exited` (and `auto_committed`) are
+                # appended *after* the terminal row, so the loop above can
+                # never have seen them.
+                for event in api.get_events(run_id, after_seq=after_seq):
+                    _print_event(event)
+                    after_seq = event["seq"]
                 _print(current)
                 return _EXIT_CODE_BY_STATE.get(current["state"], 1)
             time.sleep(_POLL_INTERVAL_SECONDS)
