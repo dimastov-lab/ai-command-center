@@ -258,6 +258,7 @@ from command_center.runtime.db.model_registry import (  # noqa: F401
     get_model_entry,
     list_model_entries,
     list_model_events,
+    list_model_events_stored,
     set_model_status,
     update_download_progress,
 )

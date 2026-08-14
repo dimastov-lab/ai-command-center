@@ -36,11 +36,14 @@ for the other table-family modules.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Allowlists (mirror ``api.models`` Literals; validated at the boundary)
@@ -167,7 +170,7 @@ def create_model_entry(
                 f"INSERT INTO model_entry ({columns}) VALUES ({placeholders})",
                 record,
             )
-            _append_model_event(
+            event = _append_model_event(
                 conn,
                 model_id=record["id"],
                 action="register",
@@ -177,7 +180,40 @@ def create_model_entry(
                 metadata={"kind": kind, "status": status},
                 now=now,
             )
+    # Entry before event, after the commit: the event references the entry, so
+    # mirroring the child first would be refused by the foreign key.
+    _mirror_model_entry(record)
+    _mirror_model_event(event)
     return dict(record)
+
+
+def _mirror_model_entry(record: dict) -> None:
+    """Best-effort dual-write of one model entry into PostgreSQL (SRV-01B slice 6).
+
+    After the authoritative commit and silent on failure, as in slices 2-5.
+    """
+    try:
+        from command_center.db.model_registry_store import PostgresModelEntryMirror
+
+        PostgresModelEntryMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror model_entry into PostgreSQL", exc_info=True)
+
+
+def _mirror_model_event(record: dict) -> None:
+    """Best-effort dual-write of one governance event into PostgreSQL.
+
+    Takes the **stored** record: it carries the id SQLite minted and the raw
+    `metadata_json`, and the decoded row has neither. Mirroring a decoded row
+    would send `id=None` into a column PostgreSQL refuses to take a non-DEFAULT
+    value for, so every event would be lost - silently, since this swallows.
+    """
+    try:
+        from command_center.db.model_registry_store import PostgresModelEventMirror
+
+        PostgresModelEventMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror model_event into PostgreSQL", exc_info=True)
 
 
 def get_model_entry(db_path: Path, model_id: str) -> dict | None:
@@ -279,7 +315,7 @@ def set_model_status(
                 raise db.LostUpdateError(
                     f"model_entry {model_id!r} update affected {cur.rowcount} rows"
                 )
-            _append_model_event(
+            event = _append_model_event(
                 conn,
                 model_id=model_id,
                 action=action,
@@ -289,10 +325,16 @@ def set_model_status(
                 metadata={"from": row["status"], "to": status},
                 now=now,
             )
-            updated = conn.execute(
-                "SELECT * FROM model_entry WHERE id = ?", (model_id,)
-            ).fetchone()
-            return dict(updated)
+            entry = dict(
+                conn.execute(
+                    "SELECT * FROM model_entry WHERE id = ?", (model_id,)
+                ).fetchone()
+            )
+    # Entry first, then its event, and both after the commit: the event's
+    # foreign key would refuse a child whose parent is not mirrored yet.
+    _mirror_model_entry(entry)
+    _mirror_model_event(event)
+    return entry
 
 
 def update_download_progress(
@@ -344,7 +386,7 @@ def update_download_progress(
                 raise db.LostUpdateError(
                     f"model_entry {model_id!r} update affected {cur.rowcount} rows"
                 )
-            _append_model_event(
+            event = _append_model_event(
                 conn,
                 model_id=model_id,
                 action="download-progress",
@@ -354,10 +396,16 @@ def update_download_progress(
                 metadata={"progress": progress},
                 now=now,
             )
-            updated = conn.execute(
-                "SELECT * FROM model_entry WHERE id = ?", (model_id,)
-            ).fetchone()
-            return dict(updated)
+            entry = dict(
+                conn.execute(
+                    "SELECT * FROM model_entry WHERE id = ?", (model_id,)
+                ).fetchone()
+            )
+    # Entry first, then its event, and both after the commit: the event's
+    # foreign key would refuse a child whose parent is not mirrored yet.
+    _mirror_model_entry(entry)
+    _mirror_model_event(event)
+    return entry
 
 
 # --------------------------------------------------------------------------
@@ -404,14 +452,20 @@ def _append_model_event(
         "metadata_json": json.dumps(metadata, ensure_ascii=False) if metadata else None,
         "created_at": now,
     }
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO model_event "
         "(model_id, seq, action, actor, target_ref, provenance, metadata_json, created_at) "
         "VALUES (:model_id, :seq, :action, :actor, :target_ref, :provenance, "
         ":metadata_json, :created_at)",
         record,
     )
-    return _decode_event_row(record)
+    # SQLite mints the id; the mirror needs *this* id, because reconciliation
+    # matches rows by it and PostgreSQL would otherwise generate its own.
+    record["id"] = cur.lastrowid
+    # Returns the **stored** shape, not the decoded one. Callers that owe an
+    # API response decode it themselves; callers that owe the mirror a row need
+    # `metadata_json` and `id`, both of which `_decode_event_row` removes.
+    return record
 
 
 def append_model_event(
@@ -436,7 +490,7 @@ def append_model_event(
             ).fetchone()
             if exists is None:
                 raise KeyError(f"No such model_entry: {model_id!r}")
-            return _append_model_event(
+            event = _append_model_event(
                 conn,
                 model_id=model_id,
                 action=action,
@@ -446,6 +500,8 @@ def append_model_event(
                 metadata=metadata,
                 now=now,
             )
+    _mirror_model_event(event)
+    return _decode_event_row(event)
 
 
 def list_model_events(db_path: Path, model_id: str) -> list[dict]:
@@ -464,10 +520,40 @@ def list_model_events(db_path: Path, model_id: str) -> list[dict]:
 # --------------------------------------------------------------------------
 
 
+def list_model_events_stored(db_path: Path) -> list[dict]:
+    """Every governance event in the shape SQLite **stores**, for reconciliation.
+
+    :func:`list_model_events` returns :func:`_decode_event_row` output, which
+    pops ``metadata_json`` in favour of a decoded ``metadata`` — the right
+    default for callers, and the wrong input for a reconciliation, which
+    compares what the authority stores against what the mirror stores. Fed the
+    decoded rows it would report every event divergent on the JSON column.
+
+    Slice 4 shipped without this for ``digest_item`` and the omission was only
+    found because independent review asked what an operator would actually
+    call. Written here in the same slice as the mirror rather than after a
+    rejection.
+
+    Ordered by ``id`` — the authority's own sequence — so the comparison runs
+    against the same order the mirror returns.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM model_event ORDER BY id ASC").fetchall()
+        return [dict(row) for row in rows]
+
+
 def _decode_event_row(row: dict) -> dict:
     """Return a copy of a ``model_event`` row with ``metadata_json`` decoded to a
-    ``metadata`` dict (the JSON column stays internal to the repository)."""
+    ``metadata`` dict (the JSON column stays internal to the repository).
+
+    ``id`` is dropped for the same reason: the log is addressed publicly by
+    ``(model_id, seq)``, and the row id is a storage detail. It became visible
+    here when :func:`_append_model_event` started carrying SQLite's minted id
+    for the mirror (SRV-01B slice 6); dropping it keeps this view exactly what
+    it was before that change, so no caller's shape moved. Reconciliation needs
+    the id and therefore reads :func:`list_model_events_stored` instead."""
     out = dict(row)
     raw = out.pop("metadata_json", None)
+    out.pop("id", None)
     out["metadata"] = json.loads(raw) if raw else {}
     return out
