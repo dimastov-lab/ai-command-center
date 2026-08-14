@@ -82,20 +82,41 @@ def _pytest_command(paths: list[str], extra: list[str]) -> list[str]:
         # measured exactly that: `HAS psycopg_pool: False` under the form this
         # tool used, `True` once pytest is resolved alongside it. The docstring
         # claimed a benefit the command did not deliver.
-        return [
-            "uv", "run",
-            # `psycopg` as well as the pool: review set the DSN with the driver
-            # absent and every PostgreSQL-backed test skipped **silently** — 393
-            # passed / 260 skipped, exit 0, no FAILED term — under a line saying
-            # `PostgreSQL requested`. The pinned extra was the pool, while every
-            # skip named the driver, so the tool's own command could not reach a
-            # database it claimed to have requested.
-            "--with", "psycopg[binary]>=3.2,<4",
-            "--with", "psycopg-pool>=3.2,<4",
-            "--with", "pytest",
-            "pytest", *paths, "-q", *extra,
-        ]
+        return ["uv", "run", *_DB_EXTRAS, "--with", "pytest", "pytest", *paths, "-q", *extra]
     return [sys.executable, "-m", "pytest", *paths, "-q", *extra]
+
+
+#: `psycopg` as well as the pool: review set the DSN with the driver absent and
+#: every PostgreSQL-backed test skipped **silently** — 393 passed / 260 skipped,
+#: exit 0, no FAILED term — under a line saying `PostgreSQL requested`. The
+#: pinned extra was the pool, while every skip named the driver, so the tool's
+#: own command could not reach a database it claimed to have requested.
+#:
+#: Named rather than inlined because `_driver_reachable` must probe the exact
+#: environment the tests will run in. Two copies of this list would drift, and
+#: the drift would be invisible: the probe would answer for an environment
+#: nothing runs in.
+_DB_EXTRAS = ["--with", "psycopg[binary]>=3.2,<4", "--with", "psycopg-pool>=3.2,<4"]
+
+
+def _driver_reachable() -> bool:
+    """Can the interpreter that runs the tests import `psycopg`?
+
+    This is the whole difference between "a database was asked for" and "a
+    database was reached". `tests/db/conftest.py` gates on
+    `pytest.importorskip("psycopg")`, so a missing driver turns every
+    database-backed test into a silent skip — which is indistinguishable, in a
+    summary line, from a suite that has none.
+    """
+    command = (
+        ["uv", "run", *_DB_EXTRAS, "python", "-c", "import psycopg"]
+        if shutil.which("uv")
+        else [sys.executable, "-c", "import psycopg"]
+    )
+    try:
+        return subprocess.run(command, cwd=ROOT, capture_output=True).returncode == 0
+    except OSError:
+        return False
 
 
 def _run_pytest(paths: list[str], extra: list[str]) -> dict[str, int]:
@@ -195,18 +216,30 @@ def _evidence_line(paths: list[str], counts: dict[str, int], ruff_state: str) ->
     # pastes. Two honest runs of one tree differ by whether a database was
     # reachable, and the lines were previously indistinguishable.
     #
-    # It reports what was *requested*, not what the run achieved, and the
-    # earlier version of this comment claimed that difference could never pose
-    # as a clean run. That was false and review broke it: with the DSN set and
-    # the driver absent, every database-backed test **skips silently** — no
-    # FAILED term, exit 0 — under a line reading `PostgreSQL requested`. The
-    # command above now pins the driver, so the tool's own path cannot produce
-    # that shape; a DSN pointing at a closed port still fails loudly. What the
-    # word `requested` cannot promise is that the database was reached, and it
-    # is chosen precisely because it does not promise it.
-    database = (
-        "PostgreSQL requested" if os.environ.get("AICC_TEST_PG_ADMIN_DSN") else "serverless"
-    )
+    # It reports what was *requested*, not what the run achieved. Two earlier
+    # versions of this comment claimed that difference could never pose as a
+    # clean run, and review broke both: with the DSN set and the driver absent,
+    # every database-backed test **skips silently** — no FAILED term, exit 0 —
+    # under a line reading `PostgreSQL requested`.
+    #
+    # The second claim was written in the commit that retracted the first, and
+    # was false the same way: it said pinning the driver meant "the tool's own
+    # path cannot produce that shape", while the pin exists on only one of
+    # `_pytest_command`'s two branches. The pip fallback — the branch that
+    # docstring says exists for CI — pins nothing, and review reproduced the
+    # 260-silent-skip line through it.
+    #
+    # So the marker no longer relies on a claim at all. It asks whether the
+    # interpreter that runs the tests can import the driver, and says so when
+    # it cannot. `requested` still does not promise the database was *reached*
+    # — a DSN pointing at a closed port fails loudly rather than skipping — but
+    # the one shape that used to pass silently is now named in the line.
+    if not os.environ.get("AICC_TEST_PG_ADMIN_DSN"):
+        database = "serverless"
+    elif _driver_reachable():
+        database = "PostgreSQL requested"
+    else:
+        database = "PostgreSQL requested, **driver missing**"
     return f"Evidence: {scope} " + " / ".join(parts) + f"{suffix} ({database})."
 
 

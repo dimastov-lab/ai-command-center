@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 EVIDENCE = ROOT / "scripts" / "evidence.py"
 SLICE_CHECKS = ROOT / "scripts" / "mirror_slice_checks.py"
@@ -238,3 +240,76 @@ def test_a_missing_ruff_is_never_reported_as_a_dirty_tree() -> None:
     dirty = subprocess.CompletedProcess([], 1, stdout="F401 unused import\n", stderr="")
     assert module._classify_ruff(dirty) == "dirty"
     assert module._classify_ruff(subprocess.CompletedProcess([], 0, stdout="", stderr="")) == "clean"
+
+
+def _evidence_module():
+    """Import the tool as a module so its internals can be exercised directly.
+
+    Loading it by path rather than adding `scripts/` to `sys.path`: the tool is
+    a script, not a package, and making it importable by side effect would be a
+    change to the thing under test.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("evidence_under_test", EVIDENCE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_marker_names_a_missing_driver_instead_of_reading_as_a_postgres_run(
+    monkeypatch,
+) -> None:
+    """The shape that twice survived a claim that it could not exist.
+
+    With the DSN set and `psycopg` absent, every database-backed test skips
+    silently: no FAILED term, exit 0, under a line reading `PostgreSQL
+    requested`. Two successive comments asserted this was impossible — the
+    second written in the commit retracting the first — and review reproduced
+    it both times, the second through the pip fallback branch, which pins
+    nothing.
+
+    So the line stops asserting and starts asking.
+    """
+    module = _evidence_module()
+    counts = {"passed": 402, "skipped": 260}
+    monkeypatch.setenv("AICC_TEST_PG_ADMIN_DSN", "host=127.0.0.1 port=1 dbname=x")
+
+    monkeypatch.setattr(module, "_driver_reachable", lambda: False)
+    unreachable = module._evidence_line(["tests/db"], counts, "clean")
+    assert "driver missing" in unreachable
+
+    monkeypatch.setattr(module, "_driver_reachable", lambda: True)
+    reachable = module._evidence_line(["tests/db"], counts, "clean")
+    assert "PostgreSQL requested" in reachable and "driver missing" not in reachable
+
+    monkeypatch.delenv("AICC_TEST_PG_ADMIN_DSN")
+    assert "serverless" in module._evidence_line(["tests/db"], counts, "clean")
+
+
+def test_the_driver_probe_and_the_test_command_pin_the_same_extras() -> None:
+    """Drift between them would be invisible.
+
+    The probe answers "can the driver be imported" for whichever environment
+    it pins. If that stops being the environment the tests run in, the probe
+    still answers — about nothing — and the marker goes back to being a
+    statement about hope.
+    """
+    module = _evidence_module()
+    command = module._pytest_command(["tests/db"], [])
+    if "uv" not in command[0]:
+        pytest.skip("no uv here; the fallback branch pins nothing by design")
+    for token in module._DB_EXTRAS:
+        assert token in command, token
+
+
+def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -> None:
+    """The one change in this PR that review found had no test at all.
+
+    `mirror_slice_checks.py` hard-coded `pytest` from PATH while its comment
+    pointed at `evidence.py` "for why the hard-coded form was a defect". The
+    code now matches the comment; this is what holds it there.
+    """
+    source = SLICE_CHECKS.read_text(encoding="utf-8")
+    assert "shutil.which(\"uv\")" in source
+    assert "sys.executable" in source
