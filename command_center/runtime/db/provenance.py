@@ -74,25 +74,27 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
                        SELECT 1 FROM run_provenance AS p WHERE p.run_id = r.id
                    )
                    ORDER BY r.created_at, r.rowid
-                   LIMIT ?""",
+                   LIMIT ?
+                   RETURNING *""",
                 (now, limit),
             )
-            inserted = cursor.rowcount
-            # The rows this INSERT ... SELECT just created, read back for the
-            # mirror. `cursor.rowcount` is a number, not rows, and the set is
-            # bounded by `limit` — so this is one extra read per backfill call,
-            # not per run. Without it the backfill silently widens the gap it
-            # exists to close: `migrate()` calls this on every upgrade past
-            # schema 13, so a fresh mirror would start life already behind.
-            backfilled = [
-                dict(row)
-                for row in conn.execute(
-                    """SELECT * FROM run_provenance
-                       WHERE updated_at = ?
-                       ORDER BY run_id""",
-                    (now,),
-                ).fetchall()
-            ]
+            # `RETURNING *` gives the rows this statement created — exactly
+            # them, and nothing else.
+            #
+            # The previous version read them back with `WHERE updated_at = ?`
+            # and its comment claimed to be "the rows this INSERT just
+            # created", bounded by `limit`. Independent acceptance measured
+            # both claims false: `iso_now()` is second-precision, so a row
+            # written by `update_run_provenance` a moment earlier, or by an
+            # earlier backfill call in the same second, came back too. Every
+            # row read was still a current authority row, so the consequence
+            # was over-mirroring rather than corruption — but a comment
+            # describing a set the query does not return is the defect class
+            # this migration keeps rejecting, and on a busy system the set it
+            # returns is bounded by how many rows share a second rather than
+            # by `limit`.
+            backfilled = [dict(row) for row in cursor.fetchall()]
+            inserted = len(backfilled)
     for record in backfilled:
         _mirror("PostgresRunProvenanceMirror", record, "run_provenance")
     return inserted
