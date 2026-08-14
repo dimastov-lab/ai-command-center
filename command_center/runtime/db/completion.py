@@ -177,6 +177,7 @@ def create_completion(
     _mirror("PostgresCompletionMirror", stored, "completion")
     return record
 
+
 def _mirror(mirror_name: str, record: dict, table: str) -> None:
     """Best-effort dual-write of one completion-family row (SRV-01B slice 14).
 
@@ -190,8 +191,6 @@ def _mirror(mirror_name: str, record: dict, table: str) -> None:
         getattr(completion_store, mirror_name)().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
         _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
-
-
 
 
 def get_completion(db_path: Path, run_id: str) -> dict | None:
