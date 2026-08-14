@@ -550,6 +550,26 @@ def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
         return events
 
 
+def list_proposal_evidence_stored(db_path: Path, proposal_id: str) -> list[dict]:
+    """Evidence rows in the shape SQLite **stores**, for reconciliation.
+
+    :func:`list_proposal_evidence` pops `data_json` and returns a parsed `data`
+    key instead, which is right for its callers and wrong for reconciliation:
+    fed those rows it reports every evidence row divergent on `data_json` and
+    agrees about a `data` column the target does not have.
+
+    The decoding here is written inline rather than in a `_decode_*` helper,
+    which is how it got past the fitness gate until that gate learned to treat
+    a `.pop("<column>")` as the same act.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM proposal_evidence WHERE proposal_id = ? ORDER BY seq ASC",
+            (proposal_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def append_proposal_event(
     db_path: Path,
     proposal_id: str,

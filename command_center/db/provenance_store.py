@@ -217,5 +217,13 @@ provenance_evidence_divergence = divergence_against(
     on two columns at once.
     """,
 )
-run_provider_route_divergence = divergence_against(RUN_PROVIDER_ROUTE)
+run_provider_route_divergence = divergence_against(
+    RUN_PROVIDER_ROUTE,
+    "Rows where the SQLite authority and a mirror disagree on `run_provider_route`.\n\n"
+    "    Takes `list_provider_routes_stored`, **not** `get_provider_route` or\n"
+    "    `get_provider_routes_for_runs`: both decode inline, popping\n"
+    "    `providers_json` in favour of a parsed `providers` key, and fed those\n"
+    "    rows this reports every route divergent on a column the mirror holds\n"
+    "    correctly. See `mirror_support.divergence` for what each shape means.",
+)
 provider_attempt_divergence = divergence_against(PROVIDER_ATTEMPT)

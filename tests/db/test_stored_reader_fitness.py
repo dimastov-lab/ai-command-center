@@ -61,6 +61,21 @@ def _returns_decoded(function: ast.FunctionDef) -> bool:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id.startswith("_decode"):
                 return True
+        # The third variant, and the one that got past this gate: decoding
+        # written inline instead of in a helper. `list_proposal_evidence` does
+        # `raw = item.pop("data_json")` and hands back `data` — a `SELECT *`
+        # with no `_decode_` call anywhere, so both rules above pass it while
+        # the column the mirror needs is gone. Any `.pop("<literal>")` on a row
+        # is the same act as a decoder, whoever wrote it.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "pop"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            return True
     for node in ast.walk(function):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             statement = " ".join(node.value.split())

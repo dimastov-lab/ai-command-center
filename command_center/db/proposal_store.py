@@ -119,4 +119,12 @@ proposal_event_divergence = divergence_against(
     the caller-facing shape. Fed that, this reports every event divergent.
     """,
 )
-proposal_evidence_divergence = divergence_against(PROPOSAL_EVIDENCE)
+proposal_evidence_divergence = divergence_against(
+    PROPOSAL_EVIDENCE,
+    "Rows where the SQLite authority and a mirror disagree on `proposal_evidence`.\n\n"
+    "    Takes `list_proposal_evidence_stored`, **not** `list_proposal_evidence`:\n"
+    "    the public reader pops `data_json` and returns a parsed `data` key, so\n"
+    "    reconciliation fed its rows reports every one of them divergent while\n"
+    "    agreeing about a column PostgreSQL does not have. See\n"
+    "    `mirror_support.divergence` for what each reported shape means.",
+)
