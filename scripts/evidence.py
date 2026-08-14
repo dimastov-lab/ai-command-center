@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,25 @@ _CLAIM = re.compile(
 )
 
 
+
+def _pytest_command(paths: list[str], extra: list[str]) -> list[str]:
+    """How to invoke pytest here, rather than how I invoke it on my laptop.
+
+    The first version hard-coded `uv run --with …`, which works locally and
+    does not exist on a CI runner that installs its dependencies with pip. The
+    tool then produced no output at all and its own tests failed on empty
+    stdout — a gate that only runs in one environment is not a gate, and this
+    one had shipped claiming it could gate a push.
+
+    `uv` is preferred when present because it supplies the optional database
+    extras this repository's PostgreSQL tests want; otherwise the interpreter
+    already running is exactly the right one.
+    """
+    if shutil.which("uv"):
+        return ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", *paths, "-q", *extra]
+    return [sys.executable, "-m", "pytest", *paths, "-q", *extra]
+
+
 def _run_pytest(paths: list[str], extra: list[str]) -> dict[str, int]:
     """Run pytest and return its own counts, parsed from its own summary.
 
@@ -67,8 +87,9 @@ def _run_pytest(paths: list[str], extra: list[str]) -> dict[str, int]:
     pytest's bookkeeping: a second definition of "how many tests passed" is a
     second thing to be wrong.
     """
-    command = ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", *paths, "-q", *extra]
-    completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    completed = subprocess.run(
+        _pytest_command(paths, extra), cwd=ROOT, capture_output=True, text=True
+    )
     tail = [line for line in completed.stdout.splitlines() if _SUMMARY.search(line)]
     if not tail:
         sys.stderr.write(completed.stdout[-4000:])
@@ -83,14 +104,30 @@ def _run_pytest(paths: list[str], extra: list[str]) -> dict[str, int]:
     return counts
 
 
-def _ruff() -> bool:
-    completed = subprocess.run(
-        ["uv", "run", "ruff", "check", "."], cwd=ROOT, capture_output=True, text=True
-    )
-    return completed.returncode == 0
+def _ruff() -> str:
+    """`clean`, `dirty`, or `unavailable` — three answers, not two.
+
+    Collapsing the third into "dirty" made the tool report a lint problem
+    where there was only a missing lint tool, and then refuse to exit 0 over
+    it. Fail-closed is right for a claim about tests; it is wrong for an
+    inability to check something the claim does not assert, and a gate that
+    cries about the wrong thing is one people route around.
+    """
+    ruff = ["uv", "run", "ruff"] if shutil.which("uv") else [sys.executable, "-m", "ruff"]
+    try:
+        completed = subprocess.run(
+            [*ruff, "check", "."], cwd=ROOT, capture_output=True, text=True
+        )
+    except OSError:
+        return "unavailable"
+    if completed.returncode == 0:
+        return "clean"
+    if "No module named" in completed.stderr or "error: unrecognized" in completed.stderr:
+        return "unavailable"
+    return "dirty"
 
 
-def _evidence_line(paths: list[str], counts: dict[str, int], ruff_clean: bool) -> str:
+def _evidence_line(paths: list[str], counts: dict[str, int], ruff_state: str) -> str:
     scope = ", ".join(f"`{path}`" for path in paths)
     failed = counts.get("failed", 0) + counts.get("errors", 0) + counts.get("error", 0)
     parts = [f"{counts['passed']} passed"]
@@ -100,9 +137,12 @@ def _evidence_line(paths: list[str], counts: dict[str, int], ruff_clean: bool) -
         # Stated, never omitted. An evidence line that quietly drops failures
         # is worse than no evidence line, because it reads like a clean run.
         parts.append(f"**{failed} FAILED**")
-    return f"Evidence: {scope} " + " / ".join(parts) + (
-        "; ruff clean." if ruff_clean else "; **ruff NOT clean**."
-    )
+    suffix = {
+        "clean": "; ruff clean.",
+        "dirty": "; **ruff NOT clean**.",
+        "unavailable": "; ruff not run here.",
+    }[ruff_state]
+    return f"Evidence: {scope} " + " / ".join(parts) + suffix
 
 
 def _head_message() -> str:
@@ -136,14 +176,18 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     counts = _run_pytest(args.paths, [])
-    ruff_clean = _ruff()
-    line = _evidence_line(args.paths, counts, ruff_clean)
-    # A failing suite or a dirty `ruff` is a non-zero exit whatever the claim
-    # says. The first version compared only the numbers, so a red suite whose
-    # `passed`/`skipped` happened to match its claim exited 0 and reported
-    # `[ok]` — the tool agreeing with a sentence while the thing it describes
-    # was on fire.
-    healthy = counts["_returncode"] == 0 and ruff_clean
+    ruff_state = _ruff()
+    line = _evidence_line(args.paths, counts, ruff_state)
+    # A failing suite is a non-zero exit whatever the claim says: the first
+    # version compared only the numbers, so a red suite whose `passed`/`skipped`
+    # happened to match its claim exited 0 and reported `[ok]` — the tool
+    # agreeing with a sentence while the thing it describes was on fire.
+    #
+    # A dirty `ruff` is reported in the line but does not decide the exit code.
+    # This tool answers one question — does the claimed measurement match the
+    # measurement — and the repository already has a dedicated lint gate that
+    # answers the other one.
+    healthy = counts["_returncode"] == 0
 
     if args.command == "measure":
         print(line)

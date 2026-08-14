@@ -31,9 +31,22 @@ def _write_suite(directory: Path, *, green: bool) -> Path:
 
 
 def _run(script: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    """Run a tool and keep its stderr with its stdout in the failure message.
+
+    The first version asserted only on stdout, so when the tool did not run at
+    all on CI — it hard-coded `uv`, which the runner does not have — every
+    assertion failed as `assert 'FAILED' in ''`. An empty string is the least
+    informative way to learn that a subprocess died, and it cost a full gate
+    round to find out why.
+    """
+    completed = subprocess.run(
         [sys.executable, str(script), *args], cwd=ROOT, capture_output=True, text=True
     )
+    assert completed.stdout or completed.returncode == 0, (
+        f"{script.name} produced no stdout (exit {completed.returncode}); stderr:\n"
+        f"{completed.stderr[-2000:]}"
+    )
+    return completed
 
 
 def test_evidence_check_fails_on_a_red_suite_even_when_the_numbers_agree(tmp_path) -> None:

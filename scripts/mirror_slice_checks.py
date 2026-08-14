@@ -35,6 +35,7 @@ import json
 import os
 import pkgutil
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -317,6 +318,14 @@ def cmd_counts(args: argparse.Namespace) -> int:
 # --- perturbation sweep --------------------------------------------------------
 
 
+def _pytest_command(suite: str) -> list[str]:
+    """`uv` when it is there, this interpreter when it is not — see
+    `scripts/evidence.py` for why the hard-coded form was a defect."""
+    if shutil.which("uv"):
+        return ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", suite, "-q"]
+    return [sys.executable, "-m", "pytest", suite, "-q"]
+
+
 def cmd_sweep(args: argparse.Namespace) -> int:
     """Drop one mirror hook at a time and ask whether anything notices.
 
@@ -359,10 +368,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     # from a suite that touches none of this code. A probe that cannot fail is
     # the defect this whole file exists to find, in the file itself.
     baseline = subprocess.run(
-        ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", args.suite, "-q"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
+        _pytest_command(args.suite), cwd=ROOT, capture_output=True, text=True
     )
     if baseline.returncode != 0:
         tail = [line for line in baseline.stdout.splitlines() if line.startswith("FAILED")]
@@ -383,10 +389,7 @@ def cmd_sweep(args: argparse.Namespace) -> int:
             patched[number - 1] = " " * indent + "pass  # perturbed by the sweep\n"
             target.write_text("".join(patched), encoding="utf-8")
             result = subprocess.run(
-                ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", args.suite, "-q"],
-                cwd=ROOT,
-                capture_output=True,
-                text=True,
+                _pytest_command(args.suite), cwd=ROOT, capture_output=True, text=True
             )
             caught = result.returncode != 0
             named = [entry for entry in result.stdout.splitlines() if entry.startswith("FAILED")]
