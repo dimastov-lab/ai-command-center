@@ -87,6 +87,9 @@
     "command_center/db/audit_store.py": [
       "audit"
     ],
+    "command_center/db/provenance_store.py": [
+      "audit"
+    ],
     "command_center/dispatch/__init__.py": [
       "orchestration"
     ],
