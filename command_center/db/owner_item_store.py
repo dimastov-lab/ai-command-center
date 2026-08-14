@@ -22,19 +22,17 @@ visible error: it would produce a divergence check that reports every row as
 different, which is a cutover gate permanently red — and a red gate nobody can
 satisfy is one someone eventually satisfies by loosening the comparison.
 
-Both conversions now live in `mirror_support`, moved there at slice 3 when a
-third table would have made a third copy. The history is worth keeping in view:
-the version of the timestamp conversion this module first shipped was wrong in
-both directions, and the reason the extraction waited until three callers
-existed is written down in that module.
+The conversions moved to `mirror_support` at slice 3 and the statements to
+`table_mirror` at slice 7; what remains here is the declaration of what makes
+this table different from the others. The history is worth keeping in view: the
+version of the timestamp conversion this module first shipped was wrong in both
+directions.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
-from command_center.db import mirror_support
 from command_center.db.mirror_support import MIRROR_UNAVAILABLE, ColumnCodec
+from command_center.db.table_mirror import MirroredTable, PostgresTableMirror, divergence_against
 
 __all__ = ["MIRROR_UNAVAILABLE", "OWNER_ITEM_COLUMNS", "PostgresOwnerItemMirror", "divergence"]
 
@@ -54,65 +52,22 @@ OWNER_ITEM_COLUMNS: tuple[str, ...] = (
 
 #: `due` is deliberately absent from `timestamps`: the map keeps it `text` on
 #: both sides because it is free user input rather than a date.
-_CODEC = ColumnCodec(
-    timestamps=frozenset({"created_at", "updated_at"}),
-    flags=frozenset({"done"}),
+OWNER_ITEM = MirroredTable(
+    table="owner_item",
+    columns=OWNER_ITEM_COLUMNS,
+    codec=ColumnCodec(
+        timestamps=frozenset({"created_at", "updated_at"}),
+        flags=frozenset({"done"}),
+    ),
 )
 
 
-class PostgresOwnerItemMirror:
+class PostgresOwnerItemMirror(PostgresTableMirror):
     """The `owner_item` table on the accepted PostgreSQL seam."""
 
-    name = "postgres"
-
-    def __init__(self, connection_factory: Any = None) -> None:
-        self._factory = connection_factory
-
-    def _connection(self) -> Any:
-        """Resolved on use, never at import.
-
-        `command_center.db.__init__` promises that importing the package pulls
-        in neither `aios_db` nor `psycopg`, because the desktop and CLI entry
-        points must keep working without a PostgreSQL client library.
-        """
-        if self._factory is not None:
-            return self._factory()
-        from command_center.db import pool
-
-        return pool.connection()
-
-    def upsert(self, record: dict) -> None:
-        values = [_CODEC.to_column(name, record.get(name)) for name in OWNER_ITEM_COLUMNS]
-        assignments = ", ".join(
-            f"{name} = EXCLUDED.{name}" for name in OWNER_ITEM_COLUMNS if name != "id"
-        )
-        placeholders = ", ".join(["%s"] * len(OWNER_ITEM_COLUMNS))
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO owner_item ({', '.join(OWNER_ITEM_COLUMNS)}) "
-                    f"VALUES ({placeholders}) "
-                    f"ON CONFLICT (id) DO UPDATE SET {assignments}",
-                    values,
-                )
-
-    def list_records(self) -> list[dict]:
-        with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT {', '.join(OWNER_ITEM_COLUMNS)} FROM owner_item ORDER BY id"
-                )
-                rows = cur.fetchall()
-        return [
-            {
-                name: _CODEC.to_authority(name, value)
-                for name, value in zip(OWNER_ITEM_COLUMNS, row, strict=True)
-            }
-            for row in rows
-        ]
+    spec = OWNER_ITEM
 
 
-def divergence(authority_rows: list[dict], mirror: Any) -> list[dict]:
-    """Rows where the SQLite authority and `mirror` disagree — see
-    `mirror_support.divergence` for what each reported shape means."""
-    return mirror_support.divergence(authority_rows, mirror, OWNER_ITEM_COLUMNS)
+#: Rows where the SQLite authority and a mirror disagree — see
+#: `mirror_support.divergence` for what each reported shape means.
+divergence = divergence_against(OWNER_ITEM)
