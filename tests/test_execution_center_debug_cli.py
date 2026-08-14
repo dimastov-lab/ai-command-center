@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -99,6 +100,47 @@ def test_launch_blocks_until_terminal_state_and_persists_final_events(configured
     assert "process_exited" in {e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"}
 
 
+
+def _wait_until_running(timeout: float = 20.0) -> dict:
+    """Block until the CLI subprocess has a run with a live pid, or fail loudly.
+
+    Replaces `time.sleep(1.0)  # let it launch and enter the polling loop`,
+    which is a guess about scheduling rather than a wait for anything. Under
+    `-n auto` the guess is sometimes wrong: the signal arrives before the CLI
+    is in its loop, the run never reaches a terminal state through the
+    cancellation path, and the assertion fails on absent output rather than on
+    behaviour. That cost two CI reruns in one day, both of them ten minutes.
+
+    The condition is the one the test actually depends on — a run row exists
+    and carries a pid — read from the same `AICC_DATA_DIR` the subprocess
+    writes to. The timeout is a diagnostic, not a schedule: it says what was
+    never observed instead of continuing into a confusing failure.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            runs = db.list_runs(db.resolve_db_path())
+        except sqlite3.OperationalError:
+            # The schema is created by the CLI subprocess, not by this process,
+            # so "no such table: run" simply means it has not got there yet —
+            # a state of the wait, not a failure of it.
+            runs = []
+        for run in runs:
+            # `first_output_at` rather than merely RUNNING: the row appears the
+            # moment the supervisor inserts it, which is before the CLI is
+            # reading output and before it can act on a signal. Waiting for the
+            # first streamed line is waiting for the loop this test signals
+            # into — CI proved the weaker condition insufficient, failing with
+            # "no JSON object found" while the local machine passed.
+            if run.get("pid") and run.get("state") == "RUNNING" and run.get("first_output_at"):
+                return run
+        time.sleep(0.05)
+    raise AssertionError(
+        f"no RUNNING run with a pid appeared within {timeout}s — the CLI never "
+        "reached its foreground polling loop, so signalling it proves nothing"
+    )
+
+
 def test_no_orphan_process_survives_normal_cli_exit(configured_repo):
     """3: no child (or grandchild) process survives CLI exit — normal
     completion path."""
@@ -124,7 +166,7 @@ def test_ctrl_c_triggers_confirmed_cancellation_and_reaches_terminal_state(confi
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
     )
     try:
-        time.sleep(1.0)  # let it launch and enter the foreground polling loop
+        _wait_until_running()
         proc.send_signal(signal.SIGINT)
         stdout, stderr = proc.communicate(timeout=20)
     finally:
