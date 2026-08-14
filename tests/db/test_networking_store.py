@@ -244,21 +244,27 @@ def test_upsert_is_idempotent_and_updates_in_place(contacts: PostgresContactMirr
 def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
-    """The assertion the cutover is gated on, driven through the real hooks.
+    """The assertion the cutover is gated on, driven through the real hooks,
+    and checked **after every write** rather than once at the end.
 
-    The first version of this test claimed a store failing on any one of the
-    writes could not pass it, and that was false: `contact` was written twice —
-    create, then update — and the update is a whole-row upsert that repairs a
-    failed create, so a store raising only on the first write left this green.
-    Independent review proved it with a store that raises once. Same shape as
-    the masked middle write found in slice 4, and the second time an e2e here
-    has claimed reach it did not have.
+    Two rounds of review went into that sentence. The first version claimed a
+    store failing on any one write could not pass it; that was false, because
+    `contact` is written twice and the update is a whole-row upsert that
+    repairs a failed create. The second version added `quiet`, a contact that
+    is never updated, and claimed the same reach — also false. Adding a
+    protected row does not protect the unprotected one: `reconciles` is still
+    created, then updated, and its create is still repaired. Worse, the
+    perturbation I used to check the fix stopped reaching the defect the moment
+    `quiet` was inserted ahead of it, so the evidence looked like confirmation
+    and was not. Independent review found this by failing each of the five
+    mirror writes in turn — four caught, one still masked.
 
-    Fixed by making the claim true rather than by narrowing it. `quiet` is
-    created and never updated, so no later write repairs it: a failure on any
-    single mirror write now leaves a divergence somewhere in the four
-    assertions below. The per-path coverage test remains the one that says
-    *which* write was lost.
+    The lesson is structural and slice 4 had already reached it: an *end-state*
+    reconciliation cannot see an intermediate write that a later whole-row
+    write covers. No arrangement of rows fixes that. So this test stops being
+    an end-state check — it reconciles after each authority write, which makes
+    every lost write visible at the stage it happened, and gives the failure an
+    address instead of leaving attribution to the per-path test.
     """
     from command_center.db import networking_store
 
@@ -278,19 +284,30 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
     db_path = tmp_path / "runtime.db"
     net_db.db.migrate(db_path)
 
-    # Written once and never touched again: nothing downstream can repair a
-    # lost mirror write for this row, which is what makes the claim above true.
-    quiet = net_db.create_contact(db_path, display_name="quiet", handle="@quiet")
-    net_db.create_message(db_path, contact_id=quiet["id"], body="only message")
+    def reconciled(stage: str) -> None:
+        assert contact_divergence(net_db.list_contacts(db_path), contacts) == [], stage
+        assert message_divergence(net_db.list_messages(db_path), messages) == [], stage
 
+    # A contact written once and never touched again — the write-once shape.
+    quiet = net_db.create_contact(db_path, display_name="quiet", handle="@quiet")
+    reconciled("quiet created")
+    net_db.create_message(db_path, contact_id=quiet["id"], body="only message")
+    reconciled("quiet's message created")
+
+    # And one that is updated after creation — the shape whose create an
+    # end-state check could not see, because the update rewrites the whole row.
     created = net_db.create_contact(db_path, display_name="reconciles", org="acme")
+    reconciled("contact created")
     net_db.update_contact_fields(
         db_path, created["id"], expected_version=0, fields={"note": "spoke on Tuesday"}
     )
+    reconciled("contact updated")
     net_db.create_message(db_path, contact_id=created["id"], body="hello", direction="outbound")
+    reconciled("message created")
 
-    assert contact_divergence(net_db.list_contacts(db_path), contacts) == []
-    assert message_divergence(net_db.list_messages(db_path), messages) == []
+    # Premise guards, not mirror assertions: they read the authority, so they
+    # can never fail for a mirror reason. Stated because the previous version
+    # of this test counted them among its evidence.
     assert len(net_db.list_contacts(db_path)) == 2
     assert len(net_db.list_messages(db_path)) == 2
 

@@ -85,9 +85,13 @@ _MESSAGE_CODEC = ColumnCodec(timestamps=frozenset({"created_at"}))
 class _TableMirror:
     """The upsert/list half both tables share.
 
-    A **new base for the two tables added here**, not an extraction: the four
-    earlier mirrors still hand-roll their own `_connection`, `upsert` and
-    `list_records`, and this commit moves none of them. An earlier version of
+    A **new base for the two tables added here**, not an extraction: three of
+    the four earlier mirrors — `owner_item_store`, `conflict_store`,
+    `digest_item_store` — still hand-roll their own `_connection`, `upsert` and
+    `list_records`, and this commit moves none of them. `queue_store` is not a
+    fourth: it has `replace_entries` and `list_entries` instead, because the
+    queue mirrors by bulk replace with a `position` column the JSON authority
+    does not have, and it is deliberately not a candidate for this base. An earlier version of
     this docstring claimed the `mirror_support` precedent, and independent
     review pointed out that the precedent runs the other way — `mirror_support`
     moved its existing callers onto it in the same slice, which is why the
