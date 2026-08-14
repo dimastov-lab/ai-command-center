@@ -79,7 +79,25 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
                    LIMIT ?""",
                 (now, limit),
             )
-            return cursor.rowcount
+            inserted = cursor.rowcount
+            # The rows this INSERT ... SELECT just created, read back for the
+            # mirror. `cursor.rowcount` is a number, not rows, and the set is
+            # bounded by `limit` — so this is one extra read per backfill call,
+            # not per run. Without it the backfill silently widens the gap it
+            # exists to close: `migrate()` calls this on every upgrade past
+            # schema 13, so a fresh mirror would start life already behind.
+            backfilled = [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT * FROM run_provenance
+                       WHERE updated_at = ?
+                       ORDER BY run_id""",
+                    (now,),
+                ).fetchall()
+            ]
+    for record in backfilled:
+        _mirror("PostgresRunProvenanceMirror", record, "run_provenance")
+    return inserted
 
 
 def get_run_provenance(db_path: Path, run_id: str) -> dict | None:
@@ -337,6 +355,26 @@ def get_provider_route(db_path: Path, run_id: str) -> dict | None:
     result = dict(row)
     result["providers"] = json.loads(result.pop("providers_json"))
     return result
+
+
+def list_provider_routes_stored(db_path: Path) -> list[dict]:
+    """Every route row in the shape SQLite **stores**, for reconciliation.
+
+    Both public readers decode inline — `result["providers"] =
+    json.loads(result.pop("providers_json"))` — so the column the mirror holds
+    is gone from what they return, and reconciliation fed those rows reports
+    every route divergent on `providers_json` while agreeing about a column
+    named `providers` that PostgreSQL does not have.
+
+    Found by the fitness gate after it was taught to recognise inline
+    decoding: it knew `_decode_*` helpers and projected `SELECT` lists, and
+    this is the third variant of the same act written a third way.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM run_provider_route ORDER BY run_id"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def get_provider_routes_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:

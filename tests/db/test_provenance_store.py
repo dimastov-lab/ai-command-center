@@ -25,9 +25,11 @@ from command_center.db.provenance_store import (
     PostgresProvenanceEvidenceMirror,
     PostgresProviderAttemptMirror,
     PostgresRunProvenanceMirror,
+    PostgresRunProviderRouteMirror,
     provenance_evidence_divergence,
     provider_attempt_divergence,
     run_provenance_divergence,
+    run_provider_route_divergence,
 )
 from command_center.db.run_store import PostgresRunMirror
 from command_center.runtime.db import execution as exec_db
@@ -62,13 +64,18 @@ def _patch(monkeypatch, factory) -> None:
             PostgresProvenanceEvidenceMirror,
         ),
         (provenance_store, "PostgresProviderAttemptMirror", PostgresProviderAttemptMirror),
+        (
+            provenance_store,
+            "PostgresRunProviderRouteMirror",
+            PostgresRunProviderRouteMirror,
+        ),
     ):
         monkeypatch.setattr(
             module, name, lambda mirror=mirror: mirror(connection_factory=factory)
         )
 
 
-def _launch(db_path: Path) -> dict:
+def _launch(db_path: Path, **extra) -> dict:
     task = exec_db.create_task(db_path, project="AICC", title="t", task_type="feature")
     session = exec_db.create_session(
         db_path, task_id=task["id"], project="AICC", repository_path="/tmp/repo"
@@ -83,6 +90,7 @@ def _launch(db_path: Path) -> dict:
         prompt="p",
         is_resume=False,
         command=["claude"],
+        **extra,
     )
 
 
@@ -94,9 +102,10 @@ def test_the_provenance_family_reconciles_after_every_write(
     evidence = PostgresProvenanceEvidenceMirror(connection_factory=pg_connection_factory)
     attempts = PostgresProviderAttemptMirror(connection_factory=pg_connection_factory)
 
+    routes = PostgresRunProviderRouteMirror(connection_factory=pg_connection_factory)
+
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
-    run = _launch(db_path)
 
     def reconciled(stage: str) -> None:
         stored = prov_db.get_run_provenance(db_path, run["id"])
@@ -113,6 +122,23 @@ def test_the_provenance_family_reconciles_after_every_write(
             )
             == []
         ), stage
+        assert (
+            run_provider_route_divergence(
+                prov_db.list_provider_routes_stored(db_path), routes
+            )
+            == []
+        ), stage
+
+    # Stage zero, and it is the stage acceptance said was missing. `create_run`
+    # writes `run_provenance` and `run_provider_route` itself, and the first
+    # reconciliation used to run only after `update_run_provenance` — whose
+    # whole-row upsert repaired the unmirrored row before anything looked at
+    # it. A staged check is only as good as its first stage, and the first
+    # write of this family was not in front of one.
+    # `provider_route` must be headed by the run's own provider — the authority
+    # refuses otherwise, which is how this stage found its own arguments.
+    run = _launch(db_path, provider_id="claude", provider_route=["claude", "codex"])
+    reconciled("run created — provenance and route written by create_run")
 
     prov_db.update_run_provenance(db_path, run["id"], fields={"branch": "feat/x"})
     reconciled("provenance updated")
