@@ -33,6 +33,7 @@ do for the other table-family modules.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
@@ -40,6 +41,8 @@ from typing import Any, Iterable
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
 from command_center.runtime.db.wave1 import _exclude_projects_clause
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Allowlists (mirror ``api.models`` Literals; validated at the boundary)
@@ -152,7 +155,35 @@ def create_audit_run(
                 f"INSERT INTO audit_run ({columns}) VALUES ({placeholders})",
                 record,
             )
+    # `record`, not the decoded row: `_decode_run_row` pops `checks_json`.
+    _mirror_audit_run(record)
     return _decode_run_row(record)
+
+def _mirror_audit_run(record: dict) -> None:
+    """Best-effort dual-write of one audit run into PostgreSQL (SRV-01B slice 8).
+
+    Takes the **stored** record, with `checks_json` as text — not the decoded
+    row the public readers return, which replaces it with a `checks` list.
+    Mirroring the decoded shape would write the column's default on every row.
+    """
+    try:
+        from command_center.db.audit_store import PostgresAuditRunMirror
+
+        PostgresAuditRunMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror audit_run into PostgreSQL", exc_info=True)
+
+
+def _mirror_audit_finding(record: dict) -> None:
+    """Best-effort dual-write of one audit finding into PostgreSQL (slice 8)."""
+    try:
+        from command_center.db.audit_store import PostgresAuditFindingMirror
+
+        PostgresAuditFindingMirror().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror audit_finding into PostgreSQL", exc_info=True)
+
+
 
 
 def get_audit_run(db_path: Path, run_id: str) -> dict | None:
@@ -264,7 +295,9 @@ def set_audit_run_status(
             updated = conn.execute(
                 "SELECT * FROM audit_run WHERE id = ?", (run_id,)
             ).fetchone()
-            return _decode_run_row(dict(updated))
+            record = dict(updated)
+    _mirror_audit_run(record)
+    return _decode_run_row(record)
 
 
 # --------------------------------------------------------------------------
@@ -353,6 +386,7 @@ def create_audit_finding(
                 f"INSERT INTO audit_finding ({columns}) VALUES ({placeholders})",
                 record,
             )
+    _mirror_audit_finding(record)
     return dict(record)
 
 
@@ -472,7 +506,7 @@ def set_audit_finding_status(
     now = db.iso_now()
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            return _audit_finding_transition(
+            record = _audit_finding_transition(
                 conn,
                 finding_id,
                 expected_version=expected_version,
@@ -480,6 +514,8 @@ def set_audit_finding_status(
                 extra_fields=None,
                 now=now,
             )
+    _mirror_audit_finding(record)
+    return record
 
 
 def promote_audit_finding(
@@ -499,7 +535,7 @@ def promote_audit_finding(
     now = db.iso_now()
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            return _audit_finding_transition(
+            record = _audit_finding_transition(
                 conn,
                 finding_id,
                 expected_version=expected_version,
@@ -507,11 +543,31 @@ def promote_audit_finding(
                 extra_fields={"promoted_task_id": task_id},
                 now=now,
             )
+    _mirror_audit_finding(record)
+    return record
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+def list_audit_runs_stored(db_path: Path) -> list[dict]:
+    """Every audit run in the shape SQLite **stores**, for reconciliation.
+
+    Every other reader here returns :func:`_decode_run_row` output, which pops
+    ``checks_json`` and substitutes a decoded ``checks`` list. Reconciliation
+    compares what the authority stores against what the mirror stores, so fed a
+    decoded row it reports **every** run divergent on the one column that
+    needed converting.
+
+    Slice 4 shipped without this for ``digest_item`` and the omission was found
+    only because independent review asked what an operator would actually call.
+    Written here in the same slice as the mirror.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM audit_run ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
 
 
 def _decode_run_row(row: dict) -> dict:

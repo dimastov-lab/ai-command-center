@@ -229,6 +229,7 @@ from command_center.runtime.db.audit import (  # noqa: F401
     get_audit_run,
     list_audit_findings,
     list_audit_runs,
+    list_audit_runs_stored,
     promote_audit_finding,
     set_audit_finding_status,
     set_audit_run_status,

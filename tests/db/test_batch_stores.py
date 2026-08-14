@@ -1,4 +1,4 @@
-"""Slice 8: four tables in one slice, because none of them adds a class.
+"""Slice 8: six tables in one slice, because none of them adds a class.
 
 Slices 1–6 each worked out one conversion class and cost a slice apiece; slice 7
 made the machinery declarative. What is left in these six tables is a
@@ -11,13 +11,14 @@ no table here introduces a conversion the shared machinery has not already been
 proved against. The council family keeps its own slice because `council_event`
 carries an identity column and its own event ordering.
 
-`audit_run`/`audit_finding` were written for this batch and then **withdrawn
-from it**: `tests/architecture/test_aios_boundary_fitness.py` freezes any new
-file matching the `audit` category, deliberately on the name alone, and its
-baseline says every edit to it is a reviewed architectural decision. Mirroring
-those two tables therefore needs that decision first — recorded centrally as
-`VOYN-W0-AICC-MIRROR-AUDIT-BOUNDARY` — and taking it inside a migration slice
-would be the writer approving his own architecture exception.
+`audit_run`/`audit_finding` trip the AIOS boundary gate on their **file name**:
+`audit` is matched without behavioural corroboration by design. The first
+version of this slice withdrew them, on the belief that a baseline edit needed
+a separate architectural decision. `docs/AIOS_BOUNDARY.md` says otherwise —
+this is its Direction 2 (reclassify a detector false positive), whose remedy is
+an ordinary reviewed PR with the justification in its description, which is the
+process that was already running. The tables are back, the baseline carries the
+entry, and the reasoning lives in `command_center/db/audit_store.py`.
 
 What still gets per-table attention, because it is per-table by nature:
 
@@ -40,6 +41,14 @@ from command_center.db.advisor_store import (
     PostgresAdvisorProposalMirror,
 )
 from command_center.db.advisor_store import divergence as advisor_divergence
+from command_center.db.audit_store import (
+    AUDIT_FINDING_COLUMNS,
+    AUDIT_RUN_COLUMNS,
+    PostgresAuditFindingMirror,
+    PostgresAuditRunMirror,
+    audit_finding_divergence,
+    audit_run_divergence,
+)
 from command_center.db.marketplace_store import (
     INSTALL_LOG_COLUMNS,
     MARKET_ITEM_COLUMNS,
@@ -54,6 +63,7 @@ from command_center.db.networking_store import (
     invitation_divergence,
 )
 from command_center.db.table_mirror import MirroredTable, PostgresTableMirror
+from command_center.runtime.db import audit as audit_db
 from command_center.runtime.db import marketplace as market_db
 from command_center.runtime.db import networking as net_db
 from command_center.runtime.db import wave1
@@ -65,6 +75,8 @@ BATCH = (
     ("networking_invitation", INVITATION_COLUMNS, PostgresInvitationMirror),
     ("market_item", MARKET_ITEM_COLUMNS, PostgresMarketItemMirror),
     ("market_install_log", INSTALL_LOG_COLUMNS, PostgresInstallLogMirror),
+    ("audit_run", AUDIT_RUN_COLUMNS, PostgresAuditRunMirror),
+    ("audit_finding", AUDIT_FINDING_COLUMNS, PostgresAuditFindingMirror),
     ("advisor_proposal", ADVISOR_PROPOSAL_COLUMNS, PostgresAdvisorProposalMirror),
 )
 
@@ -133,8 +145,114 @@ def test_the_reconciliations_carry_their_warnings_at_runtime() -> None:
 
     assert "list_model_events_stored" in (event_divergence.__doc__ or "")
     assert "list_digest_items_stored" in (digest_divergence.__doc__ or "")
+    assert "list_audit_runs_stored" in (audit_run_divergence.__doc__ or "")
     # The plain ones still say what they are, rather than nothing.
     assert "advisor_proposal" in (advisor_divergence.__doc__ or "")
+
+
+# --- the audit family: slice 4's trap in a second family ---------------------
+
+
+def test_audit_runs_have_a_reconciliation_entry_point(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """`audit_run` decodes on the way out, exactly like `digest_item`.
+
+    Every public reader — `get_audit_run`, `list_audit_runs`, and
+    `set_audit_run_status`'s return value — replaces `checks_json` with a
+    decoded `checks`. Fed those, reconciliation reports every run divergent on
+    the one column that needed converting. `list_audit_runs_stored` is the
+    answer, and this pins both halves so nobody has to rediscover which reader
+    to call.
+    """
+    from command_center.db import audit_store
+
+    monkeypatch.setattr(
+        audit_store,
+        "PostgresAuditRunMirror",
+        lambda: PostgresAuditRunMirror(connection_factory=pg_connection_factory),
+    )
+    runs = PostgresAuditRunMirror(connection_factory=pg_connection_factory)
+
+    db_path = tmp_path / "runtime.db"
+    audit_db.db.migrate(db_path)
+    created = audit_db.create_audit_run(db_path, project_ref="AICC", checks=["lint", "tests"])
+
+    decoded = audit_db.list_audit_runs(db_path)
+    assert "checks_json" not in decoded[0]  # the premise
+    assert audit_run_divergence(decoded, runs) != []
+
+    assert audit_run_divergence(audit_db.list_audit_runs_stored(db_path), runs) == []
+    assert created["checks"] == ["lint", "tests"]
+
+
+def test_the_audit_family_reconciles_after_every_write(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """Staged, not end-state: `set_audit_run_status` rewrites the whole run, so
+    an end-state check could not see a lost create (slice 5's lesson)."""
+    from command_center.db import audit_store
+
+    monkeypatch.setattr(
+        audit_store,
+        "PostgresAuditRunMirror",
+        lambda: PostgresAuditRunMirror(connection_factory=pg_connection_factory),
+    )
+    monkeypatch.setattr(
+        audit_store,
+        "PostgresAuditFindingMirror",
+        lambda: PostgresAuditFindingMirror(connection_factory=pg_connection_factory),
+    )
+    runs = PostgresAuditRunMirror(connection_factory=pg_connection_factory)
+    findings = PostgresAuditFindingMirror(connection_factory=pg_connection_factory)
+
+    db_path = tmp_path / "runtime.db"
+    audit_db.db.migrate(db_path)
+
+    def reconciled(stage: str) -> None:
+        assert audit_run_divergence(audit_db.list_audit_runs_stored(db_path), runs) == [], stage
+        assert audit_finding_divergence(audit_db.list_audit_findings(db_path), findings) == [], (
+            stage
+        )
+
+    run = audit_db.create_audit_run(db_path, project_ref="AICC", checks=["lint"])
+    reconciled("run created")
+    finding = audit_db.create_audit_finding(
+        db_path, run_id=run["id"], category="security", summary="hardcoded secret", owner="ops"
+    )
+    reconciled("finding created")
+    audit_db.set_audit_finding_status(
+        db_path, finding["id"], expected_version=finding["version"], status="ack"
+    )
+    reconciled("finding acknowledged")
+    audit_db.set_audit_run_status(
+        db_path, run["id"], expected_version=run["version"], status="completed"
+    )
+    reconciled("run completed")
+
+
+def test_a_finding_needs_its_run_in_the_mirror_first(pg_connection_factory) -> None:
+    findings = PostgresAuditFindingMirror(connection_factory=pg_connection_factory)
+    with pytest.raises(Exception) as refused:
+        findings.upsert(
+            {
+                "id": "f1",
+                "run_id": "absent-run",
+                "category": "security",
+                "severity": "info",
+                "summary": "",
+                "file_path": None,
+                "loc": None,
+                "status": "open",
+                "owner": "ops",
+                "project_ref": None,
+                "promoted_task_id": None,
+                "version": 0,
+                "created_at": "2026-08-14T00:00:00",
+                "updated_at": "2026-08-14T00:00:00",
+            }
+        )
+    assert "foreign key" in str(refused.value).lower()
 
 
 # --- the marketplace family --------------------------------------------------
@@ -308,7 +426,7 @@ def test_advisor_proposals_reconcile_after_every_write(
 def test_a_mirror_failure_cannot_break_any_authoritative_write(tmp_path, monkeypatch) -> None:
     """One test for six tables: the rule is the same everywhere, and repeating
     it per table would assert the same swallow six times."""
-    from command_center.db import advisor_store, marketplace_store, networking_store
+    from command_center.db import advisor_store, audit_store, marketplace_store, networking_store
 
     class Exploding:
         def upsert(self, record: dict) -> None:
@@ -317,6 +435,7 @@ def test_a_mirror_failure_cannot_break_any_authoritative_write(tmp_path, monkeyp
     for module, names in (
         (networking_store, ("PostgresContactMirror", "PostgresInvitationMirror")),
         (marketplace_store, ("PostgresMarketItemMirror", "PostgresInstallLogMirror")),
+        (audit_store, ("PostgresAuditRunMirror", "PostgresAuditFindingMirror")),
         (advisor_store, ("PostgresAdvisorProposalMirror",)),
     ):
         for name in names:
@@ -335,6 +454,10 @@ def test_a_mirror_failure_cannot_break_any_authoritative_write(tmp_path, monkeyp
         actor="ops",
         installer="cli",
     )
+    run = audit_db.create_audit_run(db_path, project_ref="AICC", checks=["lint"])
+    audit_db.create_audit_finding(
+        db_path, run_id=run["id"], category="security", summary="s", owner="ops"
+    )
     proposal = wave1.create_advisor_proposal(
         db_path, kind="trend", title="t", project_ref="AICC"
     )
@@ -342,6 +465,7 @@ def test_a_mirror_failure_cannot_break_any_authoritative_write(tmp_path, monkeyp
     assert net_db.get_invitation(db_path, invitation["id"])["council_ref"] == "c1"
     assert market_db.get_market_item(db_path, item["id"])["name"] == "pack"
     assert len(market_db.list_install_log(db_path, item["id"])) == 1
+    assert len(audit_db.list_audit_findings(db_path)) == 1
     assert wave1.get_advisor_proposal(db_path, proposal["id"])["title"] == "t"
 
 
@@ -351,8 +475,8 @@ def test_importing_the_new_stores_needs_no_postgresql_client() -> None:
 
     probe = (
         "import sys;"
-        "import command_center.db.advisor_store, command_center.db.marketplace_store,"
-        " command_center.db.networking_store;"
+        "import command_center.db.advisor_store, command_center.db.audit_store,"
+        " command_center.db.marketplace_store, command_center.db.networking_store;"
         "assert 'aios_db' not in sys.modules;"
         "assert 'psycopg' not in sys.modules"
     )
