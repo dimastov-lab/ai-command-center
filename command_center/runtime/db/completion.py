@@ -12,11 +12,14 @@ they did against the single module.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterable
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Completion pipeline (AICC-AUTONOMY-001)
@@ -165,7 +168,29 @@ def create_completion(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(f"INSERT INTO completion ({columns}) VALUES ({placeholders})", record)
+            # The stored row, not `record`: the insert names only
+            # `_COMPLETION_INSERT_COLUMNS`, so the record is missing whatever
+            # the schema defaults — the shape trap slice 11 measured on `run`.
+            stored = dict(
+                conn.execute("SELECT * FROM completion WHERE run_id = ?", (record["run_id"],)).fetchone()
+            )
+    _mirror("PostgresCompletionMirror", stored, "completion")
     return record
+
+
+def _mirror(mirror_name: str, record: dict, table: str) -> None:
+    """Best-effort dual-write of one completion-family row (SRV-01B slice 14).
+
+    One helper for three tables: the rule is identical for all of them — after
+    the authoritative commit, silent on failure, lazily imported so the desktop
+    and CLI entry points keep working without a driver.
+    """
+    try:
+        from command_center.db import completion_store
+
+        getattr(completion_store, mirror_name)().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
 
 
 def get_completion(db_path: Path, run_id: str) -> dict | None:
@@ -295,7 +320,9 @@ def update_completion(db_path: Path, run_id: str, *, expected_version: int, fiel
             if cur.rowcount != 1:
                 raise db.LostUpdateError(f"Completion {run_id!r} update affected {cur.rowcount} rows")
             updated = conn.execute("SELECT * FROM completion WHERE run_id = ?", (run_id,)).fetchone()
-            return dict(updated)
+            record = dict(updated)
+    _mirror("PostgresCompletionMirror", record, "completion")
+    return record
 
 
 def append_completion_event(
@@ -319,13 +346,39 @@ def append_completion_event(
                 (run_id,),
             ).fetchone()
             seq = row["next_seq"]
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO completion_event
                        (run_id, seq, event_type, reason_code, message, metadata_json, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (run_id, seq, event_type, reason_code, message, metadata_json, now),
             )
-            return seq
+            stored_event = {
+                "id": cur.lastrowid,
+                "run_id": run_id,
+                "seq": seq,
+                "event_type": event_type,
+                "reason_code": reason_code,
+                "message": message,
+                "metadata_json": metadata_json,
+                "created_at": now,
+            }
+    _mirror("PostgresCompletionEventMirror", stored_event, "completion_event")
+    return seq
+
+
+def list_completion_events_stored(db_path: Path, run_id: str) -> list[dict]:
+    """Every completion event for one run in the shape SQLite **stores**.
+
+    :func:`list_completion_events` does both things that hide a column from
+    reconciliation: it selects an explicit column list without `id`, and it
+    pops `metadata_json` in favour of a decoded `metadata`. Fed those rows the
+    reconciliation pairs on `None` and compares a column that is not there.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM completion_event WHERE run_id = ? ORDER BY seq ASC", (run_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def list_completion_events(db_path: Path, run_id: str, *, limit: int = 500) -> list[dict]:
@@ -381,6 +434,12 @@ def record_validation_result(
                            :stdout_summary, :stderr_summary, :created_at)""",
                 record,
             )
+            stored_validation = dict(
+                conn.execute(
+                    "SELECT * FROM completion_validation WHERE rowid = last_insert_rowid()"
+                ).fetchone()
+            )
+    _mirror("PostgresCompletionValidationMirror", stored_validation, "completion_validation")
     return record
 
 
