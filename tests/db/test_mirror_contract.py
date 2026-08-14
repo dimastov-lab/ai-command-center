@@ -26,6 +26,7 @@ the real writer, and anything a table does that the others do not.
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import re
 from pathlib import Path
@@ -44,6 +45,22 @@ DDL = (ROOT / "command_center/db/sql/0001_initial.up.sql").read_text(encoding="u
 
 #: What `models.iso_now()` emits: naive local, second precision, no offset.
 SAMPLE_TIMESTAMP = "2026-08-14T00:00:00"
+
+
+
+@functools.cache
+def _parsed(directory: Path) -> tuple[tuple[Path, ast.AST], ...]:
+    """Every `*.py` under `directory`, parsed once per session.
+
+    The caller check re-parsed all 311 files under `command_center/` for each
+    of the 32 mirrored tables, which acceptance measured as a fivefold slowdown
+    of that check and one that grows with every slice. The parse is pure and
+    the tree is read-only, so caching it changes nothing but the arithmetic.
+    """
+    return tuple(
+        (path, ast.parse(path.read_text(encoding="utf-8")))
+        for path in sorted(directory.rglob("*.py"))
+    )
 
 
 def _discover() -> list[tuple[str, type[PostgresTableMirror]]]:
@@ -224,15 +241,21 @@ def test_every_declared_mirror_has_a_caller(table: str, mirror) -> None:
     swallowed and lazily imported, so "was it called" has no runtime witness
     short of running every authority path with a recording mirror in place.
 
-    **What it does not catch, stated because acceptance built it:** a call site
-    that exists but can never run — `if stored_route is not None and False:`.
+    **What it does not catch, stated because acceptance built all three:** a
+    call site that exists but can never run (`if stored_route is not None and
+    False:`); a *same-named* function elsewhere in `command_center/` satisfying
+    reachability while the real hook has no caller, because `called` is a set of
+    bare names; and the class named only in a type annotation on some other
+    called function, because any non-docstring occurrence counts as code.
     A source scan sees a call and cannot see reachability, and no amount of
     tightening changes that. What catches it is the family's staged
     reconciliation, which drives the real writer and finds the row missing on
     the target; measured, that perturbation fails
     `test_the_provenance_family_reconciles_after_every_write` at stage zero.
-    The two checks are complementary, and this docstring says so rather than
-    letting the reader assume this one covers the case.
+    All three are caught by the family's staged reconciliation, which drives the
+    real writer and finds the row missing on the target — measured for each. The
+    two checks are complementary, and this docstring says how far this one
+    reaches rather than letting the reader assume it reaches further.
     """
     package = ROOT / "command_center"
     authority = package / "runtime/db"
@@ -289,8 +312,7 @@ def test_every_declared_mirror_has_a_caller(table: str, mirror) -> None:
         return False
 
     hooks: set[str] = set()
-    for path in sorted(authority.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for path, tree in _parsed(authority):
         docstrings = _docstring_nodes(tree)
         hooks |= {
             node.name
@@ -309,12 +331,12 @@ def test_every_declared_mirror_has_a_caller(table: str, mirror) -> None:
     # (`start_provider_attempt`, `finish_provider_attempt`,
     # `create_provenance_evidence`) that the services above this layer call;
     # accepting any name re-exported by the facade passed a hook with no
-    # callers at all, because the facade re-exports 252 names. Searching the
+    # callers at all, because the facade re-exports 255 names. Searching the
     # whole application for a call site covers the public writers without the
     # escape hatch.
     called: set[str] = set()
-    for path in sorted(package.rglob("*.py")):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    for _path, tree in _parsed(package):
+        for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name):
                     called.add(node.func.id)
