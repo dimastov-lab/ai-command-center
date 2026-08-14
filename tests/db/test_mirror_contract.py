@@ -152,18 +152,20 @@ def test_the_mirror_satisfies_the_row_oriented_contract(table: str, mirror) -> N
 def test_the_declared_key_is_the_tables_primary_key(table: str, mirror) -> None:
     """The declaration must name the key the database actually has.
 
-    `council_decision` is why: it is keyed by `motion_id` and carries an `id`
-    column that is *not* unique, so a mirror left on the `id` default emits
-    `ON CONFLICT (id)` — a constraint the table does not have. PostgreSQL
-    raises `InvalidColumnReference`, the dual-write hook swallows it, and the
-    table simply never mirrors. Nothing else in this suite notices: independent
-    review flipped `key="motion_id"` back to `"id"` and the whole `tests/db`
-    run stayed green without a database, because every check that would have
-    failed needs one, and none of the ones that do fail says *declaration*.
+    `council_decision` is why the check exists: it is keyed by `motion_id` and
+    carries an `id` column that is *not* unique, so a mirror left on the `id`
+    default emits `ON CONFLICT (id)` — a constraint the table does not have.
+    PostgreSQL raises `InvalidColumnReference`, the dual-write hook swallows it,
+    and the table simply never mirrors. Nothing else in the suite notices:
+    slice 9's acceptance flipped that declaration back to `"id"` and the whole
+    `tests/db` run stayed green without a database, because every check that
+    would have failed needs one and none of those says *declaration*.
 
-    So the check is here, in the half that needs no PostgreSQL, and it is the
-    reason this module can claim the declaration is verified rather than
-    trusted.
+    Two more tables have since surprised this migration the same way — `report`
+    is keyed by `run_id`, and `provider_attempt` by `(run_id, attempt_number)`,
+    the first composite key in the schema. Hence `key_columns` rather than a
+    single name: the check compares whatever was declared against whatever the
+    DDL declares, in either shape.
     """
     body = DDL.split(f"CREATE TABLE {table} (", 1)[1].split(");", 1)[0]
     composite = re.search(r"^\s*PRIMARY KEY \(([^)]+)\)", body, re.MULTILINE)
@@ -173,7 +175,7 @@ def test_the_declared_key_is_the_tables_primary_key(table: str, mirror) -> None:
         inline = re.search(r"^\s*(\w+)\s+.*PRIMARY KEY", body, re.MULTILINE)
         assert inline, f"{table}: no primary key found in the accepted schema"
         declared = (inline.group(1),)
-    assert (mirror.spec.key,) == declared, (
+    assert mirror.spec.key_columns == declared, (
         f"{table}: declared key {mirror.spec.key!r}, schema says {declared}. "
         "A wrong key means `ON CONFLICT` names a constraint the table lacks, and the "
         "dual-write hook swallows the raise — the mirror stays empty and silent."

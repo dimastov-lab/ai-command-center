@@ -205,7 +205,7 @@ def divergence(
     columns: Iterable[str],
     codec: ColumnCodec | None = None,
     *,
-    key: str = "id",
+    key: str | tuple[str, ...] = "id",
 ) -> list[dict]:
     """Rows where the authority and `mirror` disagree.
 
@@ -245,17 +245,24 @@ def divergence(
 
     names = tuple(columns)
     compare = codec.comparable if codec is not None else _comparable
-    # Rows are matched by the table's own primary key, which is not always
-    # `id`: `council_decision` is keyed by `motion_id` and its `id` column is
-    # not unique, so pairing on `id` there would compare unrelated rows or
-    # collapse several into one.
-    mirrored = {row.get(key): row for row in mirror_rows}
+    # Rows are matched by the table's own primary key, which is neither always
+    # `id` nor always a single column: `council_decision` is keyed by
+    # `motion_id` whose `id` column is not unique, and `provider_attempt` by
+    # `(run_id, attempt_number)`. Pairing on the wrong thing compares unrelated
+    # rows or collapses several into one — and reports agreement either way.
+    keys = (key,) if isinstance(key, str) else tuple(key)
+
+    def identity(row: dict) -> tuple:
+        return tuple(row.get(name) for name in keys)
+
+    mirrored = {identity(row): row for row in mirror_rows}
     differences: list[dict] = []
     for row in authority_rows:
-        counterpart = mirrored.pop(row.get(key), None)
+        row_key = identity(row)
+        counterpart = mirrored.pop(row_key, None)
         if counterpart is None:
             differences.append(
-                {"id": row.get(key), "fields": ["*"], "authority": row, "mirror": None}
+                {"id": _reported(row_key), "fields": ["*"], "authority": row, "mirror": None}
             )
             continue
         fields = sorted(
@@ -265,13 +272,24 @@ def divergence(
         )
         if fields:
             differences.append(
-                {"id": row.get(key), "fields": fields, "authority": row, "mirror": counterpart}
+                {"id": _reported(row_key), "fields": fields, "authority": row, "mirror": counterpart}
             )
     for leftover_id, leftover in mirrored.items():
         differences.append(
-            {"id": leftover_id, "fields": ["*"], "authority": None, "mirror": leftover}
+            {"id": _reported(leftover_id), "fields": ["*"], "authority": None, "mirror": leftover}
         )
     return differences
+
+
+def _reported(row_key: tuple) -> Any:
+    """What a divergence record shows as the row's identity.
+
+    A single-column key reports its bare value, as every earlier slice's report
+    did and as the operator-facing tests assert; a composite one reports the
+    tuple. Flattening the composite case to its first column would name two
+    different rows the same thing in the one report meant to tell them apart.
+    """
+    return row_key[0] if len(row_key) == 1 else row_key
 
 
 def _comparable(_name: str, value: Any) -> Any:

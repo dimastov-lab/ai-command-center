@@ -11,11 +11,15 @@ they did against the single module.
 
 from __future__ import annotations
 
+import logging
+
 import json
 from pathlib import Path
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Canonical run provenance (schema 13)
@@ -140,7 +144,26 @@ def update_run_provenance(db_path: Path, run_id: str, *, fields: dict) -> dict:
             row = conn.execute(
                 "SELECT * FROM run_provenance WHERE run_id = ?", (run_id,)
             ).fetchone()
-            return dict(row)
+            record = dict(row)
+    _mirror("PostgresRunProvenanceMirror", record, "run_provenance")
+    return record
+
+def _mirror(mirror_name: str, record: dict, table: str) -> None:
+    """Best-effort dual-write of one provenance row into PostgreSQL (slice 13).
+
+    One helper for four tables because the rule is identical for all of them
+    and repeating it four times would be four places to fix the next time.
+    After the authoritative commit, silent on failure, and lazily imported so
+    the desktop and CLI entry points keep working without a driver.
+    """
+    try:
+        from command_center.db import provenance_store
+
+        getattr(provenance_store, mirror_name)().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
+
+
 
 
 def set_run_provenance_once(
@@ -192,7 +215,9 @@ def set_run_provenance_once(
             updated = conn.execute(
                 "SELECT * FROM run_provenance WHERE run_id = ?", (run_id,)
             ).fetchone()
-            return dict(updated), True
+            record = dict(updated)
+    _mirror("PostgresRunProvenanceMirror", record, "run_provenance")
+    return record, True
 
 
 def create_provenance_evidence(
@@ -248,7 +273,26 @@ def create_provenance_evidence(
                    )""",
                 record,
             )
-            return record
+    _mirror("PostgresProvenanceEvidenceMirror", record, "provenance_evidence")
+    return record
+
+
+def list_provenance_evidence_stored(db_path: Path) -> list[dict]:
+    """Every evidence row in the shape SQLite **stores**, for reconciliation.
+
+    :func:`get_provenance_evidence_for_runs` selects an explicit column list
+    that omits both `jsonb` payloads — the read surface does not need them, and
+    they are large. Reconciliation does need them: fed the projected rows it
+    would report every evidence row divergent on two columns at once.
+
+    The fitness gate caught this before any test did, which is what it is for:
+    the same rule that found `run_event`'s projected `id` one slice earlier.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM provenance_evidence ORDER BY integrity_id"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def get_provenance_evidence_for_runs(
@@ -358,6 +402,7 @@ def start_provider_attempt(
                    )""",
                 record,
             )
+    _mirror("PostgresProviderAttemptMirror", record, "provider_attempt")
     return record
 
 
@@ -418,7 +463,9 @@ def finish_provider_attempt(
                    WHERE run_id = ? AND attempt_number = ?""",
                 (run_id, attempt_number),
             ).fetchone()
-            return dict(updated)
+            record = dict(updated)
+    _mirror("PostgresProviderAttemptMirror", record, "provider_attempt")
+    return record
 
 
 def list_provider_attempts(db_path: Path, run_id: str) -> list[dict]:
