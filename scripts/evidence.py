@@ -139,7 +139,18 @@ def _ruff() -> str:
     # made `uv run` fail to spawn and made ruff reject a config, and both were
     # reported as "**ruff NOT clean**" — a false statement in the one line this
     # tool exists to keep true.
-    if completed.returncode != 1 or completed.stderr.strip().startswith(("error", "ruff failed")):
+    stderr = completed.stderr.strip()
+    if (
+        completed.returncode != 1
+        or stderr.startswith(("error", "ruff failed"))
+        # `python -m ruff` with no ruff installed exits 1 and says so on stderr
+        # with no prefix of its own. The previous discriminator covered exactly
+        # this wording and the one before it covered only the uv wording; each
+        # traded the other's case away. Both are named now, because the point
+        # of the third state is that "could not check" never reads as "found
+        # problems".
+        or "No module named" in stderr
+    ):
         return "unavailable"
     return "dirty"
 
@@ -163,9 +174,17 @@ def _evidence_line(paths: list[str], counts: dict[str, int], ruff_state: str) ->
     }[ruff_state]
     # The configuration, in the line rather than in a stderr warning nobody
     # pastes. Two honest runs of one tree differ by whether a database was
-    # reachable, and the lines were previously indistinguishable — which is the
-    # hazard this tool's own docstring names.
-    database = "with PostgreSQL" if os.environ.get("AICC_TEST_PG_ADMIN_DSN") else "serverless"
+    # reachable, and the lines were previously indistinguishable.
+    #
+    # It reports what was *requested*, not what the run achieved: the DSN can
+    # point at nothing. Review probed that and found the difference only ever
+    # observable next to a `FAILED` term in the same line — a DSN pointing at a
+    # closed port fails the tests rather than skipping them — so the marker
+    # cannot pose as a clean PostgreSQL run. `requested` is in the wording for
+    # the same reason.
+    database = (
+        "PostgreSQL requested" if os.environ.get("AICC_TEST_PG_ADMIN_DSN") else "serverless"
+    )
     return f"Evidence: {scope} " + " / ".join(parts) + f"{suffix} ({database})."
 
 

@@ -197,4 +197,22 @@ def test_the_line_records_which_configuration_measured_it(tmp_path) -> None:
 
     with_database = {**os.environ, "AICC_TEST_PG_ADMIN_DSN": "host=127.0.0.1 dbname=irrelevant"}
     measured = _run(EVIDENCE, "measure", str(suite), env=with_database)
-    assert "(with PostgreSQL)" in measured.stdout, measured.stdout
+    assert "(PostgreSQL requested)" in measured.stdout, measured.stdout
+
+
+def test_a_missing_ruff_is_never_reported_as_a_dirty_tree(tmp_path) -> None:
+    """The third state has to hold on both branches, and twice it did not.
+
+    The first discriminator matched two literal strings that only cover
+    `python -m ruff`'s wording; the second traded that away for `uv run`'s.
+    Each time, "ruff could not run" printed as "**ruff NOT clean**" on the
+    other path — a false statement in the one line this tool exists to keep
+    true. This pins the direction that matters on the branch CI uses.
+    """
+    suite = _write_suite(tmp_path / "green", green=True)
+    without_ruff = {
+        k: v for k, v in os.environ.items() if k not in {"PATH", "AICC_TEST_PG_ADMIN_DSN"}
+    }
+    without_ruff["PATH"] = "/usr/bin:/bin"
+    measured = _run(EVIDENCE, "measure", str(suite), env=without_ruff)
+    assert "ruff NOT clean" not in measured.stdout, measured.stdout
