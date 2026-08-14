@@ -306,6 +306,7 @@ from command_center.runtime.db.proposal import (  # noqa: F401
     create_proposal_atomic,
     get_proposal,
     list_proposal_events,
+    list_proposal_events_stored,
     list_proposal_evidence,
     list_proposals,
     transition_proposal_atomic,
