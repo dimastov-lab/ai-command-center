@@ -201,10 +201,28 @@ def test_resync_identity_makes_the_next_native_write_land(
             assert cur.fetchone()[0] == 4
 
 
-def test_resync_identity_is_safe_on_an_empty_table(events: PostgresModelEventMirror) -> None:
+def test_resync_identity_is_a_no_op_on_an_empty_table(
+    entries: PostgresModelEntryMirror, events: PostgresModelEventMirror, pg_connection_factory
+) -> None:
     """A cutover may run before any row is mirrored — `setval` with `NULL`
-    would raise, and an operator would read a failed cutover step."""
+    would raise, and an operator would read a failed cutover step.
+
+    Stronger than "does not raise": the sequence must still yield **1**
+    afterwards. The two-argument `setval` marks the sequence called and would
+    burn the first id, which is harmless for a surrogate key but makes the
+    operation something other than its name. Independent review raised it; the
+    behaviour is pinned here rather than left incidental.
+    """
     assert events.resync_identity() == 1
+
+    entries.upsert(_entry("m1"))
+    with pg_connection_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO model_event (model_id, seq, action, created_at) "
+                "VALUES ('m1', 1, 'use', now()) RETURNING id"
+            )
+            assert cur.fetchone()[0] == 1
 
 
 # --- the already-solved shapes this table also has --------------------------
@@ -399,6 +417,41 @@ def test_the_event_mirror_receives_the_stored_record_not_the_decoded_one(
     event = seen[-1]
     assert isinstance(event["id"], int)
     assert json.loads(event["metadata_json"]) == {"why": "test"}
+
+
+def test_the_public_event_shapes_are_unchanged(tmp_path, monkeypatch) -> None:
+    """The two public readers had **different** shapes before this slice, and
+    both are preserved.
+
+    `list_model_events` reads `SELECT *` and has always included `id`;
+    `append_model_event` built its dict by hand and never had one. Slice 6 gave
+    the append path an id because the mirror needs it — and the first attempt
+    at keeping shapes intact dropped `id` from the shared decoder, on the belief
+    that it had only just appeared. It had not: that silently narrowed the list
+    reader, which is exported on the `runtime.db` facade. Independent review
+    caught it by running the same probe at both SHAs.
+
+    Pinned here so the next person who touches the decoder has to look at both
+    callers rather than at one.
+    """
+    from command_center.db import model_registry_store
+
+    class Recording:
+        def upsert(self, record: dict) -> None:
+            pass
+
+    monkeypatch.setattr(model_registry_store, "PostgresModelEntryMirror", lambda: Recording())
+    monkeypatch.setattr(model_registry_store, "PostgresModelEventMirror", lambda: Recording())
+
+    db_path = tmp_path / "runtime.db"
+    mr_db.db.migrate(db_path)
+    created = mr_db.create_model_entry(db_path, model_id="m1", name="n", kind="local")
+    appended = mr_db.append_model_event(db_path, created["id"], action="use")
+
+    assert "id" not in appended, "append_model_event never returned an id"
+    assert all("id" in row for row in mr_db.list_model_events(db_path, "m1")), (
+        "list_model_events has always returned an id"
+    )
 
 
 def test_a_mirror_failure_cannot_break_the_authoritative_write(tmp_path, monkeypatch) -> None:

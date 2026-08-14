@@ -501,7 +501,10 @@ def append_model_event(
                 now=now,
             )
     _mirror_model_event(event)
-    return _decode_event_row(event)
+    # `keep_id=False`: this path never returned an id before slice 6 gave the
+    # record one for the mirror, and widening a public return is still a shape
+    # change nobody asked for.
+    return _decode_event_row(event, keep_id=False)
 
 
 def list_model_events(db_path: Path, model_id: str) -> list[dict]:
@@ -542,18 +545,31 @@ def list_model_events_stored(db_path: Path) -> list[dict]:
         return [dict(row) for row in rows]
 
 
-def _decode_event_row(row: dict) -> dict:
+def _decode_event_row(row: dict, *, keep_id: bool = True) -> dict:
     """Return a copy of a ``model_event`` row with ``metadata_json`` decoded to a
     ``metadata`` dict (the JSON column stays internal to the repository).
 
-    ``id`` is dropped for the same reason: the log is addressed publicly by
-    ``(model_id, seq)``, and the row id is a storage detail. It became visible
-    here when :func:`_append_model_event` started carrying SQLite's minted id
-    for the mirror (SRV-01B slice 6); dropping it keeps this view exactly what
-    it was before that change, so no caller's shape moved. Reconciliation needs
-    the id and therefore reads :func:`list_model_events_stored` instead."""
+    ``keep_id`` exists because the two callers of this function historically
+    returned **different** shapes, and preserving that is the whole point.
+    :func:`list_model_events` reads ``SELECT *`` and has always included ``id``;
+    :func:`append_model_event` built its dict by hand and never had one, because
+    SQLite minted the id and nobody read it back.
+
+    Slice 6 gave the append path an id — the mirror needs it, since PostgreSQL
+    refuses a non-DEFAULT value for a ``GENERATED ALWAYS`` column and
+    reconciliation matches rows by id. The first attempt at keeping the public
+    shapes intact dropped ``id`` here unconditionally, on the belief that it had
+    only just become visible. That was wrong: it had always been in the list
+    reader's output, so the "fix" silently narrowed a public reader.
+    Independent review caught it by running the same probe at both SHAs. Now
+    each caller asks for the shape it always had, and
+    ``test_the_public_event_shapes_are_unchanged`` pins both.
+
+    Reconciliation needs the id under a stable column name and therefore reads
+    :func:`list_model_events_stored`, which does no decoding at all."""
     out = dict(row)
     raw = out.pop("metadata_json", None)
-    out.pop("id", None)
+    if not keep_id:
+        out.pop("id", None)
     out["metadata"] = json.loads(raw) if raw else {}
     return out

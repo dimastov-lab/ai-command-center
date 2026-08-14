@@ -218,8 +218,16 @@ class PostgresModelEventMirror(_Mirror):
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_get_serial_sequence('model_event', 'id')")
                 sequence = cur.fetchone()[0]
+                # The third `setval` argument is `is_called`: false on an empty
+                # table, so the sequence still yields 1 next. The two-argument
+                # form marks it called and would burn id 1 — harmless for a
+                # surrogate key, but it would make this operation something
+                # other than what its name says, and independent review pointed
+                # out that "advance past the largest mirrored id" has no
+                # meaning when there is no largest.
                 cur.execute(
-                    "SELECT setval(%s, (SELECT COALESCE(MAX(id), 1) FROM model_event))",
+                    "SELECT setval(%s, (SELECT COALESCE(MAX(id), 1) FROM model_event),"
+                    " (SELECT COUNT(*) > 0 FROM model_event))",
                     (sequence,),
                 )
                 return int(cur.fetchone()[0])
