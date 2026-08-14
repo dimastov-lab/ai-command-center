@@ -12,6 +12,7 @@ they did against the single module.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
@@ -19,6 +20,8 @@ from typing import Any, Iterable
 from command_center.runtime import autonomy as autonomy_domain
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Autonomy proposals (schema 7) — the pre-execution decision layer.
@@ -225,7 +228,32 @@ def create_proposal(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+            stored = dict(
+                conn.execute("SELECT * FROM proposal WHERE id = ?", (record["id"],)).fetchone()
+            )
+    _mirror("PostgresProposalMirror", stored, "proposal")
     return record
+
+def _mirror(mirror_name: str, record: dict, table: str) -> None:
+    """Best-effort dual-write of one proposal-family row (SRV-01B slice 15).
+
+    After the authoritative commit, silent on failure, lazily imported. One
+    helper for three tables because the rule is identical.
+    """
+    try:
+        from command_center.db import proposal_store
+
+        getattr(proposal_store, mirror_name)().upsert(record)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
+
+
+def _mirror_children(records: list[tuple[str, dict, str]]) -> None:
+    """Mirror a transaction's children in the order they were written."""
+    for mirror_name, record, table in records:
+        _mirror(mirror_name, record, table)
+
+
 
 
 def get_proposal(db_path: Path, proposal_id: str) -> dict | None:
@@ -300,16 +328,31 @@ def _proposal_evidence_insert(
     is_blocker: bool,
     data: dict | None,
     now: str,
-) -> int:
+) -> dict:
     seq = db._proposal_next_seq(conn, "proposal_evidence", proposal_id)
     data_json = json.dumps(data, ensure_ascii=False) if data is not None else None
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO proposal_evidence
                (proposal_id, seq, kind, source, summary, observed_at, is_blocker, data_json, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (proposal_id, seq, kind, source, summary, observed_at, 1 if is_blocker else 0, data_json, now),
     )
-    return seq
+    # The stored record, not the sequence number: the target's `id` is
+    # `GENERATED ALWAYS AS IDENTITY` and reconciliation pairs rows by it, so the
+    # mirror needs the id SQLite just minted. Callers that owe a `seq` take it
+    # from the record.
+    return {
+        "id": cur.lastrowid,
+        "proposal_id": proposal_id,
+        "seq": seq,
+        "kind": kind,
+        "source": source,
+        "summary": summary,
+        "observed_at": observed_at,
+        "is_blocker": 1 if is_blocker else 0,
+        "data_json": data_json,
+        "created_at": now,
+    }
 
 
 def _proposal_event_insert(
@@ -324,10 +367,10 @@ def _proposal_event_insert(
     reason_code: str | None = None,
     message: str | None = None,
     metadata: dict | None = None,
-) -> int:
+) -> dict:
     seq = db._proposal_next_seq(conn, "proposal_event", proposal_id)
     metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO proposal_event
                (proposal_id, seq, event_type, from_state, to_state, actor,
                 reason_code, message, metadata_json, created_at)
@@ -335,10 +378,22 @@ def _proposal_event_insert(
         (proposal_id, seq, event_type, from_state, to_state, actor,
          reason_code, message, metadata_json, now),
     )
-    return seq
+    return {
+        "id": cur.lastrowid,
+        "proposal_id": proposal_id,
+        "seq": seq,
+        "event_type": event_type,
+        "from_state": from_state,
+        "to_state": to_state,
+        "actor": actor,
+        "reason_code": reason_code,
+        "message": message,
+        "metadata_json": metadata_json,
+        "created_at": now,
+    }
 
 
-def _proposal_event_from_spec(conn: sqlite3.Connection, proposal_id: str, spec: dict, *, now: str) -> int:
+def _proposal_event_from_spec(conn: sqlite3.Connection, proposal_id: str, spec: dict, *, now: str) -> dict:
     """Append one audit event from a spec dict (`append_proposal_event` kwargs;
     `event_type` key optional). Used by the atomic composers so callers can pass
     plain dicts."""
@@ -430,8 +485,11 @@ def update_proposal(db_path: Path, proposal_id: str, *, expected_version: int, f
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             db._proposal_update(conn, proposal_id, expected_version=expected_version, fields=fields, now=now)
-            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
-            return dict(updated)
+            updated = dict(
+                conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            )
+    _mirror("PostgresProposalMirror", updated, "proposal")
+    return updated
 
 
 def append_proposal_evidence(
@@ -468,10 +526,12 @@ def append_proposal_evidence(
                 raise db.ProposalEvidenceFrozenError(
                     f"Proposal {proposal_id!r} evidence is frozen in state {row['state']!r}"
                 )
-            return db._proposal_evidence_insert(
+            evidence_record = db._proposal_evidence_insert(
                 conn, proposal_id, kind=kind, source=source, summary=summary,
                 observed_at=observed_at, is_blocker=is_blocker, data=data, now=now,
             )
+    _mirror("PostgresProposalEvidenceMirror", evidence_record, "proposal_evidence")
+    return evidence_record["seq"]
 
 
 def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
@@ -488,6 +548,26 @@ def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
             item["is_blocker"] = bool(item["is_blocker"])
             events.append(item)
         return events
+
+
+def list_proposal_evidence_stored(db_path: Path, proposal_id: str) -> list[dict]:
+    """Evidence rows in the shape SQLite **stores**, for reconciliation.
+
+    :func:`list_proposal_evidence` pops `data_json` and returns a parsed `data`
+    key instead, which is right for its callers and wrong for reconciliation:
+    fed those rows it reports every evidence row divergent on `data_json` and
+    agrees about a `data` column the target does not have.
+
+    The decoding here is written inline rather than in a `_decode_*` helper,
+    which is how it got past the fitness gate until that gate learned to treat
+    a `.pop("<column>")` as the same act.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM proposal_evidence WHERE proposal_id = ? ORDER BY seq ASC",
+            (proposal_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def append_proposal_event(
@@ -508,11 +588,30 @@ def append_proposal_event(
     now = db.iso_now()
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            return db._proposal_event_insert(
+            event_record = db._proposal_event_insert(
                 conn, proposal_id, event_type, now=now, from_state=from_state,
                 to_state=to_state, actor=actor, reason_code=reason_code,
                 message=message, metadata=metadata,
             )
+    _mirror("PostgresProposalEventMirror", event_record, "proposal_event")
+    return event_record["seq"]
+
+
+def list_proposal_events_stored(db_path: Path, proposal_id: str) -> list[dict]:
+    """Every proposal event in the shape SQLite **stores**, for reconciliation.
+
+    :func:`list_proposal_events` hands out the shape callers want, which is not
+    the shape the mirror holds — the same split `digest_item`, `model_event`,
+    `audit_run`, `run_event`, `council_event` and `completion_event` all have.
+    Six tables into that pattern, the gate that requires this reader is worth
+    more than the memory that used to.
+    """
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM proposal_event WHERE proposal_id = ? ORDER BY seq ASC",
+            (proposal_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def list_proposal_events(db_path: Path, proposal_id: str, *, limit: int = 500) -> list[dict]:
@@ -598,16 +697,34 @@ def create_proposal_atomic(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+            children: list[tuple[str, dict, str]] = []
             for e in evidence or []:
-                db._proposal_evidence_insert(
-                    conn, pid, kind=e["kind"], source=e["source"], summary=e.get("summary"),
-                    observed_at=e["observed_at"], is_blocker=bool(e.get("is_blocker", False)),
-                    data=e.get("data"), now=now,
+                children.append(
+                    (
+                        "PostgresProposalEvidenceMirror",
+                        db._proposal_evidence_insert(
+                            conn, pid, kind=e["kind"], source=e["source"],
+                            summary=e.get("summary"), observed_at=e["observed_at"],
+                            is_blocker=bool(e.get("is_blocker", False)),
+                            data=e.get("data"), now=now,
+                        ),
+                        "proposal_evidence",
+                    )
                 )
             if created_event is not None:
-                db._proposal_event_from_spec(conn, pid, created_event, now=now)
-            stored = conn.execute("SELECT * FROM proposal WHERE id = ?", (pid,)).fetchone()
-            return dict(stored)
+                children.append(
+                    (
+                        "PostgresProposalEventMirror",
+                        db._proposal_event_from_spec(conn, pid, created_event, now=now),
+                        "proposal_event",
+                    )
+                )
+            stored = dict(conn.execute("SELECT * FROM proposal WHERE id = ?", (pid,)).fetchone())
+    # Parent first, then its children in write order: the target refuses a
+    # child whose proposal is not mirrored yet.
+    _mirror("PostgresProposalMirror", stored, "proposal")
+    _mirror_children(children)
+    return stored
 
 
 def apply_assessment_atomic(
@@ -638,7 +755,15 @@ def apply_assessment_atomic(
                 conn, proposal_id, expected_version=expected_version,
                 fields=dict(verdict_fields), now=now,
             )
-            db._proposal_event_from_spec(conn, proposal_id, {"event_type": "assessed", **assessed_event}, now=now)
+            children = [
+                (
+                    "PostgresProposalEventMirror",
+                    db._proposal_event_from_spec(
+                        conn, proposal_id, {"event_type": "assessed", **assessed_event}, now=now
+                    ),
+                    "proposal_event",
+                )
+            ]
             for t in transitions:
                 fields = dict(t.get("extra_fields") or {})
                 fields["state"] = t["new_state"]
@@ -649,9 +774,19 @@ def apply_assessment_atomic(
                 version, _state = db._proposal_update(
                     conn, proposal_id, expected_version=version, fields=fields, now=now,
                 )
-                db._proposal_event_from_spec(conn, proposal_id, event_spec, now=now)
-            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
-            return dict(updated)
+                children.append(
+                    (
+                        "PostgresProposalEventMirror",
+                        db._proposal_event_from_spec(conn, proposal_id, event_spec, now=now),
+                        "proposal_event",
+                    )
+                )
+            updated = dict(
+                conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            )
+    _mirror("PostgresProposalMirror", updated, "proposal")
+    _mirror_children(children)
+    return updated
 
 
 def transition_proposal_atomic(
@@ -672,6 +807,10 @@ def transition_proposal_atomic(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             db._proposal_update(conn, proposal_id, expected_version=expected_version, fields=upd_fields, now=now)
-            db._proposal_event_from_spec(conn, proposal_id, event, now=now)
-            updated = conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
-            return dict(updated)
+            event_record = db._proposal_event_from_spec(conn, proposal_id, event, now=now)
+            updated = dict(
+                conn.execute("SELECT * FROM proposal WHERE id = ?", (proposal_id,)).fetchone()
+            )
+    _mirror("PostgresProposalMirror", updated, "proposal")
+    _mirror("PostgresProposalEventMirror", event_record, "proposal_event")
+    return updated
