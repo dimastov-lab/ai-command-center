@@ -375,8 +375,10 @@ $$;
 
 CREATE FUNCTION _identity_new_id(p_prefix text) RETURNS text
     LANGUAGE sql VOLATILE SET search_path = pg_catalog, public AS $$
-    -- Identifiers, not secrets: `gen_random_uuid()` is core, so this needs no
-    -- pgcrypto dependency the rest of the schema does not have.
+    -- These are identifiers and carry no entropy requirement, so
+    -- `gen_random_uuid()` is right and core: no pgcrypto dependency, which the
+    -- rest of the schema does not have either. Credential material is generated
+    -- by the holder and never by this function.
     SELECT p_prefix || replace(gen_random_uuid()::text, '-', '')
 $$;
 
