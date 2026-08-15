@@ -57,6 +57,21 @@ It rejects an absent credential, extra archive members, manifest mismatch,
 or wheel checksum mismatch. There is deliberately no sibling checkout,
 mutable ref, package-index, or vendored-wheel fallback.
 
+That credential reads a private repository, and it is handed to a script taken
+from the checked-out tree, so where the tree came from matters. On the
+`pull_request` path GitHub withholds secrets from forks. The `merge_group` path
+does not: the queue ref is created here, so the run is trusted with secrets,
+while the code on it is the pull request's own. Every step that carries a
+standing secret therefore begins with
+`scripts/assert_trusted_head_repository.py`, which resolves the queued pull
+request — its number is part of the queue ref, the payload naming no head
+repository — and refuses the run unless the head repository is this one. It
+refuses on anything it cannot establish: an unknown event, an unparseable ref,
+a missing token, an API error, a deleted fork.
+`tests/test_release_gate_policy.py` pins the guard to *every* secret-bearing
+step and forbids widening a secret past the step that declares it, so the
+protection cannot be dropped or side-stepped without failing the security gate.
+
 The same sole adapter implements AICC's read-only status port with only the
 SDK's public health, readiness, whoami, and workspace-timeline surfaces. Its
 timeline DTO retains event id/type/time and request evidence only; actor,
