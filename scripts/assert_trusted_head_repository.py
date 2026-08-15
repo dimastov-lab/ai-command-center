@@ -155,11 +155,16 @@ def assert_trusted(env: dict[str, str]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        repository = assert_trusted(dict(os.environ))
+        assert_trusted(dict(os.environ))
     except UntrustedContextError as error:
+        # The refusal path names the offending repository, which comes from the
+        # API rather than from the environment, and is the whole diagnostic
+        # value of this guard. The success path deliberately echoes nothing: it
+        # is handed the process environment, and printing anything derived from
+        # that is how a log line becomes a credential leak.
         print(f"untrusted context: {error}", file=sys.stderr)
         return 1
-    print(f"trusted head repository: {repository}")
+    print("head repository confirmed: the checked-out code was authored here")
     return 0
 
 
