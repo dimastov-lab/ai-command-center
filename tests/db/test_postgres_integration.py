@@ -373,7 +373,7 @@ def test_matrix_matches_the_catalog(admin_conn, psycopg, test_dsn, role_password
                 privilege, set()
             ).add(column)
 
-    for role in (roles.APP_ROLE, roles.WORKER_ROLE):
+    for role in (roles.APP_ROLE, roles.WORKER_ROLE, roles.OPERATOR_ROLE):
         # An empty privilege set is a declared refusal, not a grant of nothing:
         # it must be absent from the catalog entirely. Views are folded in here
         # because `role_table_grants` reports them through the same catalog, so

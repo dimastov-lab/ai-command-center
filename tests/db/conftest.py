@@ -23,16 +23,18 @@ import secrets
 
 import pytest
 
+from command_center.db import roles as _roles
+
 ADMIN_DSN_ENV = "AICC_TEST_PG_ADMIN_DSN"
 
-# Passwords for the login-enabled variants of the three product roles. Random
-# per session: nothing in the suite should work against a fixed credential that
+# Passwords for the login-enabled variants of the product roles. Random per
+# session: nothing in the suite should work against a fixed credential that
 # could accidentally be reused by a real deployment.
-_ROLE_PASSWORDS = {
-    "aicc_migrator": secrets.token_urlsafe(24),
-    "aicc_app": secrets.token_urlsafe(24),
-    "aicc_worker": secrets.token_urlsafe(24),
-}
+#
+# Derived from `ALL_ROLES` rather than listed: a role added to the inventory
+# without a password here fails at fixture setup with a `KeyError`, which reads
+# as a broken test rather than as the missing provisioning step it is.
+_ROLE_PASSWORDS = {role: secrets.token_urlsafe(24) for role in _roles.ALL_ROLES}
 
 
 @pytest.fixture(scope="session")
@@ -50,7 +52,7 @@ def psycopg(admin_dsn):  # noqa: ARG001 — depend on admin_dsn so we skip befor
 
 @pytest.fixture(scope="session")
 def role_passwords(admin_dsn, psycopg) -> dict[str, str]:
-    """Give the three product roles LOGIN and a password, cluster-wide.
+    """Give every product role LOGIN and a password, cluster-wide.
 
     Roles are cluster objects rather than per-database ones, so this runs once
     and the per-test databases reuse them. Production does the same: the roles
