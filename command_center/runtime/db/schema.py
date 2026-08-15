@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1088,6 +1088,27 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
+# VOYN-W0-AICC-RETENTION-TZ. Every timestamp this app writes is a *naive local*
+# ISO string (`models.iso_now`: "local time on the machine that wrote them").
+# Nothing recorded which machine — and which zone — that was, so any consumer
+# that had to compare those strings against "now" silently used the zone of its
+# own process. For retention that is a data-loss defect: a prune started with a
+# different `TZ` than the app deletes a different *set* of rows from the same
+# database at the same instant.
+#
+# `runtime_meta` is a small key/value side table that lets the database carry
+# facts about itself. Its first key, `timestamp_tz`, is the IANA zone the naive
+# timestamps in this file are on, stamped once by `migrate()` from the machine
+# that owns the database. A comparison rendered in *that* zone gives the same
+# answer no matter which process asks — which is the whole point.
+_SCHEMA_V24 = """
+CREATE TABLE IF NOT EXISTS runtime_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (1, _SCHEMA_V1),
     (2, _migration_2_add_failure_reason),
@@ -1117,4 +1138,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (21, _SCHEMA_V21),
     (22, _SCHEMA_V22),
     (23, _SCHEMA_V23),
+    (24, _SCHEMA_V24),
 ]
