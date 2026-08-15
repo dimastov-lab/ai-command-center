@@ -346,9 +346,21 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     blocker = tmp_path / "block_psycopg"
     blocker.mkdir()
     (blocker / "psycopg.py").write_text('raise ImportError("blocked")\n', encoding="utf-8")
+    # The behavioural half runs the *fallback* form — `sys.executable -c` —
+    # deliberately, and this is a limit worth stating rather than hiding. The
+    # first version ran `_driver_probe_command()` itself, which on a runner with
+    # `uv` means `uv run --with psycopg[binary] …`: an environment build, twice,
+    # inside a test. CI cancelled the job at its 30-minute ceiling against a
+    # 14-minute norm. What is exercised here is that the probe's *question*
+    # answers to reality; that the uv form asks the same question is the
+    # assertion above and `..._pin_the_same_extras`.
+    fallback = [sys.executable, "-c", "import psycopg"]
+    assert fallback[1:] == module._driver_probe_command()[-2:], (
+        "the fallback form drifted from what this test exercises"
+    )
     existing = os.environ.get("PYTHONPATH")
-    probed = subprocess.run(
-        module._driver_probe_command(),
+    blocked = subprocess.run(
+        fallback,
         cwd=ROOT,
         capture_output=True,
         env={
@@ -358,15 +370,11 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
             "PYTHONPATH": os.pathsep.join([str(blocker), *([existing] if existing else [])]),
         },
     )
-    assert probed.returncode != 0, "the probe reported a driver that cannot be imported"
+    assert blocked.returncode != 0, "the probe reported a driver that cannot be imported"
 
-    # The positive direction needs the driver to actually be installed. On the
-    # `uv` branch the command supplies it; on the pip fallback it is the host's,
-    # and asserting there would fail on any machine without it — the host
-    # dependency this file removed from another test one commit ago.
-    if "uv" not in module._driver_probe_command()[0]:
-        pytest.importorskip("psycopg")
-    assert subprocess.run(module._driver_probe_command(), cwd=ROOT, capture_output=True).returncode == 0
+    # And the other direction, which needs the driver actually installed.
+    pytest.importorskip("psycopg")
+    assert subprocess.run(fallback, cwd=ROOT, capture_output=True).returncode == 0
 
 
 def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -> None:
