@@ -220,7 +220,11 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
 
         def run(self, request):
             self.started.set()
-            assert self.release.wait(timeout=2)
+            # Longer than the lease under test, because this thread must stay
+            # blocked for the whole window the test measures. At two seconds it
+            # was shorter than the widened lease and timed out first — the
+            # fixture's own bound silently becoming the thing under test.
+            assert self.release.wait(timeout=10)
             return CampaignResult("completed", "ok", target_verified=True)
 
     backend = BlockingBackend()
@@ -228,8 +232,21 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
     service = DailyAuditService(
         config(
             tmp_path,
-            lease_duration=timedelta(milliseconds=300),
-            lease_heartbeat_seconds=0.05,
+            # A second and a tenth, not 300ms and 50ms. The property under
+            # test is "a live heartbeat refreshes the lease past its original
+            # deadline" — but at 300ms the assertion also required the
+            # heartbeat thread to be scheduled within 50ms of its turn, and on
+            # a loaded parallel runner it is not. The lease then expires
+            # *honestly*, a contender takes it, and the test fails for a reason
+            # that is not the property. Measured on CI: one failure in a
+            # 4153-test run, `acquire_due` returning a campaign id.
+            #
+            # Widening the budget is the fix here rather than an evasion,
+            # because the number was never the subject: nothing about the
+            # heartbeat is exercised more strongly by making its window smaller
+            # than the operating system's scheduling noise.
+            lease_duration=timedelta(seconds=1),
+            lease_heartbeat_seconds=0.1,
         ),
         backend,
         db_path=db_path,
@@ -249,7 +266,24 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
     # Wait past the *original* lease deadline so a missing heartbeat would hand
     # ownership to a second contender, while still expecting the refreshed lease
     # to remain valid.
-    time.sleep(0.35)
+    # Wait for the *condition* the test is about — being past the original
+    # deadline — rather than for a duration guessed to exceed it. A fixed sleep
+    # is a bet on the scheduler, and this file has already paid out on that bet
+    # once.
+    deadline = time.monotonic() + 5
+    while utc_now() <= original_until:
+        assert time.monotonic() < deadline, "never passed the original lease deadline"
+        time.sleep(0.01)
+
+    # And state the precondition instead of assuming it: if the refreshed lease
+    # has itself expired, the contender below would succeed for a reason that
+    # is not the one under test, and the failure should say so.
+    refreshed_until = datetime.fromisoformat(service.store.status()["lease_until"])
+    assert refreshed_until > utc_now(), (
+        "the heartbeat thread was starved and the refreshed lease expired too; "
+        "this says nothing about whether a live heartbeat prevents takeover"
+    )
+
     contender = DailyAuditStore(db_path)
     assert contender.acquire_due(
         now=utc_now(), owner="two", lease_duration=timedelta(seconds=1)
