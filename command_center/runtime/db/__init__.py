@@ -72,6 +72,7 @@ from command_center.runtime.db.core import (  # noqa: F401
     migrate,
     resolve_db_path,
     transaction,
+    table_exists,
 )
 from command_center.runtime.db.schema import (  # noqa: F401
     MIGRATIONS,
