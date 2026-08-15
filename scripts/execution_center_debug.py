@@ -97,6 +97,12 @@ _FINALIZATION_TIMEOUT_SECONDS = _finalization_timeout()
 #: never committed and never reported.
 _EXIT_CODE_UNFINALIZED = 5
 
+#: Ctrl+C asked for cancellation and cancellation did not happen, on a run that
+#: is still live. Distinct from every state code because the run's state is not
+#: the news: the news is that this CLI is exiting without having stopped a
+#: process it started.
+_EXIT_CODE_CANCEL_FAILED = 6
+
 _EXIT_CODE_BY_STATE = {
     "COMPLETED": 0,
     "FAILED": 1,
@@ -200,14 +206,37 @@ def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
         try:
             final = api.request_cancel(run_id, confirmed=True, grace_seconds=_DEFAULT_CANCEL_GRACE_SECONDS)
         except SupervisorError as exc:
-            # The check above narrowed this window; it did not close it. A
-            # signal arriving microseconds *before* the terminal transition
-            # still takes this path and still finds nothing to cancel — the
-            # original defect at its pre-#305 width rather than eliminated.
-            # Report the run, which is what the operator asked for by pressing
-            # Ctrl+C, rather than dying on a race.
-            print(f"\nNothing to cancel — {exc}", file=sys.stderr)
+            # `Supervisor.cancel` raises this for four different reasons, and
+            # they do not mean the same thing. Two are the terminal-transition
+            # race the check above narrowed but could not close — the run
+            # finished while the signal was in flight, and there is genuinely
+            # nothing to cancel. One is CAS exhaustion against concurrent
+            # writes, which fires while the run is still **RUNNING** and means
+            # cancellation *failed*.
+            #
+            # The first version of this handler printed "Nothing to cancel" for
+            # all four. On the CAS path that is a false statement printed
+            # directly above the exception contradicting it, and this function's
+            # own docstring promises it "never just kills this CLI process and
+            # abandons the child" — which is exactly what it then did.
+            #
+            # So re-read the run and let its state decide what happened.
             final = api.get_run(run_id)
+            if final and final["state"] in db.TERMINAL_STATES:
+                print(f"\nNothing to cancel — {exc}", file=sys.stderr)
+            else:
+                state = final["state"] if final else "UNKNOWN"
+                print(
+                    f"\nCANCELLATION FAILED — {exc}\n"
+                    f"Run {run_id} is {state}; the agent process may still be "
+                    "running and this CLI is exiting without having stopped it. "
+                    "Check it and cancel it explicitly.",
+                    file=sys.stderr,
+                )
+                for event in api.get_events(run_id, after_seq=after_seq):
+                    _print_event(event)
+                _print(final)
+                return _EXIT_CODE_CANCEL_FAILED
         for event in api.get_events(run_id, after_seq=after_seq):
             _print_event(event)
         _print(final)

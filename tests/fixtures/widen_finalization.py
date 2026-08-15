@@ -84,6 +84,7 @@ _db.update_run_state = _update_run_state
 # it never happened. A test asserting `returncode == 0` then holds the fixture
 # as well as the product.
 _MARKER = os.environ.get("AICC_TEST_WIDEN_MARKER")
+_cli_code: object = 0
 
 
 @atexit.register
@@ -97,7 +98,21 @@ def _refuse_to_report_an_unwidened_run() -> None:
         "wrapper, so nothing was widened and the run proves nothing about the "
         "race it was meant to expose.\n"
     )
+    if _cli_code not in (0, None):
+        # The CLI already failed and already said why. Overriding its code with
+        # this one would replace a real diagnosis with a fixture's complaint.
+        return
     os._exit(97)
 
 sys.argv = [str(CLI), *sys.argv[1:]]
-runpy.run_path(str(CLI), run_name="__main__")
+try:
+    runpy.run_path(str(CLI), run_name="__main__")
+except SystemExit as exit_request:
+    # Remember what the CLI itself decided, so the check above can override
+    # only a *success*. Review pointed out that a CLI failing before the first
+    # terminal write reported 97 instead of its own code — the diagnostics
+    # survive, since CPython flushes the std files before the hook, but a
+    # non-zero code replaced by a different non-zero code is a worse report
+    # than the one it replaced.
+    _cli_code = exit_request.code
+    raise
