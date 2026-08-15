@@ -291,7 +291,11 @@ def test_the_marker_names_a_missing_driver_instead_of_reading_as_a_postgres_run(
 
     monkeypatch.setattr(module, "_driver_reachable", lambda: True)
     reachable = module._evidence_line(["tests/db"], counts, "clean")
-    assert "PostgreSQL requested" in reachable and "driver missing" not in reachable
+    # Exact, not a substring. Review pointed out that a *new* suffix — say
+    # `PostgreSQL requested, **connection refused**` — passes every substring
+    # assertion in this file, so the marker could gain a meaning nothing here
+    # would notice.
+    assert reachable.endswith("(PostgreSQL requested).")
 
     monkeypatch.delenv("AICC_TEST_PG_ADMIN_DSN")
     assert "serverless" in module._evidence_line(["tests/db"], counts, "clean")
@@ -320,7 +324,7 @@ def test_the_driver_probe_and_the_test_command_pin_the_same_extras() -> None:
         assert token in probe, f"probe command lost {token}"
 
 
-def test_the_probe_asks_about_the_driver_the_tests_actually_need() -> None:
+def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> None:
     """What the probe *asks* is the fix; two tests bound only how it is spelled.
 
     Review changed `import psycopg` to `import sys` in both branches and the
@@ -334,16 +338,34 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need() -> None:
 
     # And the behaviour, not only the spelling: blocked at import, the probe
     # must say so; unblocked, it must not.
-    blocker = Path(__file__).parent / "fixtures" / "block_psycopg"
-    blocker.mkdir(parents=True, exist_ok=True)
+    #
+    # `tmp_path`, not a directory beside this file. The first version wrote a
+    # module *named `psycopg.py`* into `tests/fixtures/` and never removed it,
+    # so every run left an untracked file in the source tree — in a PR whose
+    # own body explains that `git add -A` swept a stray file in three times.
+    blocker = tmp_path / "block_psycopg"
+    blocker.mkdir()
     (blocker / "psycopg.py").write_text('raise ImportError("blocked")\n', encoding="utf-8")
+    existing = os.environ.get("PYTHONPATH")
     probed = subprocess.run(
         module._driver_probe_command(),
         cwd=ROOT,
         capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(blocker)},
+        env={
+            **os.environ,
+            # Prepended, not replacing: dropping an inherited PYTHONPATH would
+            # change more than the one import under test.
+            "PYTHONPATH": os.pathsep.join([str(blocker), *([existing] if existing else [])]),
+        },
     )
     assert probed.returncode != 0, "the probe reported a driver that cannot be imported"
+
+    # The positive direction needs the driver to actually be installed. On the
+    # `uv` branch the command supplies it; on the pip fallback it is the host's,
+    # and asserting there would fail on any machine without it — the host
+    # dependency this file removed from another test one commit ago.
+    if "uv" not in module._driver_probe_command()[0]:
+        pytest.importorskip("psycopg")
     assert subprocess.run(module._driver_probe_command(), cwd=ROOT, capture_output=True).returncode == 0
 
 
