@@ -108,15 +108,26 @@ def _driver_reachable() -> bool:
     database-backed test into a silent skip — which is indistinguishable, in a
     summary line, from a suite that has none.
     """
-    command = (
-        ["uv", "run", *_DB_EXTRAS, "python", "-c", "import psycopg"]
-        if shutil.which("uv")
-        else [sys.executable, "-c", "import psycopg"]
-    )
     try:
-        return subprocess.run(command, cwd=ROOT, capture_output=True).returncode == 0
+        return (
+            subprocess.run(_driver_probe_command(), cwd=ROOT, capture_output=True).returncode == 0
+        )
     except OSError:
         return False
+
+
+def _driver_probe_command() -> list[str]:
+    """The probe's argv, separated from running it.
+
+    Extracted for the same reason `_classify_ruff` was: a test that cannot see
+    the command cannot see it drift. Review replaced this function's extras
+    with an unrelated package and the test named for exactly that drift passed
+    — it was watching `_pytest_command` and nothing else, so it bound one side
+    of a two-sided invariant.
+    """
+    if shutil.which("uv"):
+        return ["uv", "run", *_DB_EXTRAS, "python", "-c", "import psycopg"]
+    return [sys.executable, "-c", "import psycopg"]
 
 
 def _run_pytest(paths: list[str], extra: list[str]) -> dict[str, int]:

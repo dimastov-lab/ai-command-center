@@ -199,7 +199,17 @@ def test_the_line_records_which_configuration_measured_it(tmp_path) -> None:
 
     with_database = {**os.environ, "AICC_TEST_PG_ADMIN_DSN": "host=127.0.0.1 dbname=irrelevant"}
     measured = _run(EVIDENCE, "measure", str(suite), env=with_database)
-    assert "(PostgreSQL requested)" in measured.stdout, measured.stdout
+    # `(PostgreSQL requested` without its closing paren, deliberately. The
+    # marker gained a third state — `PostgreSQL requested, **driver missing**`
+    # — and the exact-substring form made this test host-dependent again on any
+    # machine without `psycopg`: the same defect its own docstring above
+    # condemns, reintroduced by the commit that added the state. What this test
+    # is about is that a requested database is distinguishable from a
+    # serverless run; which of the two requested states appears is
+    # `test_the_marker_names_a_missing_driver_...`'s subject, where it is set
+    # explicitly rather than inherited.
+    assert "(PostgreSQL requested" in measured.stdout, measured.stdout
+    assert "(serverless)" not in measured.stdout, measured.stdout
 
 
 def test_a_missing_ruff_is_never_reported_as_a_dirty_tree() -> None:
@@ -300,7 +310,14 @@ def test_the_driver_probe_and_the_test_command_pin_the_same_extras() -> None:
     if "uv" not in command[0]:
         pytest.skip("no uv here; the fallback branch pins nothing by design")
     for token in module._DB_EXTRAS:
-        assert token in command, token
+        assert token in command, f"test command lost {token}"
+
+    # Both sides. The first version asserted only on the test command, so
+    # review replaced the *probe's* extras with an unrelated package and this
+    # test — the one named for that exact drift — passed.
+    probe = module._driver_probe_command()
+    for token in module._DB_EXTRAS:
+        assert token in probe, f"probe command lost {token}"
 
 
 def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -> None:
@@ -310,6 +327,23 @@ def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -
     pointed at `evidence.py` "for why the hard-coded form was a defect". The
     code now matches the comment; this is what holds it there.
     """
-    source = SLICE_CHECKS.read_text(encoding="utf-8")
-    assert "shutil.which(\"uv\")" in source
-    assert "sys.executable" in source
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("slice_checks_under_test", SLICE_CHECKS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    command = module._pytest_command("tests/db")
+    if "uv" not in command[0]:
+        pytest.skip("no uv here; the fallback branch resolves pytest from this interpreter")
+    # `pytest` in the `--with` set is the whole fix: without it uv resolves
+    # pytest from PATH, the console script re-pins `sys.prefix`, and the extra
+    # never reaches the interpreter that runs the tests.
+    assert command[:2] == ["uv", "run"]
+    pinned = [command[i + 1] for i, token in enumerate(command) if token == "--with"]
+
+    # The first version of this test asserted on two substrings that were both
+    # already present in the *unfixed* file, so it passed against the very
+    # defect it was named for: review restored the buggy source wholesale and
+    # watched it go green. Asserting on the command makes that impossible.
+    assert "pytest" in pinned, command
