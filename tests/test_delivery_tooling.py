@@ -12,6 +12,7 @@ here.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -311,7 +312,14 @@ def test_the_driver_probe_and_the_test_command_pin_the_same_extras() -> None:
     """
     module = _evidence_module()
     command = module._pytest_command(["tests/db"], [])
-    if "uv" not in command[0]:
+    # `shutil.which("uv")` — the predicate `_pytest_command` itself branches on.
+    # The first version asked whether `command[0]` contained the substring
+    # "uv", which is a spelling standing in for a branch, and review broke it
+    # with uv's own managed interpreters: their paths contain "uv", so a
+    # fallback-branch command was compared against the uv form and three tests
+    # failed on a host that was behaving correctly. CI cannot see it because CI
+    # installs uv.
+    if not shutil.which("uv"):
         pytest.skip("no uv here; the fallback branch pins nothing by design")
     for token in module._DB_EXTRAS:
         assert token in command, f"test command lost {token}"
@@ -367,7 +375,7 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     #
     # An argv comparison costs no runtime, so the CI-cost objection that moved
     # the behavioural half to the fallback form does not apply here.
-    if "uv" in probe[0]:
+    if shutil.which("uv"):
         assert probe == ["uv", "run", *module._DB_EXTRAS, "python", "-c", "import psycopg"]
     else:
         assert probe == fallback
@@ -385,9 +393,18 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     )
     assert blocked.returncode != 0, "the probe reported a driver that cannot be imported"
 
-    # And the other direction, which needs the driver actually installed.
-    pytest.importorskip("psycopg")
-    assert subprocess.run(fallback, cwd=ROOT, capture_output=True).returncode == 0
+    # And the other direction, which needs the driver importable *by the
+    # interpreter the probe runs*. `pytest.importorskip` asks this process
+    # instead, and the two are not the same question: an interpreter paired
+    # with another version's site-packages imports `psycopg` here and fails
+    # there on the compiled extension. Ask the subprocess.
+    unblocked = subprocess.run(fallback, cwd=ROOT, capture_output=True)
+    if unblocked.returncode != 0:
+        pytest.skip(
+            "the probe's interpreter cannot import psycopg at all, so the "
+            "positive direction would measure the host rather than the probe"
+        )
+    assert unblocked.returncode == 0
 
 
 def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -> None:
@@ -404,7 +421,7 @@ def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -
     spec.loader.exec_module(module)
 
     command = module._pytest_command("tests/db")
-    if "uv" not in command[0]:
+    if not shutil.which("uv"):
         pytest.skip("no uv here; the fallback branch resolves pytest from this interpreter")
     # `pytest` in the `--with` set is the whole fix: without it uv resolves
     # pytest from PATH, the console script re-pins `sys.prefix`, and the extra
