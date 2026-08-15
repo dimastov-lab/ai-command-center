@@ -320,6 +320,33 @@ def test_the_driver_probe_and_the_test_command_pin_the_same_extras() -> None:
         assert token in probe, f"probe command lost {token}"
 
 
+def test_the_probe_asks_about_the_driver_the_tests_actually_need() -> None:
+    """What the probe *asks* is the fix; two tests bound only how it is spelled.
+
+    Review changed `import psycopg` to `import sys` in both branches and the
+    whole file stayed green — while the tool then printed a bare
+    `(PostgreSQL requested)` over 260 silent skips, which is the round-three
+    defect verbatim. The probe is the fix here exactly as `_classify_ruff` was,
+    and that one was blocked for the same reason: a fix no test holds.
+    """
+    module = _evidence_module()
+    assert "import psycopg" in module._driver_probe_command()
+
+    # And the behaviour, not only the spelling: blocked at import, the probe
+    # must say so; unblocked, it must not.
+    blocker = Path(__file__).parent / "fixtures" / "block_psycopg"
+    blocker.mkdir(parents=True, exist_ok=True)
+    (blocker / "psycopg.py").write_text('raise ImportError("blocked")\n', encoding="utf-8")
+    probed = subprocess.run(
+        module._driver_probe_command(),
+        cwd=ROOT,
+        capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(blocker)},
+    )
+    assert probed.returncode != 0, "the probe reported a driver that cannot be imported"
+    assert subprocess.run(module._driver_probe_command(), cwd=ROOT, capture_output=True).returncode == 0
+
+
 def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -> None:
     """The one change in this PR that review found had no test at all.
 
