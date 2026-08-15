@@ -322,7 +322,17 @@ def _pytest_command(suite: str) -> list[str]:
     """`uv` when it is there, this interpreter when it is not — see
     `scripts/evidence.py` for why the hard-coded form was a defect."""
     if shutil.which("uv"):
-        return ["uv", "run", "--with", "psycopg-pool>=3.2,<4", "pytest", suite, "-q"]
+        # `pytest` resolved alongside the extra, for the reason `evidence.py`
+        # documents: without it uv takes pytest from PATH and the extra never
+        # reaches the interpreter. This file pointed at that explanation while
+        # keeping the broken form — review noticed the mismatch between the
+        # comment and the command.
+        return [
+            "uv", "run",
+            "--with", "psycopg-pool>=3.2,<4",
+            "--with", "pytest",
+            "pytest", suite, "-q",
+        ]
     return [sys.executable, "-m", "pytest", suite, "-q"]
 
 
