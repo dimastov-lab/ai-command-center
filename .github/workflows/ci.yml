@@ -25,12 +25,14 @@ on:
   # start and every entry times out, so the trigger has to exist before the
   # queue is switched on, not with it.
   #
-  # Note for whoever enables the queue: this is a base-repository event, so
-  # secrets ARE available here, while the `pull_request` path withholds them
-  # from forks. Since the queue ref carries the pull request's own commits,
-  # enabling the queue makes repository secrets reachable from fork-authored
-  # code. See `tests/test_release_gate_policy.py` and
-  # `VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`.
+  # This is a base-repository event, so secrets ARE available here, while the
+  # `pull_request` path withholds them from forks. Since the queue ref carries
+  # the pull request's own commits, the queue would otherwise make repository
+  # secrets reachable from fork-authored code. Every step that receives a
+  # repository secret therefore begins by asserting that the code it is about
+  # to run was authored here — see `scripts/assert_trusted_head_repository.py`,
+  # pinned for all steps by `tests/test_release_gate_policy.py`
+  # (`VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`).
   merge_group:
   push:
     branches: [main]
@@ -43,9 +45,15 @@ concurrency:
   cancel-in-progress: true
 
 # Least privilege: the gates only read the checked-out code.
+# `pull-requests: read` is the one addition beyond that, and it exists for a
+# single caller: `scripts/assert_trusted_head_repository.py` resolves the queued
+# pull request to learn which repository authored the code, because the
+# `merge_group` payload does not say. Read-only, and narrower than the secret it
+# protects.
 permissions:
   contents: read
   security-events: write
+  pull-requests: read
 
 jobs:
   quality-gates:
@@ -166,7 +174,9 @@ jobs:
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          python scripts/assert_trusted_head_repository.py
           python scripts/fetch_aios_sdk_artifact.py --output .artifacts
           pip install "$AICC_AIOS_SDK_WHEEL"
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
@@ -336,7 +346,9 @@ jobs:
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          python scripts/assert_trusted_head_repository.py
           python scripts/fetch_aios_sdk_artifact.py --output .artifacts
           pip install "$env:AICC_AIOS_SDK_WHEEL"
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
@@ -581,7 +593,9 @@ jobs:
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          python scripts/assert_trusted_head_repository.py
           python scripts/fetch_aios_sdk_artifact.py --output .artifacts
           pip install "$AICC_AIOS_SDK_WHEEL"
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts

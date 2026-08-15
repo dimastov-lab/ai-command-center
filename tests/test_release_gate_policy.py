@@ -102,11 +102,12 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
     #
     # That matters concretely here: `ci.yml` runs
     # `scripts/fetch_aios_sdk_artifact.py` — a script from the checked-out
-    # tree — with `AIOS_ARTIFACT_READ_TOKEN` in its environment. Enabling the
-    # queue therefore makes that credential reachable from code a fork
-    # authored, which is a decision about fork policy and not a formality.
-    # The trigger is added here; the queue stays off until that decision is
-    # made and recorded (`VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`).
+    # tree — with `AIOS_ARTIFACT_READ_TOKEN` in its environment, and that token
+    # reads the *private* `dimastov-lab/aios` repository. The need is not
+    # removable while AIOS is private, so the exposure is closed at the step
+    # instead: see
+    # `test_every_step_holding_a_repository_secret_first_proves_its_code_is_ours`
+    # (`VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`).
     for workflow in (ci, boundary):
         assert set(workflow["on"]) == {
             "pull_request",
@@ -125,6 +126,10 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
             assert workflow["permissions"] == {
                 "contents": "read",
                 "security-events": "write",
+                # Read-only, and used by exactly one caller: the trust guard has
+                # to resolve the queued pull request to learn its head
+                # repository, which the `merge_group` payload omits.
+                "pull-requests": "read",
             }
         else:
             assert workflow["permissions"] == {"contents": "read"}
@@ -132,6 +137,93 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
     for job_id, required_steps in EXPECTED_STEPS.items():
         step_names = {step.get("name") for step in jobs[job_id]["steps"]}
         assert required_steps <= step_names
+
+
+SECRET_REFERENCE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)[^}]*\}\}")
+
+# `GITHUB_TOKEN` is minted per run and already scoped by `permissions:`; it is
+# not a standing credential and the guard itself needs it to do its work.
+EPHEMERAL_SECRETS = {"GITHUB_TOKEN"}
+
+TRUST_GUARD = "python scripts/assert_trusted_head_repository.py"
+
+
+def _secret_names(value: object) -> set[str]:
+    """Every repository secret reachable from a YAML fragment."""
+    if isinstance(value, str):
+        return set(SECRET_REFERENCE.findall(value))
+    if isinstance(value, dict):
+        return set().union(set(), *(_secret_names(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(set(), *(_secret_names(item) for item in value))
+    return set()
+
+
+def _first_command(run: str) -> str:
+    for line in run.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    return ""
+
+
+def test_every_step_holding_a_repository_secret_first_proves_its_code_is_ours() -> None:
+    """A standing credential may only be handed to code this repository wrote.
+
+    The `merge_group` trigger runs in the base repository and therefore *is*
+    given repository secrets, while the ref it builds carries the pull
+    request's own commits — a fork's included. `AIOS_ARTIFACT_READ_TOKEN` reads
+    the private `dimastov-lab/aios` repository, and it is handed to
+    `scripts/fetch_aios_sdk_artifact.py`, a script read out of that same tree.
+    The need cannot be designed away while AIOS is private, so the reachability
+    is closed instead: every step that carries a standing secret must first run
+    the trust guard, which refuses any run whose head repository is not this
+    one.
+
+    Pinned per step rather than per job, because a secret is scoped to the step
+    that declares it; and pinned as the *first* command, so the guard cannot be
+    demoted to a step that runs after the credential has already been used.
+    """
+    offenders: list[tuple[str, str, str | None, str]] = []
+    for path in (CI_WORKFLOW, BOUNDARY_WORKFLOW):
+        workflow = _workflow(path)
+        for job_id, job in workflow["jobs"].items():
+            for step in job["steps"]:
+                secrets = _secret_names(step) - EPHEMERAL_SECRETS
+                if not secrets:
+                    continue
+                first = _first_command(step.get("run", ""))
+                if first != TRUST_GUARD:
+                    offenders.append((path.name, job_id, step.get("name"), first))
+                    continue
+                if "GITHUB_TOKEN" not in _secret_names(step.get("env", {})):
+                    offenders.append(
+                        (path.name, job_id, step.get("name"), "guard has no GITHUB_TOKEN")
+                    )
+    assert not offenders, (
+        "steps receive a repository secret without first proving the checked-out "
+        f"code was authored here: {offenders}"
+    )
+
+
+def test_repository_secrets_are_never_scoped_wider_than_a_single_step() -> None:
+    """A workflow- or job-level secret would leak past the guarded step.
+
+    The guard protects the step that declares the credential. Declaring one at
+    workflow or job level would put it in the environment of every step in
+    scope, including steps the guard does not precede, which would make the
+    per-step proof above meaningless without failing it.
+    """
+    for path in (CI_WORKFLOW, BOUNDARY_WORKFLOW):
+        workflow = _workflow(path)
+        assert not _secret_names(workflow.get("env", {})) - EPHEMERAL_SECRETS, path.name
+        for job_id, job in workflow["jobs"].items():
+            leaked = _secret_names(job.get("env", {})) - EPHEMERAL_SECRETS
+            assert not leaked, (path.name, job_id, leaked)
+
+
+def test_the_trust_guard_exists_where_the_workflows_expect_it() -> None:
+    assert (ROOT / "scripts/assert_trusted_head_repository.py").is_file()
 
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
