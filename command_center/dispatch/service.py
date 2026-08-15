@@ -20,6 +20,7 @@ the task up and launches it on the recorded executor.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from command_center import executors as executors_module
@@ -152,6 +153,18 @@ def _resolve_db_path(db_path: Path | None) -> Path:
     return db_path if db_path is not None else runtime_db.resolve_db_path()
 
 
+def _is_missing_spend_data(exc: Exception) -> bool:
+    """Whether `daily_spend_usd` failed because spend source tables are absent.
+
+    Distinguish "no cost data available yet" from malformed payload defects:
+    only the former is downgraded to the fail-closed ceiling assumption.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return ("no such table: run_event" in message) or ("no such table: run" in message)
+
+
 def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     """Dry run: what would be assigned, and why. No writes."""
     resolved_db = _resolve_db_path(db_path)
@@ -164,8 +177,11 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
 
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
-        spend = settings.max_daily_spend_usd or 0.0
+    except Exception as exc:  # noqa: BLE001 — only missing spend source is downgraded
+        if _is_missing_spend_data(exc):
+            spend = settings.max_daily_spend_usd or 0.0
+        else:
+            raise
 
     return plan_dispatch(
         collect_queued_tasks(root),

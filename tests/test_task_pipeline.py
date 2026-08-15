@@ -1339,3 +1339,43 @@ def test_the_dispatcher_passes_the_configured_timeout(tmp_path, git_repo, api, m
         PipelineSettings(enabled=True, auto_launch=True, run_timeout_seconds=3600),
     )
     assert seen["timeout_seconds"] == 3600
+
+
+def test_daily_spend_counts_mapping_payload_rows(tmp_path, monkeypatch):
+    class _FakeCursor:
+        def fetchall(self):
+            return [{"payload": {"type": "result", "total_cost_usd": 1.25}}]
+
+    class _FakeConn:
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor()
+
+    class _FakeConnect:
+        def __enter__(self):
+            return _FakeConn()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(runtime_db, "connect", lambda _db_path: _FakeConnect())
+    assert task_pipeline.daily_spend_usd(tmp_path / "runtime.db") == pytest.approx(1.25)
+
+
+def test_daily_spend_skips_malformed_json_payload_rows(tmp_path, monkeypatch):
+    class _FakeCursor:
+        def fetchall(self):
+            return [{"payload": "{bad json"}]
+
+    class _FakeConn:
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor()
+
+    class _FakeConnect:
+        def __enter__(self):
+            return _FakeConn()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(runtime_db, "connect", lambda _db_path: _FakeConnect())
+    assert task_pipeline.daily_spend_usd(tmp_path / "runtime.db") == 0.0

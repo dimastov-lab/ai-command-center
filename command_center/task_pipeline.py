@@ -2408,6 +2408,7 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
     """
+    from collections.abc import Mapping as _Mapping
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
 
@@ -2425,10 +2426,18 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             (cutoff, cutoff),
         ).fetchall()
     for row in rows:
-        try:
-            payload = _json.loads(row["payload"])
-        except (TypeError, ValueError):
-            continue
+        raw_payload = row["payload"]
+        if isinstance(raw_payload, _Mapping):
+            payload = raw_payload
+        else:
+            try:
+                payload = _json.loads(raw_payload)
+            except ValueError:
+                continue
+        if not isinstance(payload, _Mapping):
+            raise TypeError(
+                "run_event.payload_json must be a mapping or JSON object string"
+            )
         cost = payload.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             total += float(cost)

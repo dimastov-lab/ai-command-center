@@ -9,6 +9,7 @@ test drives a deterministic context.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -170,6 +171,41 @@ def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
 
     assert plan.assignments == ()
     assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+
+
+def test_plan_downgrades_missing_spend_source_to_budget_ceiling(monkeypatch, pool):
+    import dataclasses
+
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=0.4)
+    )
+    monkeypatch.setattr(
+        task_pipeline,
+        "daily_spend_usd",
+        lambda *_a, **_k: (_ for _ in ()).throw(sqlite3.OperationalError("no such table: run_event")),
+    )
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1", executor="claude_code", executor_pinned=True)
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+
+
+def test_plan_propagates_malformed_spend_payload_errors(monkeypatch, pool):
+    _enable_master_switch()
+    monkeypatch.setattr(
+        task_pipeline,
+        "daily_spend_usd",
+        lambda *_a, **_k: (_ for _ in ()).throw(TypeError("run_event.payload_json must be a mapping")),
+    )
+    _queued_task(title="t1")
+
+    with pytest.raises(TypeError, match="payload_json must be a mapping"):
+        service.plan(ROOT)
 
 
 # --------------------------------------------------------------------------
