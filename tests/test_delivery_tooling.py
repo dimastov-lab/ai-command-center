@@ -11,8 +11,9 @@ here.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -253,6 +254,23 @@ def test_a_missing_ruff_is_never_reported_as_a_dirty_tree() -> None:
     assert module._classify_ruff(subprocess.CompletedProcess([], 0, stdout="", stderr="")) == "clean"
 
 
+@contextlib.contextmanager
+def _forced_uv(module, *, present: bool):
+    """Run a block as if `uv` were present or absent, whatever the host has.
+
+    Both branches must be asserted everywhere, because the two machines
+    disagree: this laptop has uv, and CI has none at all. Letting each host
+    check only its own branch left the uv form unguarded exactly where it
+    mattered.
+    """
+    original = module.shutil.which
+    module.shutil.which = lambda name: "/usr/bin/uv" if present else None
+    try:
+        yield
+    finally:
+        module.shutil.which = original
+
+
 def _evidence_module():
     """Import the tool as a module so its internals can be exercised directly.
 
@@ -311,23 +329,30 @@ def test_the_driver_probe_and_the_test_command_pin_the_same_extras() -> None:
     statement about hope.
     """
     module = _evidence_module()
-    command = module._pytest_command(["tests/db"], [])
-    # `shutil.which("uv")` — the predicate `_pytest_command` itself branches on.
-    # The first version asked whether `command[0]` contained the substring
-    # "uv", which is a spelling standing in for a branch, and review broke it
-    # with uv's own managed interpreters: their paths contain "uv", so a
-    # fallback-branch command was compared against the uv form and three tests
-    # failed on a host that was behaving correctly. CI cannot see it because CI
-    # installs uv.
-    if not shutil.which("uv"):
-        pytest.skip("no uv here; the fallback branch pins nothing by design")
+
+    # Both branches are forced, on every host. Letting each host check only its
+    # own was the deeper version of the same defect: CI installs **no** uv at
+    # all — `grep -icE "astral|setup-uv|uv (run|sync|pip|venv)" ci.yml` is 0,
+    # every job installs with `pip --require-hashes` — so the uv branch this
+    # test guards was never executed by the gate, and review demonstrated both
+    # of the previous round's mutations passing green there. A test that skips
+    # on the machine that decides the merge is not a test on that machine.
+    with _forced_uv(module, present=True):
+        command = module._pytest_command(["tests/db"], [])
     for token in module._DB_EXTRAS:
         assert token in command, f"test command lost {token}"
 
     # Both sides. The first version asserted only on the test command, so
     # review replaced the *probe's* extras with an unrelated package and this
     # test — the one named for that exact drift — passed.
-    probe = module._driver_probe_command()
+    # Forced too, for the same reason: on a host without uv the probe takes the
+    # fallback form, which pins nothing by design, and comparing it against
+    # `_DB_EXTRAS` asserts something that was never true there. That is what
+    # this test did on the CI shape until the forcing was added above and not
+    # here — half a fix, which is how the whole uv branch went unguarded on the
+    # gate in the first place.
+    with _forced_uv(module, present=True):
+        probe = module._driver_probe_command()
     for token in module._DB_EXTRAS:
         assert token in probe, f"probe command lost {token}"
 
@@ -363,7 +388,10 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     # answers to reality; that the uv form asks the same question is the
     # assertion above and `..._pin_the_same_extras`.
     fallback = [sys.executable, "-c", "import psycopg"]
-    probe = module._driver_probe_command()
+    with _forced_uv(module, present=True):
+        uv_probe = module._driver_probe_command()
+    with _forced_uv(module, present=False):
+        probe = module._driver_probe_command()
     # The **whole** argv, not its tail. Comparing `[-2:]` pinned `-c` and the
     # import and left the executable and the interpreter free, and review
     # showed what that costs. Dropping `"python"` — a plausible edit, thinking
@@ -375,10 +403,8 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     #
     # An argv comparison costs no runtime, so the CI-cost objection that moved
     # the behavioural half to the fallback form does not apply here.
-    if shutil.which("uv"):
-        assert probe == ["uv", "run", *module._DB_EXTRAS, "python", "-c", "import psycopg"]
-    else:
-        assert probe == fallback
+    assert uv_probe == ["uv", "run", *module._DB_EXTRAS, "python", "-c", "import psycopg"]
+    assert probe == fallback
     existing = os.environ.get("PYTHONPATH")
     blocked = subprocess.run(
         fallback,
@@ -398,13 +424,19 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     # instead, and the two are not the same question: an interpreter paired
     # with another version's site-packages imports `psycopg` here and fails
     # there on the compiled extension. Ask the subprocess.
+    # Skip only when the driver is genuinely absent; fail when it is installed
+    # and the probe's own command still cannot import it. The previous form
+    # skipped on *any* non-zero exit and then asserted `returncode == 0` on the
+    # only path that could not reach it — a check that cannot fire, which is the
+    # shape `mirror_slice_checks.py`'s own docstring warns about.
     unblocked = subprocess.run(fallback, cwd=ROOT, capture_output=True)
     if unblocked.returncode != 0:
-        pytest.skip(
-            "the probe's interpreter cannot import psycopg at all, so the "
-            "positive direction would measure the host rather than the probe"
+        if importlib.util.find_spec("psycopg") is None:
+            pytest.skip("psycopg is not installed here; the probe is right to say so")
+        raise AssertionError(
+            "psycopg is installed and the probe's own command still cannot "
+            f"import it:\n{unblocked.stderr.decode(errors='replace')[-2000:]}"
         )
-    assert unblocked.returncode == 0
 
 
 def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -> None:
@@ -420,9 +452,11 @@ def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    command = module._pytest_command("tests/db")
-    if not shutil.which("uv"):
-        pytest.skip("no uv here; the fallback branch resolves pytest from this interpreter")
+    with _forced_uv(module, present=True):
+        command = module._pytest_command("tests/db")
+    with _forced_uv(module, present=False):
+        fallback_command = module._pytest_command("tests/db")
+    assert fallback_command[0] == sys.executable and fallback_command[1:3] == ["-m", "pytest"]
     # `pytest` in the `--with` set is the whole fix: without it uv resolves
     # pytest from PATH, the console script re-pins `sys.prefix`, and the extra
     # never reaches the interpreter that runs the tests.
