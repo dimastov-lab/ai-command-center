@@ -171,6 +171,13 @@ jobs:
 
       - name: Install exact accepted AIOS SDK and DB artifacts
         if: steps.change-scope.outputs.docs_only != 'true'
+        # `bash` is not cosmetic here and is pinned by
+        # `test_a_refused_guard_actually_stops_the_step`: GitHub runs it as
+        # `bash --noprofile --norc -eo pipefail`, so the guard's non-zero exit
+        # aborts the step. Under `pwsh` it would not — a failed native command
+        # is not a terminating error there, and the fetch below would run with
+        # the token anyway.
+        shell: bash
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
@@ -343,6 +350,16 @@ jobs:
 
       - name: Install exact accepted AIOS SDK and DB artifacts
         if: steps.change-scope.outputs.docs_only != 'true'
+        # This step is why the invariant checks the shell and not just the
+        # order of the lines. It had no `shell:`, so on `windows-latest` it ran
+        # under `pwsh`, where a native command's non-zero exit is not a
+        # terminating error and `$ErrorActionPreference = 'stop'` does not
+        # cover it. The guard refused and the very next line fetched the
+        # artifact with both tokens in its environment, and the step still
+        # exited 0. `bash` on the Windows runner is `-eo pipefail`, so the
+        # refusal now ends the step; the env references are plain `$VAR`
+        # accordingly.
+        shell: bash
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
@@ -350,9 +367,9 @@ jobs:
         run: |
           python scripts/assert_trusted_head_repository.py
           python scripts/fetch_aios_sdk_artifact.py --output .artifacts
-          pip install "$env:AICC_AIOS_SDK_WHEEL"
+          pip install "$AICC_AIOS_SDK_WHEEL"
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
-          pip install "$env:AICC_AIOS_DB_WHEEL"
+          pip install "$AICC_AIOS_DB_WHEEL"
 
       - name: Ruff
         if: steps.change-scope.outputs.docs_only != 'true'
@@ -590,6 +607,13 @@ jobs:
 
       - name: Install exact accepted AIOS SDK and DB artifacts
         if: steps.select.outputs.mode == 'subset'
+        # `bash` is not cosmetic here and is pinned by
+        # `test_a_refused_guard_actually_stops_the_step`: GitHub runs it as
+        # `bash --noprofile --norc -eo pipefail`, so the guard's non-zero exit
+        # aborts the step. Under `pwsh` it would not — a failed native command
+        # is not a terminating error there, and the fetch below would run with
+        # the token anyway.
+        shell: bash
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
           AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
