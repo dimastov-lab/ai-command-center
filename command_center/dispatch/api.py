@@ -11,6 +11,17 @@ board, runtime.db, or policy file — the same hermetic seam the existing
 Endpoints:
 
 * `GET  /api/v1/dispatch/plan`   — dry run: what would be assigned + why.
+
+Response contract for `/plan` around spend (see `models.DispatchPlan`):
+`spend_status` is `measured` | `not_measured` | `unknown`, and it is what a
+reader must branch on. `daily_spend_usd` / `projected_spend_usd` /
+`budget_remaining_usd` are `null` whenever the trailing-24h spend was not
+established — either because no ceiling is configured and it was deliberately
+not measured, or because reading it failed. A `null` is never a stand-in for
+zero. `plan_cost_usd` is always a number (this plan's own cost). A decision
+may carry the `daily_spend_unknown` reason, which is distinct from
+`daily_budget_exhausted`: both hold dispatch, only the latter means money was
+actually spent.
 * `POST /api/v1/dispatch/assign` — apply the plan (records executors; never launches).
 * `GET  /api/v1/dispatch/policy` — the current config-driven policy.
 * `PUT  /api/v1/dispatch/policy` — update limits/weights.
