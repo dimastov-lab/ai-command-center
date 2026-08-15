@@ -51,22 +51,40 @@ def test_checksum_tracks_file_contents(tmp_path) -> None:
     assert before != after
 
 
-def test_initial_migration_covers_the_declared_table_inventory() -> None:
+def test_the_migration_set_covers_the_declared_table_inventory() -> None:
     """The DDL and `roles.ALL_TABLES` must not drift apart.
 
     `ALL_TABLES` drives the grant matrix, so a table added to the schema
     without a matching entry there would end up with no declared access policy.
+
+    Every migration, not only the first. Reading `discover()[0]` was correct
+    while there was one migration and would have gone on passing afterwards
+    while checking nothing about the second — the shape of assertion that
+    weakens silently as the thing it guards grows.
     """
     from command_center.db import roles
 
-    sql = migrations.discover()[0].up_sql
     created = {
         line.split()[2].rstrip("(")
-        for line in sql.splitlines()
+        for migration in migrations.discover()
+        for line in migration.up_sql.splitlines()
         if line.startswith("CREATE TABLE ")
     }
-    # `schema_migration` is created by the runner itself, not by 0001.
+    # `schema_migration` is created by the runner itself, not by a migration.
     assert created == set(roles.ALL_TABLES) - {"schema_migration"}
+
+
+def test_the_migration_set_covers_the_declared_view_inventory() -> None:
+    """Same rule for views, which carry their own grants."""
+    from command_center.db import roles
+
+    created = {
+        line.split()[2]
+        for migration in migrations.discover()
+        for line in migration.up_sql.splitlines()
+        if line.startswith("CREATE VIEW ")
+    }
+    assert created == set(roles.ALL_VIEWS)
 
 
 def test_duplicate_down_migration_is_rejected(tmp_path) -> None:

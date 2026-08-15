@@ -18,6 +18,11 @@ from command_center.db import migrations, roles
 
 pytestmark = pytest.mark.usefixtures("role_passwords")
 
+#: Derived, never hand-written. The version numbers below used to be literals,
+#: which was correct while there was one migration; a second one turned every
+#: such literal into a failing assertion about nothing in particular.
+ALL_VERSIONS = tuple(m.version for m in migrations.discover())
+
 
 def _provision(admin_conn, psycopg, test_dsn, role_passwords):
     """Bootstrap as superuser, migrate as the migrator — the production order."""
@@ -45,7 +50,7 @@ def _as_role(dsn: str, role: str, role_passwords: dict[str, str]) -> str:
 
 def test_upgrade_creates_the_declared_schema(admin_conn, psycopg, test_dsn, role_passwords):
     applied = _provision(admin_conn, psycopg, test_dsn, role_passwords)
-    assert applied == (1,)
+    assert applied == ALL_VERSIONS
 
     with admin_conn.cursor() as cur:
         cur.execute(
@@ -62,7 +67,7 @@ def test_upgrade_is_idempotent(admin_conn, psycopg, test_dsn, role_passwords):
         _as_role(test_dsn, "aicc_migrator", role_passwords), autocommit=True
     ) as conn:
         assert migrations.upgrade(conn) == ()
-        assert migrations.current_version(conn) == 1
+        assert migrations.current_version(conn) == ALL_VERSIONS[-1]
 
 
 def test_downgrade_removes_everything_and_upgrade_restores_it(
@@ -73,7 +78,7 @@ def test_downgrade_removes_everything_and_upgrade_restores_it(
     migrator_dsn = _as_role(test_dsn, "aicc_migrator", role_passwords)
 
     with psycopg.connect(migrator_dsn, autocommit=True) as conn:
-        assert migrations.downgrade(conn, target=0) == (1,)
+        assert migrations.downgrade(conn, target=0) == ALL_VERSIONS[::-1]
         assert migrations.current_version(conn) == 0
 
     with admin_conn.cursor() as cur:
@@ -85,7 +90,7 @@ def test_downgrade_removes_everything_and_upgrade_restores_it(
         assert cur.fetchone()[0] == 1
 
     with psycopg.connect(migrator_dsn, autocommit=True) as conn:
-        assert migrations.upgrade(conn) == (1,)
+        assert migrations.upgrade(conn) == ALL_VERSIONS
         roles.apply_table_grants(conn)
 
     with admin_conn.cursor() as cur:
@@ -162,6 +167,16 @@ def test_app_can_write_every_declared_table(
         expected = roles.PRIVILEGES[roles.APP_ROLE][table]
         with psycopg.connect(app_dsn) as conn:
             with conn.cursor() as cur:
+                # A table declared with no privileges at all must refuse even
+                # the read. Asserted rather than skipped: `work_attempt` holds
+                # `claim_token_hash`, and "the app happens not to select it" is
+                # not the same claim as "the database refuses".
+                if not expected:
+                    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                        cur.execute(f"SELECT count(*) FROM {table}")
+                    conn.rollback()
+                    continue
+
                 # A missing SELECT grant raises rather than returning a row.
                 cur.execute(f"SELECT count(*) FROM {table}")
                 assert cur.fetchone() is not None
@@ -278,7 +293,7 @@ def test_worker_cannot_read_governance_tables(
                 cur.execute(f"SELECT * FROM {table}")
 
 
-def test_worker_cannot_enqueue_but_can_claim(
+def test_worker_cannot_write_the_queue_mirror(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
@@ -291,10 +306,20 @@ def test_worker_cannot_enqueue_but_can_claim(
                     "INSERT INTO queue_entry (id, state) VALUES ('q1', 'pending')"
                 )
 
+    # Nor may it claim *here* any more. `queue_entry` is a mirror rebuilt
+    # wholesale by `queue_store.replace_entries()`, so a claim written to it is
+    # destroyed by the next sync — silently, since the worker has no `DELETE`
+    # with which to notice. Claims live in `work_item` and are taken through
+    # `queue_claim()`; see `tests/db/test_queue_claim.py`.
+    with psycopg.connect(worker_dsn) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with conn.cursor() as cur:
+                cur.execute("UPDATE queue_entry SET state = 'claimed' WHERE id = 'absent'")
+
     with psycopg.connect(worker_dsn, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE queue_entry SET state = 'claimed' WHERE id = 'absent'")
-            assert cur.rowcount == 0  # allowed, matched nothing
+            cur.execute("SELECT count(*) FROM queue_entry")  # reading is still allowed
+            assert cur.fetchone()[0] == 0
 
 
 def test_worker_can_append_run_events(admin_conn, psycopg, test_dsn, role_passwords):
@@ -349,7 +374,14 @@ def test_matrix_matches_the_catalog(admin_conn, psycopg, test_dsn, role_password
             ).add(column)
 
     for role in (roles.APP_ROLE, roles.WORKER_ROLE):
-        expected = {t: set(p) for t, p in roles.PRIVILEGES[role].items()}
+        # An empty privilege set is a declared refusal, not a grant of nothing:
+        # it must be absent from the catalog entirely. Views are folded in here
+        # because `role_table_grants` reports them through the same catalog, so
+        # leaving them out would read as three unexplained extra grants.
+        expected = {t: set(p) for t, p in roles.PRIVILEGES[role].items() if p}
+        expected.update(
+            {v: set(p) for v, p in roles.VIEW_PRIVILEGES.get(role, {}).items() if p}
+        )
         narrowed = roles.COLUMN_PRIVILEGES.get(role, {})
         seen = actual.get(role, {})
         for table, per_privilege in narrowed.items():
@@ -358,6 +390,58 @@ def test_matrix_matches_the_catalog(admin_conn, psycopg, test_dsn, role_password
                 assert granted == set(columns), f"{role}.{table}.{privilege}"
                 seen.setdefault(table, set()).add(privilege)
         assert seen == expected, role
+
+        # And the refusals, stated as their own claim rather than implied by the
+        # equality above — a table that vanished from `PRIVILEGES` would satisfy
+        # that equality while granting nothing, which reads the same and is not.
+        refused = {t for t, p in roles.PRIVILEGES[role].items() if not p}
+        assert refused, role
+        assert not (refused & set(seen)), f"{role} reaches a table declared unreachable"
+
+
+def test_execute_grants_match_the_declared_protocol_steps(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Functions are the worker's only reach, so they need their own catalog check.
+
+    `role_table_grants` does not report `EXECUTE`, so the matrix test above is
+    blind to exactly the grants that carry the claim protocol: every function
+    could be granted to everyone and it would still pass.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.proname || '(' || pg_get_function_arguments(p.oid) || ')' "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public'"
+        )
+        all_functions = [row[0] for row in cur.fetchall()]
+
+    for role in (roles.APP_ROLE, roles.WORKER_ROLE):
+        expected = set()
+        for signature in roles.FUNCTION_PRIVILEGES.get(role, ()):
+            name = signature.split("(")[0]
+            matches = [f for f in all_functions if f.startswith(f"{name}(")]
+            assert len(matches) == 1, f"{signature} does not identify one function"
+            expected.add(matches[0])
+
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT p.proname || '(' || pg_get_function_arguments(p.oid) || ')' "
+                "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'public' "
+                "AND has_function_privilege(%s, p.oid, 'EXECUTE')",
+                (role,),
+            )
+            granted = {row[0] for row in cur.fetchall()}
+        assert granted == expected, role
+
+    # The helpers the protocol is built out of are SECURITY DEFINER over every
+    # table in it. PUBLIC gets EXECUTE on new functions by default, so this is
+    # the assertion that the blanket revoke actually reached them.
+    for helper in ("_queue_audit", "_queue_owns", "_queue_new_id"):
+        assert any(f.startswith(f"{helper}(") for f in all_functions), helper
 
 
 # --------------------------------------------------------------------------
@@ -481,8 +565,12 @@ def test_backup_restore_drill_round_trips_data(
                 cur.execute("SELECT state, project FROM run WHERE id = %s", (run_id,))
                 assert cur.fetchone() == ("running", "p")
                 cur.execute("SELECT count(*) FROM information_schema.tables "
-                            "WHERE table_schema = 'public'")
+                            "WHERE table_schema = 'public' "
+                            "AND table_type = 'BASE TABLE'")
                 assert cur.fetchone()[0] == len(roles.ALL_TABLES)
+                cur.execute("SELECT count(*) FROM information_schema.tables "
+                            "WHERE table_schema = 'public' AND table_type = 'VIEW'")
+                assert cur.fetchone()[0] == len(roles.ALL_VIEWS)
     finally:
         # The restored database is created by the script, so the `pg_database`
         # fixture does not know to drop it.
@@ -563,11 +651,11 @@ def test_concurrent_upgrades_are_serialized(
 
     assert not any(isinstance(r, Exception) for r in results), results
     # Exactly one run applied the migration; the other found nothing to do.
-    assert sorted([results[0], results[1]], key=len) == [(), (1,)]
+    assert sorted([results[0], results[1]], key=len) == [(), ALL_VERSIONS]
 
     with admin_conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM schema_migration")
-        assert cur.fetchone()[0] == 1
+        assert cur.fetchone()[0] == len(ALL_VERSIONS)
 
 
 def test_new_tables_are_unreachable_until_granted(
