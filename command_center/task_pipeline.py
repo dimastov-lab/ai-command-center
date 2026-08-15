@@ -2492,8 +2492,14 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
         payload = row["payload"]
         # An already-decoded mapping (a driver that adapts JSON columns) needs
         # no decoding; only text/bytes go through the parser, and only its
-        # own `ValueError` family — which includes `UnicodeDecodeError` for
-        # invalid UTF-8 — counts as "unreadable".
+        # own `ValueError` family counts as "unreadable".
+        #
+        # The `bytes` arm covers a payload stored as a BLOB. Note that such a
+        # row only reaches this loop on SQLite builds whose `LIKE` matches a
+        # BLOB operand — older builds exclude it from the query above, which
+        # understates the total silently. That gap lives in the SELECT
+        # predicate, not here, and closing it means changing the query (out of
+        # scope for this change); the writers only ever store `str`.
         if isinstance(payload, (str, bytes, bytearray)):
             try:
                 payload = _json.loads(payload)

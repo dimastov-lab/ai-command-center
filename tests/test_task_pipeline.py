@@ -1375,12 +1375,35 @@ def _seed_cost_event(api, payload, *, project: str = "AIOS"):
 
 
 def _overwrite_payload(api, run_id: str, raw) -> None:
-    """Replace a stored payload with bytes/text the writers would never
-    produce — the on-disk corruption this function must survive truthfully."""
+    """Replace a stored payload with text the writers would never produce —
+    the on-disk corruption this function must survive truthfully."""
     with runtime_db.connect(api.db_path) as conn:
         with runtime_db.transaction(conn):
             conn.execute(
                 "UPDATE run_event SET payload_json=? WHERE run_id=?", (raw, run_id)
+            )
+
+
+def _overwrite_payload_with_raw_bytes(api, run_id: str, raw: bytes) -> None:
+    """Store `raw` while keeping the column's declared TEXT type.
+
+    Binding a `bytes` parameter would store a BLOB instead, and whether a BLOB
+    satisfies the reader's `payload_json LIKE '%total_cost_usd%'` predicate
+    differs by SQLite version — older builds exclude the row entirely, so the
+    test would assert a platform quirk rather than this function's behaviour.
+    `CAST(x'..' AS TEXT)` keeps `typeof()` = `text`, so the row is selected
+    identically everywhere and it is the decoding that fails.
+    """
+    import binascii
+
+    hex_literal = binascii.hexlify(raw).decode("ascii")
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run_event SET payload_json=CAST(x'"  # noqa: S608 — test-local hex literal
+                + hex_literal
+                + "' AS TEXT) WHERE run_id=?",
+                (run_id,),
             )
 
 
@@ -1421,16 +1444,25 @@ def test_daily_spend_raises_on_a_bare_scalar_json_payload(api):
     assert excinfo.value.kind == task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
 
 
-def test_daily_spend_raises_on_invalid_utf8_payload_bytes(api):
-    """Invalid UTF-8 surfaces as `UnicodeDecodeError`, a `ValueError` subclass
-    — caught as corruption, not as a crash and not silently skipped."""
+def test_daily_spend_raises_when_a_cost_event_is_not_decodable_utf8(api):
+    """A cost event whose stored text is not valid UTF-8 must never be summed
+    past silently — the sum would understate real spend.
+
+    The *kind* is `storage_unavailable` rather than `corrupt_cost_event`
+    because the driver decodes the column while building the row: the failure
+    surfaces out of `fetchall()` with the query, before this function can look
+    at the payload, so it genuinely cannot tell it apart from a query failure.
+    The guarantee that matters — the money gate is never handed a number that
+    is quietly too low — holds either way."""
     run = _seed_cost_event(api, {"type": "result", "total_cost_usd": 1.0})
-    _overwrite_payload(api, run["id"], b'{"total_cost_usd": 1.0, "x": "\xff\xfe"}')
+    _overwrite_payload_with_raw_bytes(
+        api, run["id"], b'{"total_cost_usd": 1.0, "x": "\xff\xfe"}'
+    )
 
     with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
         task_pipeline.daily_spend_usd(api.db_path)
 
-    assert excinfo.value.kind == task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+    assert excinfo.value.kind == task_pipeline.SpendUnknownError.STORAGE_UNAVAILABLE
 
 
 def test_daily_spend_raises_on_truncated_json_payload(api):
