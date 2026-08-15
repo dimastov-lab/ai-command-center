@@ -355,9 +355,22 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     # answers to reality; that the uv form asks the same question is the
     # assertion above and `..._pin_the_same_extras`.
     fallback = [sys.executable, "-c", "import psycopg"]
-    assert fallback[1:] == module._driver_probe_command()[-2:], (
-        "the fallback form drifted from what this test exercises"
-    )
+    probe = module._driver_probe_command()
+    # The **whole** argv, not its tail. Comparing `[-2:]` pinned `-c` and the
+    # import and left the executable and the interpreter free, and review
+    # showed what that costs. Dropping `"python"` — a plausible edit, thinking
+    # `-c` belongs to uv — makes the probe fail always, so every run reads
+    # `driver missing` including against a database it reached. Replacing
+    # `"uv"` with anything that exits 0 makes it succeed always, which is the
+    # bare `(PostgreSQL requested)` over 260 silent skips: the exact defect
+    # three rounds went into closing, restored with the file green.
+    #
+    # An argv comparison costs no runtime, so the CI-cost objection that moved
+    # the behavioural half to the fallback form does not apply here.
+    if "uv" in probe[0]:
+        assert probe == ["uv", "run", *module._DB_EXTRAS, "python", "-c", "import psycopg"]
+    else:
+        assert probe == fallback
     existing = os.environ.get("PYTHONPATH")
     blocked = subprocess.run(
         fallback,
