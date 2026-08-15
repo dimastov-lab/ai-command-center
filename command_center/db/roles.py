@@ -8,7 +8,7 @@ not. That coupling is deliberate: the defect behind `VOYN-W0-SEC-AUDIT-PG-CRED`
 was a grant that no test exercised, so a grant added here without a matching
 row in the matrix cannot silently widen access.
 
-Three roles, by what fails if each one is compromised:
+Four roles, by what fails if each one is compromised:
 
 * `aicc_migrator` owns the schema and is the only role with DDL. It is used by
   the migration runner and by nothing else at runtime.
@@ -24,6 +24,14 @@ Three roles, by what fails if each one is compromised:
   independent review's verdict lives on `completion`, which a worker does write,
   so the three `review_*` columns are carved out via column-level grants (see
   COLUMN_PRIVILEGES) rather than left inside a table-wide UPDATE.
+* `aicc_operator` is the human admission lever added with `0003_worker_enrollment`.
+  It holds no DML on any domain table at all; its whole reach is EXECUTE on
+  minting an enrolment ticket, revoking one, and revoking a host. It exists
+  because two decisions must be unreachable from the control plane — readmitting
+  a host an incident retired, and taking a host offline — and "unreachable from
+  the control plane" can only be expressed as a second, more trusted
+  `session_user`. A compromised operator credential can admit and evict hosts; it
+  still cannot read any host's secret, because no role can.
 
 `DELETE` is granted to no role on any table: this schema is an append/update
 ledger, and row removal is a migration-time operation performed by the owner.
@@ -60,6 +68,7 @@ from types import MappingProxyType
 __all__ = [
     "APP_ROLE",
     "MIGRATOR_ROLE",
+    "OPERATOR_ROLE",
     "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
@@ -82,8 +91,21 @@ __all__ = [
 MIGRATOR_ROLE = "aicc_migrator"
 APP_ROLE = "aicc_app"
 WORKER_ROLE = "aicc_worker"
+#: The tier-0 admission role added by `0003_worker_enrollment`. It exists for
+#: exactly one reason: readmitting a host an incident retired must not be
+#: reachable by the control plane, and "not reachable by the control plane"
+#: needs a second, more trusted `session_user` to be expressible at all. It
+#: carries no DML on any domain table — its whole reach is EXECUTE on the
+#: admission and revocation levers.
+OPERATOR_ROLE = "aicc_operator"
 
-ALL_ROLES = (MIGRATOR_ROLE, APP_ROLE, WORKER_ROLE)
+ALL_ROLES = (MIGRATOR_ROLE, APP_ROLE, WORKER_ROLE, OPERATOR_ROLE)
+
+#: The roles the matrix grants to. The migrator is excluded because its rights
+#: come from ownership; naming it here rather than repeating a literal tuple at
+#: each of the four loops in `render_table_grants()` is what stops a fifth role
+#: from being added to three of them.
+_GRANTED_ROLES = (APP_ROLE, WORKER_ROLE, OPERATOR_ROLE)
 
 # Every domain table created by the migration set, plus the runner's own
 # bookkeeping table. `test_upgrade_creates_the_declared_schema` fails if the
@@ -105,6 +127,7 @@ ALL_TABLES: tuple[str, ...] = (
     "council_event",
     "council_vote",
     "digest_item",
+    "enrollment_ticket",
     "market_install_log",
     "market_item",
     "message",
@@ -113,6 +136,9 @@ ALL_TABLES: tuple[str, ...] = (
     "motion",
     "networking_invitation",
     "owner_item",
+    "principal",
+    "principal_credential",
+    "principal_event",
     "proposal",
     "proposal_event",
     "proposal_evidence",
@@ -131,12 +157,15 @@ ALL_TABLES: tuple[str, ...] = (
     "work_event",
     "work_item",
     "work_result",
+    "worker_host_fingerprint",
 )
 
 # Views created by the migration set. Separate from `ALL_TABLES` because the
 # schema assertions compare `ALL_TABLES` against `BASE TABLE` rows: folding the
 # two together would make a view able to stand in for a dropped table.
 ALL_VIEWS: tuple[str, ...] = (
+    "enrollment_ticket_public",
+    "principal_credential_public",
     "work_attempt_public",
     "work_dlq",
     "work_item_public",
@@ -151,10 +180,12 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
         "model_event": "model_event_id_seq",
+        "principal_event": "principal_event_id_seq",
         "proposal_event": "proposal_event_id_seq",
         "proposal_evidence": "proposal_evidence_id_seq",
         "run_event": "run_event_id_seq",
         "work_event": "work_event_id_seq",
+        "worker_host_fingerprint": "worker_host_fingerprint_id_seq",
     }
 )
 
@@ -195,6 +226,53 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
     "work_result": _READ,
     "work_event": _READ,
     "work_attempt": _NONE,  # holds `claim_token_hash`; read via the view
+}
+
+# The enrolment tables (0003), for the control plane. Read-only, and two of them
+# not even that.
+#
+# `enrollment_ticket` and `principal_credential` are granted to NOBODY: they
+# hold `ticket_hash` and `secret_hash`, which are the capabilities themselves,
+# and the redacted views are the only read path — the same treatment
+# `work_attempt` gets. That is what makes "a compromised control plane cannot
+# read a pending ticket's secret, and cannot learn any enrolled host's" a
+# property of the grant graph rather than of a WHERE clause.
+#
+# `principal` is readable and not writable, because `principal.state` IS the
+# block-list: a control plane that could `UPDATE` it could un-suspend a host an
+# incident retired, which is precisely the decision `enroll_mint_ticket()`
+# reserves to an operator. `worker_host_fingerprint` is unreachable for the same
+# family of reason — it is the record that reveals a clone, so the component
+# most likely to be compromised must be unable to erase or forge it.
+_APP_ENROLMENT_TABLES: dict[str, frozenset[str]] = {
+    "principal": _READ,
+    "principal_event": _READ,
+    "principal_credential": _NONE,
+    "enrollment_ticket": _NONE,
+    "worker_host_fingerprint": _NONE,
+}
+
+# The same tables for the operator, which is the only role that may see the
+# fingerprint history: classifying a re-enrolment as a rebuild, a hardware
+# change or a clone is the decision this role exists to make.
+_OPERATOR_ENROLMENT_TABLES: dict[str, frozenset[str]] = {
+    "principal": _READ,
+    "principal_event": _READ,
+    "worker_host_fingerprint": _READ,
+    "principal_credential": _NONE,
+    "enrollment_ticket": _NONE,
+}
+
+# A worker reaches none of it. Not even `SELECT` on `principal`: enumerating the
+# fleet tells a compromised execution host which other hosts exist and what they
+# are called, and a worker's own identity arrives in the verdict
+# `identity_assert()` returns.
+_WORKER_ENROLMENT_TABLES: dict[str, frozenset[str]] = {
+    "principal": _NONE,
+    "principal_event": _NONE,
+    "principal_credential": _NONE,
+    "enrollment_ticket": _NONE,
+    "worker_host_fingerprint": _NONE,
 }
 
 # Columns of `completion` that record the independent review's outcome. A
@@ -282,12 +360,20 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
         {
             APP_ROLE: MappingProxyType(
                 {
+                    "enrollment_ticket_public": _READ,
+                    "principal_credential_public": _READ,
                     "work_attempt_public": _READ,
                     "work_dlq": _READ,
                     "work_item_public": _READ,
                 }
             ),
             WORKER_ROLE: MappingProxyType({}),
+            OPERATOR_ROLE: MappingProxyType(
+                {
+                    "enrollment_ticket_public": _READ,
+                    "principal_credential_public": _READ,
+                }
+            ),
         }
     )
 )
@@ -311,8 +397,54 @@ _APP_FUNCTIONS = (
     "queue_redrive(text, integer)",
 )
 
+# The enrolment surface (0003), split by who may do what.
+#
+# A worker gets two entries and no third. It may prove its own identity and
+# rotate its own secret — rotation is authorised by possession of the current
+# secret, so it changes WHICH secret works and nothing else — and it may not
+# mint a ticket (enrolment is not a peer-to-peer gossip protocol), redeem one
+# (a single compromised host must not be able to consume the fleet's pending
+# enrolments), or revoke anything.
+_WORKER_ENROLMENT_FUNCTIONS = (
+    "identity_assert(text)",
+    "enroll_rotate_self(text, text, text)",
+)
+
+# The control plane may bring up a NEW host without a human at 3am, and redeem
+# on a host's behalf, because the enrolling host has no credential yet and
+# something has to make the call. It is deliberately NOT granted
+# `identity_revoke_principal`: revoking a host is an incident decision, and a
+# compromised control plane that could take the fleet offline is a different
+# blast radius from one that can add to it.
+_APP_ENROLMENT_FUNCTIONS = (
+    "enroll_mint_ticket(text, text, text, inet, interval, text)",
+    "enroll_redeem_ticket(text, text, text, jsonb)",
+    "enroll_revoke_ticket(text, text)",
+    "enroll_sweep_expired()",
+    "identity_sweep_expired()",
+)
+
+# The operator's levers, including the two the control plane must not have:
+# readmitting a retired host (through a `re_enroll` mint, gated inside the
+# function on the caller's tier) and revoking one.
+_OPERATOR_FUNCTIONS = (
+    "enroll_mint_ticket(text, text, text, inet, interval, text)",
+    "enroll_revoke_ticket(text, text)",
+    "enroll_sweep_expired()",
+    "identity_revoke_principal(text, text)",
+    "identity_sweep_expired()",
+)
+
 FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
-    {APP_ROLE: _APP_FUNCTIONS, WORKER_ROLE: _WORKER_FUNCTIONS}
+    {
+        # Concatenated rather than replaced, for the reason `merge_privileges`
+        # exists: a second task's grants must add to the first's, and the
+        # failure mode of getting it wrong — a role that may execute nothing —
+        # is silent in each task's own suite.
+        APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS,
+        WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
+        OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
+    }
 )
 
 PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
@@ -341,14 +473,24 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         table: (_READ if table == "schema_migration" else _APP_DML)
                         for table in ALL_TABLES
                         if table not in _APP_QUEUE_TABLES
+                        and table not in _APP_ENROLMENT_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
                     # table this one already names must union with it, not
                     # replace it — `merge_privileges` is what makes that true.
                     _APP_QUEUE_TABLES,
+                    _APP_ENROLMENT_TABLES,
                 )
             ),
-            WORKER_ROLE: MappingProxyType(merge_privileges(_WORKER_TABLES)),
+            WORKER_ROLE: MappingProxyType(
+                merge_privileges(_WORKER_TABLES, _WORKER_ENROLMENT_TABLES)
+            ),
+            # No blanket default: this role is not a general-purpose one, and
+            # folding the default in would hand the admission lever DML on every
+            # domain table in the schema.
+            OPERATOR_ROLE: MappingProxyType(
+                merge_privileges(_OPERATOR_ENROLMENT_TABLES)
+            ),
         }
     )
 )
@@ -397,8 +539,38 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     statements.append(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;")
 
     statements.append(f"GRANT USAGE, CREATE ON SCHEMA {schema} TO {MIGRATOR_ROLE};")
-    for role in (APP_ROLE, WORKER_ROLE):
+    for role in _GRANTED_ROLES:
         statements.append(f"GRANT USAGE ON SCHEMA {schema} TO {role};")
+
+    # Role DDL for the enrolment protocol (0003). Issuing a per-host credential
+    # is `CREATE ROLE` plus `ALTER ROLE ... PASSWORD`, and revoking one is
+    # `ALTER ROLE ... NOLOGIN` plus `pg_terminate_backend`; none of that is
+    # reachable without these three cluster-level grants, which is why they are
+    # here and not in a migration — a migration runs AS the migrator and cannot
+    # widen it.
+    #
+    # Stated rather than buried, because it is a real weakening: this makes the
+    # schema owner also the credential minter. `CREATEROLE` in PostgreSQL 16+ is
+    # bounded to roles the grantee itself created, so it cannot reach `aicc_app`
+    # or `aicc_operator` — but it can mint hosts. The two capabilities should sit
+    # on different roles; the reason they do not yet is that
+    # `render_table_grants()` opens with `REVOKE ALL ON ALL FUNCTIONS IN SCHEMA`
+    # executed as the migrator, and PostgreSQL refuses that statement outright
+    # once any function in the schema has a different owner (measured, not
+    # assumed). Splitting the owner therefore needs this renderer to learn about
+    # second owners first. Filed as VOYN-W0-AICC-SRV-03d.
+    statements.append(f"ALTER ROLE {MIGRATOR_ROLE} CREATEROLE;")
+    # `ADMIN TRUE` is what lets `CREATE ROLE ... IN ROLE aicc_worker` grant the
+    # membership; `INHERIT FALSE, SET FALSE` is what stops the migrator picking
+    # up the worker's privileges or becoming it as a side effect.
+    statements.append(
+        f"GRANT {WORKER_ROLE} TO {MIGRATOR_ROLE} "
+        "WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;"
+    )
+    # Terminating a revoked host's live backends. Without it, a leaked password
+    # that is already connected keeps its connection until the credential's TTL
+    # runs out, so revocation would stop future authentication only.
+    statements.append(f"GRANT pg_signal_backend TO {MIGRATOR_ROLE};")
 
     return statements
 
@@ -434,7 +606,7 @@ def render_table_grants(schema: str = "public") -> list[str]:
     statements.append(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM PUBLIC;")
     statements.append(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;")
 
-    for role in (APP_ROLE, WORKER_ROLE):
+    for role in _GRANTED_ROLES:
         statements.append(f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM {role};")
         statements.append(
             f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM {role};"
@@ -446,7 +618,7 @@ def render_table_grants(schema: str = "public") -> list[str]:
             f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM {role};"
         )
 
-    for role in (APP_ROLE, WORKER_ROLE):
+    for role in _GRANTED_ROLES:
         for table, privileges in sorted(PRIVILEGES[role].items()):
             _require_identifier(table)
             columns = COLUMN_PRIVILEGES.get(role, {}).get(table, {})
@@ -478,7 +650,7 @@ def render_table_grants(schema: str = "public") -> list[str]:
     # Identity columns draw from a sequence; INSERT alone is not enough. Granted
     # per sequence rather than schema-wide, so a role still cannot advance the
     # counters of tables it may not write.
-    for role in (APP_ROLE, WORKER_ROLE):
+    for role in _GRANTED_ROLES:
         for table, sequence in sorted(IDENTITY_SEQUENCES.items()):
             if "INSERT" not in PRIVILEGES[role].get(table, frozenset()):
                 continue
