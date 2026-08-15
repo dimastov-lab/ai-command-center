@@ -1435,6 +1435,12 @@ def _drive_tier_violation(psycopg, host_dsn) -> None:
 # Reversibility
 # ---------------------------------------------------------------------------
 
+#: The enrolment migration, named by version rather than reached as "the head".
+#: This test shipped while it was the last migration, so `upgrade()` with no
+#: target and a literal `(3,)` were the same thing; the next migration to land
+#: made them different and turned that into an off-by-one in a tuple.
+ENROLMENT_VERSION = 3
+
 
 def test_up_down_up_down_leaves_no_enrolment_object(
     admin_conn, psycopg, test_dsn, role_passwords
@@ -1452,7 +1458,14 @@ def test_up_down_up_down_leaves_no_enrolment_object(
         for cycle in range(2):
             with psycopg.connect(migrator_dsn, autocommit=True) as conn:
                 if cycle:
-                    assert migrations.upgrade(conn) == (3,)
+                    # `target`, not "upgrade to the head": this test owns the
+                    # enrolment migration's reversibility and nothing else, and
+                    # an unqualified `upgrade()` silently pulls in every later
+                    # migration — which then shows up as an off-by-one in the
+                    # downgrade tuple below rather than as anything readable.
+                    assert migrations.upgrade(conn, target=ENROLMENT_VERSION) == (
+                        ENROLMENT_VERSION,
+                    )
                     roles.apply_table_grants(conn)
                     with conn.cursor() as cur:
                         cur.execute(
@@ -1475,7 +1488,19 @@ def test_up_down_up_down_leaves_no_enrolment_object(
                 assert cur.fetchone()[0] == 1
 
             with psycopg.connect(migrator_dsn, autocommit=True) as conn:
-                assert migrations.downgrade(conn, target=2) == (3,)
+                # Derived from what this database actually has applied, not
+                # from the migration set: the two cycles differ, because the
+                # first starts from a fully migrated database and the second
+                # re-applies only the enrolment migration. Written as a literal,
+                # this assertion was correct only while enrolment was the last
+                # migration; written against `discover()`, it would be correct
+                # only on the first cycle. The ledger unwinds newest first.
+                expected = tuple(
+                    v
+                    for v in sorted(migrations.applied_versions(conn), reverse=True)
+                    if v >= ENROLMENT_VERSION
+                )
+                assert migrations.downgrade(conn, target=ENROLMENT_VERSION - 1) == expected
 
             with admin_conn.cursor() as cur:
                 cur.execute(

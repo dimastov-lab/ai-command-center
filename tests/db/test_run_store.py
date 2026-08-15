@@ -1,6 +1,6 @@
 """Slice 11: `run` — and the write-side sibling of slice 4's trap.
 
-The shared contract covers this table's shape: 41 columns, three flags, six
+The shared contract covers this table's shape: 42 columns, three flags, seven
 timestamps, two `jsonb`, two foreign keys, all against the accepted schema and
 the live SQLite one. What it cannot cover is the *hook*, and that is where this
 table's hazard is.
@@ -86,9 +86,12 @@ def test_the_mirror_receives_the_stored_row_not_the_writers_record(
         "failure_reason",
         "first_output_at",
         "pre_run_head",
+        # Necessarily absent from the record: it is written at the *end* of
+        # finalization, and this assertion is about the row `create_run` stores.
+        "finalized_at",
     }
     assert set(returned) - set(mirrored) == set()
-    assert len(returned) == 38 and len(mirrored) == 41
+    assert len(returned) == 38 and len(mirrored) == 42
     assert mirrored["id"] == returned["id"]
 
 
