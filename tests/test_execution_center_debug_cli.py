@@ -281,6 +281,7 @@ def test_cli_read_only_subcommands_are_safe_across_separate_invocations(configur
 WIDEN_FINALIZATION_WRAPPER = Path(__file__).parent / "fixtures" / "widen_finalization.py"
 
 
+@pytest.mark.serial  # deadline-sensitive subprocess run; the widened window is seconds, not minutes
 def test_the_cli_waits_for_finalization_and_not_merely_for_a_terminal_row(configured_repo):
     """The guard the fix shipped without, and review said so.
 
@@ -290,7 +291,7 @@ def test_the_cli_waits_for_finalization_and_not_merely_for_a_terminal_row(config
     never observes the case they are about.
 
     Here the window is widened deterministically — see
-    `tests/fixtures/widen_finalization/sitecustomize.py` — so the supervisor's
+    `tests/fixtures/widen_finalization.py` — so the supervisor's
     daemon thread is still finalizing when the poll tick sees a terminal row.
     Without the wait, this CLI returns there, the interpreter exits without
     joining that daemon thread, and the run is left COMPLETED with no
@@ -327,6 +328,7 @@ def test_the_cli_waits_for_finalization_and_not_merely_for_a_terminal_row(config
     )
 
 
+@pytest.mark.serial  # deadline-sensitive subprocess run; the widened window is seconds, not minutes
 def test_ctrl_c_during_the_finalization_wait_reports_the_run_instead_of_crashing(configured_repo):
     """The window where the run is finished and the CLI is still running.
 
@@ -373,6 +375,7 @@ def test_ctrl_c_during_the_finalization_wait_reports_the_run_instead_of_crashing
     assert _extract_last_json_object(stdout)["state"] in db.TERMINAL_STATES
 
 
+@pytest.mark.serial  # deadline-sensitive subprocess run; the widened window is seconds, not minutes
 def test_a_wedged_finalization_does_not_exit_zero(configured_repo, monkeypatch):
     """A warning printed while exiting 0 is the same defect one layer up.
 
@@ -383,7 +386,7 @@ def test_a_wedged_finalization_does_not_exit_zero(configured_repo, monkeypatch):
     """
     env = _cli_env()
     env["AICC_TEST_WIDEN_FINALIZATION_SECONDS"] = "5.0"
-    env["AICC_FINALIZATION_TIMEOUT_SECONDS"] = "1.0"
+    env["AICC_TEST_FINALIZATION_TIMEOUT_SECONDS"] = "1.0"
 
     result = subprocess.run(
         [sys.executable, str(WIDEN_FINALIZATION_WRAPPER), "launch", "AIOS", str(configured_repo), "implementation", "say ok", "--confirm"],

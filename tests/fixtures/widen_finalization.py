@@ -25,6 +25,7 @@ this version refuses to run unless it can prove it patched what it meant to.
 
 from __future__ import annotations
 
+import atexit
 import os
 import runpy
 import sys
@@ -51,23 +52,52 @@ _TERMINAL = set(_db.TERMINAL_STATES)
 _original_update_run_state = _db.update_run_state
 
 
+_slept = 0
+
+
 def _update_run_state(*args, **kwargs):
+    global _slept
     result = _original_update_run_state(*args, **kwargs)
+    # `new_state` is keyword-only in `db.execution.update_run_state`, so a
+    # positional call cannot occur without a signature change — but a rename or
+    # a relocation of the terminal write would make this condition stop
+    # matching, and that is what the exit check below exists to catch.
     if kwargs.get("new_state") in _TERMINAL:
+        _slept += 1
         time.sleep(_WIDEN)
     return result
 
 
 _db.update_run_state = _update_run_state
 
-# Proof, not hope. The supervisor resolves `db.update_run_state` at call time,
-# so this attribute is the one it will reach — and if some future refactor
-# moves the write elsewhere, this wrapper must fail loudly rather than keep
-# reporting a guarded run.
-if _db.update_run_state is not _update_run_state:  # pragma: no cover - defensive
-    raise SystemExit("failed to install the finalization widener")
-if not _TERMINAL:
-    raise SystemExit("db.TERMINAL_STATES is empty; the widener would never fire")
+# Proof that it *fired*, not that it was installed.
+#
+# The previous version checked `_db.update_run_state is not _update_run_state`
+# on the line after the assignment — a tautology on a plain module object, and
+# `if not _TERMINAL` only asked whether a constant was non-empty. Review made
+# the widener inert by renaming the keyword it reads, then also deleted the
+# guard being tested, and the test passed three times out of three. Both the
+# fixture and the fix could be removed together with the suite green: the
+# `sitecustomize` failure this file was written to design out, one layer over.
+#
+# So the sleep records itself, and the wrapper refuses to exit successfully if
+# it never happened. A test asserting `returncode == 0` then holds the fixture
+# as well as the product.
+_MARKER = os.environ.get("AICC_TEST_WIDEN_MARKER")
+
+
+@atexit.register
+def _refuse_to_report_an_unwidened_run() -> None:
+    if _slept:
+        if _MARKER:
+            Path(_MARKER).write_text(str(_slept), encoding="utf-8")
+        return
+    sys.stderr.write(
+        "widen_finalization: the terminal-state write never went through this "
+        "wrapper, so nothing was widened and the run proves nothing about the "
+        "race it was meant to expose.\n"
+    )
+    os._exit(97)
 
 sys.argv = [str(CLI), *sys.argv[1:]]
 runpy.run_path(str(CLI), run_name="__main__")

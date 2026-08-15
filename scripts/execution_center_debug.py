@@ -56,6 +56,7 @@ sys.path.insert(0, str(ROOT))
 
 from command_center.runtime import db  # noqa: E402
 from command_center.runtime.api import ExecutionCenterAPI  # noqa: E402
+from command_center.runtime.supervisor import SupervisorError  # noqa: E402
 
 _POLL_INTERVAL_SECONDS = 0.2
 _DEFAULT_CANCEL_GRACE_SECONDS = 10.0
@@ -63,10 +64,32 @@ _DEFAULT_CANCEL_GRACE_SECONDS = 10.0
 # `_await_finalization`). Generous relative to the work it covers — an event
 # append, `git commit`, and one report write — so that hitting it means
 # "finalization is wedged", never "finalization was merely slow".
-# Overridable so a test can prove the wedged path without waiting a minute for
-# it. Not a knob for operators: the default is the contract, and a shorter one
-# turns "finalization is wedged" back into "finalization was merely slow".
-_FINALIZATION_TIMEOUT_SECONDS = float(os.environ.get("AICC_FINALIZATION_TIMEOUT_SECONDS", "60"))
+def _finalization_timeout() -> float:
+    """60 s, unless a test needs to prove the wedged path in less than a minute.
+
+    `AICC_TEST_` in the name, because review pointed out the previous spelling
+    said "not a knob for operators" in a comment and did nothing to be one: it
+    read like a supported setting, was parsed at import so a garbage value
+    crashed even read-only subcommands with a traceback, and `0` made every run
+    exit 5. A comment is not an enforcement.
+    """
+    raw = os.environ.get("AICC_TEST_FINALIZATION_TIMEOUT_SECONDS")
+    if raw is None:
+        return 60.0
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise SystemExit(
+            f"AICC_TEST_FINALIZATION_TIMEOUT_SECONDS must be a number, got {raw!r}"
+        ) from None
+    if seconds <= 0:
+        # Zero made `waited >= timeout` true on every run, so every finalization
+        # reported itself wedged.
+        raise SystemExit("AICC_TEST_FINALIZATION_TIMEOUT_SECONDS must be positive")
+    return seconds
+
+
+_FINALIZATION_TIMEOUT_SECONDS = _finalization_timeout()
 
 #: A run that reached a terminal state whose finalization never completed. Not
 #: any of the state codes below, because it is not a statement about the run's
@@ -174,7 +197,17 @@ def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
             _print(current)
             return _EXIT_CODE_BY_STATE.get(current["state"], 1)
         print("\nCtrl+C received — requesting confirmed cancellation and waiting for cleanup...", file=sys.stderr)
-        final = api.request_cancel(run_id, confirmed=True, grace_seconds=_DEFAULT_CANCEL_GRACE_SECONDS)
+        try:
+            final = api.request_cancel(run_id, confirmed=True, grace_seconds=_DEFAULT_CANCEL_GRACE_SECONDS)
+        except SupervisorError as exc:
+            # The check above narrowed this window; it did not close it. A
+            # signal arriving microseconds *before* the terminal transition
+            # still takes this path and still finds nothing to cancel — the
+            # original defect at its pre-#305 width rather than eliminated.
+            # Report the run, which is what the operator asked for by pressing
+            # Ctrl+C, rather than dying on a race.
+            print(f"\nNothing to cancel — {exc}", file=sys.stderr)
+            final = api.get_run(run_id)
         for event in api.get_events(run_id, after_seq=after_seq):
             _print_event(event)
         _print(final)
