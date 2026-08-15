@@ -571,12 +571,19 @@ def test_tick_does_not_swallow_a_programming_error_from_the_spend_primitive(
     execution_queue.enqueue_and_persist(tmp_path, task, {"sb": task})
     configs = project_config.load_project_configs()
 
+    bug = AttributeError("'list' object has no attribute 'get'")
+
     def _bug(*_a, **_k):
-        raise AttributeError("'list' object has no attribute 'get'")
+        raise bug
 
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", _bug)
 
-    with pytest.raises(AttributeError):
+    with pytest.raises(AttributeError) as excinfo:
         task_pipeline.tick(
             tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
         )
+
+    # The identical exception object, not merely the same type: a handler that
+    # caught it and then read `exc.kind` off it would raise its own
+    # AttributeError, and a bare type check would not notice.
+    assert excinfo.value is bug

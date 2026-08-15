@@ -341,20 +341,37 @@ def test_plan_does_not_measure_spend_when_no_ceiling_is_configured(monkeypatch, 
     assert plan.as_dict()["daily_spend_usd"] is None
 
 
+@pytest.mark.parametrize(
+    "bug",
+    [
+        # The live defect this replaces: `payload.get(...)` sat outside the
+        # `try`, so valid non-object JSON raised exactly this.
+        AttributeError("'list' object has no attribute 'get'"),
+        KeyError("payload"),
+        TypeError("daily_spend_usd() got an unexpected keyword argument"),
+    ],
+    ids=["attribute_error", "key_error", "type_error"],
+)
 def test_plan_does_not_swallow_a_programming_error_from_the_spend_primitive(
-    monkeypatch, pool
+    monkeypatch, pool, bug
 ):
     """The old `except Exception` laundered `AttributeError`, `KeyError` and a
     misspelled call into a budget verdict. Only `SpendUnknownError` is caught
-    now, so a bug travels as a bug."""
+    now, so a bug travels as a bug — the *same* bug, unchanged, not some new
+    error raised while the handler tried to read `.kind` off it."""
     _enable_master_switch()
     _set_ceiling(5.0)
 
     def _bug(*_a, **_k):
-        raise AttributeError("'list' object has no attribute 'get'")
+        raise bug
 
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", _bug)
     _queued_task(title="t1")
 
-    with pytest.raises(AttributeError):
+    with pytest.raises(type(bug)) as excinfo:
         service.plan(ROOT)
+
+    # Identity, not merely type: a handler that catches this and then trips
+    # over `exc.kind` would raise a *different* AttributeError, which a bare
+    # `pytest.raises(AttributeError)` would happily accept.
+    assert excinfo.value is bug
