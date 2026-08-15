@@ -65,7 +65,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 import dataclasses
 from pathlib import Path
@@ -184,6 +184,11 @@ EV_PIPELINE_COMPLETED = "pipeline_task_completed"
 EV_PIPELINE_REWORK = "pipeline_rework"
 EV_PIPELINE_REMEDIATED = "pipeline_workspace_remediated"
 EV_PIPELINE_REVIEW = "pipeline_review"
+EV_PIPELINE_SPEND_DATA_MALFORMED = "pipeline_spend_data_malformed"
+
+
+class DailySpendDataMalformedError(TypeError):
+    """Raised when stored spend payloads are present but structurally invalid."""
 
 # Operator remediation per machine-readable reason code — the "and what do I do
 # about it?" half of every DEFER/BLOCKED/SKIPPED decision. Kept as data here
@@ -2230,6 +2235,12 @@ def _locked_tick(
             spend_budget_exhausted = (
                 daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
             )
+        except DailySpendDataMalformedError as exc:
+            _record(exc, "daily_spend_budget_malformed")
+            activity_log.log_event(
+                EV_PIPELINE_SPEND_DATA_MALFORMED,
+                message=str(exc),
+            )
         except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
             _record(exc, "daily_spend_budget")
             spend_budget_exhausted = True
@@ -2425,10 +2436,22 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             (cutoff, cutoff),
         ).fetchall()
     for row in rows:
-        try:
-            payload = _json.loads(row["payload"])
-        except (TypeError, ValueError):
-            continue
+        raw_payload = row["payload"]
+        if isinstance(raw_payload, Mapping):
+            payload = raw_payload
+        elif isinstance(raw_payload, str):
+            try:
+                payload = _json.loads(raw_payload)
+            except ValueError:
+                continue
+            if not isinstance(payload, Mapping):
+                raise DailySpendDataMalformedError(
+                    "run_event.payload_json decoded JSON must be an object mapping"
+                )
+        else:
+            raise DailySpendDataMalformedError(
+                "run_event.payload_json must be a JSON string or decoded mapping"
+            )
         cost = payload.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             total += float(cost)

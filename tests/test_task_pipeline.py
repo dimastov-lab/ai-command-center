@@ -164,6 +164,54 @@ def test_persisted_settings_are_json_round_trippable(tmp_path):
     assert on_disk["max_agent_concurrency"] == 3
 
 
+def test_daily_spend_counts_already_decoded_payload_mapping(monkeypatch, tmp_path):
+    class _FakeCursor:
+        def fetchall(self):
+            return [{"payload": {"type": "result", "total_cost_usd": 1.75}}]
+
+    class _FakeConn:
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor()
+
+    class _FakeConnect:
+        def __enter__(self):
+            return _FakeConn()
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return False
+
+    monkeypatch.setattr(runtime_db, "connect", lambda _db_path: _FakeConnect())
+
+    total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db", now="2026-07-03T12:00:00")
+    assert total > 0
+    assert total == pytest.approx(1.75)
+
+
+def test_daily_spend_skips_malformed_json_payload(monkeypatch, tmp_path):
+    class _FakeCursor:
+        def fetchall(self):
+            return [
+                {"payload": "{bad json"},
+                {"payload": '{"type":"result","total_cost_usd":2.5}'},
+            ]
+
+    class _FakeConn:
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor()
+
+    class _FakeConnect:
+        def __enter__(self):
+            return _FakeConn()
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return False
+
+    monkeypatch.setattr(runtime_db, "connect", lambda _db_path: _FakeConnect())
+
+    total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db", now="2026-07-03T12:00:00")
+    assert total == pytest.approx(2.5)
+
+
 def test_disabled_tick_does_nothing(tmp_path, api):
     result = task_pipeline.tick(tmp_path, api, {})
     assert result.ran is False

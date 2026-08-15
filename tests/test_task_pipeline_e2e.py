@@ -29,6 +29,7 @@ from __future__ import annotations
 import pytest
 
 from command_center import (
+    activity_log,
     execution_queue,
     models,
     pipeline_settings,
@@ -513,3 +514,42 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def test_malformed_spend_data_is_logged_and_not_reported_as_budget_exhausted(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-malformed")
+    wt = tmp_path / "wt" / "m"
+    task = _task("m", "AIOS", wt, branch="task/m")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"m": task})
+    configs = project_config.load_project_configs()
+
+    def _raise(*_args, **_kwargs):
+        raise task_pipeline.DailySpendDataMalformedError("malformed spend payload")
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    monkeypatch.setattr(
+        activity_log,
+        "log_event",
+        lambda event_type, **kwargs: events.append((event_type, kwargs)) or {},
+    )
+
+    result = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+    assert [d.task_id for d in result.launched()] == ["m"]
+    assert result.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+    assert any(
+        event_type == task_pipeline.EV_PIPELINE_SPEND_DATA_MALFORMED
+        for event_type, _payload in events
+    )

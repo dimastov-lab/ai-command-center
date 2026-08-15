@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from command_center import activity_log
 from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
 from command_center.dispatch import models, policy_config, service
@@ -49,6 +50,13 @@ def pool(monkeypatch):
 
 def _spend(monkeypatch, value: float):
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", lambda *_a, **_k: value)
+
+
+def _spend_raises(monkeypatch, exc: Exception):
+    def _raise(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
 
 
 def _enable_master_switch():
@@ -170,6 +178,52 @@ def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
 
     assert plan.assignments == ()
     assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+
+
+def test_plan_fails_closed_when_spend_is_unavailable(monkeypatch, pool):
+    import dataclasses
+
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=1.0)
+    )
+    _spend_raises(monkeypatch, RuntimeError("runtime db unavailable"))
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1", executor="claude_code", executor_pinned=True)
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+
+
+def test_plan_logs_malformed_spend_data_and_does_not_report_budget_hit(monkeypatch, pool):
+    import dataclasses
+
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=1.0)
+    )
+    _spend_raises(
+        monkeypatch,
+        task_pipeline.DailySpendDataMalformedError("bad spend payload"),
+    )
+    logged: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        activity_log,
+        "log_event",
+        lambda event_type, **kwargs: logged.append((event_type, kwargs)) or {},
+    )
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1", executor="claude_code", executor_pinned=True)
+
+    plan = service.plan(ROOT)
+
+    assert len(plan.assignments) == 1
+    assert plan.decisions[0].reason != models.DEFER_DAILY_BUDGET
+    assert logged and logged[0][0] == "dispatch_spend_data_malformed"
 
 
 # --------------------------------------------------------------------------

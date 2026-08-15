@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from command_center import activity_log
 from command_center import executors as executors_module
 from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
@@ -164,6 +165,9 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
 
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
+    except task_pipeline.DailySpendDataMalformedError as exc:
+        activity_log.log_event("dispatch_spend_data_malformed", message=str(exc))
+        spend = 0.0
     except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
         spend = settings.max_daily_spend_usd or 0.0
 
