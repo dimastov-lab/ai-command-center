@@ -122,6 +122,16 @@ def _worker_hosts(admin_conn, psycopg, test_dsn, count: int):
                     admin_conn.rollback()
 
 
+def _claim_migration():
+    """The claim migration by NAME, not by position in the set.
+
+    `discover()[-1]` meant "the claim migration" only while it was the last one;
+    once a later migration lands, the same expression keeps passing while
+    measuring something else entirely.
+    """
+    return next(m for m in migrations.discover() if m.slug == "queue_claim")
+
+
 def _token() -> tuple[str, str]:
     """A 256-bit capability and the SHA-256 the database will store.
 
@@ -1756,21 +1766,24 @@ def test_up_down_up_down_leaves_the_schema_byte_identical(
     migrator_dsn = _as_role(
         test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]
     )
-    latest = migrations.discover()[-1].version
-    assert latest == 2, "this test pins the reversibility of the claim migration"
+    assert _claim_migration().version == 2, "this test pins the claim migration"
 
     with psycopg.connect(migrator_dsn, autocommit=True) as conn:
-        assert migrations.downgrade(conn, target=1) == (2,)
+        # Strip everything above the claim migration first, and drive the cycle
+        # with an explicit target afterwards. Reading `discover()[-1]` was
+        # correct while the claim migration was the last one and would have gone
+        # on passing while quietly measuring a later migration instead.
+        migrations.downgrade(conn, target=1)
         before = _schema_snapshot(admin_conn)
 
-        assert migrations.upgrade(conn) == (2,)
+        assert migrations.upgrade(conn, target=2) == (2,)
         with_claim = _schema_snapshot(admin_conn)
         assert with_claim != before, "the snapshot notices nothing; it would pass on anything"
 
         assert migrations.downgrade(conn, target=1) == (2,)
         assert _schema_snapshot(admin_conn) == before
 
-        assert migrations.upgrade(conn) == (2,)
+        assert migrations.upgrade(conn, target=2) == (2,)
         assert _schema_snapshot(admin_conn) == with_claim
 
         assert migrations.downgrade(conn, target=1) == (2,)
@@ -1786,7 +1799,7 @@ def test_the_queue_mirror_is_untouched_by_this_migration(
     therefore stands beside the mirror rather than reshaping it, and retiring
     the mirror belongs to the JSON-queue contraction, not here.
     """
-    claim_migration = migrations.discover()[-1]
+    claim_migration = _claim_migration()
     statements = [
         line
         for sql_text in (claim_migration.up_sql, claim_migration.down_sql)

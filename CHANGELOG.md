@@ -8,6 +8,28 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Security — container deployment no longer exposes the console (`VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH`)
+
+An earlier audit (`9761459`, BLOCKER-1) pinned the Streamlit console to localhost for the bare
+`streamlit run` and `scripts/start-ui.sh` paths, but no test guarded that decision and the container
+deployment path reintroduced the same exposure: `scripts/aml-entrypoint.sh` defaulted
+`--server.address` to `0.0.0.0` and `docker-compose.aml.yml` published the port unqualified, so a
+routine `docker compose up` put an unauthenticated console that performs privileged git/gh and
+subprocess operations on every host interface — below any host firewall rule, since Docker installs
+its own.
+
+- `scripts/aml-entrypoint.sh` no longer has a default bind address. It exits `78` (`EX_CONFIG`) with
+  an explanatory message unless `STREAMLIT_SERVER_ADDRESS` is set, so the choice cannot be inherited
+  unseen.
+- `docker-compose.aml.yml` publishes on `${AML_BIND_HOST:-127.0.0.1}` instead of every interface, and
+  states the container-internal `0.0.0.0` explicitly with the reason it is correct there.
+- `tests/test_deployment_exposure.py` gates all four launch paths, executing the entrypoint rather
+  than pattern-matching it.
+
+This closes the *exposure*, not the underlying absence of authentication: the console still has no
+auth layer, which is tracked separately as `AUTH-HTTP-01`. Widening `AML_BIND_HOST` therefore still
+means publishing an unauthenticated privileged surface.
+
 ### H1 sprint history
 
 **H1** is the committed-next horizon defined by

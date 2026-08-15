@@ -157,8 +157,30 @@ def test_no_role_holds_a_table_privilege_on_the_claim_protocol() -> None:
 
 
 def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> None:
+    """Two assertions rather than one, because the role now carries two layers.
+
+    The queue half must stay exactly four steps, and the whole set must stay
+    exactly what both tasks declared. A single equality would have to be edited
+    by every later task that adds a function, and editing it is indistinguishable
+    from widening it.
+    """
     granted = {s.split("(")[0] for s in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]}
-    assert granted == {"queue_claim", "queue_heartbeat", "queue_complete", "queue_fail"}
+    assert {name for name in granted if name.startswith("queue_")} == {
+        "queue_claim",
+        "queue_heartbeat",
+        "queue_complete",
+        "queue_fail",
+    }
+    # And the enrolment layer (0003): prove its own identity, rotate its own
+    # secret, and nothing else — a worker cannot mint or redeem an enrolment.
+    assert granted == {
+        "queue_claim",
+        "queue_heartbeat",
+        "queue_complete",
+        "queue_fail",
+        "identity_assert",
+        "enroll_rotate_self",
+    }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
 
@@ -171,7 +193,24 @@ def test_the_control_plane_cannot_claim() -> None:
     """
     granted = {s.split("(")[0] for s in roles.FUNCTION_PRIVILEGES[roles.APP_ROLE]}
     assert "queue_claim" not in granted
-    assert granted == {"queue_enqueue", "queue_reap", "queue_redrive"}
+    assert {name for name in granted if name.startswith("queue_")} == {
+        "queue_enqueue",
+        "queue_reap",
+        "queue_redrive",
+    }
+    # The enrolment layer (0003). `identity_revoke_principal` is deliberately
+    # absent: taking a host offline is the operator's lever, so a compromised
+    # control plane can add to the fleet and cannot take it down.
+    assert granted == {
+        "queue_enqueue",
+        "queue_reap",
+        "queue_redrive",
+        "enroll_mint_ticket",
+        "enroll_redeem_ticket",
+        "enroll_revoke_ticket",
+        "enroll_sweep_expired",
+        "identity_sweep_expired",
+    }
 
 
 def test_the_worker_can_no_longer_write_the_queue_mirror() -> None:
