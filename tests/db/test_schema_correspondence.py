@@ -227,21 +227,40 @@ def test_every_runtime_table_has_a_postgres_target(sqlite_schema, postgres_schem
     assert sorted(postgres_tables - sqlite_tables) == [], "PostgreSQL tables with no SQLite source"
 
 
+def _tables_declared_by_the_initial_migration() -> set[str]:
+    """The count, derived from the DDL instead of transcribed from it.
+
+    A literal here (it was `33`, and before that a stale `16` that reached a
+    plan) has to be edited by hand on every migration, so the one thing it
+    reliably measures is whether someone remembered. Worse, a wrong literal and
+    a missing table are indistinguishable — the mirror-coverage gate exists
+    because exactly that ambiguity hid `queue_entry`'s separate contract inside
+    an off-by-one. Reading the migration needs no database, so the property this
+    test was written to defend — that the number stays defended on a laptop with
+    no PostgreSQL — is preserved.
+    """
+    return {
+        line.split()[2].rstrip("(")
+        for line in INITIAL_MIGRATION.read_text(encoding="utf-8").splitlines()
+        if line.startswith("CREATE TABLE ")
+    }
+
+
 def test_the_domain_table_count_is_the_live_one_not_the_early_survey(
     sqlite_schema,
 ) -> None:
-    """33, not the 16 recorded before waves W1-W3.
+    """The runtime store and the accepted schema declare the same tables.
 
     Deliberately depends on the SQLite fixture alone. Pinning it behind the
-    PostgreSQL fixture would let the number silently stop being defended on any
-    machine without a database — which is exactly the condition under which the
-    stale 16 survived long enough to reach a plan.
+    PostgreSQL fixture would let it silently stop being defended on any machine
+    without a database — which is exactly the condition under which the stale 16
+    survived long enough to reach a plan.
     """
-    assert len(sqlite_schema["tables"]) == 33
+    assert set(sqlite_schema["tables"]) == _tables_declared_by_the_initial_migration()
 
 
 def test_the_postgres_target_carries_the_same_count(postgres_schema) -> None:
-    assert len(postgres_schema["tables"]) == 33
+    assert set(postgres_schema["tables"]) == _tables_declared_by_the_initial_migration()
 
 
 def test_no_column_is_left_behind(sqlite_schema, postgres_schema) -> None:

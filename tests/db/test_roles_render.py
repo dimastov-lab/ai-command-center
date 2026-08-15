@@ -62,6 +62,155 @@ def test_worker_cannot_enqueue_work() -> None:
     assert "INSERT" not in roles.PRIVILEGES[roles.WORKER_ROLE]["queue_entry"]
 
 
+QUEUE_TABLES = ("work_item", "work_attempt", "work_result", "work_event")
+
+
+# ---------------------------------------------------------------------------
+# The grants two tasks lose when neither is wrong
+# ---------------------------------------------------------------------------
+# `render_table_grants()` opens with `REVOKE ALL ... FROM <role>`, which is what
+# makes it a complete replacement rather than additive drift — and is exactly
+# why the matrix it re-grants from has to be a *union*. Two tasks adding rows
+# for the same table is the normal case as the schema grows. Under a dict
+# update the later one wins, the earlier one's grants vanish with no error and
+# no warning, and both tasks' own suites stay green because each is correct
+# alone. The defect only exists once both have landed, which is the one
+# arrangement neither task's tests cover.
+
+
+def test_merging_two_contributions_keeps_both() -> None:
+    first = {"shared_table": frozenset({"SELECT"}), "only_first": frozenset({"INSERT"})}
+    second = {"shared_table": frozenset({"UPDATE"}), "only_second": frozenset({"SELECT"})}
+
+    merged = roles.merge_privileges(first, second)
+
+    assert merged["shared_table"] == frozenset({"SELECT", "UPDATE"})
+    assert merged["only_first"] == frozenset({"INSERT"})
+    assert merged["only_second"] == frozenset({"SELECT"})
+
+
+def test_a_later_contribution_cannot_silently_replace_an_earlier_one() -> None:
+    """The regression, stated as the thing that must not happen.
+
+    Written against the shape the mistake takes rather than against the helper:
+    `dict(first) | second` is what anyone reaches for, it type-checks, and it
+    drops `SELECT` here.
+    """
+    first = {"shared_table": frozenset({"SELECT"})}
+    second = {"shared_table": frozenset({"UPDATE"})}
+
+    naive = dict(first) | second
+    assert naive["shared_table"] == frozenset({"UPDATE"}), "the mistake, reproduced"
+    assert "SELECT" not in naive["shared_table"]
+
+    assert "SELECT" in roles.merge_privileges(first, second)["shared_table"]
+
+
+def test_the_blanket_default_never_widens_a_narrowed_table() -> None:
+    """A union can only grow, so the default must stay outside the merge.
+
+    `work_item` is `SELECT` for the app on purpose; if the per-table default
+    were merged in as a contribution it would come back as full DML and the
+    control plane would regain the direct write the protocol exists to remove.
+    """
+    assert roles.PRIVILEGES[roles.APP_ROLE]["work_item"] == frozenset({"SELECT"})
+    assert roles.PRIVILEGES[roles.APP_ROLE]["run"] == frozenset({"SELECT", "INSERT", "UPDATE"})
+
+
+def test_the_rendered_matrix_covers_every_declared_privilege() -> None:
+    """End to end: nothing declared may be missing from the rendered SQL.
+
+    The merge above is only worth anything if the renderer consumes the merged
+    result, so this reads the statements rather than the mapping.
+    """
+    statements = roles.render_table_grants()
+    for role in (roles.APP_ROLE, roles.WORKER_ROLE):
+        for table, privileges in roles.PRIVILEGES[role].items():
+            if not privileges or table in roles.COLUMN_PRIVILEGES.get(role, {}):
+                continue
+            granted = [
+                s
+                for s in statements
+                if s.endswith(f"ON public.{table} TO {role};")
+            ]
+            assert len(granted) == 1, f"{role}.{table}"
+            for privilege in privileges:
+                assert privilege in granted[0], f"{role}.{table}.{privilege}"
+
+
+def test_no_role_holds_a_table_privilege_on_the_claim_protocol() -> None:
+    """The exclusivity argument is a property of the grant graph, not of a WHERE.
+
+    If any role could `UPDATE work_item` directly there would be a second route
+    to a claim, and `queue_claim()` would stop being the only place the
+    exclusivity has to hold.
+    """
+    for role in (roles.APP_ROLE, roles.WORKER_ROLE):
+        for table in QUEUE_TABLES:
+            assert not {
+                p for p in roles.PRIVILEGES[role][table] if p in {"INSERT", "UPDATE"}
+            }, f"{role} may write {table}"
+
+    # `work_attempt` holds the capability itself and is readable by nobody.
+    for role in (roles.APP_ROLE, roles.WORKER_ROLE):
+        assert roles.PRIVILEGES[role]["work_attempt"] == frozenset()
+
+
+def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> None:
+    granted = {s.split("(")[0] for s in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]}
+    assert granted == {"queue_claim", "queue_heartbeat", "queue_complete", "queue_fail"}
+    assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
+
+
+def test_the_control_plane_cannot_claim() -> None:
+    """Dispatch is not execution.
+
+    Granting the app `queue_claim()` would restore the shape the claim protocol
+    exists to remove: a privileged process recording an executor it was merely
+    told about.
+    """
+    granted = {s.split("(")[0] for s in roles.FUNCTION_PRIVILEGES[roles.APP_ROLE]}
+    assert "queue_claim" not in granted
+    assert granted == {"queue_enqueue", "queue_reap", "queue_redrive"}
+
+
+def test_the_worker_can_no_longer_write_the_queue_mirror() -> None:
+    """`queue_entry` is a mirror; a claim written there is lost on the next sync."""
+    assert roles.PRIVILEGES[roles.WORKER_ROLE]["queue_entry"] == frozenset({"SELECT"})
+
+
+def test_internal_queue_helpers_are_granted_to_nobody() -> None:
+    """`_queue_audit` and `_queue_owns` are SECURITY DEFINER over everything."""
+    for role, signatures in roles.FUNCTION_PRIVILEGES.items():
+        assert not [s for s in signatures if s.startswith("_")], role
+
+
+def test_function_grants_are_revoked_before_they_are_reapplied() -> None:
+    """Otherwise re-running the matrix widens rather than replaces."""
+    statements = roles.render_table_grants()
+    for role in (roles.APP_ROLE, roles.WORKER_ROLE):
+        revoke = f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM {role};"
+        assert revoke in statements
+        first_grant = next(
+            i for i, s in enumerate(statements) if s.startswith("GRANT EXECUTE ON FUNCTION")
+            and s.endswith(f"TO {role};")
+        )
+        assert statements.index(revoke) < first_grant
+
+
+@pytest.mark.parametrize("bad", ["queue_claim(text; DROP TABLE task)", "queue_claim(text"])
+def test_function_signature_guard_rejects_injection(bad: str) -> None:
+    with pytest.raises(ValueError):
+        roles._require_function_signature(bad)
+
+
+def test_a_worker_host_role_is_a_login_member_of_the_worker_group() -> None:
+    """Per-host identity with no new machinery, and no password in the SQL."""
+    statement = roles.render_worker_host_role("aicc_worker_host_a")[0]
+    assert "CREATE ROLE aicc_worker_host_a LOGIN IN ROLE aicc_worker;" in statement
+    assert "PASSWORD" not in statement
+
+
 def test_app_covers_every_table() -> None:
     assert set(roles.PRIVILEGES[roles.APP_ROLE]) == set(roles.ALL_TABLES)
 
@@ -86,14 +235,14 @@ def test_identity_sequences_match_the_ddl() -> None:
     """Sequence names are guessed from PostgreSQL's naming rule; verify the guess."""
     from command_center.db import migrations
 
-    sql = migrations.discover()[0].up_sql
     identity_tables = set()
-    current: str | None = None
-    for line in sql.splitlines():
-        if line.startswith("CREATE TABLE "):
-            current = line.split()[2].rstrip("(")
-        elif "GENERATED ALWAYS AS IDENTITY" in line and current:
-            identity_tables.add(current)
+    for migration in migrations.discover():
+        current: str | None = None
+        for line in migration.up_sql.splitlines():
+            if line.startswith("CREATE TABLE "):
+                current = line.split()[2].rstrip("(")
+            elif "GENERATED ALWAYS AS IDENTITY" in line and current:
+                identity_tables.add(current)
     assert identity_tables == set(roles.IDENTITY_SEQUENCES)
 
 

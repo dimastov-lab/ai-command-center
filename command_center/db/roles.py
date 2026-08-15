@@ -27,6 +27,30 @@ Three roles, by what fails if each one is compromised:
 
 `DELETE` is granted to no role on any table: this schema is an append/update
 ledger, and row removal is a migration-time operation performed by the owner.
+
+The queue-claim protocol added by `0002_queue_claim` is granted differently, and
+the difference is the point. `aicc_worker` gets **no table privilege at all** on
+`work_item`, `work_attempt`, `work_result` or `work_event`; its entire reach is
+`EXECUTE` on the four functions that are the four steps of the protocol. That
+turns the acceptance clauses into properties of the grant graph rather than of a
+`WHERE` clause somewhere:
+
+* "two workers cannot own one attempt" — a worker cannot `UPDATE work_item` at
+  all, so `queue_claim()` is the only route to a claim, and the exclusivity
+  lives inside it. There is no second route to audit.
+* "a stale owner cannot write a result" — a worker cannot `INSERT` into
+  `work_result`, so `queue_complete()` is the only route, and it fences.
+* "acknowledge only after a durable result" — the one granted path that can
+  move an item to `succeeded` takes the result as a required argument.
+
+`aicc_app` is the mirror image: it reads the queue and its audit and gets no
+write privilege, because "an item became dead" or "an item was re-delivered"
+must have exactly one code path, which is also the one that audits. It is *not*
+granted `queue_claim()`: dispatch is not execution, and a control plane that
+could claim would be recording an executor it was merely told about.
+`work_attempt` is granted to nobody, the same treatment the `review_*` columns
+of `completion` get, because it holds `claim_token_hash` — the capability
+itself. Reads go through `work_attempt_public`, which omits it.
 """
 
 from __future__ import annotations
@@ -39,12 +63,17 @@ __all__ = [
     "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
+    "ALL_VIEWS",
     "COLUMN_PRIVILEGES",
+    "FUNCTION_PRIVILEGES",
+    "merge_privileges",
+    "VIEW_PRIVILEGES",
     "apply_bootstrap",
     "apply_table_grants",
     "IDENTITY_SEQUENCES",
     "PRIVILEGES",
     "render_bootstrap",
+    "render_worker_host_role",
     "render_grants",
     "render_table_grants",
     "render_role_creation",
@@ -56,10 +85,13 @@ WORKER_ROLE = "aicc_worker"
 
 ALL_ROLES = (MIGRATOR_ROLE, APP_ROLE, WORKER_ROLE)
 
-# Every domain table created by 0001_initial.up.sql, plus the runner's own
-# bookkeeping table. `test_schema_matches_role_inventory` fails if the database
-# and this tuple disagree, so a table added by a later migration cannot end up
-# with no declared owner of its access policy.
+# Every domain table created by the migration set, plus the runner's own
+# bookkeeping table. `test_upgrade_creates_the_declared_schema` fails if the
+# database and this tuple disagree, so a table added by a later migration cannot
+# end up with no declared owner of its access policy — and being listed here is
+# not the same as being reachable: `work_attempt` appears with an empty
+# privilege set for every role, which is a declaration that nobody may read it,
+# not an omission.
 ALL_TABLES: tuple[str, ...] = (
     "advisor_proposal",
     "audit_finding",
@@ -95,6 +127,19 @@ ALL_TABLES: tuple[str, ...] = (
     "schema_migration",
     "session",
     "task",
+    "work_attempt",
+    "work_event",
+    "work_item",
+    "work_result",
+)
+
+# Views created by the migration set. Separate from `ALL_TABLES` because the
+# schema assertions compare `ALL_TABLES` against `BASE TABLE` rows: folding the
+# two together would make a view able to stand in for a dropped table.
+ALL_VIEWS: tuple[str, ...] = (
+    "work_attempt_public",
+    "work_dlq",
+    "work_item_public",
 )
 
 # Tables whose primary key is `bigint GENERATED ALWAYS AS IDENTITY`, mapped to
@@ -109,12 +154,48 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "proposal_event": "proposal_event_id_seq",
         "proposal_evidence": "proposal_evidence_id_seq",
         "run_event": "run_event_id_seq",
+        "work_event": "work_event_id_seq",
     }
 )
 
 _APP_DML = frozenset({"SELECT", "INSERT", "UPDATE"})
 _WORKER_WRITE = frozenset({"SELECT", "INSERT", "UPDATE"})
 _READ = frozenset({"SELECT"})
+_NONE: frozenset[str] = frozenset()
+
+
+def merge_privileges(*contributions: dict[str, frozenset[str]]) -> dict[str, frozenset[str]]:
+    """Union the privilege sets of several contributions, per table.
+
+    The one operation this module must never express as `a | b`. Two tasks
+    adding rows for the same table is the normal case as the schema grows, and
+    a dict update keeps only the later value — so the earlier task's grants
+    disappear with no error, no warning, and both tasks' own tests still green,
+    because each is correct in isolation. The failure surfaces later as a role
+    that may execute nothing.
+
+    The blanket per-table default is deliberately *not* a contribution: folding
+    it in here would widen every narrowed table back to full DML, since a union
+    can only grow. Defaults apply where nothing was declared; declarations
+    union with each other.
+    """
+    merged: dict[str, frozenset[str]] = {}
+    for contribution in contributions:
+        for table, privileges in contribution.items():
+            merged[table] = frozenset(merged.get(table, frozenset())) | frozenset(privileges)
+    return merged
+
+
+# The queue-claim tables (0002), which the control plane may read and may not
+# write: every state change goes through a function so that it audits. The
+# entries exist rather than being omitted — an absent key is a table nobody
+# declared a policy for, an empty set is a declared refusal.
+_APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
+    "work_item": _READ,
+    "work_result": _READ,
+    "work_event": _READ,
+    "work_attempt": _NONE,  # holds `claim_token_hash`; read via the view
+}
 
 # Columns of `completion` that record the independent review's outcome. A
 # worker writes its own completion row, but table-level UPDATE would also let a
@@ -160,7 +241,19 @@ COLUMN_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, MappingProxyType[
 # The queue and execution tables a worker legitimately writes while running a
 # job. Anything absent from this mapping is unreachable for `aicc_worker`.
 _WORKER_TABLES: dict[str, frozenset[str]] = {
-    "queue_entry": frozenset({"SELECT", "UPDATE"}),  # claims, never enqueues
+    # Read-only since 0002. The `UPDATE` this used to carry was labelled
+    # "claims, never enqueues", and it let any worker set any queue row's state
+    # directly, with no exclusivity and no attribution — the hole the claim
+    # protocol closes. It was also futile: `queue_store.replace_entries()`
+    # rebuilds this mirror wholesale on every sync from the authoritative JSON
+    # queue, so a claim written here is destroyed by the next sync, silently,
+    # and the worker has no `DELETE` privilege with which to observe the loss.
+    # Claims live in `work_item` and are taken through `queue_claim()`.
+    #
+    # The grant changes; the table does not. `queue_entry` sits outside the
+    # SRV-07 parity gate, so altering its shape would be an uncovered data
+    # migration — 0002 does not touch it.
+    "queue_entry": _READ,
     "run": _WORKER_WRITE,
     "run_event": _WORKER_WRITE,
     "completion": _WORKER_WRITE,
@@ -171,7 +264,56 @@ _WORKER_TABLES: dict[str, frozenset[str]] = {
     "task": _READ,
     "session": _READ,
     "schema_migration": _READ,  # startup compatibility check
+    # The claim protocol, declared as reachable through nothing. Not even
+    # SELECT: enumerating the queue tells a compromised execution host what else
+    # is pending and which hosts hold it. A worker's own work arrives in the
+    # verdict `queue_claim()` returns, which carries the payload.
+    "work_item": _NONE,
+    "work_attempt": _NONE,
+    "work_result": _NONE,
+    "work_event": _NONE,
 }
+
+# Views are granted separately from tables: `information_schema` reports them
+# through the same catalog, so folding them into `PRIVILEGES` would let a view
+# silently satisfy an assertion about a table.
+VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
+    MappingProxyType(
+        {
+            APP_ROLE: MappingProxyType(
+                {
+                    "work_attempt_public": _READ,
+                    "work_dlq": _READ,
+                    "work_item_public": _READ,
+                }
+            ),
+            WORKER_ROLE: MappingProxyType({}),
+        }
+    )
+)
+
+# The four steps of the claim protocol, and nothing else. Signatures rather than
+# bare names because PostgreSQL identifies a function by its argument types, and
+# `GRANT EXECUTE ON FUNCTION queue_claim` would be ambiguous the moment an
+# overload appeared.
+_WORKER_FUNCTIONS = (
+    "queue_claim(text, text, integer)",
+    "queue_heartbeat(text, text)",
+    "queue_complete(text, text, jsonb)",
+    "queue_fail(text, text, text, boolean)",
+)
+
+# Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
+# worker may become the executor of an attempt.
+_APP_FUNCTIONS = (
+    "queue_enqueue(text, text, jsonb, text, text, integer, integer, integer, integer)",
+    "queue_reap()",
+    "queue_redrive(text, integer)",
+)
+
+FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
+    {APP_ROLE: _APP_FUNCTIONS, WORKER_ROLE: _WORKER_FUNCTIONS}
+)
 
 PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
     MappingProxyType(
@@ -181,21 +323,32 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
             # own and receives none here.
             MIGRATOR_ROLE: MappingProxyType({}),
             APP_ROLE: MappingProxyType(
-                {
-                    table: (
-                        # The ledger is read by the readiness probe and written
-                        # only by the migrator. Table-level write here would let
-                        # an injection foothold in the web layer rewrite a
-                        # checksum — defeating the one guard that stops two
-                        # environments reporting the same version for different
-                        # schemas — or fake a version so /readyz reports healthy
-                        # against an unmigrated database.
-                        _READ if table == "schema_migration" else _APP_DML
-                    )
-                    for table in ALL_TABLES
-                }
+                merge_privileges(
+                    # The blanket default, applied only to tables no task has
+                    # declared a policy for. It is kept out of the merge on
+                    # purpose: a union can only widen, so folding the default in
+                    # would restore full DML on every table a task deliberately
+                    # narrowed.
+                    #
+                    # The ledger is read by the readiness probe and written only
+                    # by the migrator. Table-level write here would let an
+                    # injection foothold in the web layer rewrite a checksum —
+                    # defeating the one guard that stops two environments
+                    # reporting the same version for different schemas — or fake
+                    # a version so /readyz reports healthy against an unmigrated
+                    # database.
+                    {
+                        table: (_READ if table == "schema_migration" else _APP_DML)
+                        for table in ALL_TABLES
+                        if table not in _APP_QUEUE_TABLES
+                    },
+                    # Declared policies. A second task adding rows here for a
+                    # table this one already names must union with it, not
+                    # replace it — `merge_privileges` is what makes that true.
+                    _APP_QUEUE_TABLES,
+                )
             ),
-            WORKER_ROLE: MappingProxyType(dict(_WORKER_TABLES)),
+            WORKER_ROLE: MappingProxyType(merge_privileges(_WORKER_TABLES)),
         }
     )
 )
@@ -286,6 +439,12 @@ def render_table_grants(schema: str = "public") -> list[str]:
         statements.append(
             f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM {role};"
         )
+        # Functions too, for the same reason and with the same consequence: the
+        # claim protocol is reachable only by `EXECUTE`, so leaving stale
+        # function grants in place would be leaving the protocol itself widened.
+        statements.append(
+            f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM {role};"
+        )
 
     for role in (APP_ROLE, WORKER_ROLE):
         for table, privileges in sorted(PRIVILEGES[role].items()):
@@ -304,6 +463,18 @@ def render_table_grants(schema: str = "public") -> list[str]:
                     f"GRANT {privilege} ({column_list}) ON {schema}.{table} TO {role};"
                 )
 
+        for view, privileges in sorted(VIEW_PRIVILEGES.get(role, {}).items()):
+            _require_identifier(view)
+            statements.append(
+                f"GRANT {', '.join(sorted(privileges))} ON {schema}.{view} TO {role};"
+            )
+
+        for signature in FUNCTION_PRIVILEGES.get(role, ()):
+            _require_function_signature(signature)
+            statements.append(
+                f"GRANT EXECUTE ON FUNCTION {schema}.{signature} TO {role};"
+            )
+
     # Identity columns draw from a sequence; INSERT alone is not enough. Granted
     # per sequence rather than schema-wide, so a role still cannot advance the
     # counters of tables it may not write.
@@ -315,6 +486,30 @@ def render_table_grants(schema: str = "public") -> list[str]:
             statements.append(f"GRANT USAGE ON SEQUENCE {schema}.{sequence} TO {role};")
 
     return statements
+
+
+def render_worker_host_role(role: str) -> list[str]:
+    """One LOGIN role per execution host, inheriting `aicc_worker`.
+
+    The claim protocol's identity is the PostgreSQL role the server itself
+    authenticated, so the fleet must not share one: a single `aicc_worker`
+    password makes `work_attempt.claimed_by_role` uninformative and turns the
+    compromise of any execution host into the compromise of all of them.
+
+    No new identity machinery is needed for this — role membership already
+    carries the grants, and revoking a host is `ALTER ROLE ... NOLOGIN`. No
+    password is rendered here, for the reason `render_role_creation()` gives.
+    """
+    _require_identifier(role)
+    return [
+        "DO $$\n"
+        "BEGIN\n"
+        f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
+        f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
+        "    END IF;\n"
+        "END\n"
+        "$$;"
+    ]
 
 
 def render_grants(schema: str = "public") -> list[str]:
@@ -342,6 +537,23 @@ def _execute(conn, statements: list[str]) -> int:
             for statement in statements:
                 cur.execute(statement)
     return len(statements)
+
+
+def _require_function_signature(signature: str) -> None:
+    """Guard `name(type, type)` the same way a bare identifier is guarded.
+
+    A function grant interpolates more than a name, so the identifier check is
+    not enough on its own: the argument list is part of the statement and would
+    otherwise be an unguarded string.
+    """
+    name, _, rest = signature.partition("(")
+    if not rest.endswith(")"):
+        raise ValueError(f"{signature!r} is not a function signature.")
+    _require_identifier(name)
+    for argument in (a.strip() for a in rest[:-1].split(",")):
+        if not argument:
+            continue
+        _require_identifier(argument)
 
 
 def _require_identifier(name: str) -> None:
