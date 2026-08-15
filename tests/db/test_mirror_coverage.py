@@ -119,6 +119,53 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-SRV-04b",
     ),
+    "principal": Exclusion(
+        reason=(
+            "PostgreSQL-native authority with no SQLite source: an identity is "
+            "half a database role, and the runtime store has no roles to mirror. "
+            "`principal.db_role` is only meaningful against `session_user` on this "
+            "server, so a copy in another engine would be a set of strings that "
+            "authorise nothing while looking exactly like the rows that do."
+        ),
+        task="VOYN-W0-AICC-SRV-03",
+    ),
+    "principal_credential": Exclusion(
+        reason=(
+            "As `principal`, and more strongly: it holds `secret_hash`, the "
+            "capability itself, and is granted to no role at all. A mirror would "
+            "move the fleet's credential material through a second process and a "
+            "second store, both outside the grant graph that currently makes it "
+            "unreadable."
+        ),
+        task="VOYN-W0-AICC-SRV-03",
+    ),
+    "principal_event": Exclusion(
+        reason=(
+            "The protocol's own audit, written inside the same transaction as the "
+            "decision it records — including the refusals, which are the half that "
+            "matters. Mirroring it would give the theft alarm a second, "
+            "eventually-consistent copy that can disagree with the first."
+        ),
+        task="VOYN-W0-AICC-SRV-03",
+    ),
+    "enrollment_ticket": Exclusion(
+        reason=(
+            "As `principal_credential`: it holds `ticket_hash` and is granted to "
+            "no role. A ticket is also short-lived by construction, measured in "
+            "minutes, so an eventually-consistent copy of one would be a record of "
+            "capabilities that have already expired."
+        ),
+        task="VOYN-W0-AICC-SRV-03",
+    ),
+    "worker_host_fingerprint": Exclusion(
+        reason=(
+            "PostgreSQL-native, and deliberately unreachable from the component "
+            "most likely to be compromised. It is the record that reveals a clone, "
+            "so a second copy maintained by a dual-writing process would be a "
+            "second place that evidence could be altered or lost."
+        ),
+        task="VOYN-W0-AICC-SRV-03",
+    ),
 }
 
 
