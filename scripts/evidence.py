@@ -82,13 +82,52 @@ def _pytest_command(paths: list[str], extra: list[str]) -> list[str]:
         # measured exactly that: `HAS psycopg_pool: False` under the form this
         # tool used, `True` once pytest is resolved alongside it. The docstring
         # claimed a benefit the command did not deliver.
-        return [
-            "uv", "run",
-            "--with", "psycopg-pool>=3.2,<4",
-            "--with", "pytest",
-            "pytest", *paths, "-q", *extra,
-        ]
+        return ["uv", "run", *_DB_EXTRAS, "--with", "pytest", "pytest", *paths, "-q", *extra]
     return [sys.executable, "-m", "pytest", *paths, "-q", *extra]
+
+
+#: `psycopg` as well as the pool: review set the DSN with the driver absent and
+#: every PostgreSQL-backed test skipped **silently** — 393 passed / 260 skipped,
+#: exit 0, no FAILED term — under a line saying `PostgreSQL requested`. The
+#: pinned extra was the pool, while every skip named the driver, so the tool's
+#: own command could not reach a database it claimed to have requested.
+#:
+#: Named rather than inlined because `_driver_reachable` must probe the exact
+#: environment the tests will run in. Two copies of this list would drift, and
+#: the drift would be invisible: the probe would answer for an environment
+#: nothing runs in.
+_DB_EXTRAS = ["--with", "psycopg[binary]>=3.2,<4", "--with", "psycopg-pool>=3.2,<4"]
+
+
+def _driver_reachable() -> bool:
+    """Can the interpreter that runs the tests import `psycopg`?
+
+    This is the whole difference between "a database was asked for" and "a
+    database was reached". `tests/db/conftest.py` gates on
+    `pytest.importorskip("psycopg")`, so a missing driver turns every
+    database-backed test into a silent skip — which is indistinguishable, in a
+    summary line, from a suite that has none.
+    """
+    try:
+        return (
+            subprocess.run(_driver_probe_command(), cwd=ROOT, capture_output=True).returncode == 0
+        )
+    except OSError:
+        return False
+
+
+def _driver_probe_command() -> list[str]:
+    """The probe's argv, separated from running it.
+
+    Extracted for the same reason `_classify_ruff` was: a test that cannot see
+    the command cannot see it drift. Review replaced this function's extras
+    with an unrelated package and the test named for exactly that drift passed
+    — it was watching `_pytest_command` and nothing else, so it bound one side
+    of a two-sided invariant.
+    """
+    if shutil.which("uv"):
+        return ["uv", "run", *_DB_EXTRAS, "python", "-c", "import psycopg"]
+    return [sys.executable, "-c", "import psycopg"]
 
 
 def _run_pytest(paths: list[str], extra: list[str]) -> dict[str, int]:
@@ -131,6 +170,18 @@ def _ruff() -> str:
         )
     except OSError:
         return "unavailable"
+    return _classify_ruff(completed)
+
+
+def _classify_ruff(completed: "subprocess.CompletedProcess[str]") -> str:
+    """The decision itself, separated from the act of running ruff.
+
+    It lives apart from `_ruff` so a test can hand it the four shapes that
+    matter without depending on whether the host happens to have ruff on it.
+    The test that used to cover this stripped `PATH` and asserted the result
+    was not `dirty` — which passes on a host where ruff is importable anyway,
+    proving nothing about the branch it names.
+    """
     if completed.returncode == 0:
         return "clean"
     # Ruff writes its findings to stdout and its own failures to stderr, and it
@@ -139,7 +190,18 @@ def _ruff() -> str:
     # made `uv run` fail to spawn and made ruff reject a config, and both were
     # reported as "**ruff NOT clean**" — a false statement in the one line this
     # tool exists to keep true.
-    if completed.returncode != 1 or completed.stderr.strip().startswith(("error", "ruff failed")):
+    stderr = completed.stderr.strip()
+    if (
+        completed.returncode != 1
+        or stderr.startswith(("error", "ruff failed"))
+        # `python -m ruff` with no ruff installed exits 1 and says so on stderr
+        # with no prefix of its own. The previous discriminator covered exactly
+        # this wording and the one before it covered only the uv wording; each
+        # traded the other's case away. Both are named now, because the point
+        # of the third state is that "could not check" never reads as "found
+        # problems".
+        or "No module named" in stderr
+    ):
         return "unavailable"
     return "dirty"
 
@@ -163,9 +225,32 @@ def _evidence_line(paths: list[str], counts: dict[str, int], ruff_state: str) ->
     }[ruff_state]
     # The configuration, in the line rather than in a stderr warning nobody
     # pastes. Two honest runs of one tree differ by whether a database was
-    # reachable, and the lines were previously indistinguishable — which is the
-    # hazard this tool's own docstring names.
-    database = "with PostgreSQL" if os.environ.get("AICC_TEST_PG_ADMIN_DSN") else "serverless"
+    # reachable, and the lines were previously indistinguishable.
+    #
+    # It reports what was *requested*, not what the run achieved. Two earlier
+    # versions of this comment claimed that difference could never pose as a
+    # clean run, and review broke both: with the DSN set and the driver absent,
+    # every database-backed test **skips silently** — no FAILED term, exit 0 —
+    # under a line reading `PostgreSQL requested`.
+    #
+    # The second claim was written in the commit that retracted the first, and
+    # was false the same way: it said pinning the driver meant "the tool's own
+    # path cannot produce that shape", while the pin exists on only one of
+    # `_pytest_command`'s two branches. The pip fallback — the branch that
+    # docstring says exists for CI — pins nothing, and review reproduced the
+    # 260-silent-skip line through it.
+    #
+    # So the marker no longer relies on a claim at all. It asks whether the
+    # interpreter that runs the tests can import the driver, and says so when
+    # it cannot. `requested` still does not promise the database was *reached*
+    # — a DSN pointing at a closed port fails loudly rather than skipping — but
+    # the one shape that used to pass silently is now named in the line.
+    if not os.environ.get("AICC_TEST_PG_ADMIN_DSN"):
+        database = "serverless"
+    elif _driver_reachable():
+        database = "PostgreSQL requested"
+    else:
+        database = "PostgreSQL requested, **driver missing**"
     return f"Evidence: {scope} " + " / ".join(parts) + f"{suffix} ({database})."
 
 
