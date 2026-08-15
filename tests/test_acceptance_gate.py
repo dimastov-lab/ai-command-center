@@ -27,8 +27,11 @@ from scripts.assert_independent_acceptance import (
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/acceptance-gate.yml"
 
-HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
-OTHER = "0f1e2d3c4b5a69788796a5b4c3d2e1f098765432"
+# Two distinct commit ids. `detect-secrets` reads any 40-character hex string as
+# a possible credential, and a fixture sha is the one place that heuristic is
+# wrong on purpose.
+HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"  # pragma: allowlist secret
+OTHER = "0f1e2d3c4b5a69788796a5b4c3d2e1f098765432"  # pragma: allowlist secret
 AUTHOR = "dimastov-lab"
 REVIEWER = "voyn-acceptance[bot]"
 
