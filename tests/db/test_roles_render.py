@@ -65,6 +65,79 @@ def test_worker_cannot_enqueue_work() -> None:
 QUEUE_TABLES = ("work_item", "work_attempt", "work_result", "work_event")
 
 
+# ---------------------------------------------------------------------------
+# The grants two tasks lose when neither is wrong
+# ---------------------------------------------------------------------------
+# `render_table_grants()` opens with `REVOKE ALL ... FROM <role>`, which is what
+# makes it a complete replacement rather than additive drift — and is exactly
+# why the matrix it re-grants from has to be a *union*. Two tasks adding rows
+# for the same table is the normal case as the schema grows. Under a dict
+# update the later one wins, the earlier one's grants vanish with no error and
+# no warning, and both tasks' own suites stay green because each is correct
+# alone. The defect only exists once both have landed, which is the one
+# arrangement neither task's tests cover.
+
+
+def test_merging_two_contributions_keeps_both() -> None:
+    first = {"shared_table": frozenset({"SELECT"}), "only_first": frozenset({"INSERT"})}
+    second = {"shared_table": frozenset({"UPDATE"}), "only_second": frozenset({"SELECT"})}
+
+    merged = roles.merge_privileges(first, second)
+
+    assert merged["shared_table"] == frozenset({"SELECT", "UPDATE"})
+    assert merged["only_first"] == frozenset({"INSERT"})
+    assert merged["only_second"] == frozenset({"SELECT"})
+
+
+def test_a_later_contribution_cannot_silently_replace_an_earlier_one() -> None:
+    """The regression, stated as the thing that must not happen.
+
+    Written against the shape the mistake takes rather than against the helper:
+    `dict(first) | second` is what anyone reaches for, it type-checks, and it
+    drops `SELECT` here.
+    """
+    first = {"shared_table": frozenset({"SELECT"})}
+    second = {"shared_table": frozenset({"UPDATE"})}
+
+    naive = dict(first) | second
+    assert naive["shared_table"] == frozenset({"UPDATE"}), "the mistake, reproduced"
+    assert "SELECT" not in naive["shared_table"]
+
+    assert "SELECT" in roles.merge_privileges(first, second)["shared_table"]
+
+
+def test_the_blanket_default_never_widens_a_narrowed_table() -> None:
+    """A union can only grow, so the default must stay outside the merge.
+
+    `work_item` is `SELECT` for the app on purpose; if the per-table default
+    were merged in as a contribution it would come back as full DML and the
+    control plane would regain the direct write the protocol exists to remove.
+    """
+    assert roles.PRIVILEGES[roles.APP_ROLE]["work_item"] == frozenset({"SELECT"})
+    assert roles.PRIVILEGES[roles.APP_ROLE]["run"] == frozenset({"SELECT", "INSERT", "UPDATE"})
+
+
+def test_the_rendered_matrix_covers_every_declared_privilege() -> None:
+    """End to end: nothing declared may be missing from the rendered SQL.
+
+    The merge above is only worth anything if the renderer consumes the merged
+    result, so this reads the statements rather than the mapping.
+    """
+    statements = roles.render_table_grants()
+    for role in (roles.APP_ROLE, roles.WORKER_ROLE):
+        for table, privileges in roles.PRIVILEGES[role].items():
+            if not privileges or table in roles.COLUMN_PRIVILEGES.get(role, {}):
+                continue
+            granted = [
+                s
+                for s in statements
+                if s.endswith(f"ON public.{table} TO {role};")
+            ]
+            assert len(granted) == 1, f"{role}.{table}"
+            for privilege in privileges:
+                assert privilege in granted[0], f"{role}.{table}.{privilege}"
+
+
 def test_no_role_holds_a_table_privilege_on_the_claim_protocol() -> None:
     """The exclusivity argument is a property of the grant graph, not of a WHERE.
 

@@ -66,6 +66,7 @@ __all__ = [
     "ALL_VIEWS",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
+    "merge_privileges",
     "VIEW_PRIVILEGES",
     "apply_bootstrap",
     "apply_table_grants",
@@ -161,6 +162,29 @@ _APP_DML = frozenset({"SELECT", "INSERT", "UPDATE"})
 _WORKER_WRITE = frozenset({"SELECT", "INSERT", "UPDATE"})
 _READ = frozenset({"SELECT"})
 _NONE: frozenset[str] = frozenset()
+
+
+def merge_privileges(*contributions: dict[str, frozenset[str]]) -> dict[str, frozenset[str]]:
+    """Union the privilege sets of several contributions, per table.
+
+    The one operation this module must never express as `a | b`. Two tasks
+    adding rows for the same table is the normal case as the schema grows, and
+    a dict update keeps only the later value — so the earlier task's grants
+    disappear with no error, no warning, and both tasks' own tests still green,
+    because each is correct in isolation. The failure surfaces later as a role
+    that may execute nothing.
+
+    The blanket per-table default is deliberately *not* a contribution: folding
+    it in here would widen every narrowed table back to full DML, since a union
+    can only grow. Defaults apply where nothing was declared; declarations
+    union with each other.
+    """
+    merged: dict[str, frozenset[str]] = {}
+    for contribution in contributions:
+        for table, privileges in contribution.items():
+            merged[table] = frozenset(merged.get(table, frozenset())) | frozenset(privileges)
+    return merged
+
 
 # The queue-claim tables (0002), which the control plane may read and may not
 # write: every state change goes through a function so that it audits. The
@@ -299,23 +323,32 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
             # own and receives none here.
             MIGRATOR_ROLE: MappingProxyType({}),
             APP_ROLE: MappingProxyType(
-                {
-                    table: (
-                        # The ledger is read by the readiness probe and written
-                        # only by the migrator. Table-level write here would let
-                        # an injection foothold in the web layer rewrite a
-                        # checksum — defeating the one guard that stops two
-                        # environments reporting the same version for different
-                        # schemas — or fake a version so /readyz reports healthy
-                        # against an unmigrated database.
-                        _READ
-                        if table == "schema_migration"
-                        else _APP_QUEUE_TABLES.get(table, _APP_DML)
-                    )
-                    for table in ALL_TABLES
-                }
+                merge_privileges(
+                    # The blanket default, applied only to tables no task has
+                    # declared a policy for. It is kept out of the merge on
+                    # purpose: a union can only widen, so folding the default in
+                    # would restore full DML on every table a task deliberately
+                    # narrowed.
+                    #
+                    # The ledger is read by the readiness probe and written only
+                    # by the migrator. Table-level write here would let an
+                    # injection foothold in the web layer rewrite a checksum —
+                    # defeating the one guard that stops two environments
+                    # reporting the same version for different schemas — or fake
+                    # a version so /readyz reports healthy against an unmigrated
+                    # database.
+                    {
+                        table: (_READ if table == "schema_migration" else _APP_DML)
+                        for table in ALL_TABLES
+                        if table not in _APP_QUEUE_TABLES
+                    },
+                    # Declared policies. A second task adding rows here for a
+                    # table this one already names must union with it, not
+                    # replace it — `merge_privileges` is what makes that true.
+                    _APP_QUEUE_TABLES,
+                )
             ),
-            WORKER_ROLE: MappingProxyType(dict(_WORKER_TABLES)),
+            WORKER_ROLE: MappingProxyType(merge_privileges(_WORKER_TABLES)),
         }
     )
 )

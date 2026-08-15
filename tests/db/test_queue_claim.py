@@ -24,9 +24,11 @@ Skipped wholesale unless `AICC_TEST_PG_ADMIN_DSN` is set — see `conftest`.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -35,6 +37,7 @@ import textwrap
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -282,6 +285,85 @@ def test_concurrent_workers_never_hand_one_item_to_two_owners(
             "WHERE a.work_item_id = i.work_item_id AND a.state = 'active') > 1"
         )
         assert cur.fetchone()[0] == 0
+
+
+def test_one_claim_call_consumes_exactly_one_attempt(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The counter, not just the verdict.
+
+    `queue_claim` returns a composite, and PostgreSQL evaluates
+    `SELECT (queue_claim(…)).*` **once per output column** — seven calls, seven
+    attempts consumed, a plausible-looking verdict and complete silence. Every
+    call site here uses `SELECT * FROM f(…)`, which evaluates once; this asserts
+    the consequence rather than the spelling, because a correct-looking result
+    is exactly what the wrong form produces.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    with psycopg.connect(
+        _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE]), autocommit=True
+    ) as app:
+        item_id = _enqueue(app, "counted", max_attempts=5)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            verdict = _claim(worker, _token()[1])
+            assert verdict[0] and verdict[4] == 1
+
+    state = _item(admin_conn, item_id)
+    assert state[1] == 1, "one call must spend one attempt"
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM work_attempt WHERE work_item_id = %s", (item_id,))
+        assert cur.fetchone()[0] == 1
+        cur.execute(
+            "SELECT count(*) FROM work_event WHERE work_item_id = %s AND event = 'claim' "
+            "AND outcome = 'granted'",
+            (item_id,),
+        )
+        assert cur.fetchone()[0] == 1
+
+
+def test_no_call_site_uses_the_per_column_expansion_form() -> None:
+    """`(f(x)).*` and `(f(x)).ok` re-evaluate `f` once per referenced column.
+
+    Cheap to write, silent when wrong, and it survives review because the result
+    looks right. Pinned as a rule about this module's own source so a later
+    addition cannot reintroduce it — the counter test above would catch it for
+    `queue_claim`, but not for a call added to some other function.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    # Docstrings are excluded by identity rather than by pattern: the paragraph
+    # above names the bad form on purpose, and a rule that cannot tell the
+    # warning from the mistake gets deleted the first time it fires on prose.
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef))
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    }
+
+    bad_form = re.compile(r"\(\s*queue_\w+\s*\([^)]*\)\s*\)\s*\.")
+
+    offenders = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+        and bad_form.search(node.value)
+    ]
+    assert offenders == [], offenders
+
+    # The rule is shown to fire, so an empty result above means "none present"
+    # rather than "the pattern never matches anything". Assembled from pieces so
+    # the sample is not itself a string constant the scan would report — a
+    # control that trips its own gate gets deleted rather than fixed.
+    sample = "SELECT (" + "queue_claim" + "(%s)).*"
+    assert bad_form.search(sample), sample
 
 
 def test_queue_claim_takes_no_actor_argument(
