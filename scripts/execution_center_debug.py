@@ -54,7 +54,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from command_center.runtime import db  # noqa: E402
+from command_center.runtime import db, identity  # noqa: E402
 from command_center.runtime.api import ExecutionCenterAPI  # noqa: E402
 from command_center.runtime.supervisor import SupervisorError  # noqa: E402
 
@@ -102,6 +102,11 @@ _EXIT_CODE_UNFINALIZED = 5
 #: the news: the news is that this CLI is exiting without having stopped a
 #: process it started.
 _EXIT_CODE_CANCEL_FAILED = 6
+
+#: How long a row may be behind its process before this CLI stops waiting and
+#: decides from the process instead. Short: the sites that raise mid-write
+#: settle almost immediately.
+_CANCEL_SETTLE_SECONDS = 2.0
 
 _EXIT_CODE_BY_STATE = {
     "COMPLETED": 0,
@@ -157,6 +162,25 @@ def _await_finalization(api: ExecutionCenterAPI, run_id: str) -> tuple[dict, boo
     return final or api.get_run(run_id), True
 
 
+def _settled_run(api: ExecutionCenterAPI, run_id: str) -> dict | None:
+    """Read the run, allowing a bounded moment for a mid-flight row to catch up.
+
+    Several of `Supervisor.cancel`'s raise sites fire precisely while the
+    terminal state is being written, so one instantaneous read is guaranteed to
+    catch the row before it settles. Bounded and short: this is not a wait for
+    finalization, only for the state itself, and the alternative is classifying
+    on a value the raise site tells us is in flight.
+    """
+    deadline = time.monotonic() + _CANCEL_SETTLE_SECONDS
+    current = api.get_run(run_id)
+    while current and current["state"] not in db.TERMINAL_STATES:
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_POLL_INTERVAL_SECONDS)
+        current = api.get_run(run_id)
+    return current
+
+
 def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
     """Block until `run` reaches a terminal state *and its supervisor has
     finished finalizing it*, printing new events as they're persisted. Ctrl+C
@@ -206,24 +230,40 @@ def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
         try:
             final = api.request_cancel(run_id, confirmed=True, grace_seconds=_DEFAULT_CANCEL_GRACE_SECONDS)
         except SupervisorError as exc:
-            # `Supervisor.cancel` raises this for four different reasons, and
-            # they do not mean the same thing. Two are the terminal-transition
-            # race the check above narrowed but could not close — the run
-            # finished while the signal was in flight, and there is genuinely
-            # nothing to cancel. One is CAS exhaustion against concurrent
-            # writes, which fires while the run is still **RUNNING** and means
-            # cancellation *failed*.
+            # `Supervisor.cancel` raises this from **nine** sites, and they do
+            # not mean the same thing. An earlier version of this handler
+            # counted four — everything before the signal is sent — and treated
+            # them all as "nothing to cancel", which was false for the one that
+            # fires on a live run after CAS exhaustion.
             #
-            # The first version of this handler printed "Nothing to cancel" for
-            # all four. On the CAS path that is a false statement printed
-            # directly above the exception contradicting it, and this function's
-            # own docstring promises it "never just kills this CLI process and
-            # abandons the child" — which is exactly what it then did.
+            # Counting four was itself the defect. Five more sites live in the
+            # post-signal tail, and two of them ("has already exited and is
+            # finalizing", "exited after cancellation, but its terminal state
+            # was not persisted in time") fire when the child is **already
+            # dead** and the row has simply not caught up. A single
+            # instantaneous re-read returns a live state there, so the handler
+            # sent the operator hunting a process that no longer exists, under
+            # the exit code reserved for "I exited without stopping what I
+            # started".
             #
-            # So re-read the run and let its state decide what happened.
-            final = api.get_run(run_id)
+            # So the row is given a bounded moment to settle, and the process
+            # itself is the tiebreaker when it does not. A row mid-flight is
+            # not evidence; a pid is.
+            final = _settled_run(api, run_id)
             if final and final["state"] in db.TERMINAL_STATES:
                 print(f"\nNothing to cancel — {exc}", file=sys.stderr)
+            elif final and final.get("pid") and not identity.process_exists(final["pid"]):
+                # The row is still live but the process is gone: cancellation
+                # took effect and only the bookkeeping is behind. Saying
+                # "may still be running" here would be the same false statement
+                # in the other direction.
+                print(
+                    f"\nCancelled — {exc}\n"
+                    f"Run {run_id} still reads {final['state']}, but its process "
+                    f"({final['pid']}) is gone, so the cancellation took effect "
+                    "and the terminal state has not been persisted yet.",
+                    file=sys.stderr,
+                )
             else:
                 state = final["state"] if final else "UNKNOWN"
                 print(

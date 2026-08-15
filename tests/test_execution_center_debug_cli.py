@@ -427,9 +427,12 @@ class _CancelFailsAPI:
         self._state = state
         self.cancel_calls = 0
         self._interrupted = False
+        #: A pid that does not exist means the process is gone. `os.getpid()`
+        #: is the live case: this very process is unquestionably running.
+        self.pid = os.getpid()
 
     def get_run(self, run_id):
-        return {"id": run_id, "state": self._state, "pid": 4242}
+        return {"id": run_id, "state": self._state, "pid": self.pid}
 
     def get_events(self, run_id, after_seq=0):
         # Once only. The handler drains events again, and a second interrupt
@@ -519,3 +522,104 @@ def test_a_run_that_finished_mid_signal_is_still_reported_as_nothing_to_cancel(c
     err = capsys.readouterr().err
     assert "Nothing to cancel" in err, err
     assert "CANCELLATION FAILED" not in err, err
+
+
+class _DeadProcessAPI(_CancelFailsAPI):
+    """Cancellation took effect; only the row has not caught up.
+
+    Two of `Supervisor.cancel`'s nine raise sites say exactly this — "has
+    already exited and is finalizing" and "exited after cancellation, but its
+    terminal state was not persisted in time". The run reads live at that
+    instant *because the raise site guarantees the write is in flight*.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        # A pid that has certainly never existed in this session's namespace.
+        self.pid = 2**22 - 1
+
+
+def test_a_cancellation_that_took_effect_is_not_reported_as_a_failure(capsys):
+    """Exit 6 said "the agent may still be running" about a dead process.
+
+    The handler counted four raise sites and classified from one instantaneous
+    read of a row those very sites guarantee is mid-write. Review drove both
+    post-signal cases and got exit 6 with an instruction to go hunt a process
+    that no longer exists — round two's defect reflected: a message asserting
+    the opposite of what happened, printed above the exception that says so.
+    """
+    module = _load_cli()
+    api = _DeadProcessAPI(
+        "Run 'r1' has already exited and is finalizing; cancellation was not recorded."
+    )
+
+    code = module._run_foreground(api, {"id": "r1"})
+
+    err = capsys.readouterr().err
+    assert "CANCELLATION FAILED" not in err, err
+    assert "may still be running" not in err, err
+    assert "its process" in err and "is gone" in err, err
+    assert code != module._EXIT_CODE_CANCEL_FAILED, (
+        "a cancellation that took effect was reported as one that failed"
+    )
+
+
+def test_a_live_process_is_still_reported_as_a_failed_cancellation(capsys):
+    # The other direction: only 'did not exit after cancellation escalation'
+    # actually means the child is still there, and that must keep exit 6.
+    module = _load_cli()
+    api = _CancelFailsAPI(
+        "Run 'r1' did not exit after cancellation escalation; ownership is retained."
+    )
+
+    code = module._run_foreground(api, {"id": "r1"})
+
+    assert code == module._EXIT_CODE_CANCEL_FAILED, code
+    err = capsys.readouterr().err
+    assert "CANCELLATION FAILED" in err, err
+
+
+class _SettlesLateAPI(_CancelFailsAPI):
+    """The row catches up a moment after the raise, with the process alive.
+
+    This is the shape a single instantaneous read cannot classify: the raise
+    site fires while the terminal write is in flight, so the first read says
+    RUNNING and the truth arrives shortly after. The pid stays alive, so the
+    process check cannot rescue it either — only waiting for the row can.
+    """
+
+    _TERMINAL_FROM_READ = 4
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._reads = 0
+
+    def get_run(self, run_id):
+        self._reads += 1
+        state = "CANCELLED" if self._reads >= self._TERMINAL_FROM_READ else "RUNNING"
+        return {"id": run_id, "state": state, "pid": self.pid}
+
+
+def test_a_row_that_settles_a_moment_later_is_not_called_a_failed_cancellation(capsys):
+    """Several raise sites fire *while* the terminal state is being written.
+
+    Classifying on one read there is classifying on a value the raise site
+    guarantees is in flight. Nothing else covers this case: the process is
+    alive, so the pid check says "still running", and only giving the row a
+    bounded moment gets the right answer.
+    """
+    module = _load_cli()
+    api = _SettlesLateAPI(
+        "Run 'r1' reached a terminal state after cancellation, but local "
+        "finalization did not complete in time."
+    )
+
+    code = module._run_foreground(api, {"id": "r1"})
+
+    err = capsys.readouterr().err
+    assert "CANCELLATION FAILED" not in err, err
+    assert code != module._EXIT_CODE_CANCEL_FAILED, (
+        "the row settled to a terminal state and was still reported as a "
+        "failed cancellation"
+    )
+    assert "Nothing to cancel" in err, err

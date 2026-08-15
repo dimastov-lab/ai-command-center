@@ -107,12 +107,16 @@ def _refuse_to_report_an_unwidened_run() -> None:
 sys.argv = [str(CLI), *sys.argv[1:]]
 try:
     runpy.run_path(str(CLI), run_name="__main__")
-except SystemExit as exit_request:
+except BaseException as exit_request:  # noqa: BLE001 — see below
     # Remember what the CLI itself decided, so the check above can override
     # only a *success*. Review pointed out that a CLI failing before the first
     # terminal write reported 97 instead of its own code — the diagnostics
     # survive, since CPython flushes the std files before the hook, but a
     # non-zero code replaced by a different non-zero code is a worse report
     # than the one it replaced.
-    _cli_code = exit_request.code
+    # `BaseException`, not `SystemExit`. Review showed the narrower catch
+    # covered only the orderly exit: an uncaught exception — the commonest
+    # pre-terminal-write failure — still had its code replaced by the
+    # fixture's 97, so a crash was reported as "nothing was widened".
+    _cli_code = exit_request.code if isinstance(exit_request, SystemExit) else 1
     raise
