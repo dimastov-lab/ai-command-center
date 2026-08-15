@@ -416,11 +416,10 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
-        if current >= 24:
-            # Stamp the zone this file's naive timestamps are on, from the
-            # process that writes them. Retention reads it back instead of
-            # trusting its own `TZ` (VOYN-W0-AICC-RETENTION-TZ).
-            db._stamp_timestamp_zone(conn)
+        # Stamp the zone this file's naive timestamps are on, from a process
+        # that also writes them. Retention reads it back instead of trusting
+        # its own `TZ` (VOYN-W0-AICC-RETENTION-TZ).
+        db._stamp_timestamp_zone(conn)
     if current >= 13:
         db.backfill_run_provenance(db_path, limit=500)
     # Optional, operator-opted-in retention: run after the migration connection
@@ -429,7 +428,16 @@ def migrate(db_path: Path) -> None:
     db.maybe_apply_runtime_retention(db_path)
 
 
-TIMESTAMP_TZ_META_KEY = "timestamp_tz"
+#: Where a database records the zone its naive timestamps are on.
+#:
+#: Deliberately a column on the `schema_version` bookkeeping ledger rather than
+#: a table of its own. It is a fact *about the store*, in the same category as
+#: `applied_at` (itself an `iso_now` value, and the row this annotates): it says
+#: which clock that timestamp — and every other naive timestamp in the file —
+#: was written on. A separate domain table would also have to acquire a
+#: PostgreSQL counterpart in the store-migration lane before it could exist,
+#: which is a coupling this fix has no reason to create.
+LEDGER_TIMESTAMP_TZ_COLUMN = "timestamp_tz"
 RETENTION_TZ_ENV = "AICC_RUNTIME_TZ"
 
 
@@ -467,45 +475,64 @@ def _machine_timestamp_zone() -> str | None:
     return name
 
 
-def _read_meta(conn: sqlite3.Connection, key: str) -> str | None:
-    """A `runtime_meta` value, or `None` — including on a database older than
-    migration 24, where the table does not exist yet."""
+def _read_timestamp_zone(conn: sqlite3.Connection) -> str | None:
+    """The zone recorded on the ledger, or `None` — including on a database
+    written before this column existed, where the `SELECT` itself fails."""
     try:
         row = conn.execute(
-            "SELECT value FROM runtime_meta WHERE key = ?", (key,)
+            f"SELECT {db.LEDGER_TIMESTAMP_TZ_COLUMN} AS zone FROM schema_version"
+            f" WHERE {db.LEDGER_TIMESTAMP_TZ_COLUMN} IS NOT NULL"
+            " ORDER BY version DESC LIMIT 1"
         ).fetchone()
     except sqlite3.OperationalError:
         return None
-    return row["value"] if row else None
+    return row["zone"] if row else None
 
 
 def _stamp_timestamp_zone(conn: sqlite3.Connection) -> None:
     """Record, once, the zone this database's naive timestamps are on.
 
-    Written by `migrate()`, i.e. by the application process that also writes
-    the timestamps, and never overwritten: the recorded zone describes the
-    history already in the file. Moving a database to a machine in another
-    zone therefore keeps the old (correct) reading of the old rows; new rows
-    written there are on a different clock, which no retention cutoff can
-    reconcile — that is the `iso_now` convention's own limit, not this
-    function's (see `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
+    Written by `migrate()`, i.e. by an application process that also writes
+    those timestamps, and never overwritten: the recorded zone describes the
+    history already in the file. Moving a database to a machine in another zone
+    therefore keeps the old (correct) reading of the old rows; new rows written
+    there are on a different clock, which no retention cutoff can reconcile —
+    that is the `iso_now` convention's own limit, not this function's (see
+    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape the run-table
+    migrations use, under the same `BEGIN IMMEDIATE`, so two processes racing
+    a brand-new database cannot both decide the column is missing.
     """
-    if db._read_meta(conn, db.TIMESTAMP_TZ_META_KEY) is not None:
-        return
     zone = db._machine_timestamp_zone()
     if zone is None:
         return
     try:
         with db.transaction(conn):
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(schema_version)").fetchall()
+            }
+            if db.LEDGER_TIMESTAMP_TZ_COLUMN not in existing:
+                conn.execute(
+                    "ALTER TABLE schema_version"
+                    f" ADD COLUMN {db.LEDGER_TIMESTAMP_TZ_COLUMN} TEXT"
+                )
+            already = conn.execute(
+                f"SELECT 1 FROM schema_version"
+                f" WHERE {db.LEDGER_TIMESTAMP_TZ_COLUMN} IS NOT NULL LIMIT 1"
+            ).fetchone()
+            if already:
+                return
             conn.execute(
-                "INSERT OR IGNORE INTO runtime_meta (key, value, updated_at)"
-                " VALUES (?, ?, ?)",
-                (db.TIMESTAMP_TZ_META_KEY, zone, db.iso_now()),
+                f"UPDATE schema_version SET {db.LEDGER_TIMESTAMP_TZ_COLUMN} = ?"
+                " WHERE version = (SELECT MAX(version) FROM schema_version)",
+                (zone,),
             )
     except sqlite3.OperationalError:
-        # Table absent (a database that stopped before migration 24) or a
-        # concurrent writer got there first. Either way the marker is not
-        # this call's to force.
+        # A concurrent writer got there first, or the ledger is not readable
+        # here. The marker is not this call's to force; retention says
+        # "process-local" rather than deleting against a guessed clock.
         pass
 
 
@@ -527,7 +554,7 @@ def resolve_timestamp_zone(db_path: Path) -> tuple[str | None, str]:
             ) from exc
         return override, "env"
     with db.connect(db_path) as conn:
-        recorded = db._read_meta(conn, db.TIMESTAMP_TZ_META_KEY)
+        recorded = db._read_timestamp_zone(conn)
     if recorded:
         try:
             ZoneInfo(recorded)
