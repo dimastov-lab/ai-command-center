@@ -163,9 +163,43 @@ into AIOS Core (post-AIOS-CORE-ACCEPTED); growth is prohibited.**
 - **Audit** — `command_center/activity_log.py`, `daily_audit.py`,
   `daily_audit_backend.py`.
 - **Authz** — `command_center/companion/auth.py` (an explicit placeholder; the
-  gate keeps it one).
+  gate keeps it one), and `command_center/http_auth/` (see below).
 - **Memory/persistence** — `command_center/storage.py`,
   `tasks_repository.py`, `aml_store.py`.
+
+### `command_center/http_auth/` — why it was added to a frozen category
+
+The gate was right to flag it, so the reasoning is recorded here rather than in
+a commit message (`VOYN-W0-AICC-AUTH-HTTP-01`).
+
+AICC's 29 mutating HTTP routes had no authentication at all. Closing that
+needed *something* named `auth` in this repository. The doctrine says new
+engine capability of a frozen category belongs in AIOS and is consumed here
+through its versioned contract — and that is precisely the shape of what was
+added:
+
+* `identity.py` **is the consumption seam**, not an engine. It stores no
+  credential, hashes nothing, holds no signing key and mints no token. It makes
+  one call to the platform's `GET /api/v1/whoami` and reads back a principal
+  id. The alternative — verifying credentials in-process — was rejected exactly
+  because it would have made AICC an identity authority and given it read
+  access to the platform's credential store.
+* `authz.py` is an **access-control list keyed by the platform's identifier**,
+  the same kind of object as `command_center/db/roles.py` is for PostgreSQL
+  roles. It exists because `whoami` answers "who", not "what may they do here":
+  its capabilities are platform-global and name no service, so treating a 200
+  as permission would grant AICC write access to every principal the platform
+  has ever issued a credential to.
+* `routing.py` is a route table and a boot check. No engine behaviour at all.
+
+What would make this a genuine violation is AICC growing its own credential
+store, its own token format, or a second principal registry. Tests assert the
+absence of the first two, and the design records the third as forbidden.
+
+The residual question — whether the *grant map* should eventually live in AIOS
+as per-service authorization rather than in this repository — is real and is
+tracked as `VOYN-W0-AICC-AUTHZ-BOUNDARY-01`. Until AIOS offers that contract,
+an AICC-local, deny-by-default ACL is the least-authority option available.
 
 ## Changing the baseline (a reviewed change)
 

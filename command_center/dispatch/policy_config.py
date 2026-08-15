@@ -15,9 +15,13 @@ from __future__ import annotations
 import contextlib
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from command_center import models, storage
 from command_center.dispatch.models import DispatchPolicy
+
+if TYPE_CHECKING:  # a type-only import: the config store stays free of FastAPI
+    from command_center.http_auth.identity import Principal
 
 POLICY_FILE_NAME = "dispatch_policy.json"
 POLICY_LOCK_FILE_NAME = "dispatch_policy.lock"
@@ -62,18 +66,25 @@ def save_policy(
 
 
 def update_policy(
-    root: Path, changes: dict, *, actor: str | None = None
+    root: Path, changes: dict, *, principal: "Principal"
 ) -> DispatchPolicy:
     """Lost-update-safe partial update: re-read the current policy under the
     lock, overlay `changes` (validated through `DispatchPolicy.from_dict`) and
-    write back — so two concurrent edits of different fields don't clobber."""
+    write back — so two concurrent edits of different fields don't clobber.
+
+    This is the HTTP-reachable mutator, so it takes a `Principal` and has no
+    `actor` parameter to forge: `updated_by` is the authenticated caller or the
+    call does not typecheck (VOYN-W0-AICC-AUTH-HTTP-01). `save_policy` below
+    keeps its `actor` string — it is the persistence primitive, reachable only
+    from in-process callers that already have their own provenance, and giving
+    it a `Principal` would force every local caller to fabricate one."""
     with policy_lock(root):
         current = DispatchPolicy.from_dict(
             storage.read_json(policy_file_path(root), {})
         )
         merged = dict(current.as_dict())
         merged.update(changes or {})
-        stamped = _stamp(DispatchPolicy.from_dict(merged), actor)
+        stamped = _stamp(DispatchPolicy.from_dict(merged), principal.principal_id)
         storage.atomic_write_json(policy_file_path(root), stamped.as_dict())
     return stamped
 
