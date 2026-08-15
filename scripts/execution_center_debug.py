@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -62,7 +63,16 @@ _DEFAULT_CANCEL_GRACE_SECONDS = 10.0
 # `_await_finalization`). Generous relative to the work it covers — an event
 # append, `git commit`, and one report write — so that hitting it means
 # "finalization is wedged", never "finalization was merely slow".
-_FINALIZATION_TIMEOUT_SECONDS = 60.0
+# Overridable so a test can prove the wedged path without waiting a minute for
+# it. Not a knob for operators: the default is the contract, and a shorter one
+# turns "finalization is wedged" back into "finalization was merely slow".
+_FINALIZATION_TIMEOUT_SECONDS = float(os.environ.get("AICC_FINALIZATION_TIMEOUT_SECONDS", "60"))
+
+#: A run that reached a terminal state whose finalization never completed. Not
+#: any of the state codes below, because it is not a statement about the run's
+#: outcome: the outcome may be `COMPLETED` while the work it describes was
+#: never committed and never reported.
+_EXIT_CODE_UNFINALIZED = 5
 
 _EXIT_CODE_BY_STATE = {
     "COMPLETED": 0,
@@ -81,7 +91,7 @@ def _print_event(event: dict) -> None:
     print(f"[{event['seq']:>5}] {event['event_type']}: {json.dumps(event['payload'], ensure_ascii=False)[:300]}")
 
 
-def _await_finalization(api: ExecutionCenterAPI, run_id: str) -> dict:
+def _await_finalization(api: ExecutionCenterAPI, run_id: str) -> tuple[dict, bool]:
     """A terminal `state` on the run row is *necessary but not sufficient* for
     this CLI to exit.
 
@@ -110,7 +120,12 @@ def _await_finalization(api: ExecutionCenterAPI, run_id: str) -> dict:
             "report may all be missing.",
             file=sys.stderr,
         )
-    return final or api.get_run(run_id)
+        # And the exit code says so too. Printing a warning while exiting 0 is
+        # the same defect one layer up: a caller that reads the status — a
+        # script, a queue, CI — was told the run finished cleanly, which is
+        # precisely the guarantee that had just been lost.
+        return final or api.get_run(run_id), False
+    return final or api.get_run(run_id), True
 
 
 def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
@@ -129,7 +144,7 @@ def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
                 _print_event(event)
                 after_seq = event["seq"]
             if current["state"] in db.TERMINAL_STATES:
-                current = _await_finalization(api, run_id)
+                current, finalized = _await_finalization(api, run_id)
                 # Drain again: `process_exited` (and `auto_committed`) are
                 # appended *after* the terminal row, so the loop above can
                 # never have seen them.
@@ -137,9 +152,27 @@ def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
                     _print_event(event)
                     after_seq = event["seq"]
                 _print(current)
+                if not finalized:
+                    return _EXIT_CODE_UNFINALIZED
                 return _EXIT_CODE_BY_STATE.get(current["state"], 1)
             time.sleep(_POLL_INTERVAL_SECONDS)
     except KeyboardInterrupt:
+        # A run that is already terminal has nothing to cancel, and asking
+        # anyway raises `SupervisorError` — so Ctrl+C *during the finalization
+        # wait* used to kill this CLI with a traceback instead of reporting the
+        # run it had just waited for. The wait is the window this covers: it is
+        # the one place where the run is finished and the CLI is still running.
+        current = api.get_run(run_id)
+        if current and current["state"] in db.TERMINAL_STATES:
+            print(
+                f"\nCtrl+C received — run {run_id} is already {current['state']}; "
+                "there is nothing to cancel. Its finalization may still be in progress.",
+                file=sys.stderr,
+            )
+            for event in api.get_events(run_id, after_seq=after_seq):
+                _print_event(event)
+            _print(current)
+            return _EXIT_CODE_BY_STATE.get(current["state"], 1)
         print("\nCtrl+C received — requesting confirmed cancellation and waiting for cleanup...", file=sys.stderr)
         final = api.request_cancel(run_id, confirmed=True, grace_seconds=_DEFAULT_CANCEL_GRACE_SECONDS)
         for event in api.get_events(run_id, after_seq=after_seq):

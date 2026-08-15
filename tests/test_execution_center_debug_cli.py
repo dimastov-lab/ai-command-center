@@ -276,3 +276,121 @@ def test_cli_read_only_subcommands_are_safe_across_separate_invocations(configur
     assert events_result.returncode == 0
     events = json.loads(events_result.stdout)
     assert any(e["event_type"] == "result" for e in events)
+
+
+WIDEN_FINALIZATION_WRAPPER = Path(__file__).parent / "fixtures" / "widen_finalization.py"
+
+
+def test_the_cli_waits_for_finalization_and_not_merely_for_a_terminal_row(configured_repo):
+    """The guard the fix shipped without, and review said so.
+
+    `test_launch_blocks_until_terminal_state_and_persists_final_events` above
+    passes with `_await_finalization` deleted: the losing schedule is roughly
+    one run in a hundred, so that test asserts the right things and almost
+    never observes the case they are about.
+
+    Here the window is widened deterministically — see
+    `tests/fixtures/widen_finalization/sitecustomize.py` — so the supervisor's
+    daemon thread is still finalizing when the poll tick sees a terminal row.
+    Without the wait, this CLI returns there, the interpreter exits without
+    joining that daemon thread, and the run is left COMPLETED with no
+    `process_exited` lifecycle event, no auto-commit and no report.
+
+    Asserting on the *events* rather than on elapsed time: a timing assertion
+    would pass for a CLI that merely slept, and the guarantee is durability,
+    not duration.
+    """
+    env = _cli_env()
+    env["AICC_TEST_WIDEN_FINALIZATION_SECONDS"] = "2.0"
+
+    result = subprocess.run(
+        [sys.executable, str(WIDEN_FINALIZATION_WRAPPER), "launch", "AIOS", str(configured_repo), "implementation", "say ok", "--confirm"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    final = _extract_last_json_object(result.stdout)
+    events = db.list_run_events(db.resolve_db_path(), final["id"])
+    lifecycle = {e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"}
+    assert "process_exited" in lifecycle, (
+        "the CLI exited on a terminal run row while its supervisor was still "
+        "finalizing; the daemon thread was never joined and the finalization "
+        f"was lost. Lifecycle events present: {sorted(x for x in lifecycle if x)}"
+    )
+
+    # The event is appended *after* the terminal row, so it can only have been
+    # printed by the drain that follows the wait. This is what distinguishes
+    # "waited" from "happened to be fast".
+    assert "process_exited" in result.stdout, (
+        "the finalization completed but this CLI never printed it, so the "
+        "second drain after the wait is missing"
+    )
+
+
+def test_ctrl_c_during_the_finalization_wait_reports_the_run_instead_of_crashing(configured_repo):
+    """The window where the run is finished and the CLI is still running.
+
+    `Supervisor.cancel` raises `SupervisorError` for a run that is not actively
+    supervised — correct on its own terms — so Ctrl+C arriving while the CLI
+    waited for finalization killed it with a traceback instead of reporting the
+    run it had just waited for. The wait made that window two seconds wide
+    where it used to be milliseconds, which is how the fix for one defect
+    exposed another.
+    """
+    env = _cli_env()
+    env["AICC_TEST_WIDEN_FINALIZATION_SECONDS"] = "6.0"
+
+    proc = subprocess.Popen(
+        [sys.executable, str(WIDEN_FINALIZATION_WRAPPER), "launch", "AIOS", str(configured_repo), "implementation", "say ok", "--confirm"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    try:
+        # Wait for the run to be terminal — that is when the CLI is inside the
+        # finalization wait and the signal lands in the window under test.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            runs = []
+            try:
+                runs = db.list_runs(db.resolve_db_path())
+            except sqlite3.OperationalError:
+                pass
+            if any(r["state"] in db.TERMINAL_STATES for r in runs):
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("no run reached a terminal state; the window was never entered")
+        proc.send_signal(signal.SIGINT)
+        stdout, stderr = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=5)
+
+    assert "Traceback" not in stderr, stderr
+    assert "SupervisorError" not in stderr, stderr
+    assert "nothing to cancel" in stderr, stderr
+    # And it still reports the run rather than exiting on a signal alone.
+    assert _extract_last_json_object(stdout)["state"] in db.TERMINAL_STATES
+
+
+def test_a_wedged_finalization_does_not_exit_zero(configured_repo, monkeypatch):
+    """A warning printed while exiting 0 is the same defect one layer up.
+
+    A caller that reads the status — a script, a queue, CI — was told the run
+    finished cleanly, which is exactly the guarantee the warning says was lost.
+    The timeout is squeezed rather than the run slowed, so this costs no wall
+    clock: the widener holds finalization past a ceiling set below it.
+    """
+    env = _cli_env()
+    env["AICC_TEST_WIDEN_FINALIZATION_SECONDS"] = "5.0"
+    env["AICC_FINALIZATION_TIMEOUT_SECONDS"] = "1.0"
+
+    result = subprocess.run(
+        [sys.executable, str(WIDEN_FINALIZATION_WRAPPER), "launch", "AIOS", str(configured_repo), "implementation", "say ok", "--confirm"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert "did not finish finalizing" in result.stderr, result.stderr
+    assert result.returncode == 5, (
+        f"a wedged finalization exited {result.returncode}; a caller reading the "
+        "status was told the run finished cleanly"
+    )
