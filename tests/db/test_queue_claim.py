@@ -287,6 +287,109 @@ def test_concurrent_workers_never_hand_one_item_to_two_owners(
         assert cur.fetchone()[0] == 0
 
 
+def test_a_claimer_is_never_blocked_by_another_transactions_row_lock(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """`SKIP LOCKED` buys throughput, not correctness — pinned as what it is.
+
+    This test exists because the claim it replaces was false. The migration used
+    to say three guards produced exclusivity and that the concurrency tests
+    measured all three; independent acceptance ran the mutations and found that
+    removing `SKIP LOCKED`, removing the `state='ready'` CAS, and making the
+    attempt index non-unique each left the entire suite green. Reproduced here
+    before writing this: all three, and all three together, still pass.
+
+    What actually refuses the loser is the row lock plus the predicate. Under
+    READ COMMITTED a waiter re-evaluates `state='ready'` after the winner
+    commits, finds it false, and gets no row — with or without `SKIP LOCKED`.
+
+    So `SKIP LOCKED` is pinned for the property it really has: a claimer steps
+    past a row another transaction is holding instead of queuing behind it. With
+    a plain `FOR UPDATE` the call below blocks on the held lock until
+    `statement_timeout` cancels it, which is a failure this test can see.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "held")
+
+    migrator_dsn = _as_role(
+        test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]
+    )
+
+    # A transaction holding the only claimable row, and not letting go.
+    with psycopg.connect(migrator_dsn) as holder:
+        with holder.cursor() as cur:
+            cur.execute(
+                "SELECT work_item_id FROM work_item WHERE work_item_id = %s FOR UPDATE",
+                (item_id,),
+            )
+            assert cur.fetchone()[0] == item_id
+
+        with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+            with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+                with worker.cursor() as cur:
+                    cur.execute("SET statement_timeout = '4s'")
+                started = time.monotonic()
+                verdict = _claim(worker, _token()[1])
+                elapsed = time.monotonic() - started
+
+        # Stepped past it rather than waiting for it.
+        assert verdict[0] is False and verdict[1] == "no_work"
+        assert elapsed < 2.0, f"the claimer queued behind the held row ({elapsed:.2f}s)"
+        holder.rollback()
+
+    # And the row was never in doubt: releasing the hold makes it claimable again,
+    # so the refusal above was the lock, not the item having gone somewhere.
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            assert _claim(worker, _token()[1])[0] is True
+
+
+def test_the_attempt_number_is_unique_per_item(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The backstop, pinned for existing rather than for producing exclusivity.
+
+    Making this index non-unique leaves every concurrency test green, because
+    the row lock and the predicate mean two claimers never reach the same
+    `attempt_no` to begin with. So the honest assertion is the direct one: the
+    database refuses a duplicate. Run as the table owner, where no grant can be
+    the reason for the refusal, and against a row whose existence is asserted
+    first so a statement that matched nothing cannot pass for a constraint.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    with psycopg.connect(
+        _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE]), autocommit=True
+    ) as app:
+        item_id = _enqueue(app, "unique-attempt")
+
+    migrator_dsn = _as_role(
+        test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]
+    )
+    insert = (
+        "INSERT INTO work_attempt (attempt_id, work_item_id, attempt_no, "
+        "claimed_by_role, claim_token_hash, visibility_seconds, visible_until, "
+        "state, created_at, updated_at) VALUES "
+        "(%s, %s, 1, session_user, %s, 60, now() + interval '1 min', "
+        "'active', now(), now())"
+    )
+    with psycopg.connect(migrator_dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(insert, ("wat_first", item_id, "0" * 64))
+            cur.execute(
+                "SELECT count(*) FROM work_attempt WHERE work_item_id = %s AND attempt_no = 1",
+                (item_id,),
+            )
+            assert cur.fetchone()[0] == 1, "the first attempt must exist for this to mean anything"
+
+    with psycopg.connect(migrator_dsn) as conn:
+        with pytest.raises(psycopg.errors.UniqueViolation) as raised:
+            with conn.cursor() as cur:
+                cur.execute(insert, ("wat_second", item_id, "0" * 64))
+    assert "idx_work_attempt_item_no" in str(raised.value)
+
+
 def test_one_claim_call_consumes_exactly_one_attempt(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
@@ -1162,6 +1265,236 @@ def test_a_refusal_is_audited_because_it_returned_rather_than_raised(
 
     # Gap-free per item, so a deleted audit row is detectable.
     assert [e[4] for e in events] == list(range(1, len(events) + 1))
+
+
+#: Every `_queue_audit()` call site in `0002_queue_claim.up.sql`, as the row it
+#: must produce. Deleting any one of them has to fail a test, which is the whole
+#: point: independent acceptance removed the reaper's audit write and the suite
+#: stayed green, so "every decision is audited" was a property of the migration's
+#: prose rather than of the gate — the same shape of hole as a store nothing
+#: reconciles, and it surfaces at the moment the audit is finally needed.
+#:
+#: A static scan cannot carry this. There are a dozen call sites and they differ
+#: only in their arguments, so a missing one looks exactly like a site that was
+#: never there. The rows are the evidence; the source is not.
+REQUIRED_AUDIT_SITES = (
+    ("enqueue", "granted", None),
+    ("enqueue", "rejected", "duplicate_idempotency_key"),
+    ("claim", "granted", None),
+    ("claim", "rejected", "bad_claim_token_hash"),
+    ("claim", "rejected", "attempt_budget_exhausted"),
+    ("heartbeat", "granted", None),
+    ("heartbeat", "rejected", "bad_claim_token"),
+    ("complete", "granted", None),
+    ("complete", "rejected", "bad_claim_token"),
+    ("fail", "granted", "requeued"),
+    ("fail", "granted", "dead_lettered"),
+    ("fail", "rejected", "attempt_expired"),
+    ("expire", "granted", "requeued"),
+    ("expire", "granted", "dead_lettered"),
+    ("redrive", "granted", None),
+    ("redrive", "rejected", "not_dead_lettered"),
+    ("redrive", "rejected", "unknown_work_item"),
+)
+
+#: The one branch no test reaches, recorded rather than quietly missing from the
+#: list above. `lost_claim_race` fires when the `state='ready'` CAS on the claim
+#: UPDATE is false, and the row lock taken by the SELECT immediately before it
+#: means nothing can make that happen. It is defence in depth against a future
+#: change that removes the lock; see the comment at that line in the migration.
+UNREACHABLE_AUDIT_SITES = (("claim", "rejected", "lost_claim_race"),)
+
+
+def test_every_reachable_audit_site_writes_a_row(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Drive every audited decision and assert each one left its record.
+
+    Written after independent acceptance deleted the reaper's `_queue_audit`
+    call and nothing failed. One assertion per call site rather than a single
+    lifecycle walk, because a lifecycle walk covers whichever branches it
+    happens to take and is silent about the rest — the reaper's two branches
+    among them.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        worker_dsn = host_dsns[0]
+
+        # enqueue: granted, then rejected as a duplicate.
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            requeued_item = _enqueue(app, "audit-requeue", max_attempts=3, backoff_seconds=0)
+            _enqueue(app, "audit-requeue")
+
+        with psycopg.connect(worker_dsn, autocommit=True) as worker:
+            # claim: rejected on a malformed token, then granted.
+            assert _claim(worker, "too-short")[1] == "bad_claim_token_hash"
+            token, token_hash = _token()
+            first = _claim(worker, token_hash)
+            assert first[0], first[1]
+
+            # heartbeat: rejected, then granted.
+            assert _call(
+                worker, "SELECT ok, reason FROM queue_heartbeat(%s, %s)", (first[3], "wrong")
+            ) == (False, "bad_claim_token")
+            assert _call(
+                worker, "SELECT ok FROM queue_heartbeat(%s, %s)", (first[3], token)
+            ) == (True,)
+
+            # complete: rejected on the token (granted comes later, on its own item).
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+                (first[3], "wrong", json.dumps({})),
+            ) == (False, "bad_claim_token")
+
+            # fail: granted/requeued.
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (first[3], token, "transient"),
+            ) == (True, "requeued")
+
+            # expire: granted/requeued — the reaper branch that returns an item.
+            token, token_hash = _token()
+            second = _claim(worker, token_hash, visibility=SHORT_VISIBILITY)
+            assert second[0], second[1]
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_attempt SET visible_until = now() - interval '1 second' "
+                    "WHERE attempt_id = %s",
+                    (second[3],),
+                )
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                assert _call(app, "SELECT queue_reap()", ())[0] == 1
+            assert _item(admin_conn, requeued_item)[0] == "ready"
+
+            # fail: rejected — the stale owner of the attempt the reaper expired.
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (second[3], token, "late"),
+            ) == (False, "attempt_expired")
+
+            # expire: granted/dead_lettered — the reaper branch that exhausts.
+            token, token_hash = _token()
+            third = _claim(worker, token_hash, visibility=SHORT_VISIBILITY)
+            assert third[0] and third[4] == 3
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_attempt SET visible_until = now() - interval '1 second' "
+                    "WHERE attempt_id = %s",
+                    (third[3],),
+                )
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                assert _call(app, "SELECT queue_reap()", ())[0] == 1
+            assert _item(admin_conn, requeued_item)[0] == "dead"
+
+            # redrive: rejected on an unknown id, granted on the dead item, then
+            # rejected because it is no longer dead.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                assert _call(app, "SELECT queue_redrive(%s, 1)", ("wki_nope",))[0] is False
+                assert _call(app, "SELECT queue_redrive(%s, 2)", (requeued_item,))[0] is True
+                assert _call(app, "SELECT queue_redrive(%s, 1)", (requeued_item,))[0] is False
+
+            # fail: granted/dead_lettered, on a non-retryable failure.
+            #
+            # Priorities from here on, because the redrive above put its item
+            # back on the queue: without them the next claim takes whichever row
+            # sorts first and the test asserts against the wrong item.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                fatal_item = _enqueue(app, "audit-fatal", max_attempts=2, priority=10)
+            token, token_hash = _token()
+            fatal = _claim(worker, token_hash)
+            assert fatal[0] and fatal[2] == fatal_item
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, false)",
+                (fatal[3], token, "malformed"),
+            ) == (True, "dead_lettered")
+
+            # complete: granted.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                complete_item = _enqueue(app, "audit-complete", priority=20)
+            token, token_hash = _token()
+            done = _claim(worker, token_hash)
+            assert done[0] and done[2] == complete_item
+            assert _call(
+                worker,
+                "SELECT ok FROM queue_complete(%s, %s, %s::jsonb)",
+                (done[3], token, json.dumps({"done": True})),
+            ) == (True,)
+
+            # claim: rejected on an exhausted budget. Forced as the owner — the
+            # failure and expiry paths dead-letter such items, so reaching it
+            # through the API alone is not possible, and leaving it out of the
+            # list would make the gate silent about a real audit site.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                stuck = _enqueue(app, "audit-exhausted", max_attempts=1, priority=30)
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_item SET attempt_count = max_attempts WHERE work_item_id = %s",
+                    (stuck,),
+                )
+                assert cur.rowcount == 1
+            assert _claim(worker, _token()[1])[1] == "attempt_budget_exhausted"
+
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT event, outcome, reason FROM work_event")
+        observed = {tuple(row) for row in cur.fetchall()}
+
+    missing = [site for site in REQUIRED_AUDIT_SITES if site not in observed]
+    assert missing == [], f"audited decisions that left no row: {missing}"
+
+    # The registry must not drift into describing rows nothing produces, which
+    # would let a deleted site hide behind an entry that was always aspirational.
+    for site in UNREACHABLE_AUDIT_SITES:
+        assert site not in observed, f"{site} is reachable after all; move it into the required set"
+
+    # And the observed set must not contain an audited decision the registry has
+    # never heard of — a new site added without a row here is a site nothing
+    # pins, which is exactly how the reaper's went unnoticed.
+    unregistered = observed - set(REQUIRED_AUDIT_SITES) - set(UNREACHABLE_AUDIT_SITES)
+    assert unregistered == set(), f"audit sites with no entry in REQUIRED_AUDIT_SITES: {unregistered}"
+
+
+def test_the_reaper_audits_both_of_its_branches(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Named separately because this is the site acceptance deleted.
+
+    The sweep above would catch it, but a reader looking for "is re-delivery
+    audited?" should find a test that says so rather than have to trust a
+    registry entry.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "reaped", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for _ in range(2):
+                verdict = _claim(worker, _token()[1], visibility=SHORT_VISIBILITY)
+                assert verdict[0], verdict[1]
+                with admin_conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE work_attempt SET visible_until = now() - interval '1 second' "
+                        "WHERE attempt_id = %s",
+                        (verdict[3],),
+                    )
+                with psycopg.connect(app_dsn, autocommit=True) as app:
+                    assert _call(app, "SELECT queue_reap()", ())[0] == 1
+
+    expiries = [e for e in _events(admin_conn, item_id) if e[0] == "expire"]
+    assert [(e[1], e[2]) for e in expiries] == [
+        ("granted", "requeued"),
+        ("granted", "dead_lettered"),
+    ]
+    # The actor is the reaper's connected role, not the worker whose attempt it
+    # expired — the one place the audit's actor and the attempt's owner differ.
+    assert {e[3] for e in expiries} == {roles.APP_ROLE}
 
 
 def test_enqueue_is_idempotent_per_queue_and_key(

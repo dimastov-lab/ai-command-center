@@ -202,11 +202,19 @@ CREATE TABLE work_attempt (
     attempt_id        text PRIMARY KEY,
     work_item_id      text        NOT NULL REFERENCES work_item(work_item_id),
 
-    -- Monotonic per item. UNIQUE(work_item_id, attempt_no) is an independent
-    -- guard against a double claim: two winners would have to insert the same
-    -- attempt_no, and the unique index refuses the loser even if every other
-    -- guard were removed. Measured by
-    -- `test_only_one_of_sixteen_concurrent_claimers_wins`.
+    -- Monotonic per item. UNIQUE(work_item_id, attempt_no) is defence in depth
+    -- against a double claim: two winners would have to insert the same
+    -- attempt_no, and the unique index would refuse the loser even if the claim
+    -- predicate were removed.
+    --
+    -- It is NOT what produces exclusivity today, and the concurrency tests do
+    -- not pin it: making the index non-unique leaves them green, because the row
+    -- lock and the predicate mean two claimers never reach the same attempt_no
+    -- in the first place. What is pinned is the constraint itself —
+    -- `test_the_attempt_number_is_unique_per_item` inserts a duplicate as the
+    -- table owner and asserts the database refuses it. That is the honest claim:
+    -- the constraint exists and works, and it is a backstop rather than the
+    -- mechanism.
     attempt_no        integer     NOT NULL,
 
     -- THE CLAIMANT. `session_user`, written by the database, enforced by
@@ -497,17 +505,34 @@ BEGIN
 
     v_vis := least(greatest(coalesce(p_visibility_seconds, 60), 1), 3600);
 
-    -- THE MUTUAL EXCLUSION. `FOR UPDATE SKIP LOCKED` is the entire mechanism,
-    -- and it is PostgreSQL's rather than this design's: a concurrent claimer
-    -- does not queue behind this row and does not see it — it moves to the next
-    -- candidate. No advisory lock, no lock table, no retry loop, and no window
-    -- in which two transactions have both selected the same row.
+    -- THE MUTUAL EXCLUSION, stated as measurement rather than as intent.
     --
-    -- `state='ready'` is re-tested by the UPDATE below as a second CAS, and
-    -- UNIQUE(work_item_id, attempt_no) is a third. Three independent guards;
-    -- `test_only_one_of_sixteen_concurrent_claimers_wins` and
-    -- `test_concurrent_workers_never_hand_one_item_to_two_owners` measure that
-    -- none of them is doing the job alone.
+    -- What produces it is the ROW LOCK plus the `state = 'ready'` PREDICATE, and
+    -- it is PostgreSQL's rather than this design's. Under READ COMMITTED a
+    -- claimer that waits on a locked row re-evaluates the predicate once the
+    -- lock is released; the winner has since set `state = 'claimed'`, so the row
+    -- no longer matches and the waiter gets no row at all.
+    --
+    -- The predicate is the guard the suite pins: widening it to
+    -- `state IN ('ready','claimed')` fails three tests, including both
+    -- concurrency ones.
+    --
+    -- `SKIP LOCKED` BUYS THROUGHPUT, NOT CORRECTNESS — measured, and the
+    -- correction of an earlier claim in this file that said otherwise. Replacing
+    -- it with a plain `FOR UPDATE` leaves the whole suite green, because the
+    -- re-evaluation above is what refuses the loser either way. What changes is
+    -- that claimers serialise behind each other instead of stepping past a held
+    -- row, so one slow claim transaction stalls every other claimer.
+    -- `test_a_claimer_is_never_blocked_by_another_transactions_row_lock` pins
+    -- that property, and pins it as liveness rather than dressing it up as
+    -- exclusivity.
+    --
+    -- The two remaining guards are defence in depth, and neither is pinned by a
+    -- concurrency test because neither can be made to fire while the row lock
+    -- holds — see the `state = 'ready'` CAS on the UPDATE below, and
+    -- UNIQUE(work_item_id, attempt_no) on `work_attempt`. Saying so is the
+    -- point: a comment claiming a guard is test-covered when it is not makes a
+    -- refactor that deletes the guard land green.
     SELECT * INTO it FROM work_item
      WHERE queue = p_queue AND state = 'ready' AND available_at <= now()
      ORDER BY priority DESC, available_at, created_at
@@ -547,7 +572,13 @@ BEGIN
        SET state = 'claimed', attempt_count = v_no,
            current_attempt_id = v_attempt_id, updated_at = now()
      WHERE work_item_id = it.work_item_id
-       AND state = 'ready';                              -- CAS, guard #2
+       -- CAS, defence in depth. Unreachable today and deliberately kept: the
+       -- row is locked by the SELECT above, so nothing can change its state
+       -- between the two statements and this can never be false. NO TEST PINS
+       -- IT, and none can without removing the lock. It is here so that a future
+       -- change dropping the lock fails closed (`lost_claim_race` below)
+       -- instead of handing one item to two workers.
+       AND state = 'ready';
 
     IF NOT FOUND THEN
         PERFORM _queue_audit(it.work_item_id, v_attempt_id, 'claim', 'rejected',
