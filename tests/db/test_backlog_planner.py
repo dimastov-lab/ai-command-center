@@ -367,3 +367,58 @@ def test_return_to_pool_refuses_outside_in_progress(rig) -> None:
                 ("VOYN-W0-RG", "manual"),
             )
             assert cur.fetchone() == (False, "not_in_progress")
+
+
+def test_the_tick_lease_uses_its_own_ttl_not_the_repo_horizon(rig) -> None:
+    """PLANNER-LEASE-TTL, pinned (acceptance 7b: the mutation
+    planner_lease_ttl_seconds -> lease_ttl_seconds in the planner:global
+    acquire survived every other test). Interception at the SQL seam: the
+    global acquire must carry the TICK ttl, and dispatch must carry the RUN
+    ttl — two deliberately different numbers in one plan."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]
+
+    calls: list[tuple[str, tuple]] = []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def recording_factory():
+        with app_factory() as conn:
+            class RecordingCursor:
+                def __init__(self, cur):
+                    self._cur = cur
+
+                def execute(self, sql, params=()):
+                    calls.append((sql, tuple(params)))
+                    return self._cur.execute(sql, params)
+
+                def __getattr__(self, name):
+                    return getattr(self._cur, name)
+
+                def __enter__(self):
+                    self._cur.__enter__()
+                    return self
+
+                def __exit__(self, *exc):
+                    return self._cur.__exit__(*exc)
+
+            class RecordingConn:
+                def cursor(self):
+                    return RecordingCursor(conn.cursor())
+
+                def __getattr__(self, name):
+                    return getattr(conn, name)
+
+            yield RecordingConn()
+
+    limits = PlanLimits(
+        planner="planner-ttl", lease_ttl_seconds=7200, planner_lease_ttl_seconds=123
+    )
+    report = plan_once(recording_factory, limits)
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-TT"]
+
+    acquires = [p for s, p in calls if "backlog_lease_acquire" in s]
+    assert ("planner:global", "planner-ttl", 123) in acquires, acquires
+    dispatches = [p for s, p in calls if "backlog_dispatch" in s]
+    assert len(dispatches) == 1 and dispatches[0][2] == 7200, dispatches
