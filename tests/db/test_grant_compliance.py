@@ -29,6 +29,7 @@ pytestmark = pytest.mark.usefixtures("role_passwords")
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _as_role(dsn: str, role: str, role_passwords: dict[str, str]) -> str:
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -60,7 +61,17 @@ def _provision(admin_conn, psycopg, test_dsn, role_passwords) -> None:
 
 
 def _actual_table_grants(admin_conn) -> dict[str, dict[str, set[str]]]:
-    """Return {role: {table: {privilege, …}}} from the catalog."""
+    """Return {role: {table: {privilege, …}}} from the catalog.
+
+    Both catalogs, deliberately: a column-scoped grant (`GRANT UPDATE (col…)`)
+    is recorded in `role_column_grants` ONLY — `role_table_grants` does not
+    synthesize a table-level row for it. The first version of this checker
+    assumed it did and flagged the worker's column-scoped INSERT/UPDATE on
+    `completion` (the review_* carve-out, roles.COLUMN_PRIVILEGES) as MISSING
+    against a fully provisioned database. The privilege-level view here unions
+    the two; whether the column *set* matches the declaration is checked
+    separately in `_column_grant_violations`.
+    """
     actual: dict[str, dict[str, set[str]]] = {}
     with admin_conn.cursor() as cur:
         cur.execute(
@@ -71,7 +82,50 @@ def _actual_table_grants(admin_conn) -> dict[str, dict[str, set[str]]]:
         )
         for grantee, table, privilege in cur.fetchall():
             actual.setdefault(grantee, {}).setdefault(table, set()).add(privilege)
+        cur.execute(
+            "SELECT grantee, table_name, privilege_type "
+            "FROM information_schema.role_column_grants "
+            "WHERE table_schema = 'public' AND grantee = ANY(%s)",
+            (list(roles.ALL_ROLES),),
+        )
+        for grantee, table, privilege in cur.fetchall():
+            actual.setdefault(grantee, {}).setdefault(table, set()).add(privilege)
     return actual
+
+
+def _column_grant_violations(admin_conn) -> list[str]:
+    """The column detail for every declared column-scoped privilege.
+
+    Exactness matters in both directions: a column missing from the grant
+    breaks the writer, and an EXTRA column on `completion`'s worker UPDATE
+    would be precisely the forged-verdict channel the carve-out exists to
+    close (roles.py: _REVIEW_COLUMNS).
+    """
+    violations: list[str] = []
+    with admin_conn.cursor() as cur:
+        for role, tables in roles.COLUMN_PRIVILEGES.items():
+            for table, per_priv in tables.items():
+                for privilege, columns in per_priv.items():
+                    cur.execute(
+                        "SELECT column_name "
+                        "FROM information_schema.role_column_grants "
+                        "WHERE table_schema = 'public' AND grantee = %s "
+                        "AND table_name = %s AND privilege_type = %s",
+                        (role, table, privilege),
+                    )
+                    actual_columns = {row[0] for row in cur.fetchall()}
+                    declared = set(columns)
+                    for column in sorted(declared - actual_columns):
+                        violations.append(
+                            f"MISSING: role={role} privilege={privilege} "
+                            f"on={table}.{column}"
+                        )
+                    for column in sorted(actual_columns - declared):
+                        violations.append(
+                            f"EXTRA:   role={role} privilege={privilege} "
+                            f"on={table}.{column}"
+                        )
+    return violations
 
 
 def _actual_function_grants(admin_conn) -> dict[str, set[str]]:
@@ -127,13 +181,16 @@ def _expected_function_grants() -> dict[str, set[str]]:
     # *declared* short-name set for comparison after resolution.
     result: dict[str, set[str]] = {}
     for role in (roles.APP_ROLE, roles.WORKER_ROLE):
-        result[role] = {sig.split("(")[0] for sig in roles.FUNCTION_PRIVILEGES.get(role, ())}
+        result[role] = {
+            sig.split("(")[0] for sig in roles.FUNCTION_PRIVILEGES.get(role, ())
+        }
     return result
 
 
 # ---------------------------------------------------------------------------
 # Compliance check  (the heart of this module)
 # ---------------------------------------------------------------------------
+
 
 def _check_compliance(admin_conn) -> list[str]:
     """Compare the rendered policy against the actual database grants.
@@ -165,17 +222,13 @@ def _check_compliance(admin_conn) -> list[str]:
         for obj, privs in role_expected.items():
             for priv in privs:
                 if priv not in role_actual.get(obj, set()):
-                    violations.append(
-                        f"MISSING: role={role} privilege={priv} on={obj}"
-                    )
+                    violations.append(f"MISSING: role={role} privilege={priv} on={obj}")
 
         # Extra grants
         for obj, privs in role_actual.items():
             for priv in privs:
                 if priv not in role_expected.get(obj, set()):
-                    violations.append(
-                        f"EXTRA:   role={role} privilege={priv} on={obj}"
-                    )
+                    violations.append(f"EXTRA:   role={role} privilege={priv} on={obj}")
 
         # Declared-refusal tables must not appear in the catalog at all
         for table, privs in roles.PRIVILEGES[role].items():
@@ -183,6 +236,9 @@ def _check_compliance(admin_conn) -> list[str]:
                 violations.append(
                     f"FORBIDDEN: role={role} has grants on declared-unreachable table={table}"
                 )
+
+    # ---- column-scoped grants: exact column sets ---------------------------
+    violations.extend(_column_grant_violations(admin_conn))
 
     # ---- tables/views not covered by the matrix at all ---------------------
     with admin_conn.cursor() as cur:
@@ -200,11 +256,15 @@ def _check_compliance(admin_conn) -> list[str]:
 
     uncovered_tables = db_tables - set(roles.ALL_TABLES)
     for table in sorted(uncovered_tables):
-        violations.append(f"UNCOVERED TABLE: {table!r} exists in the database but is not in ALL_TABLES")
+        violations.append(
+            f"UNCOVERED TABLE: {table!r} exists in the database but is not in ALL_TABLES"
+        )
 
     uncovered_views = db_views - set(roles.ALL_VIEWS)
     for view in sorted(uncovered_views):
-        violations.append(f"UNCOVERED VIEW: {view!r} exists in the database but is not in ALL_VIEWS")
+        violations.append(
+            f"UNCOVERED VIEW: {view!r} exists in the database but is not in ALL_VIEWS"
+        )
 
     # ---- function grants ---------------------------------------------------
     with admin_conn.cursor() as cur:
@@ -258,6 +318,7 @@ def _check_compliance(admin_conn) -> list[str]:
 # Tests
 # ---------------------------------------------------------------------------
 
+
 def test_compliance_passes_when_grants_are_applied(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
@@ -302,8 +363,13 @@ def test_compliance_names_the_role_and_object_in_each_violation(
         has_role = any(role in v for role in roles.ALL_ROLES)
         has_obj = any(
             obj in v
-            for obj in list(roles.ALL_TABLES) + list(roles.ALL_VIEWS)
-            + [sig.split("(")[0] for sigs in roles.FUNCTION_PRIVILEGES.values() for sig in sigs]
+            for obj in list(roles.ALL_TABLES)
+            + list(roles.ALL_VIEWS)
+            + [
+                sig.split("(")[0]
+                for sigs in roles.FUNCTION_PRIVILEGES.values()
+                for sig in sigs
+            ]
         )
         assert has_role or has_obj, f"Violation does not name a role or object: {v!r}"
 
@@ -311,6 +377,7 @@ def test_compliance_names_the_role_and_object_in_each_violation(
 # ---------------------------------------------------------------------------
 # Reproduction of the stated defect: worker can call queue_redrive without grants
 # ---------------------------------------------------------------------------
+
 
 def test_worker_cannot_call_queue_redrive_when_grants_are_applied(
     admin_conn, psycopg, test_dsn, role_passwords
@@ -376,6 +443,7 @@ def test_worker_can_call_queue_redrive_without_grants(
 # A new migration adding an object outside the policy must fail the check
 # ---------------------------------------------------------------------------
 
+
 def test_compliance_fails_for_table_outside_the_policy(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
@@ -396,8 +464,8 @@ def test_compliance_fails_for_table_outside_the_policy(
     violations = _check_compliance(admin_conn)
     uncovered = [v for v in violations if "undeclared_future_table" in v]
     assert uncovered, (
-        f"Expected a violation for 'undeclared_future_table' not in ALL_TABLES, "
-        f"but got none.\nAll violations:\n" + "\n".join(violations)
+        "Expected a violation for 'undeclared_future_table' not in ALL_TABLES, "
+        "but got none.\nAll violations:\n" + "\n".join(violations)
     )
 
 
@@ -432,6 +500,6 @@ def test_compliance_fails_for_function_outside_the_policy(
     violations = _check_compliance(admin_conn)
     extra = [v for v in violations if "undeclared_helper" in v]
     assert extra, (
-        f"Expected a violation for worker reaching 'undeclared_helper', "
-        f"but got none.\nAll violations:\n" + "\n".join(violations)
+        "Expected a violation for worker reaching 'undeclared_helper', "
+        "but got none.\nAll violations:\n" + "\n".join(violations)
     )
