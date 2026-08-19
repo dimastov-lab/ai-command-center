@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from command_center.dispatch import policy_config
+from command_center.http_auth.identity import Principal
 from command_center.dispatch.models import (
     DEFAULT_PRIORITY_WEIGHTS,
     AgentLimit,
@@ -96,7 +97,9 @@ def test_update_policy_overlays_only_named_fields():
     )
 
     updated = policy_config.update_policy(
-        ROOT, {"prefer_local": False}, actor="editor"
+        ROOT,
+        {"prefer_local": False},
+        principal=Principal(principal_id="editor", tenant_id="tenant-1"),
     )
 
     # The changed field took, the untouched cost matrix survived.

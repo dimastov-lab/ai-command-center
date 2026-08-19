@@ -1,12 +1,18 @@
 """HTTP/JSON API service for the AI Command Center (Wave 0, F-1).
 
-A read-only FastAPI application (``uvicorn command_center.api.app:app``) that
-turns the desktop and future mobile shells into thin clients over one backend.
-It is a *pure addition*: every endpoint is built ON the existing, already
-audited read paths (the Integration Center registry + health collectors, the
-tasks repository, the runtime run read model, git readers) — no Streamlit code
-is touched, no supervisor/db semantics change, and this package introduces no
-new writer.
+A FastAPI application (``uvicorn command_center.api.app:app``) that turns the
+desktop and future mobile shells into thin clients over one backend.
+
+It began as a read-only surface built ON the existing, already audited read
+paths (the Integration Center registry + health collectors, the tasks
+repository, the runtime run read model, git readers). It is **no longer
+read-only**: the Wave-1 through Wave-3 surfaces added 27 mutating routes to it.
+Saying otherwise here is not a cosmetic error — the stale wording is the
+plausible reason the mutating surface was long counted as two endpoints rather
+than 29 (``VOYN-W0-AICC-AUTH-HTTP-01a``). Every one of those routes is
+authenticated and authorized through :mod:`command_center.http_auth`, whose
+routing table is checked against the live router tree at application build.
+Streamlit code is still untouched and supervisor/db semantics are unchanged.
 
 Layering (per the project's Controller -> Service -> Repository rule):
 

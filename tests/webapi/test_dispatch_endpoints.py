@@ -56,27 +56,48 @@ def test_get_plan_returns_serialized_plan(monkeypatch):
     assert body["budget_remaining_usd"] == 5.0
 
 
-def test_post_assign_forwards_confirmation(monkeypatch):
+def test_post_assign_forwards_confirmation(monkeypatch, authenticated_caller):
     captured: dict = {}
 
-    def fake_assign(root, *, confirmed, actor=None):
+    def fake_assign(root, principal, *, confirmed):
         captured["confirmed"] = confirmed
-        captured["actor"] = actor
+        captured["principal"] = principal
         return {"applied": confirmed, "assigned_task_ids": ["t1"]}
 
     monkeypatch.setattr(apimod._service, "assign", fake_assign)
 
-    r = _client().post("/api/v1/dispatch/assign", json={"confirmed": True, "actor": "op"})
+    r = _client().post("/api/v1/dispatch/assign", json={"confirmed": True})
 
     assert r.status_code == 200
     assert r.json()["applied"] is True
-    assert captured == {"confirmed": True, "actor": "op"}
+    # The recorded actor is the authenticated caller and nothing else: there is
+    # no `actor` field left for a client to supply (VOYN-W0-AICC-AUTH-HTTP-01).
+    assert captured == {"confirmed": True, "principal": authenticated_caller}
+
+
+def test_post_assign_refuses_a_body_that_declares_an_actor(monkeypatch):
+    """`extra="forbid"` — a forged actor is refused out loud, not ignored.
+
+    Ignoring it would be safe but silent: a client that has been sending one
+    keeps getting 200s and never learns the contract changed.
+    """
+    called: list = []
+    monkeypatch.setattr(
+        apimod._service, "assign", lambda *a, **k: called.append(k) or {}
+    )
+
+    r = _client().post(
+        "/api/v1/dispatch/assign", json={"confirmed": True, "actor": "op"}
+    )
+
+    assert r.status_code == 422
+    assert called == []
 
 
 def test_post_assign_defaults_to_unconfirmed(monkeypatch):
     captured: dict = {}
 
-    def fake_assign(root, *, confirmed, actor=None):
+    def fake_assign(root, principal, *, confirmed):
         captured["confirmed"] = confirmed
         return {"applied": False, "reason": "confirmation_required"}
 
@@ -101,39 +122,57 @@ def test_get_policy_returns_serialized_policy(monkeypatch):
     assert body["cost_matrix"] == {"ollama": 0.0}
 
 
-def test_put_policy_forwards_changes(monkeypatch):
+def test_put_policy_forwards_changes(monkeypatch, authenticated_caller):
     captured: dict = {}
 
-    def fake_update(root, changes, *, actor=None):
+    def fake_update(root, changes, *, principal):
         captured["changes"] = changes
-        captured["actor"] = actor
+        captured["principal"] = principal
         return DispatchPolicy(prefer_local=False)
 
     monkeypatch.setattr(apimod._policy_config, "update_policy", fake_update)
+
+    r = _client().put(
+        "/api/v1/dispatch/policy", json={"changes": {"prefer_local": False}}
+    )
+
+    assert r.status_code == 200
+    assert r.json()["prefer_local"] is False
+    assert captured["changes"] == {"prefer_local": False}
+    assert captured["principal"] == authenticated_caller
+
+
+def test_put_policy_refuses_a_body_that_declares_an_actor(monkeypatch):
+    called: list = []
+    monkeypatch.setattr(
+        apimod._policy_config, "update_policy", lambda *a, **k: called.append(k)
+    )
 
     r = _client().put(
         "/api/v1/dispatch/policy",
         json={"changes": {"prefer_local": False}, "actor": "editor"},
     )
 
-    assert r.status_code == 200
-    assert r.json()["prefer_local"] is False
-    assert captured["changes"] == {"prefer_local": False}
-    assert captured["actor"] == "editor"
+    assert r.status_code == 422
+    assert called == []
 
 
-def test_put_policy_accepts_bare_body_as_changes(monkeypatch):
-    captured: dict = {}
+def test_put_policy_no_longer_accepts_a_bare_body(monkeypatch):
+    """The old handler treated any unwrapped body as `changes`.
 
-    def fake_update(root, changes, *, actor=None):
-        captured["changes"] = changes
-        return DispatchPolicy()
+    That form was indistinguishable from a body carrying an unexpected
+    top-level key — which is precisely what now has to be refused, so the
+    convenience had to go with it.
+    """
+    called: list = []
+    monkeypatch.setattr(
+        apimod._policy_config, "update_policy", lambda *a, **k: called.append(k)
+    )
 
-    monkeypatch.setattr(apimod._policy_config, "update_policy", fake_update)
+    r = _client().put("/api/v1/dispatch/policy", json={"prefer_local": True})
 
-    _client().put("/api/v1/dispatch/policy", json={"prefer_local": True})
-
-    assert captured["changes"] == {"prefer_local": True}
+    assert r.status_code == 422
+    assert called == []
 
 
 # --- redaction: a BANK task never surfaces in /dispatch/plan --------------
