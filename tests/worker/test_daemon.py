@@ -275,21 +275,28 @@ def test_the_claim_loop_feeds_the_watchdog_between_claims() -> None:
 
 def test_the_heartbeat_thread_feeds_the_watchdog_during_a_long_run() -> None:
     """While a handler blocks the claim loop, the ONLY thing still pinging is
-    the heartbeat thread — this pins that it actually does, even while the
-    database refuses the beat (a DB outage is not a process wedge)."""
+    the heartbeat thread — pinned by THREAD IDENTITY, not by counting: review
+    killed a counting version of this test (mutant C) because the claim loop
+    itself supplies a third ping after the handler returns. The assertion
+    holds even while the database refuses the beat (a DB outage is not a
+    process wedge)."""
     import threading
 
     store = ScriptedStore([_work({"kind": "slow"})])
     store.heartbeat_alive = False  # the DB says the lease is gone
-    pinged_during_run = threading.Event()
-    pings: list[str] = []
+    ping_from_beat_thread = threading.Event()
+    handler_running = threading.Event()
 
     def notify(state: str) -> None:
-        pings.append(state)
-        if state == "WATCHDOG=1" and len(pings) > 2:
-            pinged_during_run.set()
+        if (
+            state == "WATCHDOG=1"
+            and handler_running.is_set()
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            ping_from_beat_thread.set()
 
     def slow(payload, lease_lost):
+        handler_running.set()
         assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
         return HandlerOutcome(ok=True, result={"too": "late"})
 
@@ -297,9 +304,9 @@ def test_the_heartbeat_thread_feeds_the_watchdog_during_a_long_run() -> None:
         store, {"slow": slow}, WorkerConfig(visibility_seconds=3), notify=notify
     )
     _run_until_idle(daemon, store)
-    # visibility 3s -> beat interval 1s: the beat thread pinged at least once
-    # while the handler held the loop.
-    assert pinged_during_run.is_set()
+    # visibility 3s -> beat interval 1s: while the handler held the main
+    # thread, a WATCHDOG ping arrived from a thread that was not it.
+    assert ping_from_beat_thread.is_set()
 
 
 def test_the_watchdog_budget_caps_the_idle_sleep(monkeypatch) -> None:
@@ -329,3 +336,110 @@ def test_the_watchdog_budget_caps_the_idle_sleep(monkeypatch) -> None:
     daemon.run_forever()
 
     assert sleeps and all(t <= 4.0 for t in sleeps), sleeps
+
+
+def test_the_watchdog_budget_caps_the_refusal_sleep(monkeypatch) -> None:
+    """Mutant D2: the OTHER refusal branch (claim refused for a protocol
+    reason, not no_work) sleeps idle_max — that sleep must be capped by the
+    watchdog budget too, or a healthy worker parked on a refusal is shot."""
+    import os
+
+    monkeypatch.setenv("WATCHDOG_USEC", "8000000")  # 8s budget -> 4s interval
+    monkeypatch.setenv("WATCHDOG_PID", str(os.getpid()))
+    store = ScriptedStore([QueueRefusal("claim_refused")])
+    sleeps: list[float] = []
+    daemon = WorkerDaemon(
+        store,
+        {},
+        WorkerConfig(
+            visibility_seconds=3, idle_min_seconds=16.0, idle_max_seconds=64.0
+        ),
+        notify=lambda _s: None,
+    )
+
+    def fake_sleep(t):
+        sleeps.append(t)
+        if len(sleeps) >= 2:
+            daemon.request_stop()
+
+    daemon._sleep = fake_sleep  # type: ignore[method-assign]
+    daemon.run_forever()
+
+    assert sleeps and all(t <= 4.0 for t in sleeps), sleeps
+
+
+def test_the_watchdog_cap_keeps_the_beat_alive_under_a_long_visibility(
+    monkeypatch,
+) -> None:
+    """Mutant E: with visibility_seconds=3600 the beat interval is 1200s, and
+    the watchdog cap on that interval is the ONLY thing that keeps a healthy
+    long-lease worker pinging inside its budget. Without the cap the first
+    beat (and first in-run ping) would arrive 20 minutes late — here, never
+    within the 10s bound."""
+    import os
+    import threading
+
+    monkeypatch.setenv("WATCHDOG_USEC", "2000000")  # 2s budget -> 1s interval
+    monkeypatch.setenv("WATCHDOG_PID", str(os.getpid()))
+    store = ScriptedStore([_work({"kind": "slow"})])
+    beat_seen = threading.Event()
+    original_heartbeat = store.heartbeat
+
+    def observed_heartbeat(work):
+        beat_seen.set()
+        return original_heartbeat(work)
+
+    store.heartbeat = observed_heartbeat  # type: ignore[method-assign]
+
+    def slow(payload, lease_lost):
+        assert beat_seen.wait(timeout=10), (
+            "no heartbeat within the watchdog budget: the uncapped interval "
+            "would have parked the beat thread for visibility/3 seconds"
+        )
+        return HandlerOutcome(ok=True, result={})
+
+    daemon = WorkerDaemon(
+        store,
+        {"slow": slow},
+        WorkerConfig(visibility_seconds=3600),
+        notify=lambda _s: None,
+    )
+    _run_until_idle(daemon, store)
+    assert beat_seen.is_set()
+
+
+def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
+    """Mutant F (integration): no injected notifier — the daemon's default
+    path must put real READY/WATCHDOG/STOPPING datagrams on the socket
+    systemd names via NOTIFY_SOCKET."""
+    import os
+    import socket
+    import tempfile
+
+    path = os.path.join(tempfile.mkdtemp(prefix="sdn"), "n.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(path)
+    sock.setblocking(False)
+    monkeypatch.setenv("NOTIFY_SOCKET", path)
+    monkeypatch.delenv("WATCHDOG_USEC", raising=False)
+    try:
+        store = ScriptedStore([_work({"kind": "echo"})])
+        daemon = WorkerDaemon(
+            store,
+            {"echo": lambda p, e: HandlerOutcome(ok=True, result={})},
+            WorkerConfig(visibility_seconds=3),
+        )
+        _run_until_idle(daemon, store)
+
+        frames = []
+        while True:
+            try:
+                frames.append(sock.recv(64))
+            except BlockingIOError:
+                break
+    finally:
+        sock.close()
+
+    assert frames[0] == b"READY=1"
+    assert frames[-1] == b"STOPPING=1"
+    assert b"WATCHDOG=1" in frames
