@@ -224,12 +224,22 @@ jobs:
       # data automatically). No fail-under threshold is configured, so test
       # failures still gate the job while coverage stays informational.
       # Durations keep future runtime regressions visible in the CI log.
+      # Coverage measurement is the single largest wall-time multiplier of
+      # this job (VOYN-W0-AICC-CI-FAST-01). On pull requests it decides
+      # nothing — failures gate, coverage informs — so PRs run bare and the
+      # full instrumented pass stays on main pushes and merge queues, where
+      # the number is actually consumed. The SET of tests is identical.
       - name: Pytest + coverage (parallel)
         if: steps.change-scope.outputs.docs_only != 'true'
         run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COV_ARGS=""
+          else
+            COV_ARGS="--cov=command_center --cov-report=term --cov-report=xml"
+          fi
           pytest -q -m "not serial" -n auto --dist loadscope \
             --durations=50 \
-            --cov=command_center --cov-report=term --cov-report=xml
+            $COV_ARGS
 
       # Small non-parallel tail: the `serial`-marked tests that rely on
       # process-global or cross-process shared state. Runs in a single worker
@@ -240,8 +250,12 @@ jobs:
         if: steps.change-scope.outputs.docs_only != 'true'
         run: |
           set +e
-          pytest -q -m serial -p no:xdist \
-            --cov=command_center --cov-append --cov-report=term
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            COV_ARGS=""
+          else
+            COV_ARGS="--cov=command_center --cov-append --cov-report=term"
+          fi
+          pytest -q -m serial -p no:xdist $COV_ARGS
           rc=$?
           if [ "$rc" -eq 5 ]; then
             echo "No serial-marked tests collected; nothing to run."
