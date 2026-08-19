@@ -18,6 +18,7 @@ function's own refusal reason, including ``skipped_by_wave_gate``
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -54,8 +55,49 @@ class PlanReport:
     planner_busy: bool = False
 
 
+# Repo → (canonical project_id, worker-host repository path). The worker's
+# validate_repository accepts only PROJECT_IDS members with the configured
+# path, so the planner must translate the backlog's repo hint into that
+# vocabulary — a task whose repo has no route is reported, never dispatched
+# into a guaranteed dead-letter. One fleet, one table, env-overridable;
+# per-host routing belongs to the multi-host slice (recorded in the epic).
+_DEFAULT_REPO_ROUTES: dict[str, tuple[str, str]] = {
+    "ai-command-center": ("AICC", "/home/voynadmin/Projects/ai-command-center"),
+    "aios": ("AIOS", "/home/voynadmin/Projects/aios"),
+    "~/Projects/aios": ("AIOS", "/home/voynadmin/Projects/aios"),
+    "~/Projects/ai-command-center": ("AICC", "/home/voynadmin/Projects/ai-command-center"),
+}
+
+
+def repo_route(repo: str) -> tuple[str, str] | None:
+    raw = os.environ.get("AICC_PLANNER_REPO_ROUTES", "")
+    if raw:
+        # A broken override routes NOTHING — and "broken" includes decodable
+        # JSON of the wrong shape: a bare string would be silently misrouted
+        # by indexing ("AICC" -> ("A", "I")), a dict raises out of the tick,
+        # a non-string path dead-letters downstream. Review proved all three
+        # live; every value must be exactly two non-empty strings.
+        try:
+            decoded = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        table: dict[str, tuple[str, str]] = {}
+        for key, value in decoded.items():
+            if (
+                not isinstance(value, (list, tuple))
+                or len(value) != 2
+                or not all(isinstance(part, str) and part for part in value)
+            ):
+                return None
+            table[key] = (value[0], value[1])
+        return table.get(repo)
+    return _DEFAULT_REPO_ROUTES.get(repo)
+
+
 def _payload_for(
-    task: dict[str, Any], limits: PlanLimits
+    task: dict[str, Any], limits: PlanLimits, route: tuple[str, str]
 ) -> tuple[dict[str, Any], int]:
     """The agent_run payload plus the attempt budget (= cascade length).
 
@@ -65,6 +107,7 @@ def _payload_for(
     plane acting on the canonical store.
     """
     cascade = cascade_for("implementation")
+    project_id, repository_path = route
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
         f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
@@ -77,8 +120,8 @@ def _payload_for(
     payload = {
         "kind": "agent_run",
         "v": AGENT_RUN_SCHEMA_VERSION,
-        "project_id": task["task_id"],
-        "repository_path": task["repo"],
+        "project_id": project_id,
+        "repository_path": repository_path,
         "prompt": prompt,
         "task_type": cascade[0]["task_type"],
         "timeout_seconds": limits.timeout_seconds,
@@ -143,7 +186,14 @@ class Planner:
                 if not dispatchable:
                     report.undispatchable.append((task_id, "no_repo"))
                     continue
-                payload, budget = _payload_for(task, limits)
+                route = repo_route(repo)
+                if route is None:
+                    # An unrouted repo is a report line, never a dispatch into
+                    # a guaranteed dead-letter (the first live tick proved the
+                    # worker refuses unknown projects three times, honestly).
+                    report.undispatchable.append((task_id, "unknown_repo_route"))
+                    continue
+                payload, budget = _payload_for(task, limits, route)
                 ok, reason, work_item_id, _revision = self._row(
                     "SELECT * FROM backlog_dispatch(%s, %s, %s, %s, %s::jsonb, %s)",
                     (

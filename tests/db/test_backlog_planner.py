@@ -91,6 +91,22 @@ def rig(admin_conn, psycopg, test_dsn, role_passwords):
                 admin_conn.rollback()
 
 
+@pytest.fixture(autouse=True)
+def _test_repo_routes(monkeypatch, request):
+    """Every synthetic repo-* used by this suite gets a route: the planner now
+    refuses unrouted repos (the first live tick's lesson), and these tests are
+    about dispatch mechanics, not the route table. The route tests below opt
+    out by overriding the variable themselves."""
+    import json
+
+    repos = ["repo-d2","repo-ga","repo-gb","repo-gc","repo-in","repo-nm",
+             "repo-one","repo-p1","repo-p3","repo-pk","repo-shared","repo-tt"]
+    monkeypatch.setenv(
+        "AICC_PLANNER_REPO_ROUTES",
+        json.dumps({r: ["AICC", f"/srv/{r}"] for r in repos}),
+    )
+
+
 def _task(task_id: str, **overrides) -> ParsedTask:
     values = dict(
         task_id=task_id,
@@ -422,3 +438,41 @@ def test_the_tick_lease_uses_its_own_ttl_not_the_repo_horizon(rig) -> None:
     assert ("planner:global", "planner-ttl", 123) in acquires, acquires
     dispatches = [p for s, p in calls if "backlog_dispatch" in s]
     assert len(dispatches) == 1 and dispatches[0][2] == 7200, dispatches
+
+
+def test_repo_routes_translate_the_backlog_vocabulary(monkeypatch) -> None:
+    """The first live tick died three honest deaths: the payload carried the
+    backlog's repo string where the worker's validate_repository demands a
+    canonical PROJECT_IDS member plus its configured path. The route table
+    is the translation, and an unrouted repo must never dispatch."""
+    from command_center.orchestrator.planner import repo_route
+
+    monkeypatch.delenv("AICC_PLANNER_REPO_ROUTES", raising=False)
+    assert repo_route("ai-command-center") == (
+        "AICC", "/home/voynadmin/Projects/ai-command-center"
+    )
+    assert repo_route("aios")[0] == "AIOS"
+    assert repo_route("nowhere/unknown") is None
+    monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", '{"x": ["AIOS", "/p"]}')
+    assert repo_route("x") == ("AIOS", "/p")
+    assert repo_route("aios") is None  # override replaces, not merges
+    # Fail closed must be probed on a key the DEFAULTS would answer —
+    # otherwise "closed" and "fell through to defaults" are identical
+    # (review mutant (б) survived on exactly that blindness).
+    monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", "{broken json")
+    assert repo_route("aios") is None
+    for bad in ('{"x": "AICC"}', '{"x": {"a": 1}}', '{"x": ["AICC", 7]}',
+                '{"x": ["AICC", ""]}', '[1, 2]'):
+        monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", bad)
+        assert repo_route("x") is None and repo_route("aios") is None, bad
+
+
+def test_an_unrouted_repo_is_reported_not_dead_lettered(rig, monkeypatch) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RR", repo="repo-without-route"))[0]
+    monkeypatch.delenv("AICC_PLANNER_REPO_ROUTES", raising=False)
+    report = plan_once(app_factory, PlanLimits(planner="router-test"))
+    assert ("VOYN-W0-RR", "unknown_repo_route") in report.undispatchable
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM work_item WHERE task_id = %s", ("VOYN-W0-RR",))
+        assert cur.fetchone()[0] == 0
