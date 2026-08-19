@@ -167,6 +167,13 @@ into AIOS Core (post-AIOS-CORE-ACCEPTED); growth is prohibited.**
 - **Memory/persistence** — `command_center/storage.py`,
   `tasks_repository.py`, `aml_store.py`.
 
+Recorded exception, frozen-adjacent rather than legacy (see the procedure
+section below for why it exists at all):
+
+- **Server work queue (SRV lane)** — `command_center/db/work_queue_store.py`
+  (queue client), `command_center/worker/` (daemon, entrypoint) — clients of
+  the PL/pgSQL queue authority accepted via VOYN-W0-AICC-SRV-03/04b.
+
 ## Changing the baseline (a reviewed change)
 
 The baseline may only change through an ordinary reviewed PR that explains the
@@ -193,6 +200,25 @@ python -m tests.architecture.aios_boundary --write-baseline
 Adding a *new* engine capability is never a baseline edit — new capability of
 these categories belongs in AIOS Core and is consumed here through its
 versioned API/SDK/event contracts (ADR-0008).
+
+**One recorded exception, and its shape (2026-08-19).** The server work queue
+of the VOYN SRV lane (`VOYN-W0-AICC-SRV-01..09`) was accepted by the central
+backlog *after* this doctrine was written, and its acceptance placed the
+capability in this repository deliberately: the queue's entire authority —
+claim atomicity, claimant identity, the stale-owner fence, heartbeat clamps,
+reaping — is PL/pgSQL running under PostgreSQL role separation
+(`command_center/db/sql/0002_queue_claim.up.sql`, merged via PR #311/#313).
+The Python modules that accompany it (`command_center/db/work_queue_store.py`,
+`command_center/worker/`) are thin clients of that server authority: they
+render calls to the SQL functions and react to their refusals, exactly the
+delegation-not-ownership shape the `memory` rule above already declines to
+count. The name tokens (`queue`, `worker`) still classify them, so they are
+carried in the baseline under their own subsystem heading rather than
+silently exempted from the scanner. Growth of this subsystem follows the SRV
+lane's own reviewed PRs; growth of the *legacy* frozen engines remains
+prohibited, and convergence into AIOS Core remains this subsystem's stated
+end state once the core's dispatch contract (aios ADR-0022) is accepted and
+covers it.
 
 ## CI wiring
 
