@@ -1,11 +1,11 @@
 """The `run` table's PostgreSQL mirror (VOYN-W0-AICC-SRV-01B, slice 11).
 
 The bottleneck of the correspondence map's FK graph: ten tables reference
-`run`, so it moves alone. Forty-one columns, and not one new conversion class —
-two `jsonb` (slice 4), three `INTEGER 0/1` -> `boolean` (slice 2), six
-`timestamptz` including four nullable (slice 3), two foreign keys (slice 5).
-The machinery carries all of it; what this slice is actually about is the write
-path.
+`run`, so it moves alone. Forty-two columns, and not one new conversion class —
+two `jsonb` (slice 4), three `INTEGER 0/1` -> `boolean` (slice 2), seven
+`timestamptz` including five nullable (slice 3, plus `finalized_at` from
+`0004_run_finalized_at`), two foreign keys (slice 5). The machinery carries all
+of it; what this slice is actually about is the write path.
 
 **The record a caller assembles is not the row the database stores**, and this
 is the write-side sibling of slice 4's reader trap. `create_run` builds its
@@ -14,8 +14,10 @@ is the write-side sibling of slice 4's reader trap. `create_run` builds its
 returns is missing whatever it never set.
 
 Measured rather than asserted, because the first version of this docstring
-overstated it: the record has 38 keys and the stored row 41, and the three that
-differ are `failure_reason`, `first_output_at` and `pre_run_head`. All three
+overstated it: the record has 38 keys and the stored row 42, and the four that
+differ are `failure_reason`, `first_output_at`, `pre_run_head` and
+`finalized_at` — the last of which cannot be otherwise, since it is written
+only at the end of finalization, long after `create_run` has returned. All four
 are **nullable**, so mirroring the record would work today — it would send
 `NULL` where the authority also has `NULL`, and reconciliation would be clean.
 The dramatic version of this paragraph claimed a `NOT NULL` violation that
@@ -89,6 +91,12 @@ RUN_COLUMNS: tuple[str, ...] = (
     "granted_capabilities",
     "capability_preflight",
     "command_policy",
+    # Added by `0004_run_finalized_at` rather than declared in 0001, so the
+    # contract that pins this tuple against the SQL now applies the migration
+    # set's `ALTER TABLE ... ADD COLUMN`s in version order. Both engines append
+    # a new column at the end of the ordinal order, so the position here is the
+    # position the databases have.
+    "finalized_at",
 )
 
 #: Three flags, six timestamps (four of them nullable — a run is created before
@@ -107,6 +115,7 @@ RUN = MirroredTable(
                 "first_output_at",
                 "created_at",
                 "updated_at",
+                "finalized_at",
             }
         ),
         flags=frozenset({"is_resume", "working_tree_changed", "cancel_requested"}),
