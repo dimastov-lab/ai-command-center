@@ -54,8 +54,36 @@ class PlanReport:
     planner_busy: bool = False
 
 
+# Repo → (canonical project_id, worker-host repository path). The worker's
+# validate_repository accepts only PROJECT_IDS members with the configured
+# path, so the planner must translate the backlog's repo hint into that
+# vocabulary — a task whose repo has no route is reported, never dispatched
+# into a guaranteed dead-letter. One fleet, one table, env-overridable;
+# per-host routing belongs to the multi-host slice (recorded in the epic).
+import json as _json
+import os as _os
+
+_DEFAULT_REPO_ROUTES: dict[str, tuple[str, str]] = {
+    "ai-command-center": ("AICC", "/home/voynadmin/Projects/ai-command-center"),
+    "aios": ("AIOS", "/home/voynadmin/Projects/aios"),
+    "~/Projects/aios": ("AIOS", "/home/voynadmin/Projects/aios"),
+    "~/Projects/ai-command-center": ("AICC", "/home/voynadmin/Projects/ai-command-center"),
+}
+
+
+def repo_route(repo: str) -> tuple[str, str] | None:
+    raw = _os.environ.get("AICC_PLANNER_REPO_ROUTES", "")
+    if raw:
+        try:
+            table = {k: (v[0], v[1]) for k, v in _json.loads(raw).items()}
+        except (ValueError, TypeError, IndexError):
+            return None  # a broken override routes nothing: fail closed, visibly
+        return table.get(repo)
+    return _DEFAULT_REPO_ROUTES.get(repo)
+
+
 def _payload_for(
-    task: dict[str, Any], limits: PlanLimits
+    task: dict[str, Any], limits: PlanLimits, route: tuple[str, str]
 ) -> tuple[dict[str, Any], int]:
     """The agent_run payload plus the attempt budget (= cascade length).
 
@@ -65,6 +93,7 @@ def _payload_for(
     plane acting on the canonical store.
     """
     cascade = cascade_for("implementation")
+    project_id, repository_path = route
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
         f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
@@ -77,8 +106,8 @@ def _payload_for(
     payload = {
         "kind": "agent_run",
         "v": AGENT_RUN_SCHEMA_VERSION,
-        "project_id": task["task_id"],
-        "repository_path": task["repo"],
+        "project_id": project_id,
+        "repository_path": repository_path,
         "prompt": prompt,
         "task_type": cascade[0]["task_type"],
         "timeout_seconds": limits.timeout_seconds,
@@ -143,7 +172,14 @@ class Planner:
                 if not dispatchable:
                     report.undispatchable.append((task_id, "no_repo"))
                     continue
-                payload, budget = _payload_for(task, limits)
+                route = repo_route(repo)
+                if route is None:
+                    # An unrouted repo is a report line, never a dispatch into
+                    # a guaranteed dead-letter (the first live tick proved the
+                    # worker refuses unknown projects three times, honestly).
+                    report.undispatchable.append((task_id, "unknown_repo_route"))
+                    continue
+                payload, budget = _payload_for(task, limits, route)
                 ok, reason, work_item_id, _revision = self._row(
                     "SELECT * FROM backlog_dispatch(%s, %s, %s, %s, %s::jsonb, %s)",
                     (
