@@ -18,6 +18,7 @@ function's own refusal reason, including ``skipped_by_wave_gate``
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,9 +61,6 @@ class PlanReport:
 # vocabulary — a task whose repo has no route is reported, never dispatched
 # into a guaranteed dead-letter. One fleet, one table, env-overridable;
 # per-host routing belongs to the multi-host slice (recorded in the epic).
-import json as _json
-import os as _os
-
 _DEFAULT_REPO_ROUTES: dict[str, tuple[str, str]] = {
     "ai-command-center": ("AICC", "/home/voynadmin/Projects/ai-command-center"),
     "aios": ("AIOS", "/home/voynadmin/Projects/aios"),
@@ -72,10 +70,10 @@ _DEFAULT_REPO_ROUTES: dict[str, tuple[str, str]] = {
 
 
 def repo_route(repo: str) -> tuple[str, str] | None:
-    raw = _os.environ.get("AICC_PLANNER_REPO_ROUTES", "")
+    raw = os.environ.get("AICC_PLANNER_REPO_ROUTES", "")
     if raw:
         try:
-            table = {k: (v[0], v[1]) for k, v in _json.loads(raw).items()}
+            table = {k: (v[0], v[1]) for k, v in json.loads(raw).items()}
         except (ValueError, TypeError, IndexError):
             return None  # a broken override routes nothing: fail closed, visibly
         return table.get(repo)
