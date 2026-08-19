@@ -153,10 +153,11 @@ jobs:
       # postgresql-client, and pg_dump refuses to dump a newer server outright,
       # so the matching major is installed from PGDG.
       - name: Install PostgreSQL 17 client (for the backup/restore drill)
+        timeout-minutes: 5
         if: steps.change-scope.outputs.docs_only != 'true'
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+          sudo curl --retry 3 -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
             https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
