@@ -86,6 +86,44 @@ def _strip_bold(text: str) -> str:
 
 _REPO_HINT = re.compile(r"Target repo[^`]*`([^`]+)`")
 
+# Repo inference from the task-id family, so the whole backlog is machine-
+# routable without a per-record hint. An explicit `Target repo` hint always
+# wins (below); this is the fallback. A family whose work is NOT a code change
+# in one of our repos (ops/infra/planning/commercial/product-spec) maps to
+# None on purpose — mis-routing a non-code task into a repo is worse than
+# leaving it unrouted and visible in the planner report.
+_REPO_BY_FAMILY: dict[str, str | None] = {
+    # AIOS core and the platform/dispatch work that lives there
+    "PLAT": "aios", "AIOS": "aios", "SEC": "aios", "ARCH": "aios",
+    # AI Command Center product + server lane
+    "AICC": "ai-command-center", "BE": "ai-command-center",
+    "MIN": "ai-command-center", "UX": "ai-command-center",
+    "AGT": "ai-command-center", "IOS": "ai-command-center",
+    "BO": "ai-command-center", "APP": "ai-command-center",
+    # Non-code families: no repo, reported not dispatched
+    "OPS": None, "CI": None, "INFRA": None, "COMMON": None, "PLAN": None,
+    "COM": None, "STAGE": None, "G": None, "EXT": None, "AI": None,
+    "AML": None, "AICOS": None,
+}
+
+# The F* wave-0 foundation tasks were split across repos by owner decision;
+# encoded explicitly rather than by prefix.
+_REPO_BY_ID: dict[str, str] = {
+    "VOYN-W0-F2": "aios", "VOYN-W0-F3": "ai-command-center",
+    "VOYN-W0-F4": "aios", "VOYN-W0-F5": "ai-command-center",
+}
+
+
+def _infer_repo(task_id: str) -> str | None:
+    if task_id in _REPO_BY_ID:
+        return _REPO_BY_ID[task_id]
+    # VOYN-<wave?>-<FAMILY>-... — take the family token after the optional wave.
+    parts = task_id.split("-")
+    for token in parts[1:]:
+        if token in _REPO_BY_FAMILY:
+            return _REPO_BY_FAMILY[token]
+    return None
+
 
 def parse_backlog(text: str) -> ParseReport:
     report = ParseReport()
@@ -107,6 +145,8 @@ def parse_backlog(text: str) -> ParseReport:
             hint = _REPO_HINT.search(body)
             if hint:
                 repo = hint.group(1).strip()
+        if repo is None:
+            repo = _infer_repo(current.task_id)
         report.tasks.append(
             ParsedTask(
                 task_id=current.task_id,
