@@ -222,9 +222,10 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",
         "backlog_lease_release",
-        # BO-S2 (0006): the planner's atomic dispatch and lane release.
+        # BO-S2 (0006) + BO-S3 (0007): dispatch, ingest, return-to-pool.
         "backlog_dispatch",
-        "backlog_release_terminal",
+        "backlog_ingest_results",
+        "backlog_return_to_pool",
     }
 
 
