@@ -55,7 +55,8 @@ MUTATING_VERBS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 #: ``(method, path template) -> operation``. Exhaustive over both HTTP
 #: surfaces: ``command_center/api/app.py`` (27) and
-#: ``command_center/webapi/app.py`` (2).
+#: ``command_center/webapi/app.py`` (3: two dispatch writes and the queue
+#: audit enqueue, VOYN-W0-APP-CONTROL-S1/S4).
 ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     # -- command_center/api/wave1_routes.py -------------------------------
     ("POST", "/api/v1/proposals"): "proposals:create",
@@ -94,6 +95,8 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     # -- command_center/dispatch/api.py -----------------------------------
     ("POST", "/api/v1/dispatch/assign"): "dispatch:assign",
     ("PUT", "/api/v1/dispatch/policy"): "dispatch:policy:update",
+    # -- command_center/webapi/queue_routes.py ----------------------------
+    ("POST", "/api/v1/queue/audit"): "queue:audit:enqueue",
 }
 
 
@@ -214,7 +217,9 @@ def authenticate(request: Request) -> Principal:
         #
         # 503, not 401, on purpose: "we do not know who you are" and "you are
         # not authenticated" want different alerts and different client retries.
-        raise HTTPException(status_code=503, detail="identity authority unavailable") from None
+        raise HTTPException(
+            status_code=503, detail="identity authority unavailable"
+        ) from None
 
     if principal is None:
         # A flat refusal. The platform's own reason vocabulary is never
@@ -266,7 +271,9 @@ def require_principal(principal: Principal | None = Depends(enforce)) -> Princip
     invent an actor when authentication did not produce one.
     """
     if principal is None:  # pragma: no cover - unreachable on a mutating route
-        raise HTTPException(status_code=500, detail="unauthenticated handler invocation")
+        raise HTTPException(
+            status_code=500, detail="unauthenticated handler invocation"
+        )
     return principal
 
 
@@ -377,9 +384,14 @@ def validate_routing(app: FastAPI) -> None:
     if unrouted:
         problems.append("no routing entry: " + "; ".join(sorted(unrouted)))
     if unknown_operation:
-        problems.append("operation outside the closed inventory: " + "; ".join(sorted(unknown_operation)))
+        problems.append(
+            "operation outside the closed inventory: "
+            + "; ".join(sorted(unknown_operation))
+        )
     if unguarded:
-        problems.append("authentication dependency not mounted: " + "; ".join(sorted(unguarded)))
+        problems.append(
+            "authentication dependency not mounted: " + "; ".join(sorted(unguarded))
+        )
     if checked == 0:
         problems.append("walked 0 mutating routes — the route walker is broken")
     if problems:
