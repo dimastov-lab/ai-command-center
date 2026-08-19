@@ -142,10 +142,11 @@ jobs:
       # (even non-desktop ones) can run. Cheap (apt), only needed when the
       # desktop deps are installed.
       - name: Install Qt system libraries (for optional desktop shell)
+        timeout-minutes: 5
         if: steps.change-scope.outputs.docs_only != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
 
       # `tests/db`'s backup/restore drill runs the real scripts, which need a
       # client at least as new as the server. The runner image ships an older
@@ -160,8 +161,8 @@ jobs:
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
             https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-17
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends postgresql-client-17
 
       - name: Install dependencies
         if: steps.change-scope.outputs.docs_only != 'true'
@@ -608,10 +609,11 @@ jobs:
           cache-dependency-path: requirements-ci-linux.lock
 
       - name: Install Qt system libraries (for optional desktop shell)
+        timeout-minutes: 5
         if: steps.select.outputs.mode == 'subset'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
 
       - name: Install dependencies
         if: steps.select.outputs.mode == 'subset'
