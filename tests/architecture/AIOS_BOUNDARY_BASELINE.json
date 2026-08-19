@@ -293,6 +293,12 @@
     "command_center/worker/daemon.py": [
       "orchestration"
     ],
+    "command_center/worker/handlers.py": [
+      "orchestration"
+    ],
+    "command_center/worker/payloads.py": [
+      "orchestration"
+    ],
     "command_center/worktree_launcher.py": [
       "orchestration"
     ],

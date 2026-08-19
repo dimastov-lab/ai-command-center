@@ -22,6 +22,7 @@ def main() -> int:
     from command_center.db.config import ConfigError, load_config
     from command_center.db.work_queue_store import WorkQueueStore
     from command_center.worker.daemon import WorkerDaemon
+    from command_center.worker.handlers import build_handlers
 
     try:
         config = load_config()
@@ -34,7 +35,7 @@ def main() -> int:
         print(f"worker: cannot reach PostgreSQL: {error}", file=sys.stderr)
         return 3
 
-    daemon = WorkerDaemon(WorkQueueStore(), handlers={})
+    daemon = WorkerDaemon(WorkQueueStore(), handlers=build_handlers())
     daemon.install_signal_handlers()
     try:
         daemon.run_forever()
