@@ -176,3 +176,49 @@ def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
     outcome = run_agent(_payload(), _event())
     assert len(outcome.result["stdout_tail"]) == 4000
     assert len(outcome.result["stderr_tail"]) == 4000
+
+
+def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
+    """A timed-out run may have half-executed its mutations; redelivery
+    would re-apply them. It is a *result* (status timed_out), never the
+    never-started retryable path — pinned because the mutant
+    `if run.exit_code is None:` survived review's mutation pass."""
+    run_agent, _ = handler
+
+    def timed_out(**kwargs):
+        return agent_runner.RunResult(
+            status="timed_out", exit_code=None, stdout="partial work...",
+            stderr="", duration_seconds=900.0,
+            started_at="2026-08-19T12:00:00+00:00",
+            completed_at="2026-08-19T12:15:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
+    outcome = run_agent(_payload(), _event())
+    assert outcome.ok and outcome.result["status"] == "timed_out"
+
+
+def test_every_payload_defect_is_non_retryable() -> None:
+    """Per-site pinning: only the version error's retryability was asserted,
+    so a site-local `retryable=True` regression would dead-letter-loop bad
+    payloads through max_attempts (review finding 2)."""
+    defects = [
+        _payload(prompt="", project_id=None),      # missing fields
+        _payload(timeout_seconds=7200),            # beyond visibility ceiling
+        _payload(model=123),                       # wrong type
+        _payload(untrusted="yes"),                 # wrong type
+    ]
+    for payload in defects:
+        error = parse_agent_run(payload)
+        assert isinstance(error, PayloadError), payload
+        assert error.retryable is False, error.reason
+
+
+def test_cli_unavailable_is_retryable_and_runs_nothing(handler, monkeypatch) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda: (False, "binary missing")
+    )
+    outcome = run_agent(_payload(), _event())
+    assert not outcome.ok and outcome.retryable
+    assert "unavailable" in outcome.reason and runs == []
