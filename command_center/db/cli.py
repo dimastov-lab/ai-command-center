@@ -59,6 +59,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional attempts to grant beyond those already burned (default 1).",
     )
 
+    # The structured backlog store (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S1).
+    imp = sub.add_parser(
+        "backlog-import",
+        help="Reconcile the Markdown backlog projection into the structured "
+        "store (idempotent; unparsed lines are reported, never dropped).",
+    )
+    imp.add_argument("path", help="Path to VOYN_TASKS_BACKLOG.md")
+    imp.add_argument(
+        "--parse-only",
+        action="store_true",
+        help="Parse and report without touching the database.",
+    )
+    sub.add_parser("backlog-status", help="Task counts by status from the store.")
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -155,6 +169,42 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
+
+            if args.command == "backlog-import":
+                from pathlib import Path
+
+                from command_center.db.backlog_parser import parse_backlog
+                from command_center.db.backlog_store import BacklogStore
+
+                text = Path(args.path).read_text(encoding="utf-8")
+                if args.parse_only:
+                    parsed = parse_backlog(text)
+                    print(f"parsed: {len(parsed.tasks)} tasks")
+                    for line_no, reason, excerpt in parsed.unparsed:
+                        print(f"UNPARSED line {line_no}: {reason} :: {excerpt}")
+                    print(f"unparsed: {len(parsed.unparsed)} lines")
+                    return 0
+                report = BacklogStore(lambda: nullcontext(conn)).import_markdown(text)
+                print(
+                    f"inserted {report.inserted}, updated {report.updated}, "
+                    f"unchanged {report.unchanged}"
+                )
+                for task_id, reason in report.refused:
+                    print(f"REFUSED {task_id}: {reason}")
+                for line_no, reason, excerpt in report.unparsed:
+                    print(f"UNPARSED line {line_no}: {reason} :: {excerpt}")
+                # Refused records are a defect of the file or the vocabulary;
+                # surface them in the exit code so a timer/CI run goes red.
+                return 1 if report.refused else 0
+
+            if args.command == "backlog-status":
+                from command_center.db.backlog_store import BacklogStore
+
+                for status, count in sorted(
+                    BacklogStore(lambda: nullcontext(conn)).counts_by_status().items()
+                ):
+                    print(f"{status}: {count}")
+                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
