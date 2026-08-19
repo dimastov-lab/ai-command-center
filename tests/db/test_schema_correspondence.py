@@ -30,6 +30,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INITIAL_MIGRATION = REPO_ROOT / "command_center" / "db" / "sql" / "0001_initial.up.sql"
 
+#: Migrations after 0001 that alter a table the SQLite authority also has, and
+#: must therefore be applied here for the two sides to be comparable at all.
+#:
+#: Deliberately a list of specific files rather than `migrations.upgrade()`:
+#: 0002 creates `work_item` and its family, which are PostgreSQL-native and have
+#: no SQLite source, so applying the whole set would make every table-count and
+#: table-coverage assertion below fail for a reason that is not a divergence.
+#: The rule for adding a file here is "it changes a table that exists on both
+#: sides"; a migration that only creates PostgreSQL-native objects stays out.
+CORRESPONDING_MIGRATIONS = (
+    REPO_ROOT / "command_center" / "db" / "sql" / "0004_run_finalized_at.up.sql",
+)
+
 #: The bookkeeping table; not a domain table on either side.
 SQLITE_LEDGER = "schema_version"
 
@@ -67,7 +80,24 @@ def sqlite_schema() -> dict:
                     "columns": columns,
                     "pk": [c for _, c in sorted(primary_key)],
                 }
-            shapes, unique_shapes = set(), set()
+            # Partial indexes are collected separately, and the reason is a hole
+            # this scan used to have: the PostgreSQL side filters them out with
+            # `indpred IS NULL`, so a SQLite partial index was compared against a
+            # set that could not contain it — and the only way that stayed green
+            # was that no SQLite partial index existed yet. The first one added
+            # would have failed the comparison while being perfectly correct.
+            # Two sets, compared against their own counterparts, keeps the
+            # original property (a partial index may not stand in for a full one
+            # on the same columns) and adds the missing one (a partial index
+            # must exist on both sides).
+            partial = {
+                name
+                for table in tables
+                for row in conn.execute(f'PRAGMA index_list("{table}")').fetchall()
+                for name in (row[1],)
+                if row[4]
+            }
+            shapes, partial_shapes, unique_shapes = set(), set(), set()
             for index, table in conn.execute(
                 "SELECT name, tbl_name FROM sqlite_master WHERE type='index' "
                 "AND name NOT LIKE 'sqlite_%'"
@@ -75,7 +105,7 @@ def sqlite_schema() -> dict:
                 cols = tuple(
                     row[2] for row in conn.execute(f'PRAGMA index_info("{index}")')
                 )
-                shapes.add((table, cols))
+                (partial_shapes if index in partial else shapes).add((table, cols))
             for table in tables:
                 for row in conn.execute(f'PRAGMA index_list("{table}")').fetchall():
                     if row[3] != "u":
@@ -109,6 +139,7 @@ def sqlite_schema() -> dict:
             return {
                 "tables": tables,
                 "index_shapes": shapes,
+                "partial_index_shapes": partial_shapes,
                 "unique_shapes": unique_shapes,
                 "check_shapes": check_shapes,
             }
@@ -118,8 +149,10 @@ def sqlite_schema() -> dict:
 
 @pytest.fixture
 def postgres_schema(admin_conn) -> dict:
-    """The PostgreSQL target, produced by applying the real migration."""
+    """The PostgreSQL target, produced by applying the real migrations."""
     admin_conn.execute(INITIAL_MIGRATION.read_text(encoding="utf-8"))
+    for migration in CORRESPONDING_MIGRATIONS:
+        admin_conn.execute(migration.read_text(encoding="utf-8"))
 
     tables: dict[str, dict] = {}
     for table, column, nullable, data_type, default in admin_conn.execute(
@@ -154,22 +187,31 @@ def postgres_schema(admin_conn) -> dict:
     # so dropping the secondary index would leave the shape present and the
     # check silent. Counting only non-constraint indexes removes that shadow.
     # `indpred IS NULL` keeps a partial index from standing in for a full one on
-    # the same columns.
-    shapes = {
-        (table, tuple(columns))
-        for table, columns in admin_conn.execute(
-            "SELECT t.relname, array_agg(a.attname ORDER BY k.ord) "
-            "FROM pg_index i "
-            "JOIN pg_class c ON c.oid = i.indexrelid "
-            "JOIN pg_class t ON t.oid = i.indrelid "
-            "JOIN pg_namespace n ON n.oid = t.relnamespace "
-            "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
-            "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
-            "WHERE n.nspname = 'public' AND NOT i.indisprimary AND NOT i.indisunique "
-            "AND i.indpred IS NULL "
-            "GROUP BY c.oid, t.relname"
-        ).fetchall()
-    }
+    # the same columns — which is why the partial ones are collected into their
+    # own set below rather than dropped. Discarding them entirely made this side
+    # unable to represent a SQLite partial index at all, so the first one to be
+    # added would have failed the comparison for being partial rather than for
+    # being absent.
+    def _index_shapes(partial: bool) -> set[tuple[str, tuple[str, ...]]]:
+        predicate = "IS NOT NULL" if partial else "IS NULL"
+        return {
+            (table, tuple(columns))
+            for table, columns in admin_conn.execute(
+                "SELECT t.relname, array_agg(a.attname ORDER BY k.ord) "
+                "FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "JOIN pg_class t ON t.oid = i.indrelid "
+                "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE "
+                "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum "
+                "WHERE n.nspname = 'public' AND NOT i.indisprimary AND NOT i.indisunique "
+                f"AND i.indpred {predicate} "
+                "GROUP BY c.oid, t.relname"
+            ).fetchall()
+        }
+
+    shapes = _index_shapes(partial=False)
+    partial_shapes = _index_shapes(partial=True)
     # Constraints by the columns they cover, not by how many there are: a UNIQUE
     # moving from (a, b) to (a, c) leaves the count at 7 and changes what the
     # database actually guarantees.
@@ -207,6 +249,7 @@ def postgres_schema(admin_conn) -> dict:
     return {
         "tables": tables,
         "index_shapes": shapes,
+        "partial_index_shapes": partial_shapes,
         "unique_shapes": unique_shapes,
         "check_shapes": check_shapes,
         "identity_columns": identity,
@@ -310,6 +353,27 @@ def test_every_sqlite_index_keeps_its_column_set(sqlite_schema, postgres_schema)
     assert lost == [], "SQLite index column sets with no PostgreSQL counterpart"
 
 
+def test_every_sqlite_partial_index_keeps_its_column_set(
+    sqlite_schema, postgres_schema
+) -> None:
+    """Partial indexes, compared against partial indexes.
+
+    Separate from the full-index check on purpose. Folding the two sets together
+    would let a full index satisfy a partial one and the other way round, and
+    those are different objects: `idx_run_unfinalized` covers `(state)` only
+    `WHERE finalized_at IS NULL`, and a full index on `(state)` would answer the
+    cutover's predicate by scanning every run that ever finished.
+
+    The positive control is that the set is non-empty — an assertion between two
+    empty sets is the shape this file already warns about elsewhere.
+    """
+    assert sqlite_schema["partial_index_shapes"], "no partial index to compare"
+    lost = sorted(
+        sqlite_schema["partial_index_shapes"] - postgres_schema["partial_index_shapes"]
+    )
+    assert lost == [], "SQLite partial index column sets with no PostgreSQL counterpart"
+
+
 def test_constraint_parity(sqlite_schema, postgres_schema) -> None:
     """UNIQUE and CHECK counts must match.
 
@@ -381,7 +445,7 @@ def test_the_columns_needing_value_conversion_are_the_documented_ones(
 ) -> None:
     """The map's headline hazard, pinned.
 
-    114 of 395 columns change type, and 75 of them are `TEXT` -> `timestamptz`.
+    115 of 396 columns change type, and 76 of them are `TEXT` -> `timestamptz`.
     `command_center/models.py:iso_now` writes naive local time with no offset, so
     those strings are reinterpreted under the importer's session time zone —
     a silent, unrecoverable shift. The count is asserted so the migration cannot
@@ -402,7 +466,7 @@ def test_the_columns_needing_value_conversion_are_the_documented_ones(
             elif target == "boolean" and declared.startswith("INT"):
                 conversions["boolean"] += 1
 
-    assert conversions["timestamptz"] == 75
+    assert conversions["timestamptz"] == 76
     assert conversions["jsonb"] == 22
     assert conversions["boolean"] == 8
 

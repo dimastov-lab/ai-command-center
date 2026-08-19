@@ -43,6 +43,14 @@ from tests.db.mirror_discovery import mirror_classes
 ROOT = Path(__file__).resolve().parents[2]
 DDL = (ROOT / "command_center/db/sql/0001_initial.up.sql").read_text(encoding="utf-8")
 
+#: `ALTER TABLE <t> ADD COLUMN <name> <type>;` as later migrations write it.
+#: Anchored at the start of a line so the same words inside a comment — and
+#: these files are mostly comment — cannot invent a column.
+_ADD_COLUMN = re.compile(
+    r"^ALTER\s+TABLE\s+([a-z_][a-z0-9_]*)\s+ADD\s+COLUMN\s+([a-z_][a-z0-9_]*)\s+([^;]+);",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 #: What `models.iso_now()` emits: naive local, second precision, no offset.
 SAMPLE_TIMESTAMP = "2026-08-14T00:00:00"
 
@@ -81,12 +89,39 @@ MIRRORS = _discover()
 IDS = [table for table, _ in MIRRORS]
 
 
+@functools.cache
+def _added_columns() -> dict[str, tuple[tuple[str, str], ...]]:
+    """`{table: ((column, declared type), ...)}` from migrations after 0001.
+
+    The accepted schema stopped being one file the moment a migration altered a
+    table it declared. Reading only 0001 made this contract unsatisfiable rather
+    than merely incomplete: a mirror that listed the new column failed the
+    column-list pin, and a mirror that omitted it failed the coverage check
+    against the live SQLite schema — so the honest fix is to let the pin read
+    what the migration set actually produces.
+
+    In migration order, because both engines append `ADD COLUMN` at the end of
+    the ordinal order; applying them out of order would pin a column sequence no
+    database has.
+    """
+    added: dict[str, list[tuple[str, str]]] = {}
+    for path in sorted((ROOT / "command_center/db/sql").glob("*.up.sql")):
+        if path.name.startswith("0001_"):
+            continue
+        for table, column, declared in _ADD_COLUMN.findall(path.read_text(encoding="utf-8")):
+            added.setdefault(table.lower(), []).append((column.lower(), declared.strip()))
+    return {table: tuple(columns) for table, columns in added.items()}
+
+
 def _declared_columns(table: str) -> dict[str, str]:
     """`{column: declared type}` from the accepted schema.
 
     The DDL is the source of truth for the sample rows below: a `text` value in
     an `integer NOT NULL` column would fail on the real database and tell us
     nothing about the mirror.
+
+    "The accepted schema" means 0001 *plus* every later `ADD COLUMN`, in
+    migration order — see `_added_columns`.
     """
     body = DDL.split(f"CREATE TABLE {table} (", 1)[1].split(");", 1)[0]
     columns: dict[str, str] = {}
@@ -96,7 +131,31 @@ def _declared_columns(table: str) -> dict[str, str]:
             continue
         name, _, rest = line.partition(" ")
         columns[name] = rest.strip().rstrip(",")
+    for column, declared in _added_columns().get(table, ()):
+        columns[column] = declared
     return columns
+
+
+def test_the_migration_scan_finds_a_column_added_after_0001() -> None:
+    """The positive control for `_added_columns`.
+
+    Without it, a regex that matched nothing would silently return to pinning
+    only 0001 — and every mirror would still be green until the next migration
+    added a column, which is exactly the failure mode this scan replaces.
+    """
+    assert _added_columns()["run"] == (("finalized_at", "timestamptz"),)
+    assert _declared_columns("run")["finalized_at"] == "timestamptz"
+
+
+def test_the_migration_scan_ignores_add_column_inside_prose() -> None:
+    """These files are mostly comment, and the words appear in them.
+
+    A scan that matched a discussion of `ALTER TABLE ... ADD COLUMN` would
+    invent columns no database has, and the pin would then demand that mirrors
+    declare them.
+    """
+    prose = "-- ALTER TABLE run ADD COLUMN invented_by_a_comment text;\n"
+    assert _ADD_COLUMN.findall(prose) == []
 
 
 def _value_for(table: str, column: str, spec: MirroredTable, row_id: str) -> object:
