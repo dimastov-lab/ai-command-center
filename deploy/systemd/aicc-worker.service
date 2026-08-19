@@ -43,6 +43,14 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 StateDirectory=aicc-worker
+# Resource envelope (SRV-05): declared limits, enforced by cgroups — which,
+# unlike the mount/network sandbox directives, apply for user units too.
+# Acceptance of the *sandbox* directives is measurement-from-inside per
+# SRV-05-B and deliberately not claimed here.
+MemoryMax=6G
+MemoryHigh=5G
+CPUQuota=300%
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target

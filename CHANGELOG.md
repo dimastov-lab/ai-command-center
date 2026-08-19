@@ -8,6 +8,19 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added (SRV-05 slice 2)
+- `command_center/worker/payloads.py` — versioned `agent_run` payload contract
+  (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
+  provenance defaults to untrusted.
+- `command_center/worker/handlers.py` — the payload→execution bridge through
+  the existing `agent_runner.run_claude_code` (sandbox profiles, credential
+  scrubbing and timeouts stay the runner's decisions); untrusted mutating
+  payloads are refused, not silently downgraded; results travel as bounded
+  tails.
+- `deploy/systemd/aicc-worker.service` — declared cgroup resource envelope
+  (MemoryMax/MemoryHigh/CPUQuota/TasksMax); sandbox-directive acceptance
+  stays measurement-from-inside per SRV-05-B.
+
 ### Added — the headless worker service (`VOYN-W0-AICC-SRV-05`, slice 1)
 
 - `command_center/db/work_queue_store.py`: the first Python surface over the
