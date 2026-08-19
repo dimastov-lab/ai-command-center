@@ -103,6 +103,29 @@ class RunFinalizer:
         self.append_lifecycle_event_best_effort("auto_committed", run_id, head=head)
         return head
 
+    def mark_finalized(self, run_id: str) -> None:
+        """Stamp the run's durability watermark — the last write of any
+        finalization path (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
+
+        Every caller must place this *after* the writes it is vouching for: the
+        `process_exited` event, the auto-commit, the report. The marker's whole
+        meaning is that those are already durable, so a call moved earlier — in
+        particular into the `fields` of `update_run_state` — would keep the
+        column and destroy the guarantee, leaving a marker that says "finished"
+        during the window in which nothing has been written yet.
+
+        Best-effort in the same sense as the lifecycle events: a marker that
+        cannot be written leaves the run *unfinalized*, which is the safe
+        direction. A reader then waits or recovers a run that was in fact
+        complete, where the failure in the other direction — declaring a run
+        finalized when its report is missing — is the one that loses work.
+        """
+        try:
+            db.mark_run_finalized(self.db_path, run_id)
+        except Exception:
+            logger.exception("Could not mark run %s finalized", run_id)
+            self.append_lifecycle_event_best_effort("finalization_marker_failed", run_id)
+
     def persist_run_failure(
         self,
         run_id: str,
@@ -161,6 +184,13 @@ class RunFinalizer:
                     run_id,
                     exit_code=exit_code,
                 )
+                # Last, as everywhere: this path *is* the whole finalization for
+                # a run whose supervision failed or whose child was confirmed
+                # gone — there is no report to wait for — so the marker goes
+                # after the attempt is finished and the lifecycle event is
+                # appended. Without it such runs would stay permanently
+                # unfinalized and the cutover predicate would never drain.
+                self.mark_finalized(run_id)
                 return True
             except (db.LostUpdateError, db.InvalidTransitionError):
                 continue

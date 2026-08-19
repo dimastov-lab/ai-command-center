@@ -676,6 +676,95 @@ def update_run_state(
     return stored_run
 
 
+def mark_run_finalized(db_path: Path, run_id: str) -> dict | None:
+    """Stamp `run.finalized_at` — the last write of finalization, never part of
+    the terminal-state UPDATE (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
+
+    The ordering *is* the feature. `update_run_state` publishes the terminal
+    state, and the report, the auto-commit and the `process_exited` event are
+    all written after it, on a daemon thread interpreter shutdown does not join.
+    Calling this at the end of that sequence makes the marker a consequence of
+    those durable writes rather than an announcement of them: a reader that sees
+    `finalized_at` knows the report exists, and a process killed anywhere in the
+    window leaves the run terminal-but-unfinalized, which is recoverable,
+    instead of terminal-and-silently-reportless, which is not detectable at all.
+    Folding this into the `fields` dict of `update_run_state` would restore
+    exactly the bug this task exists to remove.
+
+    Write-once and idempotent: `WHERE finalized_at IS NULL` means a retry, a
+    duplicate finalization or a recovery pass cannot move a marker that is
+    already set, so the recorded moment stays the first one at which the run's
+    evidence was durable.
+
+    Deliberately does **not** bump `version`, and deliberately does not touch
+    `updated_at`. Those belong to the optimistic-concurrency protocol for
+    *domain* mutations, and this is a durability watermark, not a domain change.
+    Bumping the version would make an unrelated CAS holder — `task_sync` writing
+    `commit_hash` at terminal state is the live example — lose its update
+    because a bookkeeping write landed between its read and its write, turning
+    the marker into precisely the kind of race it was added to close.
+
+    Returns the stored row, or `None` if the run is gone or was already marked.
+    """
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            cur = conn.execute(
+                "UPDATE run SET finalized_at = ? WHERE id = ? AND finalized_at IS NULL",
+                (db.iso_now(), run_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            stored_run = dict(conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone())
+    _mirror_run(stored_run)
+    return stored_run
+
+
+def count_unfinalized_runs(db_path: Path) -> int:
+    """How many runs are terminal but have not finished finalizing.
+
+    The cross-process predicate that did not exist. `Supervisor.wait_for_run`
+    answers a similar question by watching an in-memory registry, which is
+    private to the process that launched the run — so the operator draining a
+    cutover, the backward mirror deciding whether the seam is quiet, and a
+    readiness probe all had nothing to read. This is a plain query against the
+    stored marker, so any process that can open the database can evaluate it.
+
+    Zero means every terminal run's report and auto-commit are durable. Nonzero
+    means at least one run is either still inside its finalization window or was
+    killed inside it; the two are distinguished by whether the owning process is
+    still alive, not by this count.
+
+    Served by the partial index `idx_run_unfinalized`, which holds an entry only
+    while a run is unfinalized.
+    """
+    placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
+    with db.connect(db_path) as conn:
+        (n,) = conn.execute(
+            f"SELECT COUNT(*) FROM run WHERE finalized_at IS NULL AND state IN ({placeholders})",
+            tuple(db.TERMINAL_STATES),
+        ).fetchone()
+        return int(n)
+
+
+def list_unfinalized_runs(db_path: Path, *, limit: int = 100) -> list[dict]:
+    """The rows behind `count_unfinalized_runs`, oldest completion first.
+
+    An operator who sees a nonzero count needs to know *which* runs, to decide
+    whether to wait or to recover them; a bare number turns a drainable
+    condition into an opaque one.
+    """
+    placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT * FROM run
+                WHERE finalized_at IS NULL AND state IN ({placeholders})
+                ORDER BY completed_at ASC, id ASC
+                LIMIT ?""",
+            (*db.TERMINAL_STATES, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def set_run_result_fields(
     db_path: Path,
     run_id: str,

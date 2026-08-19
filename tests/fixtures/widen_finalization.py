@@ -29,7 +29,6 @@ import atexit
 import os
 import runpy
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,29 +45,14 @@ if _WIDEN <= 0:
         "it without one would quietly measure nothing"
     )
 
-from command_center.runtime import db as _db  # noqa: E402  (after sys.path setup)
+# The widening itself now lives in `finalization_window`, because the kill probe
+# needs the same mechanism around a bare `Supervisor` rather than around this
+# CLI, and two copies of it would drift apart exactly where it matters. What
+# this file keeps is what is specific to wrapping the CLI: the argv rewrite, the
+# marker file, and the refusal below.
+from tests.fixtures import finalization_window  # noqa: E402  (after sys.path setup)
 
-_TERMINAL = set(_db.TERMINAL_STATES)
-_original_update_run_state = _db.update_run_state
-
-
-_slept = 0
-
-
-def _update_run_state(*args, **kwargs):
-    global _slept
-    result = _original_update_run_state(*args, **kwargs)
-    # `new_state` is keyword-only in `db.execution.update_run_state`, so a
-    # positional call cannot occur without a signature change — but a rename or
-    # a relocation of the terminal write would make this condition stop
-    # matching, and that is what the exit check below exists to catch.
-    if kwargs.get("new_state") in _TERMINAL:
-        _slept += 1
-        time.sleep(_WIDEN)
-    return result
-
-
-_db.update_run_state = _update_run_state
+finalization_window.widen(_WIDEN)
 
 # Proof that it *fired*, not that it was installed.
 #
@@ -89,9 +73,10 @@ _cli_code: object = 0
 
 @atexit.register
 def _refuse_to_report_an_unwidened_run() -> None:
-    if _slept:
+    slept = finalization_window.fired()
+    if slept:
         if _MARKER:
-            Path(_MARKER).write_text(str(_slept), encoding="utf-8")
+            Path(_MARKER).write_text(str(slept), encoding="utf-8")
         return
     sys.stderr.write(
         "widen_finalization: the terminal-state write never went through this "

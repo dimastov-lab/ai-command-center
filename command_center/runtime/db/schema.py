@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -198,6 +198,48 @@ def _migration_11_add_pre_run_head(conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
         if "pre_run_head" not in existing:
             conn.execute("ALTER TABLE run ADD COLUMN pre_run_head TEXT")
+
+
+def _migration_24_add_finalized_at(conn: sqlite3.Connection) -> None:
+    """The durable marker that a run's finalization finished, not merely that
+    its state went terminal (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
+
+    `_supervise` commits the terminal row first and only then appends
+    `process_exited`, auto-commits the agent's work and saves the report, on a
+    daemon thread interpreter shutdown does not join. For the width of that
+    window — measured over 20 runs at a 6.1 ms median on a clean working tree
+    and a 139 ms median (152 ms max) on a changed one, where the real `git
+    commit` of the auto-commit costs 133 ms — the run reads COMPLETED while its
+    report does not exist and the agent's commit has not been made. The window
+    is widest precisely when there is work to lose. `finalized_at` is written
+    *after* those, so a reader can tell
+    "finished" from "terminal, still finalizing", and a process killed inside
+    the window leaves the run visibly unfinalized rather than silently
+    reportless.
+
+    Its point is to be readable from *another process*: `Supervisor.wait_for_run`
+    answers the same question from an in-memory registry, which the operator
+    running a cutover does not have. See `db.count_unfinalized_runs`.
+
+    Nullable and never backfilled — a pre-existing row finalized under a
+    supervisor that recorded nothing, and stamping it now would assert durable
+    evidence that was never checked.
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2,
+    3, 4, 9, 11 — safe to re-run and safe under concurrent first-application via
+    the `BEGIN IMMEDIATE` transaction in `migrate()`. The partial index mirrors
+    `idx_run_unfinalized` in `0004_run_finalized_at.up.sql`: it holds an entry
+    only while a run is unfinalized, so a successful finalization removes its
+    own row from it.
+    """
+    with db.transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        if "finalized_at" not in existing:
+            conn.execute("ALTER TABLE run ADD COLUMN finalized_at TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_unfinalized "
+            "ON run (state) WHERE finalized_at IS NULL"
+        )
 
 
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
@@ -1117,4 +1159,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (21, _SCHEMA_V21),
     (22, _SCHEMA_V22),
     (23, _SCHEMA_V23),
+    (24, _migration_24_add_finalized_at),
 ]
