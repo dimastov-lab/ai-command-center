@@ -171,8 +171,10 @@ Recorded exception, frozen-adjacent rather than legacy (see the procedure
 section below for why it exists at all):
 
 - **Server work queue (SRV lane)** — `command_center/db/work_queue_store.py`
-  (queue client), `command_center/worker/` (daemon, entrypoint, payload
-  contract, agent_run bridge) — clients of the PL/pgSQL queue authority
+  (queue client), `command_center/db/work_queue_admin.py` (control-plane
+  recovery surface: reap/DLQ/redrive, VOYN-W0-AICC-SRV-06),
+  `command_center/worker/` (daemon, entrypoint, payload contract, agent_run
+  bridge, sd_notify watchdog seam) — clients of the PL/pgSQL queue authority
   accepted via VOYN-W0-AICC-SRV-03/04b. The bridge executes through the
   frozen runner (`agent_runner.run_claude_code`) unchanged — sandbox
   profiles, credential scrubbing and timeouts stay the legacy engine's
