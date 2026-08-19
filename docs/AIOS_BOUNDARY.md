@@ -163,9 +163,56 @@ into AIOS Core (post-AIOS-CORE-ACCEPTED); growth is prohibited.**
 - **Audit** — `command_center/activity_log.py`, `daily_audit.py`,
   `daily_audit_backend.py`.
 - **Authz** — `command_center/companion/auth.py` (an explicit placeholder; the
-  gate keeps it one).
+  gate keeps it one), and `command_center/http_auth/` (see below).
 - **Memory/persistence** — `command_center/storage.py`,
   `tasks_repository.py`, `aml_store.py`.
+
+Recorded exception, frozen-adjacent rather than legacy (see the procedure
+section below for why it exists at all):
+
+- **Server work queue (SRV lane)** — `command_center/db/work_queue_store.py`
+  (queue client), `command_center/db/work_queue_admin.py` (control-plane
+  recovery surface: reap/DLQ/redrive, VOYN-W0-AICC-SRV-06),
+  `command_center/worker/` (daemon, entrypoint, payload contract, agent_run
+  bridge, sd_notify watchdog seam) — clients of the PL/pgSQL queue authority
+  accepted via VOYN-W0-AICC-SRV-03/04b. The bridge executes through the
+  frozen runner (`agent_runner.run_claude_code`) unchanged — sandbox
+  profiles, credential scrubbing and timeouts stay the legacy engine's
+  decisions; the bridge owns only payload validation and outcome folding.
+
+### `command_center/http_auth/` — why it was added to a frozen category
+
+The gate was right to flag it, so the reasoning is recorded here rather than in
+a commit message (`VOYN-W0-AICC-AUTH-HTTP-01`).
+
+AICC's 29 mutating HTTP routes had no authentication at all. Closing that
+needed *something* named `auth` in this repository. The doctrine says new
+engine capability of a frozen category belongs in AIOS and is consumed here
+through its versioned contract — and that is precisely the shape of what was
+added:
+
+* `identity.py` **is the consumption seam**, not an engine. It stores no
+  credential, hashes nothing, holds no signing key and mints no token. It makes
+  one call to the platform's `GET /api/v1/whoami` and reads back a principal
+  id. The alternative — verifying credentials in-process — was rejected exactly
+  because it would have made AICC an identity authority and given it read
+  access to the platform's credential store.
+* `authz.py` is an **access-control list keyed by the platform's identifier**,
+  the same kind of object as `command_center/db/roles.py` is for PostgreSQL
+  roles. It exists because `whoami` answers "who", not "what may they do here":
+  its capabilities are platform-global and name no service, so treating a 200
+  as permission would grant AICC write access to every principal the platform
+  has ever issued a credential to.
+* `routing.py` is a route table and a boot check. No engine behaviour at all.
+
+What would make this a genuine violation is AICC growing its own credential
+store, its own token format, or a second principal registry. Tests assert the
+absence of the first two, and the design records the third as forbidden.
+
+The residual question — whether the *grant map* should eventually live in AIOS
+as per-service authorization rather than in this repository — is real and is
+tracked as `VOYN-W0-AICC-AUTHZ-BOUNDARY-01`. Until AIOS offers that contract,
+an AICC-local, deny-by-default ACL is the least-authority option available.
 
 ## Changing the baseline (a reviewed change)
 
@@ -193,6 +240,25 @@ python -m tests.architecture.aios_boundary --write-baseline
 Adding a *new* engine capability is never a baseline edit — new capability of
 these categories belongs in AIOS Core and is consumed here through its
 versioned API/SDK/event contracts (ADR-0008).
+
+**One recorded exception, and its shape (2026-08-19).** The server work queue
+of the VOYN SRV lane (`VOYN-W0-AICC-SRV-01..09`) was accepted by the central
+backlog *after* this doctrine was written, and its acceptance placed the
+capability in this repository deliberately: the queue's entire authority —
+claim atomicity, claimant identity, the stale-owner fence, heartbeat clamps,
+reaping — is PL/pgSQL running under PostgreSQL role separation
+(`command_center/db/sql/0002_queue_claim.up.sql`, merged via PR #311/#313).
+The Python modules that accompany it (`command_center/db/work_queue_store.py`,
+`command_center/worker/`) are thin clients of that server authority: they
+render calls to the SQL functions and react to their refusals, exactly the
+delegation-not-ownership shape the `memory` rule above already declines to
+count. The name tokens (`queue`, `worker`) still classify them, so they are
+carried in the baseline under their own subsystem heading rather than
+silently exempted from the scanner. Growth of this subsystem follows the SRV
+lane's own reviewed PRs; growth of the *legacy* frozen engines remains
+prohibited, and convergence into AIOS Core remains this subsystem's stated
+end state once the core's dispatch contract (aios ADR-0022) is accepted and
+covers it.
 
 ## CI wiring
 

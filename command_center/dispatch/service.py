@@ -21,6 +21,7 @@ the task up and launches it on the recorded executor.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from command_center import executors as executors_module
 from command_center import pipeline_settings, project_config, tasks_repository
@@ -35,6 +36,9 @@ from command_center.dispatch.models import (
 )
 from command_center.dispatch.policy import plan_dispatch
 from command_center.runtime import db as runtime_db
+
+if TYPE_CHECKING:  # a type-only import: the service layer stays free of FastAPI
+    from command_center.http_auth.identity import Principal
 
 # Kanban statuses that mean "waiting to be dispatched" — not yet running,
 # not in review, not done. These are the only tasks a dispatch plan considers.
@@ -180,12 +184,19 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
 
 def assign(
     root: Path,
+    principal: "Principal",
     *,
     confirmed: bool,
-    actor: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Compute the plan and APPLY its assignments.
+
+    There is no `actor` parameter, and that is the point: the caller is a
+    `Principal`, a type only the HTTP boundary's platform verification can
+    construct, so an actor cannot be declared by whoever calls this. Passing
+    `actor="whoever"` is a `TypeError` at the call site rather than a value
+    written to the record — the same property `queue_claim()` gets by taking no
+    claimant argument at all (VOYN-W0-AICC-AUTH-HTTP-01, SRV-04b).
 
     Applying means: record the chosen executor onto each assigned task through
     `tasks_repository` (the board's single writer). It does **not** launch a
@@ -233,7 +244,7 @@ def assign(
 
     return {
         "applied": True,
-        "actor": actor,
+        "actor": principal.principal_id,
         "assigned_task_ids": applied_ids,
         "plan": computed.as_dict(),
     }

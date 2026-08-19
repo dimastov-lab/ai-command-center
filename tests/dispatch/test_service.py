@@ -17,8 +17,14 @@ from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
 from command_center.dispatch import models, policy_config, service
 from command_center.dispatch.models import DispatchPolicy, ExecutorProfile
+from command_center.http_auth.identity import Principal
 
 ROOT = Path("/unused-AICC_DATA_DIR-overrides")
+
+# `assign()` has no `actor` parameter to pass (VOYN-W0-AICC-AUTH-HTTP-01): the
+# caller is a verified `Principal`, so these tests supply one rather than a
+# string an HTTP client could have chosen.
+CALLER = Principal(principal_id="operator:test", tenant_id="tenant-1")
 
 
 @pytest.fixture
@@ -183,7 +189,7 @@ def test_assign_records_executor_on_the_task(monkeypatch, pool):
     policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
     task = _queued_task(title="t1")
 
-    result = service.assign(ROOT, confirmed=True, actor="op")
+    result = service.assign(ROOT, CALLER, confirmed=True)
 
     assert result["applied"] is True
     assert result["assigned_task_ids"] == [task["id"]]
@@ -198,7 +204,7 @@ def test_assign_requires_confirmation(monkeypatch, pool):
     _spend(monkeypatch, 0.0)
     task = _queued_task(title="t1")
 
-    result = service.assign(ROOT, confirmed=False)
+    result = service.assign(ROOT, CALLER, confirmed=False)
 
     assert result["applied"] is False
     assert result["reason"] == "confirmation_required"
@@ -212,7 +218,7 @@ def test_assign_is_a_noop_while_kill_switch_engaged(monkeypatch, pool):
     _spend(monkeypatch, 0.0)
     task = _queued_task(title="t1")
 
-    result = service.assign(ROOT, confirmed=True)
+    result = service.assign(ROOT, CALLER, confirmed=True)
 
     assert result["applied"] is False
     assert result["reason"] == "kill_switch_engaged"

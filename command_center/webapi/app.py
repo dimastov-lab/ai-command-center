@@ -1,11 +1,15 @@
 """FastAPI app factory for the AI Command Center web dashboard's backend.
 
-Read-only for this slice: `GET /api/home` and `GET /api/execution` build the
+`GET /api/home` and `GET /api/execution` are read-only and build the
 Workspace Home read model (`workspace_home.build_workspace_home_snapshot`,
 already redacted for BANK/LEGAL at the run/report/artifact/activity level)
 and map it onto frontend DTOs via pure serializers (which
 additionally closes the one redaction gap that function leaves open — see
-`serializers.py`'s module docstring). No mutation, no other routes.
+`serializers.py`'s module docstring). They mutate nothing.
+
+The app also mounts the health probes and the two mutating dispatch routes
+(`POST /api/v1/dispatch/assign`, `PUT /api/v1/dispatch/policy`), which are
+authenticated and authorized through `command_center.http_auth`.
 
 `build_workspace_home_snapshot` and `ExecutionCenterAPI` are imported as
 plain module-level names and referenced unqualified inside the route
@@ -30,11 +34,12 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Response
+from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from command_center.dispatch.api import create_dispatch_router
+from command_center.http_auth.routing import enforce, validate_routing
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.webapi.serializers import serialize_execution, serialize_home
 from command_center.workspace_home import build_workspace_home_snapshot
@@ -137,7 +142,18 @@ def create_app() -> FastAPI:
     # Agent-dispatch policy layer (VOYN-W2-AGENT): `/api/v1/dispatch/*`.
     # Registered before the SPA mount so its routes resolve ahead of the
     # catch-all static handler.
-    app.include_router(create_dispatch_router())
+    # Its two write routes are authenticated and authorized through
+    # `command_center.http_auth` (VOYN-W0-AICC-AUTH-HTTP-01); `enforce` is
+    # mounted here rather than on the individual routes so `validate_routing`
+    # below can prove the coverage against the router tree instead of trusting
+    # that every future route remembers a decorator. `/api/home`,
+    # `/api/execution`, `/healthz` and `/readyz` are registered directly on the
+    # app and stay unauthenticated reads (VOYN-W0-AICC-AUTH-HTTP-02).
+    app.include_router(create_dispatch_router(), dependencies=[Depends(enforce)])
+
+    # Fail closed at boot: an unrouted mutating route stops the process here,
+    # in the environment that matters, not only in a CI report.
+    validate_routing(app)
 
     # Serve the built SPA (built via `web/`'s `npm run build`) from the same
     # origin as the API, so production needs no CORS configuration. Mounted
