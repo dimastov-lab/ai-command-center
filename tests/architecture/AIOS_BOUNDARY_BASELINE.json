@@ -120,6 +120,18 @@
     "command_center/executors.py": [
       "orchestration"
     ],
+    "command_center/http_auth/__init__.py": [
+      "authz"
+    ],
+    "command_center/http_auth/authz.py": [
+      "authz"
+    ],
+    "command_center/http_auth/identity.py": [
+      "authz"
+    ],
+    "command_center/http_auth/routing.py": [
+      "authz"
+    ],
     "command_center/pipeline_settings.py": [
       "orchestration"
     ],

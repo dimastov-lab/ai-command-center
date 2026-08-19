@@ -166,6 +166,58 @@ still describe the desktop client as a pure shell with no data wiring, or as doc
 work only. The code, its tests, and this changelog are the current authority; those three documents
 need reconciliation.
 
+### HTTP authentication for the mutating API surfaces (VOYN-W0-AICC-AUTH-HTTP-01) — 2026-08-15
+
+Both FastAPI applications served no authentication at all. Every mutating route
+now requires a verified platform principal and an explicit AICC-local grant.
+
+#### Added
+- **`command_center/http_auth/`** — `identity.py` (forwards the caller's platform
+  bearer credential to `GET /api/v1/whoami`; stores no credential, hashes
+  nothing, holds no key; fails closed with `503` when the authority is
+  unreachable, which is deliberately distinct from the `401` for a rejected
+  credential; no cache, so a revoked principal is refused on its next request),
+  `authz.py` (a closed, deny-by-default operation inventory and a
+  configuration-driven grant map — a 200 from `whoami` is authentication, never
+  permission), and `routing.py` (the table of all 29 mutating routes, the
+  dependency, and `validate_routing`).
+- **A boot check.** `validate_routing` runs in both app factories: a mutating
+  route with no routing entry, no mounted dependency, or an operation outside
+  the inventory stops the process from starting, as does an unparseable grant
+  file. It also refuses a zero-route inventory, because a route walker that
+  inspects nothing must not report success.
+- **`tests/http_auth/`** — 84 checks, including an unauthenticated sweep of all
+  29 routes, and `tests/http_auth/negative_control.py`, which removes each
+  control in turn on a throwaway copy of the tree and requires the suite to go
+  red (15 mutants, 15 killed, 0 survived).
+
+#### Changed
+- **The mutating surface is 29 routes across two apps, not two.**
+  `command_center/api/app.py` mounts 27 of them while its package docstring
+  still called the application read-only; the docstrings are corrected
+  (`VOYN-W0-AICC-AUTH-HTTP-01a`).
+- **`actor` is gone from the dispatch write bodies.** Not validated — made
+  impossible, following `queue_claim()`: the field is deleted, the request
+  models set `extra="forbid"` so a forged actor is a `422` rather than a silent
+  ignore, and `dispatch.service.assign` / `dispatch.policy_config.update_policy`
+  take a `Principal` and have no `actor` parameter to pass.
+  `PUT /api/v1/dispatch/policy` no longer accepts an unwrapped body as
+  `changes`: that form was indistinguishable from a body carrying an
+  unexpected top-level key.
+
+#### Known limitations
+- **Read paths remain unauthenticated** — out of scope by acceptance criteria,
+  not by cost (measured: 47–76 ms median per verification, a ceiling of roughly
+  105–169 authentications/second). Filed as `VOYN-W0-AICC-AUTH-HTTP-02`.
+- **Seven routes still accept a client-supplied identity field** (`voter_id`,
+  `owner` ×2, `actor` ×4). They are authenticated and authorized like every
+  other route; removing the fields needs per-endpoint product decisions, so each
+  is a signed carve-out in `routing.CLIENT_IDENTITY_CARVE_OUTS` with a reason
+  and a task (`VOYN-W0-AICC-AUTH-HTTP-01b`), and a test refuses any *unsigned*
+  one.
+- **The Streamlit console is untouched** and remains the most exposed surface
+  (`VOYN-W0-AICC-STREAMLIT-EXPOSURE-01`).
+
 ### AIOS Tasks backend (Sprint 4) — 2026-08-06
 
 Feature flag `AICC_TASKS_BACKEND=json|aios` selects the tasks persistence layer at runtime.
