@@ -33,7 +33,12 @@ _PLANNER_AUTHORITY = "planner:global"
 class PlanLimits:
     planner: str = "aicc-planner"
     wip_limit: int = 4
+    #: Repo leases must outlive the dispatched RUN (hours).
     lease_ttl_seconds: int = 7200
+    #: The planner:global lease covers one TICK (seconds) — its own parameter
+    #: (PLANNER-LEASE-TTL follow-up): a tick that dies before releasing must
+    #: not lock every control host out for the repo-lease horizon.
+    planner_lease_ttl_seconds: int = 300
     #: Per-tick dispatch cap, distinct from WIP: one tick must stay short.
     max_dispatches_per_tick: int = 4
     timeout_seconds: int = 900
@@ -45,7 +50,7 @@ class PlanReport:
     skipped_by_wave_gate: list[tuple[str, str]] = field(default_factory=list)
     refused: list[tuple[str, str]] = field(default_factory=list)
     undispatchable: list[tuple[str, str]] = field(default_factory=list)
-    released: list[tuple[str, str]] = field(default_factory=list)  # (task, queue_state)
+    ingested: list[tuple[str, str]] = field(default_factory=list)  # (task, action)
     planner_busy: bool = False
 
 
@@ -63,8 +68,12 @@ def _payload_for(
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
         f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
-        f"{task['body']}".strip()
-    )
+        f"{task['body']}\n\n"
+        "When you open or update a pull request, include its URL in your "
+        "final message, and end the message with a line of exactly this "
+        "form so the orchestrator can record the evidence:\n"
+        "HEAD_SHA: <the branch head commit sha>"
+    ).strip()
     payload = {
         "kind": "agent_run",
         "v": AGENT_RUN_SCHEMA_VERSION,
@@ -98,17 +107,23 @@ class Planner:
         report = PlanReport()
         ok, reason, *_ = self._row(
             "SELECT * FROM backlog_lease_acquire(%s, %s, %s)",
-            (_PLANNER_AUTHORITY, limits.planner, max(limits.lease_ttl_seconds, 60)),
+            (
+                _PLANNER_AUTHORITY,
+                limits.planner,
+                max(limits.planner_lease_ttl_seconds, 60),
+            ),
         )
         if not ok:
             report.planner_busy = True
             return report
         try:
-            # Free finished lanes first, so this very tick can refill them.
-            for task_id, queue_state, _action in self._rows(
-                "SELECT * FROM backlog_release_terminal(%s)", (limits.planner,)
+            # Ingest finished work first (BO-S3): evidence + READY_TO_REVIEW
+            # for the succeeded, return-to-pool (or park) for the dead, lanes
+            # freed — so this very tick can refill them.
+            for task_id, queue_state, action, _detail in self._rows(
+                "SELECT * FROM backlog_ingest_results(%s)", (limits.planner,)
             ):
-                report.released.append((task_id, queue_state))
+                report.ingested.append((task_id, action))
 
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable "

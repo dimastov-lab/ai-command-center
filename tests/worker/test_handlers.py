@@ -306,3 +306,43 @@ def test_absent_cascade_keeps_the_single_executor_behaviour(handler) -> None:
     assert outcome.ok
     assert outcome.result["cascade_step"] is None
     assert runs[-1]["task_type"] == _payload()["task_type"]
+
+
+# -- machine outcome extraction (BO-S3) ---------------------------------------
+
+
+def test_result_carries_pr_url_and_labelled_head_sha(handler, monkeypatch) -> None:
+    from command_center import agent_runner
+
+    run_agent, _runs = handler
+    monkeypatch.setattr(
+        agent_runner,
+        "extract_result_text",
+        lambda stdout: (
+            "Opened https://github.com/o/r/pull/42 for review.\nHEAD_SHA: deadbeefcafe"
+        ),
+    )
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert outcome.result["pr_url"] == "https://github.com/o/r/pull/42"
+    assert outcome.result["head_sha"] == "deadbeefcafe"
+
+
+def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:
+    """Only the labelled trailer counts: a transcript is full of object ids,
+    and guessing which one is the head is the substring-matching the rules
+    forbid. No trailer, no sha — the DONE gate simply holds."""
+    from command_center import agent_runner
+
+    run_agent, _runs = handler
+    monkeypatch.setattr(
+        agent_runner,
+        "extract_result_text",
+        lambda stdout: (
+            "commit 0123456789abcdef0123456789abcdef01234567 pushed, no trailer"
+        ),
+    )
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert outcome.result["head_sha"] is None
+    assert outcome.result["pr_url"] is None

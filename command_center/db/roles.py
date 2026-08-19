@@ -476,7 +476,9 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_lease_release(text, text)",
     # BO-S2, the planner's atomic acts (0006).
     "backlog_dispatch(text, text, integer, integer, jsonb, integer)",
-    "backlog_release_terminal(text)",
+    # BO-S3, result ingest (0007; replaced 0006's backlog_release_terminal).
+    "backlog_ingest_results(text)",
+    "backlog_return_to_pool(text, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.

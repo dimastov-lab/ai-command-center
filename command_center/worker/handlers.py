@@ -28,6 +28,7 @@ stays on the worker host's journal.
 
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any
 
@@ -38,6 +39,26 @@ from command_center.worker.payloads import PayloadError, parse_agent_run
 __all__ = ["build_handlers"]
 
 _TAIL_CHARS = 4000
+
+#: BO-S3 result enrichment: the delivery contract for machine-readable
+#: outcomes. A PR reference is extracted by its exact URL shape — nothing
+#: else on GitHub looks like it — and the head SHA ONLY from an explicit
+#: labelled trailer line (`HEAD_SHA: <hex>`), because a bare 40-hex string in
+#: a transcript is any object id at all and guessing is what the
+#: no-substring rule forbids. The planner's prompt asks the executor for the
+#: trailer; an executor that omits it simply yields a result without a sha,
+#: and the backlog's DONE gate holds until the fact arrives another way.
+_PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+_HEAD_SHA_TRAILER = re.compile(r"^HEAD_SHA:\s*([0-9a-f]{7,40})\s*$", re.MULTILINE)
+
+
+def _machine_outcome(result_text: str) -> dict[str, str | None]:
+    pr_match = _PR_URL.search(result_text)
+    sha_match = _HEAD_SHA_TRAILER.search(result_text)
+    return {
+        "pr_url": pr_match.group(0) if pr_match else None,
+        "head_sha": sha_match.group(1) if sha_match else None,
+    }
 
 
 def _tail(text: str) -> str:
@@ -133,9 +154,11 @@ def _run_agent(
         model=model,
     )
 
+    result_text = agent_runner.extract_result_text(run.stdout)
     result = {
         "cascade_step": attempt_no if link is not None else None,
         "executor": (link or {}).get("executor", "claude"),
+        **_machine_outcome(result_text),
         "status": run.status,
         "exit_code": run.exit_code,
         "duration_seconds": round(run.duration_seconds, 3),
@@ -143,7 +166,7 @@ def _run_agent(
         "completed_at": run.completed_at,
         "stdout_tail": _tail(run.stdout),
         "stderr_tail": _tail(run.stderr),
-        "result_text": _tail(agent_runner.extract_result_text(run.stdout)),
+        "result_text": _tail(result_text),
     }
     if run.status == "failed" and run.exit_code is None and not run.stdout:
         # The process never started (OSError path in the runner): nothing

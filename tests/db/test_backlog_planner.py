@@ -229,14 +229,18 @@ def test_planner_tick_end_to_end_with_a_real_worker(rig) -> None:
     assert worker.fail(claimed, reason="synthetic failure", retryable=False)
 
     report2 = plan_once(app_factory, limits)
-    assert ("VOYN-W0-P1", "dead") in report2.released
+    assert ("VOYN-W0-P1", "returned_to_pool") in report2.ingested
+    # A finding, not a loss (BO-S3): the freed task re-enters the pool and
+    # the SAME tick redispatches it as a fresh epoch — new revision, new
+    # idempotency key, new work item, fresh cascade budget.
+    assert "VOYN-W0-P1" in [t for t, _ in report2.dispatched]
     with app_factory() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
-                ("repo:repo-p1",),
+                "SELECT count(*) FROM work_item_public WHERE task_id = %s",
+                ("VOYN-W0-P1",),
             )
-            assert cur.fetchone()[0] == 0, "the dead lane must be freed"
+            assert cur.fetchone()[0] == 2, "a fresh dispatch epoch, not a re-run"
 
 
 def test_two_planner_ticks_cannot_run_concurrently(rig) -> None:
@@ -249,3 +253,172 @@ def test_two_planner_ticks_cannot_run_concurrently(rig) -> None:
             assert cur.fetchone()[0]
     report = plan_once(app_factory, PlanLimits(planner="planner-late"))
     assert report.planner_busy and report.dispatched == []
+
+
+# -- result ingest (BO-S3) ----------------------------------------------------
+
+
+def _complete_latest(app_factory, worker, task_id, result):
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert isinstance(claimed, ClaimedWork), claimed
+    assert claimed.payload.get("project_id", task_id)  # sanity
+    assert worker.complete(claimed, result)
+    return claimed
+
+
+def test_ingest_succeeded_records_evidence_and_moves_to_review(rig) -> None:
+    """One act: evidence from the persisted result (never from a claim) +
+    IN_PROGRESS -> READY_TO_REVIEW through the existing machine + lane
+    freed. The recorded pr/sha are exactly what the DONE gate then accepts."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-IN", repo="repo-in"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-IN")[0]
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-IN",
+        {
+            "status": "completed",
+            "pr_url": "https://github.com/o/r/pull/7",
+            "head_sha": "feedface",
+        },
+    )
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-IN", "ready_to_review")]
+
+    task = store.get_task("VOYN-W0-IN")
+    assert task["status"] == "READY_TO_REVIEW"
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT kind, value FROM backlog_evidence WHERE task_id = %s ORDER BY kind",
+                ("VOYN-W0-IN",),
+            )
+            assert cur.fetchall() == [
+                ("pr", "https://github.com/o/r/pull/7"),
+                ("sha", "feedface"),
+            ]
+            cur.execute(
+                "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
+                ("repo:repo-in",),
+            )
+            assert cur.fetchone()[0] == 0
+
+    # The external merge fact then closes through the EXISTING gate.
+    ok, reason, _ = store.transition("VOYN-W0-IN", "DONE", task["revision"])
+    assert ok, reason
+
+
+def test_ingest_without_machine_outcome_still_reviews_but_done_holds(rig) -> None:
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-NM", repo="repo-nm"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-NM")[0]
+    _complete_latest(app_factory, worker, "VOYN-W0-NM", {"status": "completed"})
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            cur.fetchall()
+    task = store.get_task("VOYN-W0-NM")
+    assert task["status"] == "READY_TO_REVIEW"
+    ok, reason, _ = store.transition("VOYN-W0-NM", "DONE", task["revision"])
+    assert not ok and reason.startswith("missing_evidence")
+
+
+def test_second_cascade_exhaustion_parks_for_the_owner(rig) -> None:
+    """First exhaustion: a finding — back to OPEN, fresh epoch. Second:
+    DEFER_TO_USER — two full budgets failing is a human's decision point,
+    and the OPEN<->dead pump would otherwise burn the fleet on one task."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-PK", repo="repo-pk"))[0]
+
+    for round_no, expected in ((1, "OPEN"), (2, "DEFER_TO_USER")):
+        assert _dispatch(app_factory, "VOYN-W0-PK")[0], f"round {round_no}"
+        claimed = worker.claim("execution", visibility_seconds=60)
+        assert isinstance(claimed, ClaimedWork)
+        assert worker.fail(claimed, reason=f"round {round_no}", retryable=False)
+        with app_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+                rows = cur.fetchall()
+        assert len(rows) == 1
+        assert store.get_task("VOYN-W0-PK")["status"] == expected, rows
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason FROM backlog_event WHERE task_id = %s "
+                "AND event = 'return_to_pool' AND outcome = 'granted' ORDER BY event_id",
+                ("VOYN-W0-PK",),
+            )
+            reasons = [r[0] for r in cur.fetchall()]
+    assert len(reasons) == 2 and all(r.startswith("cascade_exhausted") for r in reasons)
+
+
+def test_return_to_pool_refuses_outside_in_progress(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RG"))[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok, reason FROM backlog_return_to_pool(%s, %s)",
+                ("VOYN-W0-RG", "manual"),
+            )
+            assert cur.fetchone() == (False, "not_in_progress")
+
+
+def test_the_tick_lease_uses_its_own_ttl_not_the_repo_horizon(rig) -> None:
+    """PLANNER-LEASE-TTL, pinned (acceptance 7b: the mutation
+    planner_lease_ttl_seconds -> lease_ttl_seconds in the planner:global
+    acquire survived every other test). Interception at the SQL seam: the
+    global acquire must carry the TICK ttl, and dispatch must carry the RUN
+    ttl — two deliberately different numbers in one plan."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]
+
+    calls: list[tuple[str, tuple]] = []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def recording_factory():
+        with app_factory() as conn:
+            class RecordingCursor:
+                def __init__(self, cur):
+                    self._cur = cur
+
+                def execute(self, sql, params=()):
+                    calls.append((sql, tuple(params)))
+                    return self._cur.execute(sql, params)
+
+                def __getattr__(self, name):
+                    return getattr(self._cur, name)
+
+                def __enter__(self):
+                    self._cur.__enter__()
+                    return self
+
+                def __exit__(self, *exc):
+                    return self._cur.__exit__(*exc)
+
+            class RecordingConn:
+                def cursor(self):
+                    return RecordingCursor(conn.cursor())
+
+                def __getattr__(self, name):
+                    return getattr(conn, name)
+
+            yield RecordingConn()
+
+    limits = PlanLimits(
+        planner="planner-ttl", lease_ttl_seconds=7200, planner_lease_ttl_seconds=123
+    )
+    report = plan_once(recording_factory, limits)
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-TT"]
+
+    acquires = [p for s, p in calls if "backlog_lease_acquire" in s]
+    assert ("planner:global", "planner-ttl", 123) in acquires, acquires
+    dispatches = [p for s, p in calls if "backlog_dispatch" in s]
+    assert len(dispatches) == 1 and dispatches[0][2] == 7200, dispatches
