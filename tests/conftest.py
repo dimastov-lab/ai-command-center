@@ -234,7 +234,7 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
         return original_run(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", guarded_run)
-    return generated_dir
+    yield generated_dir
 
 
 @pytest.fixture(autouse=True)

@@ -46,8 +46,8 @@ class ClaimedWork:
     after the attempt ends.
     """
 
-    work_item_id: int
-    attempt_id: int
+    work_item_id: str
+    attempt_id: str
     attempt_no: int
     visible_until: str
     payload: dict[str, Any]

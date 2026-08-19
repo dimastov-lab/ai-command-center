@@ -150,13 +150,36 @@ class WorkerDaemon:
             )
             return
         if outcome.ok:
-            self._store.complete(work, outcome.result)
+            accepted = self._store.complete(work, outcome.result)
         else:
-            self._store.fail(work, reason=outcome.reason, retryable=outcome.retryable)
+            accepted = self._store.fail(
+                work, reason=outcome.reason, retryable=outcome.retryable
+            )
+        if not accepted:
+            # The database refused the report: the lease lapsed between our
+            # last successful beat and this write, and the attempt belongs to
+            # someone else now. The refusal is the protocol working — but a
+            # daemon that does not KNOW it happened re-runs the handler's side
+            # effects on retry with no operator-visible trace of why. Review
+            # found exactly this interleaving via the heartbeat-error path.
+            logger.warning(
+                "attempt %s: report refused as stale owner; outcome lost to a "
+                "lapsed lease (handler effects may re-run on the next attempt)",
+                work.attempt_id,
+            )
 
     def _dispatch(
         self, work: ClaimedWork, lease_lost: threading.Event
     ) -> HandlerOutcome:
+        if not isinstance(work.payload, dict):
+            # queue_enqueue accepts any jsonb — a list or bare string is
+            # producible by the app role, and `.get` on it would raise out of
+            # run_forever and kill the daemon over one malformed item.
+            return HandlerOutcome(
+                ok=False,
+                reason=f"payload is {type(work.payload).__name__}, not an object",
+                retryable=False,
+            )
         kind = str(work.payload.get("kind", ""))
         handler = self._handlers.get(kind)
         if handler is None:
@@ -183,12 +206,25 @@ class WorkerDaemon:
         # A third of the window: two consecutive beats may fail (a restarting
         # PostgreSQL, a network blip) before the lease actually lapses.
         interval = max(self._config.visibility_seconds / 3.0, 1.0)
+        consecutive_errors = 0
         while not beat_stop.wait(interval):
             try:
                 alive = self._store.heartbeat(work)
             except Exception:  # noqa: BLE001 -- transient DB errors must not kill the beat
+                consecutive_errors += 1
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
+                # Errors are not refusals, but they are not free either: after
+                # a full visibility window without one successful beat the
+                # lease has provably lapsed on the server, whatever the reason
+                # here — and the handler must stop before its outcome becomes
+                # a stale write. Review found the interleaving this closes:
+                # DB down through the lapse, recovered before the handler
+                # finished, result refused as stale with no trace.
+                if consecutive_errors * interval >= self._config.visibility_seconds:
+                    lease_lost.set()
+                    return
                 continue
+            consecutive_errors = 0
             if not alive:
                 lease_lost.set()
                 return

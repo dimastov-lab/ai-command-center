@@ -22,12 +22,18 @@ EnvironmentFile=/etc/aicc/worker.env
 WorkingDirectory=/opt/aicc
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
 
-# Exit codes are the daemon's interface: 2 = config refused, 3 = DB
-# unreachable, both cured by time or by an operator, never by a tight loop.
+# Exit codes are the daemon's interface: 2 = config refused (an operator's
+# problem — restarting cannot cure a bad env file, so it is excluded from
+# restart), 3 = DB unreachable (cured by time).
 Restart=always
 RestartSec=10s
-# SIGTERM stops claiming and finishes the item in hand; the stop timeout must
-# outlive the visibility window so a healthy handler is never killed mid-item.
+RestartPreventExitStatus=2
+# SIGTERM stops claiming and finishes the item in hand. The stop timeout
+# outlives ONE visibility window — a handler that finishes within its first
+# lease survives shutdown intact. A longer-running handler (heartbeats exist
+# so they may) is abandoned at the timeout; that abandonment is safe by
+# construction (reaper + stale-owner fence), it is just not free: the item
+# re-runs elsewhere.
 TimeoutStopSec=330s
 
 # Containment: the worker executes claimed payloads and talks to PostgreSQL —
@@ -36,7 +42,6 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/aicc-worker
 StateDirectory=aicc-worker
 
 [Install]

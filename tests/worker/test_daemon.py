@@ -1,4 +1,5 @@
-"""The daemon's loop, driven by a fake store — no database, no threads slept.
+"""The daemon's loop, driven by a fake store — no database, and only the
+lost-lease test waits on a real beat interval (~1s).
 
 What these tests deliberately do NOT cover: the SQL protocol itself, which is
 already proven by tests/db/test_queue_claim.py against real PostgreSQL, and
@@ -18,9 +19,9 @@ from command_center.worker.daemon import (
 )
 
 
-def _work(payload: dict, attempt_id: int = 1) -> ClaimedWork:
+def _work(payload: dict, attempt_id: str = "wat-1") -> ClaimedWork:
     return ClaimedWork(
-        work_item_id=10,
+        work_item_id="wki-10",
         attempt_id=attempt_id,
         attempt_no=1,
         visible_until="2026-01-01T00:00:00+00:00",
@@ -77,7 +78,7 @@ def test_a_claimed_item_is_dispatched_and_completed() -> None:
     _run_until_idle(daemon, store)
 
     assert outcomes == [{"kind": "echo", "x": 1}]
-    assert ("complete", 1, {"echoed": 1}) in store.calls
+    assert ("complete", "wat-1", {"echoed": 1}) in store.calls
 
 
 def test_a_failing_handler_reports_fail_not_complete() -> None:
@@ -89,7 +90,7 @@ def test_a_failing_handler_reports_fail_not_complete() -> None:
     daemon = WorkerDaemon(store, {"boom": boom}, WorkerConfig(visibility_seconds=3))
     _run_until_idle(daemon, store)
 
-    assert ("fail", 1, "did not work", True) in store.calls
+    assert ("fail", "wat-1", "did not work", True) in store.calls
     assert not any(c[0] == "complete" for c in store.calls)
 
 
@@ -139,7 +140,7 @@ def test_a_lost_lease_discards_the_outcome() -> None:
 
 
 def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
-    store = ScriptedStore([_work({"kind": "echo"}), _work({"kind": "echo"}, attempt_id=2)])
+    store = ScriptedStore([_work({"kind": "echo"}), _work({"kind": "echo"}, attempt_id="wat-2")])
     seen = []
 
     def echo(payload, lease_lost):
@@ -158,7 +159,7 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
     daemon.run_forever()
 
     assert len(seen) == 1, "the second item must not be claimed after stop"
-    assert ("complete", 1, {}) in store.calls
+    assert ("complete", "wat-1", {}) in store.calls
 
 
 def test_idle_backoff_grows_and_resets_on_work(monkeypatch) -> None:
@@ -184,3 +185,62 @@ def test_idle_backoff_grows_and_resets_on_work(monkeypatch) -> None:
     assert sleeps[0] == 1.0 and sleeps[1] == 2.0, "backoff must grow while idle"
     # after real work the next idle starts from the floor again
     assert sleeps[2] == 1.0
+
+
+def test_a_refused_report_is_logged_not_swallowed(caplog) -> None:
+    """Review found the interleaving: DB down through the lease lapse,
+    recovered before the handler finished — the report is refused as a stale
+    owner, and the first version neither logged it nor knew. A daemon that
+    silently loses an outcome re-runs side effects on retry with no trace."""
+    import logging
+
+    store = ScriptedStore([_work({"kind": "echo"})])
+
+    def refuse_complete(work, result):
+        store.calls.append(("complete", work.attempt_id, result))
+        return False  # stale owner
+
+    store.complete = refuse_complete  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        store,
+        {"echo": lambda p, e: HandlerOutcome(ok=True, result={})},
+        WorkerConfig(visibility_seconds=3),
+    )
+    with caplog.at_level(logging.WARNING):
+        _run_until_idle(daemon, store)
+    assert any("report refused as stale owner" in r.message for r in caplog.records)
+
+
+def test_a_non_object_payload_dead_letters_instead_of_killing_the_daemon() -> None:
+    """queue_enqueue accepts any jsonb; a list payload used to raise
+    AttributeError out of run_forever and kill the process over one item."""
+    store = ScriptedStore([_work(["not", "an", "object"])])  # type: ignore[arg-type]
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    fails = [c for c in store.calls if c[0] == "fail"]
+    assert len(fails) == 1 and fails[0][3] is False
+    assert "list" in fails[0][2]
+
+
+def test_persistent_heartbeat_errors_stop_the_work() -> None:
+    """Errors are not refusals, but after a full visibility window without one
+    successful beat the lease has provably lapsed server-side — the handler
+    must stop before its outcome becomes a stale write."""
+    store = ScriptedStore([_work({"kind": "slow"})])
+
+    def broken_heartbeat(work):
+        store.calls.append(("heartbeat", work.attempt_id))
+        raise ConnectionError("db unreachable")
+
+    store.heartbeat = broken_heartbeat  # type: ignore[method-assign]
+
+    def slow(payload, lease_lost):
+        assert lease_lost.wait(timeout=30), "errors alone never signalled loss"
+        return HandlerOutcome(ok=True, result={"too": "late"})
+
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=3)
+    )
+    _run_until_idle(daemon, store)
+    assert not any(c[0] == "complete" for c in store.calls)
