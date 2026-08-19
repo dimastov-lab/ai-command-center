@@ -116,3 +116,12 @@ def test_repo_is_inferred_from_the_task_family() -> None:
     by_id = {t.task_id: t.repo for t in report.tasks}
     assert by_id["VOYN-W0-AICC-X"] == "ai-command-center"  # inferred
     assert by_id["VOYN-W0-PLAT-Y"] == "aios"  # explicit hint (also matches family)
+
+    # Diverging hint must win over inference (reversing the if-order is a real
+    # regression the same-repo case above cannot catch — review found it).
+    md2 = (
+        "- **VOYN-W0-AICC-Z** | Wave 0 | OPEN | P0 | T | `s` | body.\n"
+        "  - Target repo (owner decision): `aios`.\n"
+    )
+    r2 = parse_backlog(md2)
+    assert r2.tasks[0].repo == "aios"  # hint aios beats AICC-family inference
