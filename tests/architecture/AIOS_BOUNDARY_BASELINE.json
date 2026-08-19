@@ -296,6 +296,9 @@
     "command_center/tasks_repository.py": [
       "memory"
     ],
+    "command_center/webapi/queue_routes.py": [
+      "queue"
+    ],
     "command_center/worker/__init__.py": [
       "orchestration"
     ],
