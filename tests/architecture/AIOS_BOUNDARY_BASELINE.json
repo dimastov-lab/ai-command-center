@@ -90,6 +90,9 @@
     "command_center/db/provenance_store.py": [
       "audit"
     ],
+    "command_center/db/work_queue_store.py": [
+      "queue"
+    ],
     "command_center/dispatch/__init__.py": [
       "orchestration"
     ],
@@ -292,6 +295,24 @@
     ],
     "command_center/tasks_repository.py": [
       "memory"
+    ],
+    "command_center/worker/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/worker/__main__.py": [
+      "orchestration"
+    ],
+    "command_center/worker/daemon.py": [
+      "orchestration"
+    ],
+    "command_center/worker/handlers.py": [
+      "orchestration"
+    ],
+    "command_center/worker/payloads.py": [
+      "orchestration"
+    ],
+    "command_center/worker/sdnotify.py": [
+      "orchestration"
     ],
     "command_center/worktree_launcher.py": [
       "orchestration"
