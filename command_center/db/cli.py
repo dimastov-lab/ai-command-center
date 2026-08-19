@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from contextlib import nullcontext
 
 from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
@@ -33,6 +34,29 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "upgrade",
         help="Apply pending migrations and re-assert table grants (as the migrator).",
+    )
+
+    # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
+    # role the SQL protocol granted queue_reap/queue_redrive/work_dlq to —
+    # which is why they live in the db CLI beside `status`, not in the worker.
+    sub.add_parser(
+        "queue-reap",
+        help="Expire lapsed leases: requeue items with attempt budget left, "
+        "dead-letter the exhausted (idempotent; run by aicc-queue-reaper.timer).",
+    )
+    dlq = sub.add_parser("queue-dlq", help="List dead-lettered work items.")
+    dlq.add_argument("--queue", default=None, help="Restrict to one queue name.")
+    dlq.add_argument("--limit", type=int, default=50, help="Rows to show (default 50).")
+    redrive = sub.add_parser(
+        "queue-redrive",
+        help="Return one dead-lettered item to 'ready' with a raised attempt budget.",
+    )
+    redrive.add_argument("work_item_id", help="The wki_* id from queue-dlq.")
+    redrive.add_argument(
+        "--extra-attempts",
+        type=int,
+        default=1,
+        help="Additional attempts to grant beyond those already burned (default 1).",
     )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
@@ -54,7 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
     args = build_parser().parse_args(argv)
 
     try:
@@ -88,6 +114,48 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"re-asserted {count} table grants")
                 return 0
 
+            if args.command == "queue-reap":
+                from command_center.db.work_queue_admin import WorkQueueAdmin
+
+                reaped = WorkQueueAdmin(lambda: nullcontext(conn)).reap()
+                print(f"reaped {reaped} lapsed attempt(s)")
+                return 0
+
+            if args.command == "queue-dlq":
+                from command_center.db.work_queue_admin import WorkQueueAdmin
+
+                letters = WorkQueueAdmin(lambda: nullcontext(conn)).dead_letters(
+                    args.queue, limit=args.limit
+                )
+                if not letters:
+                    print("dead-letter queue is empty")
+                    return 0
+                for letter in letters:
+                    print(
+                        f"{letter.work_item_id}  queue={letter.queue}  "
+                        f"attempts={letter.attempt_count}/{letter.max_attempts}  "
+                        f"dead_at={letter.dead_at}\n"
+                        f"    dead_reason: {letter.dead_reason}\n"
+                        f"    last_attempt: {letter.last_attempt_reason or '(none recorded)'}"
+                    )
+                return 0
+
+            if args.command == "queue-redrive":
+                from command_center.db.work_queue_admin import WorkQueueAdmin
+
+                accepted = WorkQueueAdmin(lambda: nullcontext(conn)).redrive(
+                    args.work_item_id, extra_attempts=args.extra_attempts
+                )
+                if accepted:
+                    print(f"redriven: {args.work_item_id}")
+                    return 0
+                # The refusal is already audited server-side with its cause.
+                print(
+                    f"refused: {args.work_item_id} is unknown or not dead-lettered",
+                    file=sys.stderr,
+                )
+                return 1
+
             if args.command == "downgrade":
                 if not args.confirmed:
                     print(
@@ -97,7 +165,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return 2
                 reverted = migrations.downgrade(conn, target=args.to)
-                print(f"reverted: {list(reverted)}" if reverted else "nothing to revert")
+                print(
+                    f"reverted: {list(reverted)}" if reverted else "nothing to revert"
+                )
                 return 0
     finally:
         pool.close_pool()

@@ -1,5 +1,11 @@
 """FastAPI application for the AI Command Center HTTP/JSON API.
 
+Not a read-only application, whatever earlier revisions of this docstring said:
+it mounts 27 mutating routes alongside the read surface. All of them are
+authenticated and authorized by :mod:`command_center.http_auth`, mounted once
+as an ``include_router`` dependency below and verified against the routing
+table by ``validate_routing`` before this factory returns.
+
 Run it with::
 
     uvicorn command_center.api.app:app
@@ -24,7 +30,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from command_center.api import (
@@ -38,6 +44,7 @@ from command_center.api import (
     service,
     wave1_routes,
 )
+from command_center.http_auth.routing import enforce, validate_routing
 
 # All read-only endpoints hang off one versioned router; the Wave-1 write
 # endpoints live on their own router (also ``/api/v1``) and are included below.
@@ -109,14 +116,25 @@ def create_app() -> FastAPI:
             allow_headers=["*"],
         )
 
-    app.include_router(_build_read_router())
-    app.include_router(wave1_routes.router)
-    app.include_router(conflict_routes.router)
-    app.include_router(audit_routes.router)
-    app.include_router(council_routes.router)
-    app.include_router(marketplace_routes.router)
-    app.include_router(model_registry_routes.router)
-    app.include_router(networking_routes.router)
+    # One authentication dependency, mounted on every included router
+    # (VOYN-W0-AICC-AUTH-HTTP-01). It resolves the operation for the *matched*
+    # route from `http_auth.routing.ROUTE_OPERATIONS` and returns immediately
+    # for anything that is not a mutating verb, so no read pays for it. Mounted
+    # here rather than repeated at 27 decorators so that coverage is a table
+    # `validate_routing` can check against the router tree.
+    guard = [Depends(enforce)]
+    app.include_router(_build_read_router(), dependencies=guard)
+    app.include_router(wave1_routes.router, dependencies=guard)
+    app.include_router(conflict_routes.router, dependencies=guard)
+    app.include_router(audit_routes.router, dependencies=guard)
+    app.include_router(council_routes.router, dependencies=guard)
+    app.include_router(marketplace_routes.router, dependencies=guard)
+    app.include_router(model_registry_routes.router, dependencies=guard)
+    app.include_router(networking_routes.router, dependencies=guard)
+
+    # Fail closed at boot, not only in CI: a mutating route this build does not
+    # route to an operation stops the process here.
+    validate_routing(app)
     return app
 
 
