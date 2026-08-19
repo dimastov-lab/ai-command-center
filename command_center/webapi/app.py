@@ -40,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 
 from command_center.dispatch.api import create_dispatch_router
 from command_center.http_auth.routing import enforce, validate_routing
+from command_center.webapi.queue_routes import create_queue_router
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.webapi.serializers import serialize_execution, serialize_home
 from command_center.workspace_home import build_workspace_home_snapshot
@@ -150,6 +151,14 @@ def create_app() -> FastAPI:
     # `/api/execution`, `/healthz` and `/readyz` are registered directly on the
     # app and stay unauthenticated reads (VOYN-W0-AICC-AUTH-HTTP-02).
     app.include_router(create_dispatch_router(), dependencies=[Depends(enforce)])
+
+    # Server work-queue status + audit enqueue (VOYN-W0-APP-CONTROL-S1/S4):
+    # `/api/v1/queue/*`, before the SPA mount. The POST is a mutating route
+    # and therefore rides the same `enforce` table row
+    # (`queue:audit:enqueue`); the two GETs additionally authenticate inside
+    # the router (they expose run transcripts — see queue_routes.py for the
+    # recorded read-auth decision under VOYN-W0-AICC-AUTH-HTTP-02).
+    app.include_router(create_queue_router(), dependencies=[Depends(enforce)])
 
     # Fail closed at boot: an unrouted mutating route stops the process here,
     # in the environment that matters, not only in a CI report.

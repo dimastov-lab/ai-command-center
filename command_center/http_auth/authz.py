@@ -108,6 +108,8 @@ OPERATIONS: frozenset[str] = frozenset(
         "networking:message:send",
         "networking:feedback:submit",
         "networking:invite",
+        # command_center/webapi/queue_routes.py (VOYN-W0-APP-CONTROL-S1/S4)
+        "queue:audit:enqueue",
         # command_center/dispatch/api.py
         "dispatch:assign",
         "dispatch:policy:update",
@@ -127,12 +129,18 @@ def reset_grants_cache() -> None:
 
 def _parse(raw: object, source: str) -> MappingProxyType[str, frozenset[str]]:
     if not isinstance(raw, dict):
-        raise GrantsConfigurationError(f"{source}: expected a JSON object at the top level")
+        raise GrantsConfigurationError(
+            f"{source}: expected a JSON object at the top level"
+        )
     parsed: dict[str, frozenset[str]] = {}
     for principal_id, operations in raw.items():
         if not isinstance(principal_id, str) or not principal_id:
-            raise GrantsConfigurationError(f"{source}: principal ids must be non-empty strings")
-        if not isinstance(operations, list) or not all(isinstance(o, str) for o in operations):
+            raise GrantsConfigurationError(
+                f"{source}: principal ids must be non-empty strings"
+            )
+        if not isinstance(operations, list) or not all(
+            isinstance(o, str) for o in operations
+        ):
             raise GrantsConfigurationError(
                 f"{source}: grants for {principal_id!r} must be a list of operation names"
             )

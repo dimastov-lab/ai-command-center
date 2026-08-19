@@ -125,14 +125,53 @@ class WorkQueueStore:
         )
         return bool(row["ok"])
 
-    def fail(
-        self, work: ClaimedWork, *, reason: str, retryable: bool = True
-    ) -> bool:
+    def fail(self, work: ClaimedWork, *, reason: str, retryable: bool = True) -> bool:
         row = self._call(
             "SELECT * FROM queue_fail(%s, %s, %s, %s)",
             (work.attempt_id, work.claim_token, reason, retryable),
         )
         return bool(row["ok"])
+
+    # -- enqueue (control plane, app role) ------------------------------------
+
+    def enqueue(
+        self,
+        queue: str,
+        *,
+        idempotency_key: str,
+        payload: dict[str, Any],
+        task_id: str | None = None,
+        repository_id: str | None = None,
+        max_attempts: int = 3,
+        priority: int = 0,
+        delay_seconds: int = 0,
+        backoff_seconds: int = 2,
+    ) -> str:
+        """Enqueue one item; returns its ``work_item_id``.
+
+        Exactly-once by key: ``queue_enqueue`` is an upsert on
+        ``(queue, idempotency_key)``, and a duplicate returns the EXISTING
+        item id (auditing the refusal server-side) — so a retried HTTP
+        request or dispatcher crash-loop cannot create a second run. This is
+        an ``aicc_app`` privilege: the worker role is deliberately not
+        granted enqueue, and this method on a worker connection fails at the
+        database, not here.
+        """
+        row = self._call(
+            "SELECT queue_enqueue(%s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s) AS work_item_id",
+            (
+                queue,
+                idempotency_key,
+                json.dumps(payload),
+                task_id,
+                repository_id,
+                max_attempts,
+                priority,
+                delay_seconds,
+                backoff_seconds,
+            ),
+        )
+        return str(row["work_item_id"])
 
     # -- plumbing -------------------------------------------------------------
 

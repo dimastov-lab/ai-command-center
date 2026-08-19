@@ -179,6 +179,12 @@ section below for why it exists at all):
   frozen runner (`agent_runner.run_claude_code`) unchanged — sandbox
   profiles, credential scrubbing and timeouts stay the legacy engine's
   decisions; the bridge owns only payload validation and outcome folding.
+  `command_center/db/work_queue_read.py` (status reads over the public
+  views) and `command_center/webapi/queue_routes.py`
+  (VOYN-W0-APP-CONTROL-S1) are the HTTP presentation of the same authority —
+  status reads and the audit enqueue wrapper, authenticated and authorized
+  through the accepted `command_center/http_auth` boundary — not a second
+  queue and not a second identity system.
 
 ### `command_center/http_auth/` — why it was added to a frozen category
 
