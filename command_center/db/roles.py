@@ -169,6 +169,7 @@ ALL_TABLES: tuple[str, ...] = (
 # schema assertions compare `ALL_TABLES` against `BASE TABLE` rows: folding the
 # two together would make a view able to stand in for a dropped table.
 ALL_VIEWS: tuple[str, ...] = (
+    "backlog_eligible",
     "enrollment_ticket_public",
     "principal_credential_public",
     "work_attempt_public",
@@ -425,6 +426,7 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
         {
             APP_ROLE: MappingProxyType(
                 {
+                    "backlog_eligible": _READ,
                     "enrollment_ticket_public": _READ,
                     "principal_credential_public": _READ,
                     "work_attempt_public": _READ,
@@ -472,6 +474,9 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_lease_acquire(text, text, integer)",
     "backlog_lease_heartbeat(text, text, integer)",
     "backlog_lease_release(text, text)",
+    # BO-S2, the planner's atomic acts (0006).
+    "backlog_dispatch(text, text, integer, integer, jsonb, integer)",
+    "backlog_release_terminal(text)",
 )
 
 # The enrolment surface (0003), split by who may do what.

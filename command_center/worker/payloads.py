@@ -47,6 +47,9 @@ class AgentRunRequest:
     timeout_seconds: int
     model: str | None
     untrusted: bool
+    #: BO-S2a: the ordered executor cascade. Empty means "no cascade" — the
+    #: pre-cascade single-executor behaviour, byte-for-byte.
+    cascade: tuple[dict[str, Any], ...] = ()
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -69,17 +72,26 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
     repository_path = _string(payload, "repository_path")
     prompt = _string(payload, "prompt")
     task_type = _string(payload, "task_type")
-    if project_id is None or repository_path is None or prompt is None or task_type is None:
+    if (
+        project_id is None
+        or repository_path is None
+        or prompt is None
+        or task_type is None
+    ):
         missing = [
             key
             for key in ("project_id", "repository_path", "prompt", "task_type")
             if _string(payload, key) is None
         ]
-        return PayloadError(reason=f"agent_run payload missing required fields: {missing}")
+        return PayloadError(
+            reason=f"agent_run payload missing required fields: {missing}"
+        )
 
     timeout = payload.get("timeout_seconds", 900)
     if not isinstance(timeout, int) or isinstance(timeout, bool):
-        return PayloadError(reason=f"timeout_seconds must be an integer, got {timeout!r}")
+        return PayloadError(
+            reason=f"timeout_seconds must be an integer, got {timeout!r}"
+        )
     if not _MIN_TIMEOUT_SECONDS <= timeout <= _MAX_TIMEOUT_SECONDS:
         return PayloadError(
             reason=(
@@ -90,7 +102,9 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
 
     model = payload.get("model")
     if model is not None and not (isinstance(model, str) and model.strip()):
-        return PayloadError(reason=f"model must be a non-empty string or absent, got {model!r}")
+        return PayloadError(
+            reason=f"model must be a non-empty string or absent, got {model!r}"
+        )
 
     # Provenance travels with the item. Absent means untrusted: the queue is
     # writable by the whole control plane, and a payload that *forgot* to
@@ -98,6 +112,23 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
     untrusted = payload.get("untrusted", True)
     if not isinstance(untrusted, bool):
         return PayloadError(reason=f"untrusted must be a boolean, got {untrusted!r}")
+
+    # BO-S2a: the executor cascade, validated as data before any attempt
+    # burns on it. Absent or empty is fine (single-executor behaviour); a
+    # malformed cascade is a payload defect — non-retryable, because
+    # redelivery re-reads the same broken plan.
+    raw_cascade = payload.get("cascade", [])
+    if not isinstance(raw_cascade, list):
+        return PayloadError(
+            reason=f"cascade must be a list, got {type(raw_cascade).__name__}"
+        )
+    cascade: list[dict[str, Any]] = []
+    for index, link in enumerate(raw_cascade):
+        if not isinstance(link, dict) or not _string(link, "executor"):
+            return PayloadError(
+                reason=f"cascade[{index}] must be an object with a non-empty 'executor'"
+            )
+        cascade.append(dict(link))
 
     return AgentRunRequest(
         project_id=project_id,
@@ -107,4 +138,5 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         timeout_seconds=timeout,
         model=model,
         untrusted=untrusted,
+        cascade=tuple(cascade),
     )

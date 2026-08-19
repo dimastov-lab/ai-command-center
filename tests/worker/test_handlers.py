@@ -89,7 +89,7 @@ def test_provenance_defaults_to_untrusted() -> None:
 
 def test_a_completed_run_reports_ok_with_bounded_result(handler) -> None:
     run_agent, runs = handler
-    outcome = run_agent(_payload(), _event())
+    outcome = run_agent(_payload(), _event(), 1)
     assert outcome.ok
     assert outcome.result["status"] == "completed"
     assert outcome.result["result_text"] == "done"
@@ -103,14 +103,17 @@ def test_agent_failure_is_still_ok_not_redelivered(handler, monkeypatch) -> None
 
     def failed_run(**kwargs):
         return agent_runner.RunResult(
-            status="failed", exit_code=1, stdout="partial", stderr="boom",
+            status="failed",
+            exit_code=1,
+            stdout="partial",
+            stderr="boom",
             duration_seconds=2.0,
             started_at="2026-08-19T12:00:00+00:00",
             completed_at="2026-08-19T12:00:02+00:00",
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", failed_run)
-    outcome = run_agent(_payload(), _event())
+    outcome = run_agent(_payload(), _event(), 1)
     assert outcome.ok and outcome.result["status"] == "failed"
 
 
@@ -119,14 +122,17 @@ def test_runner_never_started_is_retryable(handler, monkeypatch) -> None:
 
     def never_started(**kwargs):
         return agent_runner.RunResult(
-            status="failed", exit_code=None, stdout="", stderr="no binary",
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr="no binary",
             duration_seconds=0.0,
             started_at="2026-08-19T12:00:00+00:00",
             completed_at="2026-08-19T12:00:00+00:00",
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", never_started)
-    outcome = run_agent(_payload(), _event())
+    outcome = run_agent(_payload(), _event(), 1)
     assert not outcome.ok and outcome.retryable
 
 
@@ -134,9 +140,7 @@ def test_untrusted_mutating_task_is_refused_not_downgraded(handler) -> None:
     """Audit D7 at the queue boundary: refusal with the reason named, not a
     silent read-only downgrade that half-executes and looks completed."""
     run_agent, runs = handler
-    outcome = run_agent(
-        _payload(task_type="implementation", untrusted=True), _event()
-    )
+    outcome = run_agent(_payload(task_type="implementation", untrusted=True), _event())
     assert not outcome.ok and not outcome.retryable
     assert "operator elevation" in outcome.reason
     assert runs == []  # nothing executed
@@ -149,7 +153,7 @@ def test_unknown_repository_is_retryable_elsewhere(handler, monkeypatch) -> None
         raise agent_runner.RunnerError("repository not registered on this host")
 
     monkeypatch.setattr(agent_runner, "validate_repository", refuse)
-    outcome = run_agent(_payload(), _event())
+    outcome = run_agent(_payload(), _event(), 1)
     assert not outcome.ok and outcome.retryable
 
 
@@ -166,14 +170,17 @@ def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
 
     def chatty(**kwargs):
         return agent_runner.RunResult(
-            status="completed", exit_code=0, stdout="x" * 50000, stderr="y" * 50000,
+            status="completed",
+            exit_code=0,
+            stdout="x" * 50000,
+            stderr="y" * 50000,
             duration_seconds=1.0,
             started_at="2026-08-19T12:00:00+00:00",
             completed_at="2026-08-19T12:00:01+00:00",
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", chatty)
-    outcome = run_agent(_payload(), _event())
+    outcome = run_agent(_payload(), _event(), 1)
     assert len(outcome.result["stdout_tail"]) == 4000
     assert len(outcome.result["stderr_tail"]) == 4000
 
@@ -187,14 +194,17 @@ def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
 
     def timed_out(**kwargs):
         return agent_runner.RunResult(
-            status="timed_out", exit_code=None, stdout="partial work...",
-            stderr="", duration_seconds=900.0,
+            status="timed_out",
+            exit_code=None,
+            stdout="partial work...",
+            stderr="",
+            duration_seconds=900.0,
             started_at="2026-08-19T12:00:00+00:00",
             completed_at="2026-08-19T12:15:00+00:00",
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
-    outcome = run_agent(_payload(), _event())
+    outcome = run_agent(_payload(), _event(), 1)
     assert outcome.ok and outcome.result["status"] == "timed_out"
 
 
@@ -203,10 +213,10 @@ def test_every_payload_defect_is_non_retryable() -> None:
     so a site-local `retryable=True` regression would dead-letter-loop bad
     payloads through max_attempts (review finding 2)."""
     defects = [
-        _payload(prompt="", project_id=None),      # missing fields
-        _payload(timeout_seconds=7200),            # beyond visibility ceiling
-        _payload(model=123),                       # wrong type
-        _payload(untrusted="yes"),                 # wrong type
+        _payload(prompt="", project_id=None),  # missing fields
+        _payload(timeout_seconds=7200),  # beyond visibility ceiling
+        _payload(model=123),  # wrong type
+        _payload(untrusted="yes"),  # wrong type
     ]
     for payload in defects:
         error = parse_agent_run(payload)
@@ -219,6 +229,80 @@ def test_cli_unavailable_is_retryable_and_runs_nothing(handler, monkeypatch) -> 
     monkeypatch.setattr(
         agent_runner, "claude_cli_preflight", lambda: (False, "binary missing")
     )
-    outcome = run_agent(_payload(), _event())
+    outcome = run_agent(_payload(), _event(), 1)
     assert not outcome.ok and outcome.retryable
     assert "unavailable" in outcome.reason and runs == []
+
+
+# -- the executor cascade (BO-S2a) -------------------------------------------
+
+
+def _cascade_payload(**overrides):
+    payload = _payload()
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "review"},
+        {"executor": "claude", "task_type": "review", "model": "stronger-model"},
+    ]
+    payload.update(overrides)
+    return payload
+
+
+def test_cascade_selects_the_link_for_this_delivery(handler) -> None:
+    run_agent, runs = handler
+    outcome = run_agent(_cascade_payload(), _event(), 1)
+    assert outcome.ok
+    assert runs[-1]["task_type"] == "review"
+    assert runs[-1]["model"] is None
+    assert outcome.result["cascade_step"] == 1
+
+
+def test_cascade_second_attempt_takes_the_second_link(handler) -> None:
+    run_agent, runs = handler
+    outcome = run_agent(_cascade_payload(), _event(), 2)
+    assert outcome.ok
+    assert runs[-1]["model"] == "stronger-model"
+    assert outcome.result["cascade_step"] == 2
+
+
+def test_cascade_clamps_at_the_tail(handler) -> None:
+    """Past the last link the tail keeps serving until the attempt budget
+    (the cascade's own length, set by the planner) dead-letters the item."""
+    run_agent, runs = handler
+    outcome = run_agent(_cascade_payload(), _event(), 7)
+    assert outcome.ok
+    assert runs[-1]["model"] == "stronger-model"
+
+
+def test_unavailable_executor_is_a_routing_signal_not_a_task_error(handler) -> None:
+    """BO-S2a decision: a link naming an executor this host cannot run is a
+    RETRYABLE refusal — the attempt returns to the pool and the next delivery
+    selects the next link. Nothing may have executed."""
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "codex"
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert "executor_unavailable" in outcome.reason and "codex" in outcome.reason
+    assert runs == [], "an unavailable executor must not execute anything"
+    # The same payload on attempt 2 runs the second (available) link.
+    assert run_agent(payload, _event(), 2).ok
+
+
+def test_malformed_cascade_is_a_non_retryable_payload_defect(handler) -> None:
+    run_agent, runs = handler
+    for bad in (
+        {"cascade": "claude"},
+        {"cascade": [{"model": "x"}]},
+        {"cascade": [42]},
+    ):
+        outcome = run_agent(_payload(**bad), _event(), 1)
+        assert not outcome.ok and outcome.retryable is False, bad
+    assert runs == []
+
+
+def test_absent_cascade_keeps_the_single_executor_behaviour(handler) -> None:
+    run_agent, runs = handler
+    outcome = run_agent(_payload(), _event(), 3)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] is None
+    assert runs[-1]["task_type"] == _payload()["task_type"]

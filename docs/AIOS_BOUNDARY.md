@@ -185,6 +185,12 @@ section below for why it exists at all):
   status reads and the audit enqueue wrapper, authenticated and authorized
   through the accepted `command_center/http_auth` boundary — not a second
   queue and not a second identity system.
+  `command_center/orchestrator/` (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S2/S2a)
+  composes the two accepted authorities — the structured backlog store
+  (0005/0006) and this queue — into the dispatch tick and the executor
+  cascade. Every atomic decision is a SQL function of the store; the package
+  owns candidate iteration, the static routing matrix and the plan report,
+  and adds no engine capability of its own.
 
 ### `command_center/http_auth/` — why it was added to a frozen category
 

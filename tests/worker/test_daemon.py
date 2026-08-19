@@ -70,7 +70,7 @@ def test_a_claimed_item_is_dispatched_and_completed() -> None:
     store = ScriptedStore([_work({"kind": "echo", "x": 1})])
     outcomes = []
 
-    def echo(payload, lease_lost):
+    def echo(payload, lease_lost, attempt_no=1):
         outcomes.append(payload)
         return HandlerOutcome(ok=True, result={"echoed": payload["x"]})
 
@@ -84,7 +84,7 @@ def test_a_claimed_item_is_dispatched_and_completed() -> None:
 def test_a_failing_handler_reports_fail_not_complete() -> None:
     store = ScriptedStore([_work({"kind": "boom"})])
 
-    def boom(payload, lease_lost):
+    def boom(payload, lease_lost, attempt_no=1):
         return HandlerOutcome(ok=False, reason="did not work", retryable=True)
 
     daemon = WorkerDaemon(store, {"boom": boom}, WorkerConfig(visibility_seconds=3))
@@ -97,7 +97,7 @@ def test_a_failing_handler_reports_fail_not_complete() -> None:
 def test_a_raising_handler_is_a_retryable_failure() -> None:
     store = ScriptedStore([_work({"kind": "raise"})])
 
-    def raiser(payload, lease_lost):
+    def raiser(payload, lease_lost, attempt_no=1):
         raise RuntimeError("crashed")
 
     daemon = WorkerDaemon(store, {"raise": raiser}, WorkerConfig(visibility_seconds=3))
@@ -127,7 +127,7 @@ def test_a_lost_lease_discards_the_outcome() -> None:
     store = ScriptedStore([_work({"kind": "slow"})])
     store.heartbeat_alive = False  # first beat discovers the lease is gone
 
-    def slow(payload, lease_lost):
+    def slow(payload, lease_lost, attempt_no=1):
         # Wait until the heartbeat thread notices; then finish "successfully".
         assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
         return HandlerOutcome(ok=True, result={"too": "late"})
@@ -145,7 +145,7 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
     )
     seen = []
 
-    def echo(payload, lease_lost):
+    def echo(payload, lease_lost, attempt_no=1):
         seen.append(payload)
         return HandlerOutcome(ok=True, result={})
 
@@ -171,7 +171,7 @@ def test_idle_backoff_grows_and_resets_on_work(monkeypatch) -> None:
     sleeps: list[float] = []
     daemon = WorkerDaemon(
         store,
-        {"echo": lambda p, e: HandlerOutcome(ok=True)},
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True)},
         WorkerConfig(visibility_seconds=3, idle_min_seconds=1.0, idle_max_seconds=8.0),
     )
     monkeypatch.setattr(
@@ -208,7 +208,7 @@ def test_a_refused_report_is_logged_not_swallowed(caplog) -> None:
     store.complete = refuse_complete  # type: ignore[method-assign]
     daemon = WorkerDaemon(
         store,
-        {"echo": lambda p, e: HandlerOutcome(ok=True, result={})},
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
         WorkerConfig(visibility_seconds=3),
     )
     with caplog.at_level(logging.WARNING):
@@ -240,7 +240,7 @@ def test_persistent_heartbeat_errors_stop_the_work() -> None:
 
     store.heartbeat = broken_heartbeat  # type: ignore[method-assign]
 
-    def slow(payload, lease_lost):
+    def slow(payload, lease_lost, attempt_no=1):
         assert lease_lost.wait(timeout=30), "errors alone never signalled loss"
         return HandlerOutcome(ok=True, result={"too": "late"})
 
@@ -260,7 +260,7 @@ def test_the_claim_loop_feeds_the_watchdog_between_claims() -> None:
     pings: list[str] = []
     daemon = WorkerDaemon(
         store,
-        {"echo": lambda p, e: HandlerOutcome(ok=True, result={})},
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
         WorkerConfig(visibility_seconds=3),
         notify=pings.append,
     )
@@ -295,7 +295,7 @@ def test_the_heartbeat_thread_feeds_the_watchdog_during_a_long_run() -> None:
         ):
             ping_from_beat_thread.set()
 
-    def slow(payload, lease_lost):
+    def slow(payload, lease_lost, attempt_no=1):
         handler_running.set()
         assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
         return HandlerOutcome(ok=True, result={"too": "late"})
@@ -391,7 +391,7 @@ def test_the_watchdog_cap_keeps_the_beat_alive_under_a_long_visibility(
 
     store.heartbeat = observed_heartbeat  # type: ignore[method-assign]
 
-    def slow(payload, lease_lost):
+    def slow(payload, lease_lost, attempt_no=1):
         assert beat_seen.wait(timeout=10), (
             "no heartbeat within the watchdog budget: the uncapped interval "
             "would have parked the beat thread for visibility/3 seconds"
@@ -426,7 +426,7 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
         store = ScriptedStore([_work({"kind": "echo"})])
         daemon = WorkerDaemon(
             store,
-            {"echo": lambda p, e: HandlerOutcome(ok=True, result={})},
+            {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
             WorkerConfig(visibility_seconds=3),
         )
         _run_until_idle(daemon, store)

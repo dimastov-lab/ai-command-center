@@ -61,12 +61,19 @@ class HandlerOutcome:
 
 
 class Handler(Protocol):
-    """One payload executor. It receives the payload and a ``lease_lost``
-    event it must honour: when the event is set, the lease is gone and any
-    further effect the handler produces is unaccountable."""
+    """One payload executor. It receives the payload, a ``lease_lost`` event
+    it must honour (when set, the lease is gone and any further effect the
+    handler produces is unaccountable), and ``attempt_no`` — the queue's own
+    delivery count for this item. The attempt number is an explicit
+    parameter rather than a smuggled payload key because it is DELIVERY
+    metadata: the executor-cascade (BO-S2a) selects its link from it, and a
+    contract a handler can see is one a test can pin."""
 
     def __call__(
-        self, payload: dict[str, Any], lease_lost: threading.Event
+        self,
+        payload: dict[str, Any],
+        lease_lost: threading.Event,
+        attempt_no: int,
     ) -> HandlerOutcome: ...
 
 
@@ -216,7 +223,7 @@ class WorkerDaemon:
                 retryable=False,
             )
         try:
-            return handler(work.payload, lease_lost)
+            return handler(work.payload, lease_lost, work.attempt_no)
         except Exception as error:  # noqa: BLE001 -- the boundary of the daemon
             logger.exception("handler for %r raised", kind)
             return HandlerOutcome(ok=False, reason=repr(error), retryable=True)
