@@ -118,6 +118,11 @@ ALL_TABLES: tuple[str, ...] = (
     "advisor_proposal",
     "audit_finding",
     "audit_run",
+    "backlog_dependency",
+    "backlog_event",
+    "backlog_evidence",
+    "backlog_task",
+    "backlog_writer_lease",
     "completion",
     "completion_event",
     "completion_validation",
@@ -176,6 +181,8 @@ ALL_VIEWS: tuple[str, ...] = (
 # the sequence in addition to INSERT on the table.
 IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
     {
+        "backlog_event": "backlog_event_event_id_seq",
+        "backlog_evidence": "backlog_evidence_evidence_id_seq",
         "completion_event": "completion_event_id_seq",
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
@@ -195,7 +202,9 @@ _READ = frozenset({"SELECT"})
 _NONE: frozenset[str] = frozenset()
 
 
-def merge_privileges(*contributions: dict[str, frozenset[str]]) -> dict[str, frozenset[str]]:
+def merge_privileges(
+    *contributions: dict[str, frozenset[str]],
+) -> dict[str, frozenset[str]]:
     """Union the privilege sets of several contributions, per table.
 
     The one operation this module must never express as `a | b`. Two tasks
@@ -213,7 +222,9 @@ def merge_privileges(*contributions: dict[str, frozenset[str]]) -> dict[str, fro
     merged: dict[str, frozenset[str]] = {}
     for contribution in contributions:
         for table, privileges in contribution.items():
-            merged[table] = frozenset(merged.get(table, frozenset())) | frozenset(privileges)
+            merged[table] = frozenset(merged.get(table, frozenset())) | frozenset(
+                privileges
+            )
     return merged
 
 
@@ -226,6 +237,35 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
     "work_result": _READ,
     "work_event": _READ,
     "work_attempt": _NONE,  # holds `claim_token_hash`; read via the view
+}
+
+# The structured backlog store (0005, BO-S1), the queue-claim idiom again:
+# the control plane READS; every write travels through a SECURITY DEFINER
+# function so that it audits and the status machine cannot be bypassed —
+# there is no SQL path that performs OPEN -> DONE. Workers get nothing: an
+# execution host has no business reading the programme's plan, and a
+# compromised one must not learn it.
+#
+# TODO(VOYN-W0-BACKLOG-ORCHESTRATOR BO-S1, after #321 merged): #321's grant
+# compliance checker now verifies this matrix against the live catalog;
+# extend tests/db/test_grant_compliance.py's provisioning coverage to the
+# backlog tables/functions in the first post-#321 slice. [#321 merged
+# 2026-08-19 as 8b9c89d — the extension rides the next BO slice to keep this
+# PR's surface reviewable.]
+_APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
+    "backlog_task": _READ,
+    "backlog_dependency": _READ,
+    "backlog_evidence": _READ,
+    "backlog_event": _READ,
+    "backlog_writer_lease": _READ,
+}
+
+_WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
+    "backlog_task": _NONE,
+    "backlog_dependency": _NONE,
+    "backlog_evidence": _NONE,
+    "backlog_event": _NONE,
+    "backlog_writer_lease": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -283,14 +323,39 @@ _WORKER_ENROLMENT_TABLES: dict[str, frozenset[str]] = {
 _REVIEW_COLUMNS = ("review_verdict", "review_run_id", "review_summary")
 
 _COMPLETION_COLUMNS = (
-    "run_id", "task_id", "session_id", "project", "repository_path", "branch",
-    "base_branch", "head_commit", "remote", "remote_branch", "pull_request_number",
-    "pull_request_url", "pull_request_state", "replaced_pull_request_number",
-    "replaced_pull_request_url", "merge_commit", "merge_mode", "merge_method",
-    "completion_state", "last_reason_code", "requires_human", "is_recoverable",
-    "recommended_action", "validation_summary", "policy_json", "last_checked_at",
-    "next_retry_at", "retry_count", "recovery_count", "version", "created_at",
-    "updated_at", *_REVIEW_COLUMNS,
+    "run_id",
+    "task_id",
+    "session_id",
+    "project",
+    "repository_path",
+    "branch",
+    "base_branch",
+    "head_commit",
+    "remote",
+    "remote_branch",
+    "pull_request_number",
+    "pull_request_url",
+    "pull_request_state",
+    "replaced_pull_request_number",
+    "replaced_pull_request_url",
+    "merge_commit",
+    "merge_mode",
+    "merge_method",
+    "completion_state",
+    "last_reason_code",
+    "requires_human",
+    "is_recoverable",
+    "recommended_action",
+    "validation_summary",
+    "policy_json",
+    "last_checked_at",
+    "next_retry_at",
+    "retry_count",
+    "recovery_count",
+    "version",
+    "created_at",
+    "updated_at",
+    *_REVIEW_COLUMNS,
 )
 
 _WORKER_COMPLETION_COLUMNS = tuple(
@@ -299,21 +364,21 @@ _WORKER_COMPLETION_COLUMNS = tuple(
 
 # role -> table -> privilege -> the columns it is limited to. A privilege listed
 # here is granted per column; anything not listed is granted table-wide.
-COLUMN_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, MappingProxyType[str, tuple[str, ...]]]] = (
-    MappingProxyType(
-        {
-            WORKER_ROLE: MappingProxyType(
-                {
-                    "completion": MappingProxyType(
-                        {
-                            "INSERT": _WORKER_COMPLETION_COLUMNS,
-                            "UPDATE": _WORKER_COMPLETION_COLUMNS,
-                        }
-                    )
-                }
-            )
-        }
-    )
+COLUMN_PRIVILEGES: MappingProxyType[
+    str, MappingProxyType[str, MappingProxyType[str, tuple[str, ...]]]
+] = MappingProxyType(
+    {
+        WORKER_ROLE: MappingProxyType(
+            {
+                "completion": MappingProxyType(
+                    {
+                        "INSERT": _WORKER_COMPLETION_COLUMNS,
+                        "UPDATE": _WORKER_COMPLETION_COLUMNS,
+                    }
+                )
+            }
+        )
+    }
 )
 
 # The queue and execution tables a worker legitimately writes while running a
@@ -397,6 +462,18 @@ _APP_FUNCTIONS = (
     "queue_redrive(text, integer)",
 )
 
+# The backlog store's whole write surface (0005, BO-S1). Control-plane
+# privileges: workers are deliberately absent.
+_APP_BACKLOG_FUNCTIONS = (
+    "backlog_upsert_task(text, text, text, text, text, text, text, text)",
+    "backlog_transition(text, text, bigint)",
+    "backlog_record_evidence(text, text, text)",
+    "backlog_add_dependency(text, text)",
+    "backlog_lease_acquire(text, text, integer)",
+    "backlog_lease_heartbeat(text, text, integer)",
+    "backlog_lease_release(text, text)",
+)
+
 # The enrolment surface (0003), split by who may do what.
 #
 # A worker gets two entries and no third. It may prove its own identity and
@@ -441,7 +518,7 @@ FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
         # exists: a second task's grants must add to the first's, and the
         # failure mode of getting it wrong — a role that may execute nothing —
         # is silent in each task's own suite.
-        APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS,
+        APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS + _APP_BACKLOG_FUNCTIONS,
         WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
         OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
     }
@@ -474,16 +551,20 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         for table in ALL_TABLES
                         if table not in _APP_QUEUE_TABLES
                         and table not in _APP_ENROLMENT_TABLES
+                        and table not in _APP_BACKLOG_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
                     # table this one already names must union with it, not
                     # replace it — `merge_privileges` is what makes that true.
                     _APP_QUEUE_TABLES,
                     _APP_ENROLMENT_TABLES,
+                    _APP_BACKLOG_TABLES,
                 )
             ),
             WORKER_ROLE: MappingProxyType(
-                merge_privileges(_WORKER_TABLES, _WORKER_ENROLMENT_TABLES)
+                merge_privileges(
+                    _WORKER_TABLES, _WORKER_ENROLMENT_TABLES, _WORKER_BACKLOG_TABLES
+                )
             ),
             # No blanket default: this role is not a general-purpose one, and
             # folding the default in would hand the admission lever DML on every
@@ -575,15 +656,38 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     return statements
 
 
-def render_table_grants(schema: str = "public") -> list[str]:
+def render_table_grants(
+    schema: str = "public",
+    *,
+    existing_relations: set[str] | None = None,
+    existing_functions: set[str] | None = None,
+) -> list[str]:
     """Per-table privileges. Runs as the table owner (`aicc_migrator`).
 
     Idempotent and order-independent by construction — it starts from a clean
     `REVOKE ALL`, so re-running it after a role has been widened by hand puts
     the database back on the declared matrix instead of layering on top of it.
+
+    ``existing_relations`` / ``existing_functions`` (names, not signatures)
+    restrict the GRANT statements to objects that exist. ``None`` — the pure
+    default every render test uses — renders the full matrix. The filter
+    exists for a database standing at an intermediate migration version
+    (downgrade tests, partial upgrades): granting on a not-yet-created table
+    raises, yet the matrix must still describe the whole schema. Skipping is
+    safe against drift because absence of a declared grant on a LIVE object
+    is exactly what tests/db/test_grant_compliance.py (#321) turns red.
     """
     _require_identifier(schema)
     statements: list[str] = []
+
+    def _relation_exists(name: str) -> bool:
+        return existing_relations is None or name in existing_relations
+
+    def _function_exists(signature: str) -> bool:
+        return (
+            existing_functions is None
+            or signature.partition("(")[0] in existing_functions
+        )
 
     # Re-stripping PUBLIC here rather than only at bootstrap is what makes this
     # cover objects created by *later* migrations: at bootstrap the schema is
@@ -621,6 +725,8 @@ def render_table_grants(schema: str = "public") -> list[str]:
     for role in _GRANTED_ROLES:
         for table, privileges in sorted(PRIVILEGES[role].items()):
             _require_identifier(table)
+            if not _relation_exists(table):
+                continue
             columns = COLUMN_PRIVILEGES.get(role, {}).get(table, {})
             table_wide = sorted(p for p in privileges if p not in columns)
             if table_wide:
@@ -637,12 +743,16 @@ def render_table_grants(schema: str = "public") -> list[str]:
 
         for view, privileges in sorted(VIEW_PRIVILEGES.get(role, {}).items()):
             _require_identifier(view)
+            if not _relation_exists(view):
+                continue
             statements.append(
                 f"GRANT {', '.join(sorted(privileges))} ON {schema}.{view} TO {role};"
             )
 
         for signature in FUNCTION_PRIVILEGES.get(role, ()):
             _require_function_signature(signature)
+            if not _function_exists(signature):
+                continue
             statements.append(
                 f"GRANT EXECUTE ON FUNCTION {schema}.{signature} TO {role};"
             )
@@ -653,6 +763,8 @@ def render_table_grants(schema: str = "public") -> list[str]:
     for role in _GRANTED_ROLES:
         for table, sequence in sorted(IDENTITY_SEQUENCES.items()):
             if "INSERT" not in PRIVILEGES[role].get(table, frozenset()):
+                continue
+            if not _relation_exists(table):
                 continue
             _require_identifier(sequence)
             statements.append(f"GRANT USAGE ON SEQUENCE {schema}.{sequence} TO {role};")
@@ -699,8 +811,32 @@ def apply_table_grants(conn, schema: str = "public") -> int:
 
     Run after every migration: this is what stops a newly created table from
     shipping with no grants (invisible to the app) or with inherited ones.
+    Grants are restricted to the objects the catalog actually holds, so a
+    database standing at an intermediate version (a downgrade test, a partial
+    upgrade) re-asserts the matrix for what exists instead of erroring on
+    what does not; the #321 compliance checker is the guard against a LIVE
+    object missing its declared grant.
     """
-    return _execute(conn, render_table_grants(schema))
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n "
+            "ON n.oid = c.relnamespace WHERE n.nspname = %s "
+            "AND c.relkind IN ('r', 'v')",
+            (schema,),
+        )
+        relations = {row[0] for row in cur.fetchall()}
+        cur.execute(
+            "SELECT p.proname FROM pg_proc p JOIN pg_namespace n "
+            "ON n.oid = p.pronamespace WHERE n.nspname = %s",
+            (schema,),
+        )
+        functions = {row[0] for row in cur.fetchall()}
+    return _execute(
+        conn,
+        render_table_grants(
+            schema, existing_relations=relations, existing_functions=functions
+        ),
+    )
 
 
 def _execute(conn, statements: list[str]) -> int:

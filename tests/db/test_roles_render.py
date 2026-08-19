@@ -201,6 +201,8 @@ def test_the_control_plane_cannot_claim() -> None:
     # The enrolment layer (0003). `identity_revoke_principal` is deliberately
     # absent: taking a host offline is the operator's lever, so a compromised
     # control plane can add to the fleet and cannot take it down.
+    # The backlog store (0005, BO-S1): the control plane's whole write path —
+    # every mutation is a SECURITY DEFINER function, tables are read-only.
     assert granted == {
         "queue_enqueue",
         "queue_reap",
@@ -210,6 +212,13 @@ def test_the_control_plane_cannot_claim() -> None:
         "enroll_revoke_ticket",
         "enroll_sweep_expired",
         "identity_sweep_expired",
+        "backlog_upsert_task",
+        "backlog_transition",
+        "backlog_record_evidence",
+        "backlog_add_dependency",
+        "backlog_lease_acquire",
+        "backlog_lease_heartbeat",
+        "backlog_lease_release",
     }
 
 

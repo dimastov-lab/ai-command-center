@@ -70,6 +70,52 @@ class Exclusion:
 # ---------------------------------------------------------------------------
 
 UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
+    # The backlog store (0005, BO-S1) is PostgreSQL-native authority from
+    # birth, like the work_item family below: there is no SQLite source to
+    # dual-write from — the incumbent it replaces is a Markdown FILE, and its
+    # reconciliation path is the importer (backlog_store.import_markdown),
+    # not the mirror machinery. One exclusion per table so a future table in
+    # the family still has to sign in on its own.
+    "backlog_task": Exclusion(
+        reason=(
+            "PostgreSQL-native authority from birth (BO-S1): the incumbent it "
+            "replaces is the Markdown backlog file, reconciled by the importer, "
+            "so there is no SQLite source for the mirror machinery to dual-write."
+        ),
+        task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
+    "backlog_dependency": Exclusion(
+        reason=(
+            "PostgreSQL-native (BO-S1): dependency edges exist only through the "
+            "cycle-checked backlog_add_dependency function; no SQLite authority "
+            "ever held them, so there is nothing for a mirror to copy from."
+        ),
+        task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
+    "backlog_evidence": Exclusion(
+        reason=(
+            "PostgreSQL-native (BO-S1): acceptance evidence rows are written only "
+            "by backlog_record_evidence and never existed in SQLite; a mirror "
+            "would invent a source rather than copy one."
+        ),
+        task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
+    "backlog_event": Exclusion(
+        reason=(
+            "PostgreSQL-native (BO-S1): the append-only audit trail written by "
+            "the store's SECURITY DEFINER functions, the work_event idiom — "
+            "born in PostgreSQL with no SQLite counterpart to mirror."
+        ),
+        task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
+    "backlog_writer_lease": Exclusion(
+        reason=(
+            "PostgreSQL-native (BO-S1): a writer-lease coordination row whose "
+            "whole meaning is the transactional takeover protocol; outside "
+            "PostgreSQL the row is not a lease, so mirroring it would be noise."
+        ),
+        task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
     "queue_entry": Exclusion(
         reason=(
             "Mirrored under a contract of its own rather than the shared one: the "
@@ -212,12 +258,16 @@ RUNTIME_TABLES_WITHOUT_A_TARGET: dict[str, Exclusion] = {
 # ---------------------------------------------------------------------------
 
 
-def _uncovered(tables: set[str], covered: set[str], declared: dict[str, Exclusion]) -> list[str]:
+def _uncovered(
+    tables: set[str], covered: set[str], declared: dict[str, Exclusion]
+) -> list[str]:
     """Tables that are neither covered nor signed out of scope."""
     return sorted(tables - covered - set(declared))
 
 
-def _stale(tables: set[str], covered: set[str], declared: dict[str, Exclusion]) -> list[str]:
+def _stale(
+    tables: set[str], covered: set[str], declared: dict[str, Exclusion]
+) -> list[str]:
     """Declarations that have outlived their reason.
 
     An exclusion for a table that has since been mirrored, or that no longer
@@ -277,7 +327,9 @@ def _runtime_tables() -> set[str]:
 
 
 def test_every_schema_table_is_mirrored_or_signed_out_of_scope() -> None:
-    uncovered = _uncovered(_schema_tables(), _mirrored_tables(), UNMIRRORED_SCHEMA_TABLES)
+    uncovered = _uncovered(
+        _schema_tables(), _mirrored_tables(), UNMIRRORED_SCHEMA_TABLES
+    )
     assert uncovered == [], (
         "tables with neither a mirror nor a signed exclusion: "
         f"{uncovered}. Declare a `PostgresTableMirror` subclass for each, or add "
@@ -313,7 +365,9 @@ def test_the_coverage_gate_fails_on_a_table_that_is_neither() -> None:
 
 def test_the_staleness_gate_fails_on_an_exclusion_for_a_mirrored_table() -> None:
     covered = _mirrored_tables() | {"queue_entry"}
-    assert _stale(_schema_tables(), covered, UNMIRRORED_SCHEMA_TABLES) == ["queue_entry"]
+    assert _stale(_schema_tables(), covered, UNMIRRORED_SCHEMA_TABLES) == [
+        "queue_entry"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +416,12 @@ def test_every_runtime_table_has_a_postgres_target_or_a_signed_exclusion() -> No
 
 
 def test_no_runtime_exclusion_outlives_its_reason() -> None:
-    stale = _stale(_runtime_tables(), set(roles.ALL_TABLES), RUNTIME_TABLES_WITHOUT_A_TARGET)
-    assert stale == [], f"exclusions for runtime tables that are gone or migrated: {stale}"
+    stale = _stale(
+        _runtime_tables(), set(roles.ALL_TABLES), RUNTIME_TABLES_WITHOUT_A_TARGET
+    )
+    assert stale == [], (
+        f"exclusions for runtime tables that are gone or migrated: {stale}"
+    )
 
 
 def test_the_runtime_gate_fails_on_an_undeclared_ad_hoc_table() -> None:
@@ -391,7 +449,9 @@ def test_every_exclusion_is_signed(registry: dict[str, Exclusion]) -> None:
     """
     assert registry, "an empty registry would satisfy every check above"
     for table, exclusion in registry.items():
-        assert len(exclusion.reason.split()) >= 10, f"{table}: the reason is not a reason"
+        assert len(exclusion.reason.split()) >= 10, (
+            f"{table}: the reason is not a reason"
+        )
         assert re.fullmatch(r"VOYN-[A-Z0-9-]+[a-z]?", exclusion.task), (
             f"{table}: {exclusion.task!r} is not a central backlog task id"
         )
