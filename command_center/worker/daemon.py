@@ -21,6 +21,14 @@ Design decisions, each traceable to the shipped substrate:
   first-writer-wins); hammering the server with a dead secret is
   indistinguishable from an attack, so the daemon exits non-zero and leaves
   restart pacing to systemd.
+* **The watchdog is fed from both threads, because each covers the other's
+  blind spot** (SRV-06). The claim loop pings between claims but blocks for
+  the whole of a handler's run; the heartbeat thread pings during exactly
+  that run but exists only while an item is held. Together every healthy
+  state pings within one heartbeat interval, so a wedged process — a handler
+  that hangs *and* takes the beat thread with it, a claim loop stuck in a
+  driver call — misses two pings and systemd restarts the unit. Restart is
+  safe by the same construction as SIGKILL: lease expiry plus the reaper.
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ from command_center.db.work_queue_store import (
     QueueRefusal,
     WorkQueueStore,
 )
+from command_center.worker import sdnotify
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +89,7 @@ class WorkerDaemon:
         config: WorkerConfig = WorkerConfig(),
         *,
         sleep: Callable[[float], None] | None = None,
+        notify: Callable[[str], object] | None = None,
     ) -> None:
         self._store = store
         self._handlers = dict(handlers)
@@ -87,6 +97,9 @@ class WorkerDaemon:
         self._stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
         self._sleep = sleep if sleep is not None else self._stop.wait
+        # Injectable so tests observe pings; the default is a no-op outside
+        # systemd (sd_notify returns quietly without NOTIFY_SOCKET).
+        self._notify = notify if notify is not None else sdnotify.sd_notify
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -104,24 +117,35 @@ class WorkerDaemon:
     # -- the loop -------------------------------------------------------------
 
     def run_forever(self) -> None:
+        self._notify("READY=1")
+        # Read once: systemd sets WATCHDOG_USEC at spawn and never changes it
+        # for a running unit. Every sleep below is capped by it, so the ping
+        # cadence adapts to whatever WatchdogSec the unit declares instead of
+        # baking the unit file's number into the code.
+        watchdog = sdnotify.watchdog_interval_seconds()
+        cap = watchdog if watchdog is not None else float("inf")
         idle = self._config.idle_min_seconds
         while not self._stop.is_set():
+            self._notify("WATCHDOG=1")
             claimed = self._store.claim(
                 self._config.queue,
                 visibility_seconds=self._config.visibility_seconds,
             )
             if isinstance(claimed, QueueRefusal):
                 if claimed.reason == "no_work":
-                    self._sleep(idle + random.uniform(0, idle))
+                    self._sleep(min(idle + random.uniform(0, idle), cap))
                     idle = min(idle * 2, self._config.idle_max_seconds)
                     continue
                 # Every other refusal is a protocol-level fact worth a log
                 # line, and none of them is cured by asking again faster.
                 logger.warning("claim refused: %s", claimed.reason)
-                self._sleep(self._config.idle_max_seconds)
+                self._sleep(min(self._config.idle_max_seconds, cap))
                 continue
             idle = self._config.idle_min_seconds
             self._execute(claimed)
+        # STOPPING=1 tells systemd the exit it is about to observe is ours,
+        # not a crash — TimeoutStopSec pacing instead of watchdog action.
+        self._notify("STOPPING=1")
 
     def _execute(self, work: ClaimedWork) -> None:
         lease_lost = threading.Event()
@@ -204,10 +228,20 @@ class WorkerDaemon:
         beat_stop: threading.Event,
     ) -> None:
         # A third of the window: two consecutive beats may fail (a restarting
-        # PostgreSQL, a network blip) before the lease actually lapses.
+        # PostgreSQL, a network blip) before the lease actually lapses. The
+        # watchdog cap can shorten the wait — an extra lease renewal is
+        # harmless, a missed watchdog deadline during a long run is a restart.
         interval = max(self._config.visibility_seconds / 3.0, 1.0)
+        watchdog = sdnotify.watchdog_interval_seconds()
+        if watchdog is not None:
+            interval = min(interval, max(watchdog, 1.0))
         consecutive_errors = 0
         while not beat_stop.wait(interval):
+            # Fed even when the database is unreachable: the watchdog answers
+            # "is the process alive", not "is PostgreSQL up" — restarting the
+            # unit cures a wedged process and cures nothing about a DB outage,
+            # which the lease-lapse logic below already handles.
+            self._notify("WATCHDOG=1")
             try:
                 alive = self._store.heartbeat(work)
             except Exception:  # noqa: BLE001 -- transient DB errors must not kill the beat

@@ -299,6 +299,9 @@
     "command_center/worker/payloads.py": [
       "orchestration"
     ],
+    "command_center/worker/sdnotify.py": [
+      "orchestration"
+    ],
     "command_center/worktree_launcher.py": [
       "orchestration"
     ],

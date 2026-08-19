@@ -140,7 +140,9 @@ def test_a_lost_lease_discards_the_outcome() -> None:
 
 
 def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
-    store = ScriptedStore([_work({"kind": "echo"}), _work({"kind": "echo"}, attempt_id="wat-2")])
+    store = ScriptedStore(
+        [_work({"kind": "echo"}), _work({"kind": "echo"}, attempt_id="wat-2")]
+    )
     seen = []
 
     def echo(payload, lease_lost):
@@ -163,16 +165,19 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
 
 
 def test_idle_backoff_grows_and_resets_on_work(monkeypatch) -> None:
-    store = ScriptedStore([QueueRefusal("no_work"), QueueRefusal("no_work"),
-                           _work({"kind": "echo"})])
+    store = ScriptedStore(
+        [QueueRefusal("no_work"), QueueRefusal("no_work"), _work({"kind": "echo"})]
+    )
     sleeps: list[float] = []
     daemon = WorkerDaemon(
         store,
         {"echo": lambda p, e: HandlerOutcome(ok=True)},
         WorkerConfig(visibility_seconds=3, idle_min_seconds=1.0, idle_max_seconds=8.0),
     )
-    monkeypatch.setattr("command_center.worker.daemon.random",
-                        type("R", (), {"uniform": staticmethod(lambda a, b: 0.0)}))
+    monkeypatch.setattr(
+        "command_center.worker.daemon.random",
+        type("R", (), {"uniform": staticmethod(lambda a, b: 0.0)}),
+    )
 
     def fake_sleep(t):
         sleeps.append(t)
@@ -239,8 +244,88 @@ def test_persistent_heartbeat_errors_stop_the_work() -> None:
         assert lease_lost.wait(timeout=30), "errors alone never signalled loss"
         return HandlerOutcome(ok=True, result={"too": "late"})
 
-    daemon = WorkerDaemon(
-        store, {"slow": slow}, WorkerConfig(visibility_seconds=3)
-    )
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
     _run_until_idle(daemon, store)
     assert not any(c[0] == "complete" for c in store.calls)
+
+
+# -- the systemd watchdog seam (SRV-06) --------------------------------------
+
+
+def test_the_claim_loop_feeds_the_watchdog_between_claims() -> None:
+    """READY once at startup, a WATCHDOG ping before every claim, STOPPING at
+    exit — the exact three states aicc-worker.service (Type=notify,
+    WatchdogSec) supervises on."""
+    store = ScriptedStore([_work({"kind": "echo"})])
+    pings: list[str] = []
+    daemon = WorkerDaemon(
+        store,
+        {"echo": lambda p, e: HandlerOutcome(ok=True, result={})},
+        WorkerConfig(visibility_seconds=3),
+        notify=pings.append,
+    )
+    _run_until_idle(daemon, store)
+
+    assert pings[0] == "READY=1", "readiness must precede the first claim"
+    assert pings[-1] == "STOPPING=1", "a clean exit must announce itself"
+    watchdog = [p for p in pings if p == "WATCHDOG=1"]
+    claims = [c for c in store.calls if c[0] == "claim"]
+    assert len(watchdog) == len(claims), "one ping per loop iteration"
+
+
+def test_the_heartbeat_thread_feeds_the_watchdog_during_a_long_run() -> None:
+    """While a handler blocks the claim loop, the ONLY thing still pinging is
+    the heartbeat thread — this pins that it actually does, even while the
+    database refuses the beat (a DB outage is not a process wedge)."""
+    import threading
+
+    store = ScriptedStore([_work({"kind": "slow"})])
+    store.heartbeat_alive = False  # the DB says the lease is gone
+    pinged_during_run = threading.Event()
+    pings: list[str] = []
+
+    def notify(state: str) -> None:
+        pings.append(state)
+        if state == "WATCHDOG=1" and len(pings) > 2:
+            pinged_during_run.set()
+
+    def slow(payload, lease_lost):
+        assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
+        return HandlerOutcome(ok=True, result={"too": "late"})
+
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=3), notify=notify
+    )
+    _run_until_idle(daemon, store)
+    # visibility 3s -> beat interval 1s: the beat thread pinged at least once
+    # while the handler held the loop.
+    assert pinged_during_run.is_set()
+
+
+def test_the_watchdog_budget_caps_the_idle_sleep(monkeypatch) -> None:
+    """WatchdogSec shorter than the idle backoff must shorten the sleep, not
+    let a healthy idle worker miss its deadline and be shot by systemd."""
+    monkeypatch.setenv("WATCHDOG_USEC", "8000000")  # 8s budget -> 4s interval
+    import os
+
+    monkeypatch.setenv("WATCHDOG_PID", str(os.getpid()))
+    store = ScriptedStore([QueueRefusal("no_work")] * 3)
+    sleeps: list[float] = []
+    daemon = WorkerDaemon(
+        store,
+        {},
+        WorkerConfig(
+            visibility_seconds=3, idle_min_seconds=16.0, idle_max_seconds=64.0
+        ),
+        notify=lambda _s: None,
+    )
+
+    def fake_sleep(t):
+        sleeps.append(t)
+        if len(sleeps) >= 3:
+            daemon.request_stop()
+
+    daemon._sleep = fake_sleep  # type: ignore[method-assign]
+    daemon.run_forever()
+
+    assert sleeps and all(t <= 4.0 for t in sleeps), sleeps
