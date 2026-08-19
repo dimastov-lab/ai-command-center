@@ -132,6 +132,15 @@
     "command_center/http_auth/routing.py": [
       "authz"
     ],
+    "command_center/orchestrator/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/planner.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/routing.py": [
+      "orchestration"
+    ],
     "command_center/pipeline_settings.py": [
       "orchestration"
     ],

@@ -80,7 +80,10 @@ QUEUE_TABLES = ("work_item", "work_attempt", "work_result", "work_event")
 
 def test_merging_two_contributions_keeps_both() -> None:
     first = {"shared_table": frozenset({"SELECT"}), "only_first": frozenset({"INSERT"})}
-    second = {"shared_table": frozenset({"UPDATE"}), "only_second": frozenset({"SELECT"})}
+    second = {
+        "shared_table": frozenset({"UPDATE"}),
+        "only_second": frozenset({"SELECT"}),
+    }
 
     merged = roles.merge_privileges(first, second)
 
@@ -114,7 +117,9 @@ def test_the_blanket_default_never_widens_a_narrowed_table() -> None:
     control plane would regain the direct write the protocol exists to remove.
     """
     assert roles.PRIVILEGES[roles.APP_ROLE]["work_item"] == frozenset({"SELECT"})
-    assert roles.PRIVILEGES[roles.APP_ROLE]["run"] == frozenset({"SELECT", "INSERT", "UPDATE"})
+    assert roles.PRIVILEGES[roles.APP_ROLE]["run"] == frozenset(
+        {"SELECT", "INSERT", "UPDATE"}
+    )
 
 
 def test_the_rendered_matrix_covers_every_declared_privilege() -> None:
@@ -129,9 +134,7 @@ def test_the_rendered_matrix_covers_every_declared_privilege() -> None:
             if not privileges or table in roles.COLUMN_PRIVILEGES.get(role, {}):
                 continue
             granted = [
-                s
-                for s in statements
-                if s.endswith(f"ON public.{table} TO {role};")
+                s for s in statements if s.endswith(f"ON public.{table} TO {role};")
             ]
             assert len(granted) == 1, f"{role}.{table}"
             for privilege in privileges:
@@ -219,6 +222,9 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",
         "backlog_lease_release",
+        # BO-S2 (0006): the planner's atomic dispatch and lane release.
+        "backlog_dispatch",
+        "backlog_release_terminal",
     }
 
 
@@ -240,13 +246,16 @@ def test_function_grants_are_revoked_before_they_are_reapplied() -> None:
         revoke = f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM {role};"
         assert revoke in statements
         first_grant = next(
-            i for i, s in enumerate(statements) if s.startswith("GRANT EXECUTE ON FUNCTION")
-            and s.endswith(f"TO {role};")
+            i
+            for i, s in enumerate(statements)
+            if s.startswith("GRANT EXECUTE ON FUNCTION") and s.endswith(f"TO {role};")
         )
         assert statements.index(revoke) < first_grant
 
 
-@pytest.mark.parametrize("bad", ["queue_claim(text; DROP TABLE task)", "queue_claim(text"])
+@pytest.mark.parametrize(
+    "bad", ["queue_claim(text; DROP TABLE task)", "queue_claim(text"]
+)
 def test_function_signature_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError):
         roles._require_function_signature(bad)

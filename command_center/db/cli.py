@@ -72,6 +72,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    plan = sub.add_parser(
+        "backlog-plan",
+        help="One planner tick (BO-S2): release finished lanes, dispatch "
+        "eligible tasks to the execution queue (run by aicc-backlog-planner.timer).",
+    )
+    plan.add_argument("--wip-limit", type=int, default=4)
+    plan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the eligible set without dispatching.",
+    )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -204,6 +215,41 @@ def main(argv: list[str] | None = None) -> int:
                     BacklogStore(lambda: nullcontext(conn)).counts_by_status().items()
                 ):
                     print(f"{status}: {count}")
+                return 0
+
+            if args.command == "backlog-plan":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.planner import PlanLimits, plan_once
+
+                if args.dry_run:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT task_id, wave, priority, dispatchable "
+                            "FROM backlog_eligible"
+                        )
+                        for task_id, wave, priority, dispatchable in cur.fetchall():
+                            print(
+                                f"{task_id}  wave={wave} priority={priority or '-'} "
+                                f"{'dispatchable' if dispatchable else 'NO REPO'}"
+                            )
+                    return 0
+                report = plan_once(
+                    lambda: _nc(conn), PlanLimits(wip_limit=args.wip_limit)
+                )
+                if report.planner_busy:
+                    print("planner lease held elsewhere; nothing done")
+                    return 0
+                for task_id, work_item in report.dispatched:
+                    print(f"DISPATCHED {task_id} -> {work_item}")
+                for task_id, state in report.released:
+                    print(f"RELEASED  {task_id} (queue: {state})")
+                for task_id, reason in report.skipped_by_wave_gate:
+                    print(f"WAVE-GATE {task_id}: {reason}")
+                for task_id, reason in report.refused:
+                    print(f"REFUSED   {task_id}: {reason}")
+                for task_id, reason in report.undispatchable:
+                    print(f"NO-REPO   {task_id}: {reason}")
                 return 0
 
             if args.command == "downgrade":
