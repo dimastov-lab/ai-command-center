@@ -1,0 +1,43 @@
+# The headless worker under systemd (VOYN-W0-AICC-SRV-05).
+#
+# Install:
+#   cp deploy/systemd/aicc-worker.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-worker
+#
+# The unit assumes the host is already enrolled: /etc/aicc/worker.env carries
+# AICC_PG_USER=<its aicc_w_* role> and the SCRAM secret produced at ticket
+# redemption. Enrolment is an operator act — a worker cannot redeem its own
+# ticket by design.
+
+[Unit]
+Description=AI Command Center headless worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=aicc-worker
+Group=aicc-worker
+EnvironmentFile=/etc/aicc/worker.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
+
+# Exit codes are the daemon's interface: 2 = config refused, 3 = DB
+# unreachable, both cured by time or by an operator, never by a tight loop.
+Restart=always
+RestartSec=10s
+# SIGTERM stops claiming and finishes the item in hand; the stop timeout must
+# outlive the visibility window so a healthy handler is never killed mid-item.
+TimeoutStopSec=330s
+
+# Containment: the worker executes claimed payloads and talks to PostgreSQL —
+# nothing here needs privileges, a home, or a writable system.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aicc-worker
+StateDirectory=aicc-worker
+
+[Install]
+WantedBy=multi-user.target

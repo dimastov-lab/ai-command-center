@@ -8,6 +8,28 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — the headless worker service (`VOYN-W0-AICC-SRV-05`, slice 1)
+
+- `command_center/db/work_queue_store.py`: the first Python surface over the
+  `0002_queue_claim` protocol — until now `queue_claim`/`queue_heartbeat`/
+  `queue_complete`/`queue_fail` had no caller outside tests. Token generated
+  locally, only its SHA-256 travels on claim; refusals are data, not
+  exceptions.
+- `command_center/worker/`: the claim-execute-report daemon. Heartbeat runs
+  beside the handler and stops the work when the lease is lost; SIGTERM
+  finishes the item in hand and claims no more; an unknown payload kind is a
+  non-retryable failure; auth loss exits non-zero and leaves restart pacing to
+  systemd. Handlers are a registry — the bridge from a claimed payload to a
+  real agent run is deliberately a follow-up slice, because the `execution`
+  payload schema and its producer do not exist yet.
+- `deploy/systemd/aicc-worker.service`: the first systemd unit in the repo.
+  `TimeoutStopSec` outlives the visibility window so a healthy handler is
+  never killed mid-item; hardened (`NoNewPrivileges`, `ProtectSystem=strict`).
+- Test conftest guards: two autouse fixtures hard-imported streamlit (directly
+  and via `app.py`), turning every test on a headless host red at setup — the
+  exact host the worker ships to. Both are now guarded, with the reason
+  recorded at the guard.
+
 ### Security — container deployment no longer exposes the console (`VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH`)
 
 An earlier audit (`9761459`, BLOCKER-1) pinned the Streamlit console to localhost for the bare
