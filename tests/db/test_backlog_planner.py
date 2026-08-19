@@ -456,8 +456,15 @@ def test_repo_routes_translate_the_backlog_vocabulary(monkeypatch) -> None:
     monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", '{"x": ["AIOS", "/p"]}')
     assert repo_route("x") == ("AIOS", "/p")
     assert repo_route("aios") is None  # override replaces, not merges
+    # Fail closed must be probed on a key the DEFAULTS would answer —
+    # otherwise "closed" and "fell through to defaults" are identical
+    # (review mutant (б) survived on exactly that blindness).
     monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", "{broken json")
-    assert repo_route("x") is None  # fail closed, visibly
+    assert repo_route("aios") is None
+    for bad in ('{"x": "AICC"}', '{"x": {"a": 1}}', '{"x": ["AICC", 7]}',
+                '{"x": ["AICC", ""]}', '[1, 2]'):
+        monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", bad)
+        assert repo_route("x") is None and repo_route("aios") is None, bad
 
 
 def test_an_unrouted_repo_is_reported_not_dead_lettered(rig, monkeypatch) -> None:

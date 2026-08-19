@@ -72,10 +72,26 @@ _DEFAULT_REPO_ROUTES: dict[str, tuple[str, str]] = {
 def repo_route(repo: str) -> tuple[str, str] | None:
     raw = os.environ.get("AICC_PLANNER_REPO_ROUTES", "")
     if raw:
+        # A broken override routes NOTHING — and "broken" includes decodable
+        # JSON of the wrong shape: a bare string would be silently misrouted
+        # by indexing ("AICC" -> ("A", "I")), a dict raises out of the tick,
+        # a non-string path dead-letters downstream. Review proved all three
+        # live; every value must be exactly two non-empty strings.
         try:
-            table = {k: (v[0], v[1]) for k, v in json.loads(raw).items()}
-        except (ValueError, TypeError, IndexError):
-            return None  # a broken override routes nothing: fail closed, visibly
+            decoded = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        table: dict[str, tuple[str, str]] = {}
+        for key, value in decoded.items():
+            if (
+                not isinstance(value, (list, tuple))
+                or len(value) != 2
+                or not all(isinstance(part, str) and part for part in value)
+            ):
+                return None
+            table[key] = (value[0], value[1])
         return table.get(repo)
     return _DEFAULT_REPO_ROUTES.get(repo)
 
