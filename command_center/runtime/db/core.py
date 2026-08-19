@@ -17,9 +17,10 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, TypeVar
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
@@ -415,12 +416,183 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
+        # Stamp the zone this file's naive timestamps are on, from a process
+        # that also writes them. Retention reads it back instead of trusting
+        # its own `TZ` (VOYN-W0-AICC-RETENTION-TZ).
+        db._stamp_timestamp_zone(conn)
     if current >= 13:
         db.backfill_run_provenance(db_path, limit=500)
     # Optional, operator-opted-in retention: run after the migration connection
     # above has closed so VACUUM (if enabled) does not contend with it. See
     # `apply_runtime_retention`.
     db.maybe_apply_runtime_retention(db_path)
+
+
+#: Where a database records the zone its naive timestamps are on.
+#:
+#: Deliberately a column on the `schema_version` bookkeeping ledger rather than
+#: a table of its own. It is a fact *about the store*, in the same category as
+#: `applied_at` (itself an `iso_now` value, and the row this annotates): it says
+#: which clock that timestamp — and every other naive timestamp in the file —
+#: was written on. A separate domain table would also have to acquire a
+#: PostgreSQL counterpart in the store-migration lane before it could exist,
+#: which is a coupling this fix has no reason to create.
+LEDGER_TIMESTAMP_TZ_COLUMN = "timestamp_tz"
+RETENTION_TZ_ENV = "AICC_RUNTIME_TZ"
+
+
+def _machine_timestamp_zone() -> str | None:
+    """The IANA zone name this machine writes `models.iso_now` timestamps in,
+    or `None` when it cannot be identified as an IANA key.
+
+    Two sources, in order: an explicit `TZ` (what a container, a service unit
+    or a cron entry sets), then the `/etc/localtime` symlink (macOS and Linux
+    both point it into the zoneinfo tree). A `TZ` in POSIX rule form
+    (`EST5EDT`), or a Windows host with no symlink, yields `None` — a name we
+    cannot resolve is worse than no name, because it would be recorded as
+    authoritative and then silently mis-resolve later.
+    """
+    declared = os.environ.get("TZ")
+    if declared:
+        try:
+            ZoneInfo(declared)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+        else:
+            return declared
+    try:
+        link = os.readlink("/etc/localtime")
+    except OSError:
+        return None
+    marker = "zoneinfo/"
+    if marker not in link:
+        return None
+    name = link.split(marker, 1)[1]
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    return name
+
+
+def _read_timestamp_zone(conn: sqlite3.Connection) -> str | None:
+    """The zone recorded on the ledger, or `None` — including on a database
+    written before this column existed, where the `SELECT` itself fails."""
+    try:
+        row = conn.execute(
+            f"SELECT {db.LEDGER_TIMESTAMP_TZ_COLUMN} AS zone FROM schema_version"
+            f" WHERE {db.LEDGER_TIMESTAMP_TZ_COLUMN} IS NOT NULL"
+            " ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row["zone"] if row else None
+
+
+def _stamp_timestamp_zone(conn: sqlite3.Connection) -> None:
+    """Record, once, the zone this database's naive timestamps are on.
+
+    Written by `migrate()`, i.e. by an application process that also writes
+    those timestamps, and never overwritten: the recorded zone describes the
+    history already in the file. Moving a database to a machine in another zone
+    therefore keeps the old (correct) reading of the old rows; new rows written
+    there are on a different clock, which no retention cutoff can reconcile —
+    that is the `iso_now` convention's own limit, not this function's (see
+    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape the run-table
+    migrations use, under the same `BEGIN IMMEDIATE`, so two processes racing
+    a brand-new database cannot both decide the column is missing.
+    """
+    zone = db._machine_timestamp_zone()
+    if zone is None:
+        return
+    try:
+        with db.transaction(conn):
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(schema_version)").fetchall()
+            }
+            if db.LEDGER_TIMESTAMP_TZ_COLUMN not in existing:
+                conn.execute(
+                    "ALTER TABLE schema_version"
+                    f" ADD COLUMN {db.LEDGER_TIMESTAMP_TZ_COLUMN} TEXT"
+                )
+            already = conn.execute(
+                f"SELECT 1 FROM schema_version"
+                f" WHERE {db.LEDGER_TIMESTAMP_TZ_COLUMN} IS NOT NULL LIMIT 1"
+            ).fetchone()
+            if already:
+                return
+            conn.execute(
+                f"UPDATE schema_version SET {db.LEDGER_TIMESTAMP_TZ_COLUMN} = ?"
+                " WHERE version = (SELECT MAX(version) FROM schema_version)",
+                (zone,),
+            )
+    except sqlite3.OperationalError:
+        # A concurrent writer got there first, or the ledger is not readable
+        # here. The marker is not this call's to force; retention says
+        # "process-local" rather than deleting against a guessed clock.
+        pass
+
+
+def resolve_timestamp_zone(db_path: Path) -> tuple[str | None, str]:
+    """Which zone `completed_at`/`created_at` strings in `db_path` are on, and
+    where that answer came from (`"env"`, `"database"`, `"process-local"`).
+
+    `AICC_RUNTIME_TZ` wins so an operator can state the truth for a database
+    stamped on the wrong machine; an unusable value raises rather than falling
+    back, because a wrong zone here silently changes which rows get deleted.
+    """
+    override = os.environ.get(RETENTION_TZ_ENV)
+    if override:
+        try:
+            ZoneInfo(override)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"{RETENTION_TZ_ENV}={override!r} is not a usable IANA timezone"
+            ) from exc
+        return override, "env"
+    with db.connect(db_path) as conn:
+        recorded = db._read_timestamp_zone(conn)
+    if recorded:
+        try:
+            ZoneInfo(recorded)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+        else:
+            return recorded, "database"
+    return None, "process-local"
+
+
+def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, str]:
+    """The `completed_at < ?` bound for `retention_days`, as
+    `(cutoff, zone_name, zone_source)`.
+
+    The single reason this exists: `completed_at` is a naive local string, so
+    the bound has to be rendered on the *same* clock the rows were written on
+    — not on whatever clock the pruning process happens to be started with.
+    Anchoring to `datetime.now(timezone.utc)` and converting into the
+    database's declared zone makes the returned string identical in every
+    process timezone, which is what makes the deleted row *set* deterministic
+    (`VOYN-W0-AICC-RETENTION-TZ`).
+
+    With no declared zone (a database that predates migration 24 and has not
+    been migrated since) the process clock is all there is; the third element
+    says so, so a caller can record that the answer was not pinned.
+    """
+    zone_name, source = db.resolve_timestamp_zone(db_path)
+    if zone_name is None:
+        now_local = datetime.now()
+        zone_name = datetime.now().astimezone().tzname() or ""
+    else:
+        now_local = (
+            datetime.now(timezone.utc)
+            .astimezone(ZoneInfo(zone_name))
+            .replace(tzinfo=None)
+        )
+    cutoff = (now_local - timedelta(days=retention_days)).isoformat(timespec="seconds")
+    return cutoff, zone_name, source
 
 
 def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
@@ -431,9 +603,12 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     Bounded and conservative:
       * only *terminal* runs are eligible (their events are historical audit
         trail, not live state);
-      * the cutoff is computed in Python with the same naive-local ISO
-        convention every other timestamp in this app uses (`models.iso_now`),
-        so it never disagrees with `completed_at` by a UTC offset;
+      * the cutoff comes from `retention_cutoff`, which renders it in the zone
+        the database declares its naive timestamps are on — so the deleted row
+        *set* is the same whichever timezone the pruning process runs in. It
+        used to be a bare `datetime.now()`, i.e. the pruning process's own
+        zone, which deleted a different set of rows from the same database at
+        the same instant (`VOYN-W0-AICC-RETENTION-TZ`);
       * the run row itself is kept (its `state`/`completed_at` remain visible
         in the Execution Center and to reconciliation); only the bulky
         per-output-event history is pruned;
@@ -444,7 +619,9 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     """
     if retention_days <= 0:
         return 0
-    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(timespec="seconds")
+    cutoff, _zone, _zone_source = db.retention_cutoff(
+        db_path, retention_days=retention_days
+    )
     placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
     with db.connect(db_path) as conn:
         with db.transaction(conn):
@@ -486,7 +663,15 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
         return
     if retention_days <= 0:
         return
-    db.apply_runtime_retention(db_path, retention_days=retention_days)
+    try:
+        db.apply_runtime_retention(db_path, retention_days=retention_days)
+    except ValueError:
+        # An unusable `AICC_RUNTIME_TZ`. This path runs inside `migrate()`, on
+        # every service construction, so it must not take the app down — but it
+        # must not delete rows against a guessed clock either. Skipping is the
+        # safe half of that trade; the operator's next deliberate
+        # `apply_runtime_retention` call raises and says why.
+        return
     if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
         with db.connect(db_path) as conn:
             conn.execute("VACUUM")
