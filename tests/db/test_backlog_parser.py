@@ -93,3 +93,35 @@ def test_the_real_canonical_file_parses_with_no_vocabulary_gaps():
         assert reason.startswith(("duplicate id", "id outside the VOYN namespace")), (
             reason
         )
+
+
+def test_repo_is_inferred_from_the_task_family() -> None:
+    """The whole backlog routes without a per-record hint: family → repo,
+    non-code families → None (reported, never mis-routed), explicit hint wins."""
+    from command_center.db.backlog_parser import _infer_repo, parse_backlog
+
+    assert _infer_repo("VOYN-W0-PLAT-09") == "aios"
+    assert _infer_repo("VOYN-W0-AICC-SRV-08") == "ai-command-center"
+    assert _infer_repo("VOYN-W0-F2") == "aios"
+    assert _infer_repo("VOYN-W0-F3") == "ai-command-center"
+    assert _infer_repo("VOYN-OPS-CI-SPEED-01") is None
+    assert _infer_repo("VOYN-W0-BE-ACC") == "ai-command-center"
+
+    md = (
+        "- **VOYN-W0-AICC-X** | Wave 0 | OPEN | P0 | T | `s` | body.\n"
+        "- **VOYN-W0-PLAT-Y** | Wave 0 | OPEN | P0 | T | `s` | body.\n"
+        "  - Target repo (owner decision): `aios`.\n"
+    )
+    report = parse_backlog(md)
+    by_id = {t.task_id: t.repo for t in report.tasks}
+    assert by_id["VOYN-W0-AICC-X"] == "ai-command-center"  # inferred
+    assert by_id["VOYN-W0-PLAT-Y"] == "aios"  # explicit hint (also matches family)
+
+    # Diverging hint must win over inference (reversing the if-order is a real
+    # regression the same-repo case above cannot catch — review found it).
+    md2 = (
+        "- **VOYN-W0-AICC-Z** | Wave 0 | OPEN | P0 | T | `s` | body.\n"
+        "  - Target repo (owner decision): `aios`.\n"
+    )
+    r2 = parse_backlog(md2)
+    assert r2.tasks[0].repo == "aios"  # hint aios beats AICC-family inference
