@@ -174,7 +174,11 @@ section below for why it exists at all):
   (queue client), `command_center/db/work_queue_admin.py` (control-plane
   recovery surface: reap/DLQ/redrive, VOYN-W0-AICC-SRV-06),
   `command_center/worker/` (daemon, entrypoint, payload contract, agent_run
-  bridge, sd_notify watchdog seam) — clients of the PL/pgSQL queue authority
+  bridge, sd_notify watchdog seam, writer-lease dispatch gate —
+  `worktree_lease.py`, VOYN-OPS-WORKER-DISPATCH-INTO-LEASED-WORKTREE: a
+  read-only query of the `voyn_coordination.writer_lease` authority that
+  refuses a mutating dispatch into a worktree another writer holds; it owns no
+  lease state and never acquires) — clients of the PL/pgSQL queue authority
   accepted via VOYN-W0-AICC-SRV-03/04b. The bridge executes through the
   frozen runner (`agent_runner.run_claude_code`) unchanged — sandbox
   profiles, credential scrubbing and timeouts stay the legacy engine's

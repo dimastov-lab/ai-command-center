@@ -36,6 +36,7 @@ from typing import Any
 from command_center import agent_runner
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
+from command_center.worker.worktree_lease import blocking_lease
 from command_center.orchestrator.publish import PublishConfig, publish_run
 
 __all__ = ["build_handlers"]
@@ -147,6 +148,20 @@ def _run_agent(
             ),
             retryable=False,
         )
+
+    # Single-writer gate at the dispatch boundary (part B of
+    # VOYN-OPS-WORKER-DISPATCH-INTO-LEASED-WORKTREE). The git hooks enforce
+    # the writer lease for commits made through them, but this handler wrote
+    # into the routed checkout without ever asking who holds it -- so an agent
+    # could edit files in a tree another writer owns, and the hook would only
+    # notice at commit time, with the collision already on disk. Retryable:
+    # a lease is a temporary claim, so redelivery lands once it is released,
+    # bounded by the item's own max_attempts. Mutating types only -- a
+    # read-only run gets the read-only sandbox profile and writes nothing.
+    if task_type in agent_runner.MUTATING_TASK_TYPES:
+        held = blocking_lease(repository)
+        if held is not None:
+            return HandlerOutcome(ok=False, reason=held, retryable=True)
 
     run = agent_runner.run_claude_code(
         repository_path=repository,
