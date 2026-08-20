@@ -82,3 +82,56 @@ def test_unknown_decision_is_refused_as_data(rig):  # noqa: F811
     ok, reason = _triage(f, "VOYN-W0-T6", "nonsense")
     assert not ok and "unknown_decision" in reason
     assert _status(f, "VOYN-W0-T6") == "UNTRIAGED"
+
+
+def test_concurrent_triage_of_one_finding_applies_once(rig):  # noqa: F811
+    """The only serializer of two simultaneous triages of one finding is the
+    row lock (backlog_triage has no optimistic revision gate, unlike
+    transition/dispatch). Removing FOR UPDATE lets both read UNTRIAGED and
+    both apply — this pins the lock: exactly one 'granted', the loser sees
+    not_untriaged."""
+    import threading
+
+    f, store, _ = rig
+    _untriaged(store, f, "VOYN-W0-TC")
+    results = []
+    barrier = threading.Barrier(2)
+
+    def worker(decision):
+        with f() as c, c.cursor() as cur:
+            barrier.wait()
+            cur.execute("SELECT ok, reason FROM backlog_triage(%s, %s, %s)",
+                        ("VOYN-W0-TC", decision, None))
+            results.append(cur.fetchone())
+
+    ts = [threading.Thread(target=worker, args=(d,)) for d in ("accept", "duplicate")]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    granted = [r for r in results if r[0]]
+    refused = [r for r in results if not r[0]]
+    assert len(granted) == 1, results
+    assert len(refused) == 1 and "not_untriaged" in refused[0][1], results
+
+
+def test_migration_0008_is_reversible_without_residue(pg_connection_factory):
+    """Live up->down->up: down drops the function, up recreates it with no
+    'already exists' residue (CREATE FUNCTION, not CREATE OR REPLACE — a
+    no-op down would break the second up, which nothing else catches)."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_proc WHERE proname='backlog_triage'")
+            assert cur.fetchone()[0] == 1
+        migrations.downgrade(conn, target=7)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_proc WHERE proname='backlog_triage'")
+            assert cur.fetchone()[0] == 0
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM pg_proc WHERE proname='backlog_triage'")
+            assert cur.fetchone()[0] == 1
