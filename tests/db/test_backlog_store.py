@@ -233,3 +233,49 @@ def test_app_role_cannot_write_the_tables_directly(
                     "UPDATE backlog_task SET status = 'DONE' WHERE task_id = %s",
                     ("VOYN-W0-NODML",),
                 )
+
+
+# -- list_tasks / list_events / list_evidence (VOYN-W0-AICC-DESKTOP-BACKLOG-VIEW) --
+
+
+def test_list_tasks_filters_paginates_and_counts_the_total(store) -> None:
+    for i in range(3):
+        assert store.upsert_task(_task(f"VOYN-W0-LT{i}"))[0]
+    assert store.upsert_task(_task("VOYN-W0-LT-DONE", status="UNTRIAGED"))[0]
+
+    page, total = store.list_tasks(status="OPEN", limit=2, offset=0)
+    assert total == 3  # the full filtered count, not just this page's length
+    assert len(page) == 2
+    ids_page1 = {t["task_id"] for t in page}
+
+    page2, total2 = store.list_tasks(status="OPEN", limit=2, offset=2)
+    assert total2 == 3
+    assert len(page2) == 1
+    assert page2[0]["task_id"] not in ids_page1  # no overlap across pages
+
+    unfiltered, total_all = store.list_tasks(limit=100)
+    assert total_all >= 4
+    assert any(t["status"] == "UNTRIAGED" for t in unfiltered)
+
+
+def test_list_events_and_evidence_are_newest_and_ordered(store) -> None:
+    assert store.upsert_task(_task("VOYN-W0-EV"))[0]
+    task = store.get_task("VOYN-W0-EV")
+    ok, reason, revision = store.transition("VOYN-W0-EV", "IN_PROGRESS", task["revision"])
+    assert ok, reason
+
+    events = store.list_events("VOYN-W0-EV")
+    assert events[0]["event"] == "transition"  # newest first
+    assert events[0]["detail"]["to"] == "IN_PROGRESS"
+    assert any(e["reason"] == "inserted" for e in events)  # the upsert too
+
+    assert store.record_evidence("VOYN-W0-EV", "pr", "https://github.com/o/r/pull/9")[0]
+    assert store.record_evidence("VOYN-W0-EV", "sha", "cafef00d")[0]
+    evidence = store.list_evidence("VOYN-W0-EV")
+    assert [e["kind"] for e in evidence] == ["pr", "sha"]  # recorded_at order
+    assert evidence[0]["value"] == "https://github.com/o/r/pull/9"
+
+
+def test_list_events_for_unknown_task_is_an_empty_list_not_an_error(store) -> None:
+    assert store.list_events("VOYN-W0-GHOST") == []
+    assert store.list_evidence("VOYN-W0-GHOST") == []
