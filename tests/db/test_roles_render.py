@@ -215,6 +215,10 @@ def test_the_control_plane_cannot_claim() -> None:
         "enroll_revoke_ticket",
         "enroll_sweep_expired",
         "identity_sweep_expired",
+        # The rollout mode (0011) is readable and not settable, which is the
+        # same asymmetry `identity_revoke_principal` has: the control plane may
+        # observe the gate it runs under and may not switch it off.
+        "identity_enforcement",
         "backlog_upsert_task",
         "backlog_transition",
         "backlog_record_evidence",

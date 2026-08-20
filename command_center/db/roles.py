@@ -133,6 +133,7 @@ ALL_TABLES: tuple[str, ...] = (
     "council_vote",
     "digest_item",
     "enrollment_ticket",
+    "identity_policy",
     "market_install_log",
     "market_item",
     "message",
@@ -291,6 +292,13 @@ _APP_ENROLMENT_TABLES: dict[str, frozenset[str]] = {
     "principal_credential": _NONE,
     "enrollment_ticket": _NONE,
     "worker_host_fingerprint": _NONE,
+    # The rollout switch (0011). Readable so the control plane can report which
+    # mode it is running under — a process that cannot tell advisory from
+    # authoritative cannot report a half-finished rollout. Not writable, and
+    # that is the point of the table existing at all: the party a control is
+    # aimed at must not be able to turn it off. Flipping it is
+    # `identity_set_enforcement()`, granted to the operator alone.
+    "identity_policy": _READ,
 }
 
 # The same tables for the operator, which is the only role that may see the
@@ -302,6 +310,11 @@ _OPERATOR_ENROLMENT_TABLES: dict[str, frozenset[str]] = {
     "worker_host_fingerprint": _READ,
     "principal_credential": _NONE,
     "enrollment_ticket": _NONE,
+    # SELECT and no UPDATE, even though this is the role that changes the mode.
+    # The write goes through `identity_set_enforcement()` because that is what
+    # appends the `policy` row to `principal_event`; a direct UPDATE would move
+    # the switch and leave no record of who moved it or from what.
+    "identity_policy": _READ,
 }
 
 # A worker reaches none of it. Not even `SELECT` on `principal`: enumerating the
@@ -314,6 +327,10 @@ _WORKER_ENROLMENT_TABLES: dict[str, frozenset[str]] = {
     "principal_credential": _NONE,
     "enrollment_ticket": _NONE,
     "worker_host_fingerprint": _NONE,
+    # Not even SELECT. A worker that could read the mode would learn whether the
+    # gate governing it is currently enforcing — which is the one fact that
+    # makes waiting for an advisory window a strategy.
+    "identity_policy": _NONE,
 }
 
 # Columns of `completion` that record the independent review's outcome. A
@@ -508,6 +525,12 @@ _APP_ENROLMENT_FUNCTIONS = (
     "enroll_revoke_ticket(text, text)",
     "enroll_sweep_expired()",
     "identity_sweep_expired()",
+    # Reading the rollout mode (0011), not setting it. `identity_set_enforcement`
+    # is absent from this tuple for the same reason `identity_revoke_principal`
+    # is: a compromised control plane may act within the protocol and may not
+    # change what the protocol is, and "stop enforcing identity" is the widest
+    # version of that.
+    "identity_enforcement()",
 )
 
 # The operator's levers, including the two the control plane must not have:
@@ -519,6 +542,12 @@ _OPERATOR_FUNCTIONS = (
     "enroll_sweep_expired()",
     "identity_revoke_principal(text, text)",
     "identity_sweep_expired()",
+    # The rollout switch (0011). Both directions are here — advancing to
+    # 'authoritative' and rolling back to 'advisory' — because a rollback that
+    # needed a different, more privileged actor than the rollout would be a
+    # rollback nobody performs during the incident it exists for.
+    "identity_enforcement()",
+    "identity_set_enforcement(text)",
 )
 
 FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(

@@ -212,6 +212,18 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-SRV-03",
     ),
+    "identity_policy": Exclusion(
+        reason=(
+            "One row deciding whether this server's identity gate enforces. It "
+            "governs SECURITY DEFINER functions on this cluster and means nothing "
+            "off it, so there is no SQLite source to mirror from. Mirroring it "
+            "would be actively wrong rather than merely useless: an "
+            "eventually-consistent copy of an authorisation switch is a second "
+            "answer to 'are we enforcing?', and the window in which the two "
+            "disagree is exactly the window an operator is reading it in."
+        ),
+        task="VOYN-W0-AICC-SRV-02-MIGRATION",
+    ),
 }
 
 

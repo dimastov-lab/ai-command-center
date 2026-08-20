@@ -14,7 +14,6 @@ spend):
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -22,6 +21,7 @@ from streamlit.testing.v1 import AppTest
 from command_center import tasks_repository
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
+from tests.finalization_helpers import wait_for_finalized_run
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -34,15 +34,6 @@ def _at(page_key: str = "execution_center", **session_state) -> AppTest:
         at.session_state[key] = value
     at.run()
     return at
-
-
-def _wait_for_report(db_path, run_id: str, *, timeout: float = 15.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if runtime_db.get_report(db_path, run_id) is not None:
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"run {run_id!r} did not finish within {timeout}s")
 
 
 # --------------------------------------------------------------------------
@@ -143,7 +134,7 @@ def test_attention_triage_fix_relaunches_a_failed_task(git_repo, configure_proje
         "Исправить must launch a write-capable remediation attempt even when "
         "the failed task itself was a read-only review"
     )
-    _wait_for_report(api.db_path, newest["id"])
+    wait_for_finalized_run(api.db_path, newest["id"])
 
 
 # --------------------------------------------------------------------------

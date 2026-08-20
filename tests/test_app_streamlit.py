@@ -26,42 +26,9 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
 from command_center.runtime import supervisor as runtime_supervisor
 from command_center.ui import project_selector
+from tests.finalization_helpers import wait_for_finalized_run
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
-
-
-def _wait_for_run_terminal(db_path, run_id: str, *, timeout: float = 10.0) -> dict:
-    """Poll `runtime.db` directly until `run_id` reaches a terminal state
-    *and* — for the states that produce one (`COMPLETED`/`FAILED`/
-    `CANCELLED`) — its report row exists too, not just `state` (set partway
-    through `Supervisor._supervise`, before report-saving, which is the
-    background thread's last write before it exits). Waiting for state alone
-    leaves that thread still running past this test's teardown, racing the
-    next test's fixtures (e.g. `isolated_reports_dir` reverting `REPORTS_ROOT`
-    out from under it) — the same hazard `tests/test_execution_center_ui.py`'s
-    `_wait_for_report` guards against.
-
-    Deliberately does not go through any `Supervisor`/`ExecutionCenterAPI`
-    instance: `st.cache_resource` (used by `app.get_execution_center_api()`)
-    only reliably resolves to the *same* cached singleton when called from
-    inside a live Streamlit `ScriptRunContext` — calling it from a test's own
-    thread constructs an unrelated second `Supervisor` with an empty
-    `_active` registry, whose own `reconcile()` would then race the real
-    one still finishing this exact run (see the `Supervisor.reconcile()`
-    docstring on why an actively-supervised run is skipped, which only
-    protects the *correct* instance). Reading `runtime.db` directly sidesteps
-    that hazard entirely."""
-    import time
-
-    report_producing_states = {"COMPLETED", "FAILED", "CANCELLED"}
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        run = runtime_db.get_run(db_path, run_id)
-        if run is not None and run["state"] in runtime_db.TERMINAL_STATES:
-            if run["state"] not in report_producing_states or runtime_db.get_report(db_path, run_id) is not None:
-                return run
-        time.sleep(0.05)
-    raise AssertionError(f"run {run_id!r} did not reach a settled terminal state within {timeout}s")
 
 
 def _at_on_page(page_key: str, **extra_session_state) -> AppTest:
@@ -758,7 +725,7 @@ def test_full_launch_flow_records_run_and_parses_verdict(fake_claude, tmp_path):
     db_path = runtime_db.resolve_db_path()
     runs = runtime_db.list_runs(db_path, task_id="seeded-task-1")
     assert len(runs) == 1
-    final = _wait_for_run_terminal(db_path, runs[0]["id"])
+    final = wait_for_finalized_run(db_path, runs[0]["id"])
     assert final["state"] == "COMPLETED"
     assert final["repository_path"] == str(repo.resolve())
 
@@ -818,7 +785,7 @@ def test_launcher_provisions_missing_isolated_worktree_and_launches(fake_claude,
     db_path = runtime_db.resolve_db_path()
     runs = runtime_db.list_runs(db_path, task_id="seeded-task-1")
     assert len(runs) == 1
-    final = _wait_for_run_terminal(db_path, runs[0]["id"])
+    final = wait_for_finalized_run(db_path, runs[0]["id"])
     assert final["state"] == "COMPLETED"
     assert final["repository_path"] == str(worktree.resolve())
     assert final["expected_branch"] == "audit/execution-queue"
@@ -888,7 +855,7 @@ def test_launcher_launches_claude_against_task_workspace_not_project_repository(
     db_path = runtime_db.resolve_db_path()
     runs = runtime_db.list_runs(db_path, task_id="seeded-task-1")
     assert len(runs) == 1
-    final = _wait_for_run_terminal(db_path, runs[0]["id"])
+    final = wait_for_finalized_run(db_path, runs[0]["id"])
     assert final["state"] == "COMPLETED"
     assert final["repository_path"] == str(task_workspace.resolve())
     assert final["repository_path"] != str(project_repo.resolve())
@@ -1675,7 +1642,7 @@ def test_recommendations_panel_launch_button_starts_v2_run(fake_claude, tmp_path
 
     run_id = successes[0].split("`")[1]
     db_path = Path(os.environ["AICC_DATA_DIR"]) / "runtime.db"
-    _wait_for_run_terminal(db_path, run_id)
+    wait_for_finalized_run(db_path, run_id)
 
 
 def test_recommendations_panel_launch_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_path):

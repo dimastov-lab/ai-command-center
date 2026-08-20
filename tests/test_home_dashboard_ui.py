@@ -27,6 +27,7 @@ from streamlit.testing.v1 import AppTest
 from command_center import models, tasks_repository
 from command_center.runtime import db as runtime_db
 from command_center.ui import home_dashboard
+from tests.finalization_helpers import wait_for_finalized_run
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
@@ -429,17 +430,6 @@ def test_dashboard_localization_is_russian():
         assert label in body
 
 
-def _wait_for_report(db_path, run_id: str, *, timeout: float = 10.0) -> None:
-    import time
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if runtime_db.get_report(db_path, run_id) is not None:
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"run {run_id!r} did not finish in the background within {timeout}s")
-
-
 @pytest.mark.serial  # real subprocess + DB running-then-completed timing; flaky when xdist saturates all cores
 def test_dashboard_queue_and_footer_reflect_a_genuinely_running_then_completed_session(
     git_repo, configure_project_repo, fake_claude
@@ -474,7 +464,7 @@ def test_dashboard_queue_and_footer_reflect_a_genuinely_running_then_completed_s
     assert "Всего запусков (runtime.db): <b style='color:var(--hx-text)'>1</b>" in body
     assert "Завершено в окне: 0" in body  # not finished yet — no fabricated completion
 
-    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+    wait_for_finalized_run(runtime_db.resolve_db_path(), run_id)
 
     at.session_state["nav_page"] = "dashboard"
     at = at.run()

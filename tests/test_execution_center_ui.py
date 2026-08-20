@@ -27,6 +27,7 @@ from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
 from command_center.runtime import identity
 from command_center.runtime import session_view
+from tests.finalization_helpers import wait_for_finalized_run
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
@@ -59,20 +60,6 @@ def _most_recent_run_id(db_path) -> str:
     runs = runtime_db.list_runs(db_path, limit=1)
     assert runs, "expected at least one run row in runtime.db"
     return runs[0]["id"]
-
-
-def _wait_for_report(db_path, run_id: str, *, timeout: float = 10.0) -> None:
-    """Block until `Supervisor._supervise`'s background thread has fully
-    finished a run — not just until `run.state` turns terminal (set partway
-    through that same thread, *before* report-saving), but until its report
-    row exists (the last DB write that thread makes, right before it exits).
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if runtime_db.get_report(db_path, run_id) is not None:
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"run {run_id!r} did not finish in the background within {timeout}s")
 
 
 # --------------------------------------------------------------------------
@@ -265,7 +252,7 @@ def test_launch_is_nonblocking_and_running_status_is_displayed(git_repo, configu
     run_id = _most_recent_run_id(runtime_db.resolve_db_path())
     at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
     at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
-    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+    wait_for_finalized_run(runtime_db.resolve_db_path(), run_id)
 
 
 # --------------------------------------------------------------------------
@@ -308,7 +295,7 @@ def test_cancel_requires_confirmation_before_calling_api(monkeypatch, git_repo, 
         # exit naturally instead of leaking a background Supervisor thread.
         hold_file.unlink(missing_ok=True)
         if run_id is not None:
-            _wait_for_report(db_path, run_id)
+            wait_for_finalized_run(db_path, run_id)
 
 
 @pytest.mark.parametrize("state", ["PREPARED", "QUEUED"])
@@ -349,7 +336,7 @@ def test_cancel_action_visible_while_running(git_repo, configure_project_repo, f
 
     at.checkbox(key=f"exec_card_cancel_ack_{run_id}").check().run()
     at.button(key=f"exec_card_cancel_btn_{run_id}").click().run()
-    _wait_for_report(runtime_db.resolve_db_path(), run_id)
+    wait_for_finalized_run(runtime_db.resolve_db_path(), run_id)
 
 
 # --------------------------------------------------------------------------
@@ -396,7 +383,7 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
         at = at.button(key=cancel_btn_key).click().run()
         # supervisor.cancel() blocks until done_event is set (report saved), so
         # by the time the button-click render returns the run is fully terminal.
-        _wait_for_report(db_path, run_id)
+        wait_for_finalized_run(db_path, run_id)
         final_run = runtime_db.get_run(db_path, run_id)
         assert final_run is not None
         assert final_run["state"] == "CANCELLED"
@@ -414,7 +401,7 @@ def test_cancelled_status_eventually_displayed(git_repo, configure_project_repo,
     finally:
         hold_file.unlink(missing_ok=True)
         if run_id is not None:
-            _wait_for_report(db_path, run_id)
+            wait_for_finalized_run(db_path, run_id)
 
 
 # --------------------------------------------------------------------------
@@ -622,7 +609,7 @@ def test_auto_refresh_does_not_duplicate_runs_or_task_mutations(git_repo, config
         project="AIOS", repository_path=str(git_repo), task_type="review", instruction="p", confirmed=True
     )
     api.supervisor.wait_for_run(run["id"], timeout=10)
-    _wait_for_report(api.db_path, run["id"])
+    wait_for_finalized_run(api.db_path, run["id"])
 
     at = _at_on_page("execution_center")
     for _ in range(3):

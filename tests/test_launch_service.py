@@ -8,6 +8,7 @@ import pytest
 from command_center import launch, launch_service, models, workspace_provisioning
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
+from tests.finalization_helpers import wait_for_finalized_run
 
 
 def test_launch_service_module_never_constructs_a_git_subprocess_call():
@@ -21,24 +22,6 @@ def test_launch_service_module_never_constructs_a_git_subprocess_call():
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert "git" not in string_literals
-
-
-def _wait_for_run_terminal(db_path, run_id: str, *, timeout: float = 10.0) -> dict:
-    """Waits for terminal state *and* (for report-producing states) the
-    report row too — see `tests/test_app_streamlit.py`'s helper of the same
-    name for why state alone isn't enough (the background `_supervise`
-    thread keeps running past a state that's already terminal)."""
-    import time
-
-    report_producing_states = {"COMPLETED", "FAILED", "CANCELLED"}
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        run = runtime_db.get_run(db_path, run_id)
-        if run is not None and run["state"] in runtime_db.TERMINAL_STATES:
-            if run["state"] not in report_producing_states or runtime_db.get_report(db_path, run_id) is not None:
-                return run
-        time.sleep(0.05)
-    raise AssertionError(f"run {run_id!r} did not reach a settled terminal state within {timeout}s")
 
 
 def test_execute_agent_launch_v2_returns_immediately(git_repo, fake_claude):
@@ -65,7 +48,7 @@ def test_execute_agent_launch_v2_returns_immediately(git_repo, fake_claude):
 
     if run["state"] == "RUNNING":
         api.request_cancel(run["id"], confirmed=True)
-    _wait_for_run_terminal(api.db_path, run["id"])
+    wait_for_finalized_run(api.db_path, run["id"])
 
 
 def test_execute_agent_launch_v2_persists_task_metadata_and_expected_branch(git_repo, fake_claude):
@@ -92,7 +75,7 @@ def test_execute_agent_launch_v2_persists_task_metadata_and_expected_branch(git_
         repository_path=worktree, task=task, validation=validation, confirmed=True,
         execution_center_api=api, expected_branch="feature/x", source_repository_path=str(git_repo),
     )
-    final = _wait_for_run_terminal(api.db_path, run["id"])
+    final = wait_for_finalized_run(api.db_path, run["id"])
 
     assert final["state"] == "COMPLETED"
     assert final["task_id"] == "t-v2-2"
@@ -118,7 +101,7 @@ def test_execute_agent_launch_v2_without_task_is_execution_center_adhoc(git_repo
         repository_path=git_repo, task=None, validation=None, confirmed=True,
         execution_center_api=api,
     )
-    final = _wait_for_run_terminal(api.db_path, run["id"])
+    final = wait_for_finalized_run(api.db_path, run["id"])
 
     assert final["launch_source"] == "execution_center_adhoc"
     assert final["prompt_version"] is None
@@ -191,7 +174,7 @@ def test_execute_agent_launch_v2_refuses_second_launch_against_same_task(git_rep
     assert len(runtime_db.list_runs(api.db_path, task_id="dup-task-1")) == 1
 
     api.request_cancel(first_run["id"], confirmed=True)
-    _wait_for_run_terminal(api.db_path, first_run["id"])
+    wait_for_finalized_run(api.db_path, first_run["id"])
 
 
 def test_execute_agent_launch_v2_refuses_second_launch_against_same_workspace_different_task(
@@ -226,7 +209,7 @@ def test_execute_agent_launch_v2_refuses_second_launch_against_same_workspace_di
     assert task_b.get("current_run_id") is None
 
     api.request_cancel(first_run["id"], confirmed=True)
-    _wait_for_run_terminal(api.db_path, first_run["id"])
+    wait_for_finalized_run(api.db_path, first_run["id"])
 
 
 def test_execute_agent_launch_v2_allows_relaunch_once_prior_run_is_terminal(git_repo, fake_claude):
@@ -241,7 +224,7 @@ def test_execute_agent_launch_v2_allows_relaunch_once_prior_run_is_terminal(git_
         repository_path=git_repo, task=task, validation=validation, confirmed=True,
         execution_center_api=api, source_repository_path=str(git_repo),
     )
-    _wait_for_run_terminal(api.db_path, first_run["id"])
+    wait_for_finalized_run(api.db_path, first_run["id"])
 
     second_run = launch_service.execute_agent_launch_v2(
         project="AIOS", task_type="implementation", prompt="second", timeout_seconds=30,
@@ -249,7 +232,7 @@ def test_execute_agent_launch_v2_allows_relaunch_once_prior_run_is_terminal(git_
         execution_center_api=api, source_repository_path=str(git_repo),
     )
     assert second_run["id"] != first_run["id"]
-    _wait_for_run_terminal(api.db_path, second_run["id"])
+    wait_for_finalized_run(api.db_path, second_run["id"])
 
 
 def test_find_active_run_conflict_none_when_nothing_active(git_repo):

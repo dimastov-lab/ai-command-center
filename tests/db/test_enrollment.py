@@ -1142,6 +1142,10 @@ def test_the_operator_role_holds_no_dml_on_any_domain_table() -> None:
         "principal_credential",
         "enrollment_ticket",
         "worker_host_fingerprint",
+        # 0011. SELECT only, like the rest: the operator moves this switch
+        # through `identity_set_enforcement()`, which audits the move. A direct
+        # UPDATE grant would let the mode change without a `policy` row.
+        "identity_policy",
     }
     for table, privileges in granted.items():
         assert privileges <= frozenset({"SELECT"}), table
@@ -1346,9 +1350,13 @@ def test_every_reachable_audit_site_writes_a_row(
                 "UPDATE principal SET expected_cidr = NULL WHERE principal_id = %s",
                 (offsite[0],),
             )
-            # `identity_revoke_principal` also took the role's login away, so
-            # give it back: the branch under test is the one where a live
-            # credential meets a dead principal, which needs a connection.
+            # `identity_revoke_principal` also took the role's login AND its
+            # privileges away (0010), so give both back: the branch under test
+            # is the one where a live credential meets a dead principal, which
+            # needs a connection that can still reach `identity_assert`. Two
+            # calls rather than one because after 0010 they are two different
+            # facts — see `tests/db/test_revocation_bites.py`.
+            cur.execute("SELECT identity_enable_role(%s)", (offsite[1],))
             cur.execute(
                 "SELECT identity_set_role_secret(%s, %s, now() + interval '1 hour')",
                 (offsite[1], _scram_verifier(offsite_secret)),
