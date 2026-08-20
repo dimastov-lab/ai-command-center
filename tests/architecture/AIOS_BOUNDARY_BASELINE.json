@@ -138,6 +138,12 @@
     "command_center/orchestrator/planner.py": [
       "orchestration"
     ],
+    "command_center/orchestrator/publish.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/review_merge.py": [
+      "orchestration"
+    ],
     "command_center/orchestrator/routing.py": [
       "orchestration"
     ],
