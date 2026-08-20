@@ -1,0 +1,105 @@
+"""publish_run (BO-S3b part 1): the git/lease/gh mechanics against a real
+local git repo, with the lease tool and gh faked by tiny scripts on PATH.
+No network, no GitHub — the contract is the argv and the branch state."""
+
+from __future__ import annotations
+
+import subprocess
+
+import pytest
+
+from command_center.orchestrator.publish import PublishConfig, publish_run
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def repo(tmp_path):
+    """A clone with an 'origin' bare remote, one base commit, and a fake
+    lease tool + gh on PATH that record their calls."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", str(bare), str(work)], check=True, capture_output=True)
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "base.txt").write_text("base\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    _git(work, "push", "origin", "main")
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    calls = tmp_path / "calls.log"
+    lease = bin_ / "voyn-lease"
+    lease.write_text(f"#!/bin/sh\necho \"lease $*\" >> {calls}\nexit 0\n")
+    lease.chmod(0o755)
+    gh = bin_ / "gh"
+    gh.write_text(
+        f"#!/bin/sh\necho \"gh $*\" >> {calls}\n"
+        "case \"$2\" in\n"
+        "  view) exit 1 ;;\n"  # no existing PR
+        "  create) echo 'https://github.com/x/y/pull/1'; exit 0 ;;\n"
+        "esac\n"
+    )
+    gh.chmod(0o755)
+    return work, bin_, calls
+
+
+def _cfg(bin_):
+    return PublishConfig(
+        lease_tool=str(bin_ / "voyn-lease"), repository="ai-command-center",
+        owner="server-worker", session="s1", task="VOYN-W0-TEST",
+        deploy_key="/dev/null",
+    )
+
+
+def _with_path(bin_, monkeypatch):
+    import os
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+
+def test_a_run_with_no_commit_is_nothing_to_publish(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    r = publish_run(work, _cfg(bin_))
+    assert not r.ok and r.reason == "nothing_to_publish"
+
+
+def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+
+    r = publish_run(work, _cfg(bin_))
+    assert r.ok, r.reason
+    assert r.branch == "backlog/VOYN-W0-TEST"
+    assert r.pr_url == "https://github.com/x/y/pull/1"
+    assert r.head_sha
+    # branch landed on the remote
+    out = subprocess.run(["git", "ls-remote", "--heads", str(work.parent / "origin.git")],
+                         capture_output=True, text=True).stdout
+    assert "backlog/VOYN-W0-TEST" in out
+    log = calls.read_text()
+    assert " acquire " in log and " release " in log  # lease taken and freed
+    assert log.index("acquire") < log.index("create")  # acquired before publishing
+
+
+def test_lease_refusal_does_not_push(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "c.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "w")
+    (bin_ / "voyn-lease").write_text(f"#!/bin/sh\necho \"lease $*\" >> {calls}\nexit 3\n")
+    (bin_ / "voyn-lease").chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+    assert not r.ok and r.reason.startswith("lease_unavailable")
+    out = subprocess.run(["git", "ls-remote", "--heads", str(work.parent / "origin.git")],
+                         capture_output=True, text=True).stdout
+    assert "backlog" not in out  # never pushed

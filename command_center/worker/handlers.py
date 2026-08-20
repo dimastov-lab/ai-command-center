@@ -28,6 +28,7 @@ stays on the worker host's journal.
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from typing import Any
@@ -35,6 +36,7 @@ from typing import Any
 from command_center import agent_runner
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
+from command_center.orchestrator.publish import PublishConfig, publish_run
 
 __all__ = ["build_handlers"]
 
@@ -176,6 +178,33 @@ def _run_agent(
             reason=_tail(run.stderr) or "runner failed to start",
             retryable=True,
         )
+    # BO-S3b: a successful mutating run publishes its commits as a PR so the
+    # autonomous loop closes without a human. Opt-in by env
+    # (AICC_PUBLISH_DEPLOY_KEY); unset = local commit only, review fleets
+    # unaffected. The lease inside publish_run enforces single-writer.
+    deploy_key = os.environ.get("AICC_PUBLISH_DEPLOY_KEY", "")
+    if task_type in agent_runner.MUTATING_TASK_TYPES and deploy_key:
+        pub = publish_run(
+            repository,
+            PublishConfig(
+                lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
+                repository=os.environ.get(
+                    "VOYN_LEASE_REPOSITORY", request.project_id
+                ),
+                owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
+                session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
+                task=request.project_id,
+                deploy_key=deploy_key,
+            ),
+        )
+        result["publish"] = {
+            "ok": pub.ok,
+            "branch": pub.branch,
+            "pr_url": pub.pr_url,
+            "reason": pub.reason,
+        }
+        if pub.pr_url:
+            result["pr_url"] = pub.pr_url
     return HandlerOutcome(ok=True, result=result)
 
 
