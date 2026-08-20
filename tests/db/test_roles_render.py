@@ -226,6 +226,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_dispatch",
         "backlog_ingest_results",
         "backlog_return_to_pool",
+        "backlog_triage",
     }
 
 
