@@ -479,6 +479,8 @@ _APP_BACKLOG_FUNCTIONS = (
     # BO-S3, result ingest (0007; replaced 0006's backlog_release_terminal).
     "backlog_ingest_results(text)",
     "backlog_return_to_pool(text, text)",
+    # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
+    "backlog_triage(text, text, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
