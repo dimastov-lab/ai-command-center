@@ -24,7 +24,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["ReviewConfig", "LoopReport", "review_once", "merge_once"]
+__all__ = ["LoopReport", "ReviewConfig", "merge_once", "review_once"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,20 +67,21 @@ _REVIEW_PROMPT = (
 )
 
 
-def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig = ReviewConfig()) -> LoopReport:
+def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig | None = None) -> LoopReport:
     """Enqueue a review run for each READY_TO_REVIEW task with a pr and no
     review queued yet. ``enqueue(queue, key, payload)`` is the queue writer
     (control-plane privilege); passing it in keeps this composable and
     testable without a live queue."""
+    cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Idempotency is the queue's: enqueue keys on review:<task>, so a task
     # already under review returns the same work item, never a second run.
     tasks = _rows(
         factory,
-        "SELECT DISTINCT t.id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.id AND e.kind = 'pr' "
+        "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
+        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW' "
-        "ORDER BY t.id LIMIT %s",
+        "ORDER BY t.task_id LIMIT %s",
         (cfg.max_per_tick,),
     )
     for task_id, pr_url in tasks:
@@ -129,14 +130,16 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return True, head
 
 
-def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig = ReviewConfig()) -> LoopReport:
+def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE with the merged sha as evidence."""
+    cfg = cfg or ReviewConfig()
+    cfg = cfg or ReviewConfig()
     report = LoopReport()
     tasks = _rows(
         factory,
-        "SELECT t.id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.id AND e.kind = 'pr' "
+        "SELECT t.task_id, e.value FROM backlog_task t "
+        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at LIMIT %s",
         (cfg.max_per_tick,),
     )
@@ -150,13 +153,41 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig = ReviewConfig())
             report.skipped.append((task_id, f"merge_failed: {merged.stderr.strip()[:100]}"))
             continue
         head = detail  # _pr_is_mergeable returned the head sha
-        with factory() as conn, conn.cursor() as cur:
-            cur.execute("SELECT backlog_record_evidence(%s, 'sha', %s)", (task_id, head))
-            cur.execute(
-                "SELECT ok, reason FROM backlog_transition(%s, 'DONE', %s)",
-                (task_id, cfg.reviewer),
-            )
-            ok, reason = cur.fetchone()
-            conn.commit()
-        report.merged.append((task_id, head)) if ok else report.skipped.append((task_id, f"transition:{reason}"))
+        # Evidence and the DONE transition are one act: the sha row and the
+        # status move commit together or not at all (an explicit transaction,
+        # since the app factory is autocommit). backlog_transition's third
+        # argument is the optimistic-lock revision (bigint), read here (a plain SELECT — the app role writes only through
+        # functions, so no row lock is taken; the optimistic revision below is
+        # the concurrency guard); the
+        # actor is session_user inside the function, not an argument.
+        with factory() as conn:
+            conn.autocommit = False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT revision FROM backlog_task WHERE task_id = %s",
+                        (task_id,),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        conn.rollback()
+                        report.skipped.append((task_id, "task_vanished"))
+                        continue
+                    revision = row[0]
+                    cur.execute(
+                        "SELECT backlog_record_evidence(%s, 'sha', %s)", (task_id, head)
+                    )
+                    cur.execute(
+                        "SELECT ok, reason FROM backlog_transition(%s, 'DONE', %s)",
+                        (task_id, revision),
+                    )
+                    ok, reason = cur.fetchone()
+                if ok:
+                    conn.commit()
+                    report.merged.append((task_id, head))
+                else:
+                    conn.rollback()
+                    report.skipped.append((task_id, f"transition:{reason}"))
+            finally:
+                conn.autocommit = True
     return report

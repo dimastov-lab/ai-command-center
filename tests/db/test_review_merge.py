@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 
 
+from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401 — pytest fixtures
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
     merge_once, review_once,
@@ -20,14 +21,19 @@ def _ready(store, factory, task_id, pr):
     from tests.db.test_backlog_planner import _task
     assert store.upsert_task(_task(task_id, repo="repo-x", status="OPEN"))[0]
     with factory() as c, c.cursor() as cur:
-        # walk OPEN -> IN_PROGRESS -> READY_TO_REVIEW via the real machine
-        cur.execute("SELECT ok FROM backlog_transition(%s,'IN_PROGRESS','w')", (task_id,))
+        # walk OPEN -> IN_PROGRESS -> READY_TO_REVIEW via the real machine;
+        # transition's third arg is the bigint revision, re-read each step.
+        def _rev():
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            return cur.fetchone()[0]
+        cur.execute("SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)", (task_id, _rev()))
         cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", (task_id, pr))
-        cur.execute("SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW','w')", (task_id,))
+        cur.execute("SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)", (task_id, _rev()))
         c.commit()
 
 
-def test_review_enqueues_one_run_per_ready_task(rig):
+def test_review_enqueues_one_run_per_ready_task(rig):  # noqa: F811
+
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R1", "https://github.com/x/y/pull/7")
     calls = []
@@ -39,7 +45,8 @@ def test_review_enqueues_one_run_per_ready_task(rig):
     assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
 
 
-def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):
+def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noqa: F811
+
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
     head = "a" * 40
@@ -61,11 +68,12 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1", head) in report.merged
     with app_factory() as c, c.cursor() as cur:
-        cur.execute("SELECT status FROM backlog_task WHERE id=%s", ("VOYN-W0-M1",))
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1",))
         assert cur.fetchone()[0] == "DONE"
 
 
-def test_merge_skips_without_marker(rig, monkeypatch):
+def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
+
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M2", "https://github.com/x/y/pull/9")
 
@@ -81,11 +89,12 @@ def test_merge_skips_without_marker(rig, monkeypatch):
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M2", "no_accept_marker_on_head") in report.skipped
     with app_factory() as c, c.cursor() as cur:
-        cur.execute("SELECT status FROM backlog_task WHERE id=%s", ("VOYN-W0-M2",))
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M2",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
 
 
-def test_merge_skips_when_a_check_is_red(rig, monkeypatch):
+def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
+
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/10")
     head = "c" * 40
