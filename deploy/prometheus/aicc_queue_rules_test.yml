@@ -1,0 +1,271 @@
+# `promtool test rules aicc_queue_rules_test.yml`
+#
+# The acceptance clause of VOYN-W0-AICC-SRV-08-WORKER-METRICS is that
+# `WorkerLost` DEMONSTRABLY FIRES on a killed worker. That is proven twice, and
+# the two proofs answer different questions:
+#
+#   here            — does the RULE fire, given the series a killed worker
+#                     produces? Deterministic, hermetic, runs in CI in a second.
+#   worker_lost_drill.py — do those series actually occur? Boots PostgreSQL,
+#                     runs the real WorkerDaemon, SIGKILLs it, scrapes the real
+#                     exporter and feeds the captured samples to a real
+#                     Prometheus.
+#
+# Neither is sufficient alone: this file could pass against series nothing
+# emits (the exact defect the ticket recorded), and the drill could pass
+# against a rule that fires on everything. The negative cases below are what
+# rule out the second.
+
+rule_files:
+  - aicc_queue_rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # =========================================================================
+  # WorkerLost — the killed worker
+  # =========================================================================
+  # A worker holding one attempt on a default 300s lease is SIGKILLed at t=0.
+  # Nothing beats after that, so the collector's `now() - heartbeat_at` climbs
+  # one second per second; the lease window it is measured against does not
+  # move, because a heartbeat is what would have moved it.
+  - name: WorkerLost fires when a killed worker stops beating
+    interval: 30s
+    input_series:
+      - series: 'aicc_worker_heartbeat_age_seconds{worker_role="aicc_w_voyn_worker_01",queue="execution"}'
+        values: "0+30x24"
+      - series: 'aicc_worker_lease_visibility_seconds{worker_role="aicc_w_voyn_worker_01",queue="execution"}'
+        values: "300x24"
+      - series: 'aicc_worker_active_attempts{worker_role="aicc_w_voyn_worker_01",queue="execution"}'
+        values: "1x24"
+    alert_rule_test:
+      # t=180s. Two beats missed is 200s, so at 180 the daemon's own tolerance
+      # is not yet spent and a page here would be the false positive that
+      # teaches operators to ignore this alert.
+      - eval_time: 3m
+        alertname: WorkerLost
+        exp_alerts: []
+      # t=210s: threshold crossed this instant, `for: 30s` has not elapsed.
+      - eval_time: 3m30s
+        alertname: WorkerLost
+        exp_alerts: []
+      # t=240s: crossed at 210, held 30s -> FIRING, and 60s before the lease
+      # itself lapses at 300s.
+      - eval_time: 4m
+        alertname: WorkerLost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: worker
+              worker_role: aicc_w_voyn_worker_01
+              queue: execution
+            exp_annotations:
+              summary: "Worker aicc_w_voyn_worker_01 stopped heartbeating while holding work on queue execution"
+              description: "The most overdue attempt held by aicc_w_voyn_worker_01 last beat 240s ago, past the two missed heartbeats the daemon is built to tolerate. The lease will lapse and aicc-queue-reaper.timer will requeue the item, so the work is not lost — the worker is. Check the host and `systemctl status aicc-worker`."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#workerlost"
+      - eval_time: 10m
+        alertname: WorkerLost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: worker
+              worker_role: aicc_w_voyn_worker_01
+              queue: execution
+            exp_annotations:
+              summary: "Worker aicc_w_voyn_worker_01 stopped heartbeating while holding work on queue execution"
+              description: "The most overdue attempt held by aicc_w_voyn_worker_01 last beat 600s ago, past the two missed heartbeats the daemon is built to tolerate. The lease will lapse and aicc-queue-reaper.timer will requeue the item, so the work is not lost — the worker is. Check the host and `systemctl status aicc-worker`."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#workerlost"
+
+  # =========================================================================
+  # WorkerLost — the healthy worker it must stay silent about
+  # =========================================================================
+  # The daemon beats every visibility/3 = 100s, so a healthy worker's
+  # heartbeat age is a sawtooth that resets before it reaches 100. This is the
+  # case that makes the alert worth having: a rule that also fires here would
+  # be indistinguishable from `up == 0` on a busy fleet.
+  - name: WorkerLost stays silent while a worker keeps beating
+    interval: 30s
+    input_series:
+      - series: 'aicc_worker_heartbeat_age_seconds{worker_role="aicc_w_voyn_worker_01",queue="execution"}'
+        values: "0 30 60 90 0 30 60 90 0 30 60 90 0 30 60 90 0 30 60 90 0"
+      - series: 'aicc_worker_lease_visibility_seconds{worker_role="aicc_w_voyn_worker_01",queue="execution"}'
+        values: "300x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WorkerLost
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: WorkerLost
+        exp_alerts: []
+
+  # =========================================================================
+  # WorkerLost — the threshold is the lease, not a constant
+  # =========================================================================
+  # Same absolute staleness (60s), two queues running different leases. The
+  # long-lease worker is one beat into its tolerance and healthy; the
+  # short-lease worker is far past two beats and lost. A hard-coded seconds
+  # threshold cannot tell these apart, which is why the rule divides by the
+  # worker's own visibility window.
+  - name: WorkerLost calibrates to each queue's own lease
+    interval: 30s
+    input_series:
+      - series: 'aicc_worker_heartbeat_age_seconds{worker_role="aicc_w_long",queue="execution"}'
+        values: "60x20"
+      - series: 'aicc_worker_lease_visibility_seconds{worker_role="aicc_w_long",queue="execution"}'
+        values: "300x20"
+      - series: 'aicc_worker_heartbeat_age_seconds{worker_role="aicc_w_short",queue="fast"}'
+        values: "60x20"
+      - series: 'aicc_worker_lease_visibility_seconds{worker_role="aicc_w_short",queue="fast"}'
+        values: "30x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WorkerLost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: worker
+              worker_role: aicc_w_short
+              queue: fast
+            exp_annotations:
+              summary: "Worker aicc_w_short stopped heartbeating while holding work on queue fast"
+              description: "The most overdue attempt held by aicc_w_short last beat 60s ago, past the two missed heartbeats the daemon is built to tolerate. The lease will lapse and aicc-queue-reaper.timer will requeue the item, so the work is not lost — the worker is. Check the host and `systemctl status aicc-worker`."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#workerlost"
+
+  # =========================================================================
+  # WorkerLost — survives its own remedy
+  # =========================================================================
+  # The reaper expires the attempt at t=5m; the collector then emits nothing
+  # for that worker, because the population is "workers holding work". Without
+  # `keep_firing_for` the alert would resolve the instant the series vanished
+  # — silently, and while the operator still has a dead host to deal with.
+  - name: WorkerLost keeps firing after the reaper clears the series
+    interval: 30s
+    input_series:
+      - series: 'aicc_worker_heartbeat_age_seconds{worker_role="aicc_w_voyn_worker_01",queue="execution"}'
+        values: "0+30x10 _ _ _ _ _ _ _ _ _ _"
+      - series: 'aicc_worker_lease_visibility_seconds{worker_role="aicc_w_voyn_worker_01",queue="execution"}'
+        values: "300x10 _ _ _ _ _ _ _ _ _ _"
+    alert_rule_test:
+      # t=300s: last sample of the killed worker, well past threshold.
+      - eval_time: 5m
+        alertname: WorkerLost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: worker
+              worker_role: aicc_w_voyn_worker_01
+              queue: execution
+            exp_annotations:
+              summary: "Worker aicc_w_voyn_worker_01 stopped heartbeating while holding work on queue execution"
+              description: "The most overdue attempt held by aicc_w_voyn_worker_01 last beat 300s ago, past the two missed heartbeats the daemon is built to tolerate. The lease will lapse and aicc-queue-reaper.timer will requeue the item, so the work is not lost — the worker is. Check the host and `systemctl status aicc-worker`."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#workerlost"
+      # t=8m: the series has been gone for ~2.5m (past the 5m staleness
+      # horizon it would otherwise still resolve within), yet the alert is
+      # still up because keep_firing_for is 5m.
+      - eval_time: 8m
+        alertname: WorkerLost
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: worker
+              worker_role: aicc_w_voyn_worker_01
+              queue: execution
+            exp_annotations:
+              summary: "Worker aicc_w_voyn_worker_01 stopped heartbeating while holding work on queue execution"
+              description: "The most overdue attempt held by aicc_w_voyn_worker_01 last beat 300s ago, past the two missed heartbeats the daemon is built to tolerate. The lease will lapse and aicc-queue-reaper.timer will requeue the item, so the work is not lost — the worker is. Check the host and `systemctl status aicc-worker`."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#workerlost"
+
+  # =========================================================================
+  # The reaper stopped
+  # =========================================================================
+  - name: QueueLeaseLapsedUnreaped fires on a sustained reap backlog
+    interval: 30s
+    input_series:
+      - series: 'aicc_lease_lapsed{queue="execution"}'
+        values: "0 0 1 2 2 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3"
+    alert_rule_test:
+      # Lapsed for 60s only: normal, the reaper runs every minute.
+      - eval_time: 2m
+        alertname: QueueLeaseLapsedUnreaped
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: QueueLeaseLapsedUnreaped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: reaper
+              queue: execution
+            exp_annotations:
+              summary: "3 lapsed lease(s) on queue execution still awaiting queue_reap()"
+              description: "The reaper clears lapsed leases within a minute when it is running. A sustained backlog means aicc-queue-reaper.timer is stopped, its credential is refused, or the control plane cannot reach PostgreSQL."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#queueleaselapsedunreaped"
+
+  # =========================================================================
+  # No worker left to go missing
+  # =========================================================================
+  - name: QueueDispatchLagHigh fires when claimable work goes unclaimed
+    interval: 1m
+    input_series:
+      - series: 'aicc_queue_oldest_ready_age_seconds{queue="execution"}'
+        values: "0+60x40"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QueueDispatchLagHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: QueueDispatchLagHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: queue
+              queue: execution
+            exp_annotations:
+              summary: "Queue execution has claimable work unclaimed for 1800s"
+              description: "The oldest claimable item has been available and unclaimed past the 15 minute budget. Either no worker is running against this queue or every worker is saturated."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#queuedispatchlaghigh"
+
+  # =========================================================================
+  # The exporter's own failure modes, which every other rule is blind to
+  # =========================================================================
+  - name: QueueMetricsStale fires when the writer stops
+    interval: 30s
+    input_series:
+      # A frozen generated-timestamp: the file is no longer being rewritten.
+      # Value 0 is the unix epoch, so `time() - 0` is enormous from the first
+      # evaluation and the only thing under test is `for`.
+      - series: "aicc_queue_metrics_generated_timestamp_seconds"
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: QueueMetricsStale
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: QueueMetricsStale
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: telemetry
+            exp_annotations:
+              summary: "AICC queue metrics have not been rewritten for over 3 minutes"
+              description: "aicc-queue-metrics.timer has stopped or cannot write to the node_exporter textfile directory. Every other rule in this group is evaluating frozen values and must not be trusted until this clears."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#queuemetricsstale"
+
+  - name: QueueMetricsCollectionFailing fires when the database is unreachable
+    interval: 30s
+    input_series:
+      - series: "aicc_queue_metrics_up"
+        values: "1 1 0 0 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 1m30s
+        alertname: QueueMetricsCollectionFailing
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: QueueMetricsCollectionFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: telemetry
+            exp_annotations:
+              summary: "AICC queue metrics collector cannot read the database"
+              description: "The writer is running (the file is fresh) but its queries failed — PostgreSQL is unreachable or the app credential was refused. Queue state is unobserved; WorkerLost cannot fire while this is true."
+              runbook: "docs/operations/WORKER_TELEMETRY.md#queuemetricscollectionfailing"
