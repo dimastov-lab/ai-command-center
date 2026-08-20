@@ -24,6 +24,7 @@ is absent — those rules are enforced by the evaluator it consults.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,8 @@ from command_center.runtime.completion import (
     ReasonCode,
 )
 from command_center.runtime.github import GitHubClient, GitHubError, PullRequestState
+
+_LOG = logging.getLogger(__name__)
 
 # Audit event types (spec §14).
 EV_EXECUTION_COMPLETED = "EXECUTION_COMPLETED"
@@ -72,6 +75,13 @@ EV_REVIEW_REJECTED = "REVIEW_REJECTED"
 # when only `next_retry_at`/`retry_count` moved.
 EV_RETRY_SCHEDULED = "RETRY_SCHEDULED"
 EV_MERGE_SLOT_BUSY = "MERGE_SLOT_BUSY"
+# A publication fence refused a privileged side effect. This is the *denial
+# record*: it is appended, in its own committed transaction, before the refusal
+# is ever turned into an exception (VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS). A
+# refusal signals that some other owner holds the scheduler lease this campaign
+# still believes it owns — exactly the event that must outlive the failure it
+# causes, so it can never be written inside the work it aborts.
+EV_PUBLICATION_FENCE_DENIED = "PUBLICATION_FENCE_DENIED"
 
 # Canonical independent-review verdicts persisted in `completion.review_verdict`.
 REVIEW_VERDICT_APPROVED = "approved"
@@ -143,21 +153,33 @@ class CompletionOrchestrator:
             lambda: datetime.now().astimezone()
         )
 
-    def _assert_publication_fence(
+    def _publication_fence_denial(
         self,
         row: dict,
         *,
         policy: CompletionPolicy | None = None,
         renew_for_action: bool = False,
-    ) -> None:
-        """Fail closed when a fenced daily campaign no longer owns a live lease."""
+    ) -> str | None:
+        """Evaluate the fence: the refusal reason, or None when it stays open.
+
+        This function deliberately **never raises** `CompletionFenceLostError`.
+        A refusal is data here, and only data can be audited: the caller
+        (:meth:`_assert_publication_fence`) commits the denial record first and
+        turns it into an exception second. Written the other way round — raise
+        from inside the fence's own `BEGIN IMMEDIATE` — the exception unwinds
+        through the transaction that would have carried the audit row, and the
+        signal deletes itself (VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS).
+
+        The renewal branch still writes: extending a lease this campaign
+        provably owns is not a refusal, and it commits before returning None.
+        """
         policy = policy or CompletionPolicy.from_json(row.get("policy_json"))
         campaign_id = policy.publication_fence_campaign_id
         owner = policy.publication_fence_owner
         if not campaign_id and not owner:
-            return
+            return None
         if not campaign_id or not owner:
-            raise CompletionFenceLostError("publication fence policy is incomplete")
+            return "publication fence policy is incomplete"
         try:
             with runtime_db.connect(self.db_path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -166,13 +188,13 @@ class CompletionOrchestrator:
                        FROM daily_audit_schedule WHERE singleton = 1"""
                 ).fetchone()
                 if schedule is None or not schedule["lease_until"]:
-                    raise CompletionFenceLostError("daily-audit lease is absent")
+                    connection.rollback()
+                    return "daily-audit lease is absent"
                 try:
                     lease_until = datetime.fromisoformat(schedule["lease_until"])
-                except (TypeError, ValueError) as exc:
-                    raise CompletionFenceLostError(
-                        "daily-audit lease timestamp is malformed"
-                    ) from exc
+                except (TypeError, ValueError):
+                    connection.rollback()
+                    return "daily-audit lease timestamp is malformed"
                 checked_at = self._publication_fence_clock()
                 if lease_until.tzinfo is not None:
                     checked_at = checked_at.astimezone(lease_until.tzinfo)
@@ -183,7 +205,8 @@ class CompletionOrchestrator:
                     or schedule["lease_owner"] != owner
                     or lease_until <= checked_at
                 ):
-                    raise CompletionFenceLostError(
+                    connection.rollback()
+                    return (
                         f"daily-audit campaign {campaign_id!r} no longer owns a live lease"
                     )
                 if renew_for_action:
@@ -205,14 +228,62 @@ class CompletionOrchestrator:
                         ),
                     )
                     if cursor.rowcount != 1:
-                        raise CompletionFenceLostError(
-                            "daily-audit lease changed before publication renewal"
-                        )
+                        connection.rollback()
+                        return "daily-audit lease changed before publication renewal"
                 connection.commit()
-        except CompletionFenceLostError:
-            raise
         except Exception as exc:  # noqa: BLE001 - a publication fence must fail closed
-            raise CompletionFenceLostError("publication fence state is unavailable") from exc
+            return f"publication fence state is unavailable: {exc}"
+        return None
+
+    def _record_publication_fence_denial(self, row: dict, reason: str) -> None:
+        """Commit the denial record for `reason`, in its own transaction.
+
+        `append_completion_event` opens and commits its own connection, so the
+        row is durable the moment this returns — independent of whatever the
+        caller does next, including raising and rolling back its own work.
+
+        A failed audit write is never allowed to swallow the refusal: the
+        caller raises either way (fail closed). It *is* logged at ERROR, because
+        a fence that refuses without leaving a record is the defect this method
+        exists to prevent, and it must be visible rather than silent.
+        """
+        try:
+            runtime_db.append_completion_event(
+                self.db_path,
+                row["run_id"],
+                EV_PUBLICATION_FENCE_DENIED,
+                reason_code=ReasonCode.PUBLICATION_FENCE_LOST,
+                message=f"Publication refused: {reason}.",
+            )
+        except Exception:  # noqa: BLE001 - the refusal still stands; see docstring
+            _LOG.exception(
+                "publication fence denial for run %r could not be recorded: %s",
+                row.get("run_id"),
+                reason,
+            )
+
+    def _assert_publication_fence(
+        self,
+        row: dict,
+        *,
+        policy: CompletionPolicy | None = None,
+        renew_for_action: bool = False,
+    ) -> None:
+        """Fail closed when a fenced daily campaign no longer owns a live lease.
+
+        Order matters and is the whole point: evaluate, **commit the denial
+        record**, then raise. Every one of this method's call sites inherits
+        that guarantee, so a fence refusal survives whether the caller catches
+        the exception (`advance_safely`) or lets it escape (`advance`,
+        `request_manual_merge`).
+        """
+        reason = self._publication_fence_denial(
+            row, policy=policy, renew_for_action=renew_for_action
+        )
+        if reason is None:
+            return
+        self._record_publication_fence_denial(row, reason)
+        raise CompletionFenceLostError(reason)
 
     # -- seeding ------------------------------------------------------------------
     def begin_completion(

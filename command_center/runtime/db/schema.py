@@ -200,48 +200,6 @@ def _migration_11_add_pre_run_head(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE run ADD COLUMN pre_run_head TEXT")
 
 
-def _migration_24_add_finalized_at(conn: sqlite3.Connection) -> None:
-    """The durable marker that a run's finalization finished, not merely that
-    its state went terminal (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
-
-    `_supervise` commits the terminal row first and only then appends
-    `process_exited`, auto-commits the agent's work and saves the report, on a
-    daemon thread interpreter shutdown does not join. For the width of that
-    window — measured over 20 runs at a 6.1 ms median on a clean working tree
-    and a 139 ms median (152 ms max) on a changed one, where the real `git
-    commit` of the auto-commit costs 133 ms — the run reads COMPLETED while its
-    report does not exist and the agent's commit has not been made. The window
-    is widest precisely when there is work to lose. `finalized_at` is written
-    *after* those, so a reader can tell
-    "finished" from "terminal, still finalizing", and a process killed inside
-    the window leaves the run visibly unfinalized rather than silently
-    reportless.
-
-    Its point is to be readable from *another process*: `Supervisor.wait_for_run`
-    answers the same question from an in-memory registry, which the operator
-    running a cutover does not have. See `db.count_unfinalized_runs`.
-
-    Nullable and never backfilled — a pre-existing row finalized under a
-    supervisor that recorded nothing, and stamping it now would assert durable
-    evidence that was never checked.
-
-    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2,
-    3, 4, 9, 11 — safe to re-run and safe under concurrent first-application via
-    the `BEGIN IMMEDIATE` transaction in `migrate()`. The partial index mirrors
-    `idx_run_unfinalized` in `0004_run_finalized_at.up.sql`: it holds an entry
-    only while a run is unfinalized, so a successful finalization removes its
-    own row from it.
-    """
-    with db.transaction(conn):
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
-        if "finalized_at" not in existing:
-            conn.execute("ALTER TABLE run ADD COLUMN finalized_at TEXT")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_run_unfinalized "
-            "ON run (state) WHERE finalized_at IS NULL"
-        )
-
-
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
 # run drives a *separate* state machine — the post-execution "is the engineering
 # task actually merged into the target branch" lifecycle — distinct from and
@@ -1127,6 +1085,128 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 """
 
 
+# Wave-0 Companion notify/sync (VOYN-W0-F5): push, the offline queue, and the
+# two-way sync between the desktop backend and a companion (mobile) client.
+#
+# The acceptance this family exists to satisfy is one sentence — *a state
+# transition that happens while a device is offline is delivered once the
+# network comes back* — and the four tables are what makes that a property of
+# the store rather than of whoever is holding the socket at the time.
+#
+#   sync_device   -- one row per paired companion device. `push_token` is where
+#                    a push goes; `push_enabled` says whether to try. `acked_seq`
+#                    is the device's confirmed cursor: everything at or below it
+#                    the device has acknowledged holding, so it is the only
+#                    number a re-installed client needs to resume. Mutable row
+#                    guarded by a `version` compare-and-set column.
+#   sync_event    -- the append-only journal of state transitions. `id` is
+#                    `INTEGER PRIMARY KEY AUTOINCREMENT`, so it is a globally
+#                    monotonic sequence and *is* the sync cursor; the writer
+#                    discipline the rest of this package follows (one
+#                    `BEGIN IMMEDIATE` writer at a time) is what makes commit
+#                    order and id order the same, and therefore what makes a
+#                    cursor safe to advance past. `event_id` is the stable public
+#                    identity a client dedups on. `project_ref` is the redaction
+#                    key.
+#   sync_delivery -- **the offline queue**: one row per (device, event), created
+#                    when the event is recorded rather than when the device next
+#                    appears. That fan-out-on-write is the whole design — a
+#                    device that is offline for an hour has an hour of rows
+#                    waiting for it, and nothing has to reconstruct what it
+#                    missed from a timestamp. `UNIQUE(device_id, event_seq)`
+#                    makes a re-queue a no-op, so a retry cannot duplicate a
+#                    notification. Status moves pending → delivered → acked, or
+#                    pending → failed → pending on a push that did not land.
+#   sync_command  -- the *other* direction: commands a client queued locally
+#                    while offline and replayed on reconnect.
+#                    `UNIQUE(device_id, client_command_id)` is the idempotency
+#                    key — a replayed batch is deduped at the persistence
+#                    boundary, not by hoping the client only sends once.
+#                    `submitted_at` is when the operator acted (offline, on the
+#                    device); `received_at` is when the server heard about it.
+#                    The two differ by exactly the outage, which is why both are
+#                    kept.
+#
+# Schema version is **24**, directly above the Wave-3 networking family (23).
+#
+# Statuses are stored as their stable string *values* (never a Python enum's
+# member name), so a column round-trips to exactly the Literal the API contract
+# (`api/models.py`) declares — the enum-name lesson carried forward.
+_SCHEMA_V24 = """
+CREATE TABLE IF NOT EXISTS sync_device (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    platform TEXT NOT NULL DEFAULT 'unknown',
+    push_token TEXT,
+    push_enabled INTEGER NOT NULL DEFAULT 1,
+    acked_seq INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_device_platform ON sync_device(platform);
+CREATE INDEX IF NOT EXISTS idx_sync_device_last_seen ON sync_device(last_seen_at);
+
+CREATE TABLE IF NOT EXISTS sync_event (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    from_state TEXT,
+    to_state TEXT,
+    project_ref TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_event_entity ON sync_event(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_sync_event_project ON sync_event(project_ref);
+CREATE INDEX IF NOT EXISTS idx_sync_event_created ON sync_event(created_at);
+
+CREATE TABLE IF NOT EXISTS sync_delivery (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES sync_device(id) ON DELETE CASCADE,
+    event_seq INTEGER NOT NULL REFERENCES sync_event(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    delivered_at TEXT,
+    acked_at TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(device_id, event_seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_delivery_device_status ON sync_delivery(device_id, status);
+CREATE INDEX IF NOT EXISTS idx_sync_delivery_event ON sync_delivery(event_seq);
+
+CREATE TABLE IF NOT EXISTS sync_command (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES sync_device(id) ON DELETE CASCADE,
+    client_command_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'accepted',
+    result_json TEXT,
+    reason TEXT,
+    submitted_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    applied_at TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(device_id, client_command_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_command_device_status ON sync_command(device_id, status);
+CREATE INDEX IF NOT EXISTS idx_sync_command_kind ON sync_command(kind);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1159,5 +1239,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (21, _SCHEMA_V21),
     (22, _SCHEMA_V22),
     (23, _SCHEMA_V23),
-    (24, _migration_24_add_finalized_at),
+    (24, _SCHEMA_V24),
 ]
