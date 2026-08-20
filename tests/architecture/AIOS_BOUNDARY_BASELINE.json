@@ -332,6 +332,9 @@
     "command_center/worker/sdnotify.py": [
       "orchestration"
     ],
+    "command_center/worker/worktree_lease.py": [
+      "orchestration"
+    ],
     "command_center/worktree_launcher.py": [
       "orchestration"
     ],

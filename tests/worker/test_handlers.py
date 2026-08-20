@@ -4,7 +4,12 @@ claude binary, no repository on disk unless a test builds one."""
 
 from __future__ import annotations
 
+import json
+import os
+import socket
 import threading
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -53,7 +58,51 @@ def handler(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", fake_run)
+    # The writer-lease gate is a real external seam: it shells out to the
+    # lease tool whenever VOYN_LEASE_DSN names an authority, and this host
+    # has one. Unset it here so the default fixture stays hermetic -- the
+    # gate's own tests opt back in explicitly.
+    monkeypatch.delenv("VOYN_LEASE_DSN", raising=False)
     return build_handlers()["agent_run"], runs
+
+
+@pytest.fixture
+def lease_tool(monkeypatch, tmp_path):
+    """Install a fake ``voyn-lease`` and point the gate at an authority.
+
+    Mirrors tests/orchestrator/test_publish.py: a shell script on disk, so
+    the subprocess boundary itself is exercised rather than stubbed out.
+    """
+
+    def install(stdout: str = "[]", exit_code: int = 0):
+        binary = tmp_path / "fake-voyn-lease"
+        binary.write_text(
+            "#!/bin/sh\n"
+            f"cat <<'JSON'\n{stdout}\nJSON\n"
+            f"exit {exit_code}\n"
+        )
+        binary.chmod(0o755)
+        monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+        monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+        return binary
+
+    return install
+
+
+def _lease_row(worktree, **overrides) -> str:
+    row = {
+        "repository_id": "ai-command-center",
+        "owner": "claude-worker",
+        "host": socket.gethostname(),
+        "session_id": "sess-1",
+        "worktree": str(worktree),
+        "process_pid": 4242,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(minutes=5)
+        ).isoformat(),
+    }
+    row.update(overrides)
+    return json.dumps([row])
 
 
 # -- payload contract ---------------------------------------------------------
@@ -346,3 +395,151 @@ def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:
     assert outcome.ok
     assert outcome.result["head_sha"] is None
     assert outcome.result["pr_url"] is None
+
+
+# -- single-writer dispatch gate (VOYN-OPS-WORKER-DISPATCH-INTO-LEASED-WORKTREE)
+
+
+def test_mutating_dispatch_into_a_leased_worktree_is_refused(
+    handler, lease_tool, tmp_path
+) -> None:
+    """The defect this task names: the worker dispatched into a checkout
+    another writer holds, and the collision only surfaced at commit time --
+    by which point the foreign edits were already in the tree."""
+    run_agent, runs = handler
+    lease_tool(_lease_row(tmp_path))
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert "claude-worker" in outcome.reason and str(tmp_path) in outcome.reason
+    assert runs == [], "nothing may execute in another writer's checkout"
+
+
+def test_a_lease_one_level_up_still_covers_the_dispatch(
+    handler, lease_tool, tmp_path
+) -> None:
+    """Routing at a subdirectory of a leased checkout is the same collision,
+    so containment -- not path equality -- is what the gate tests."""
+    run_agent, runs = handler
+    lease_tool(_lease_row(tmp_path.parent))
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable and runs == []
+
+
+def test_a_read_only_dispatch_is_not_gated(handler, lease_tool, tmp_path) -> None:
+    """Scope, stated rather than assumed: a non-mutating run gets the
+    read-only sandbox profile and cannot write into the tree at all, so a
+    lease it could not violate must not block it."""
+    run_agent, runs = handler
+    lease_tool(_lease_row(tmp_path))
+    outcome = run_agent(_payload(task_type="review"), _event())
+    assert outcome.ok and len(runs) == 1
+
+
+def test_expired_other_host_and_other_path_leases_do_not_block(
+    handler, lease_tool, tmp_path
+) -> None:
+    """Three ways a row can name this path without holding it."""
+    run_agent, runs = handler
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    for row in (
+        _lease_row(tmp_path, expires_at=stale),
+        _lease_row(tmp_path, host="some-other-worker"),
+        _lease_row(tmp_path.parent / "a-different-checkout"),
+    ):
+        runs.clear()
+        lease_tool(row)
+        outcome = run_agent(_payload(task_type="implementation"), _event())
+        assert outcome.ok, f"{row} must not block: {outcome.reason}"
+        assert len(runs) == 1
+
+
+def test_an_unreachable_authority_blocks_rather_than_opens(
+    handler, lease_tool, monkeypatch, tmp_path
+) -> None:
+    """A guard that opens when it cannot see is not a guard. Every failure
+    to ask a configured authority -- non-zero exit, unreadable output,
+    missing binary -- refuses the dispatch."""
+    run_agent, runs = handler
+
+    lease_tool("boom: connection refused", exit_code=1)
+    refused = run_agent(_payload(task_type="implementation"), _event())
+    assert not refused.ok and refused.retryable and runs == []
+    assert "connection refused" in refused.reason
+
+    lease_tool("not json at all")
+    unreadable = run_agent(_payload(task_type="implementation"), _event())
+    assert not unreadable.ok and unreadable.retryable and runs == []
+    assert "unreadable" in unreadable.reason
+
+    lease_tool("[]")
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(tmp_path / "does-not-exist"))
+    missing = run_agent(_payload(task_type="implementation"), _event())
+    assert not missing.ok and missing.retryable and runs == []
+    assert "unreachable" in missing.reason
+
+
+def test_no_configured_authority_leaves_the_gate_inert(handler, tmp_path) -> None:
+    """A host with no lease authority has no lease to violate: VOYN_LEASE_DSN
+    is the tool's only DSN source, so without it ``list`` cannot answer and
+    blocking every mutating run would strand hosts that never had a lease."""
+    run_agent, runs = handler
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok and len(runs) == 1
+
+
+def _own_start(pid: int) -> str:
+    """The identity token the lease authority stores for a pid, read the same
+    way the gate reads it -- past the last ``)``, because ``comm`` is
+    parenthesised and may contain spaces."""
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    return stat[stat.rindex(")") + 2 :].split()[19]
+
+
+def test_a_lease_held_by_our_own_supervisor_does_not_block(
+    handler, lease_tool, tmp_path
+) -> None:
+    """The process that launched us owning the tree is the normal shape.
+
+    A supervisor holds the lease and dispatches this worker into the tree it
+    owns; refusing there would deadlock the loop the supervisor runs. Our own
+    pid stands in for the ancestor -- self is the first entry of the ancestry
+    walk, so it exercises the same match.
+    """
+    run_agent, runs = handler
+    pid = os.getpid()
+    lease_tool(_lease_row(tmp_path, process_pid=pid, process_start=_own_start(pid)))
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1, "the dispatch was refused by its own supervisor's lease"
+
+
+def test_a_recycled_pid_matching_an_ancestor_still_blocks(
+    handler, lease_tool, tmp_path
+) -> None:
+    """Identity is (pid, process_start), not pid alone.
+
+    Same pid as ours, different start token: a foreign writer whose pid the
+    kernel happened to reuse. Matching on the number alone would open the gate
+    for it.
+    """
+    run_agent, runs = handler
+    lease_tool(
+        _lease_row(tmp_path, process_pid=os.getpid(), process_start="not-our-start")
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert runs == []
+
+
+def test_a_lease_with_no_identity_token_still_blocks(
+    handler, lease_tool, tmp_path
+) -> None:
+    """An unverifiable match is not a match: the row names our pid, but with
+    no ``process_start`` on either side to confirm it, the gate fails closed."""
+    run_agent, runs = handler
+    row = json.loads(_lease_row(tmp_path, process_pid=os.getpid()))
+    row[0].pop("process_start", None)
+    lease_tool(json.dumps(row))
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert runs == []
