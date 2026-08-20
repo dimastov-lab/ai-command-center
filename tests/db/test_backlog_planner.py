@@ -344,6 +344,70 @@ def test_ingest_without_machine_outcome_still_reviews_but_done_holds(rig) -> Non
     assert not ok and reason.startswith("missing_evidence")
 
 
+def test_ingest_queue_succeeded_but_task_failed_returns_to_pool_not_review(rig) -> None:
+    """The queue's `succeeded` means only "this attempt is terminal, do not
+    redeliver it" (worker/handlers.py: redelivering an already-executed
+    mutating run would re-apply its side effects) -- it is NOT a claim that
+    the agent's own run succeeded. A `worker.complete()` result whose
+    payload says `status: "failed"` (e.g. exit_code=1, an API/credit error)
+    must take the same cascade-exhaustion path as a `dead` work item, not
+    reach READY_TO_REVIEW with no pr/sha and no path back. Reproduces the
+    live 2026-08-20 incident (4 tasks stuck exactly this way)."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-QF", repo="repo-qf"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-QF")[0]
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-QF",
+        {"status": "failed", "exit_code": 1, "result_text": "Credit balance is too low"},
+    )
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-QF", "returned_to_pool")]
+
+    task = store.get_task("VOYN-W0-QF")
+    assert task["status"] == "OPEN"
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_evidence WHERE task_id = %s",
+                ("VOYN-W0-QF",),
+            )
+            assert cur.fetchone()[0] == 0
+
+
+def test_migration_0009_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up on the exact function body: down restores 0007's
+    (pre-fix) definition, up reapplies 0009's fix -- pinned so a future
+    no-op down (CREATE FUNCTION, not OR REPLACE) breaks the second up
+    loudly instead of leaving stale behaviour undetected."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
+            )
+            assert "v_task_status" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=8)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
+            )
+            assert "v_task_status" not in cur.fetchone()[0]
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
+            )
+            assert "v_task_status" in cur.fetchone()[0]
+
+
 def test_second_cascade_exhaustion_parks_for_the_owner(rig) -> None:
     """First exhaustion: a finding — back to OPEN, fresh epoch. Second:
     DEFER_TO_USER — two full budgets failing is a human's decision point,
