@@ -83,6 +83,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report the eligible set without dispatching.",
     )
+    sub.add_parser(
+        "backlog-review",
+        help="One review tick (BO-S3b): enqueue an adversarial review run for "
+        "each READY_TO_REVIEW task carrying a PR (aicc-backlog-review.timer).",
+    )
+    sub.add_parser(
+        "backlog-merge",
+        help="One merge tick (BO-S3b): merge every reviewed PR whose ACCEPT "
+        "marker and checks are green, closing the task DONE "
+        "(aicc-backlog-merge.timer). Needs --repo-path.",
+    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -250,6 +261,33 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                return 0
+
+            if args.command == "backlog-review":
+                from contextlib import nullcontext as _nc
+
+                from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.review_merge import review_once
+
+                store = WorkQueueStore(lambda: _nc(conn))
+                report = review_once(
+                    lambda: _nc(conn),
+                    lambda q, k, pl: store.enqueue(q, idempotency_key=k, payload=pl),
+                )
+                for task_id, pr in report.reviewed:
+                    print(f"REVIEW    {task_id} -> {pr}")
+                return 0
+
+            if args.command == "backlog-merge":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.review_merge import merge_once
+
+                report = merge_once(lambda: _nc(conn), args.repo_path)
+                for task_id, head in report.merged:
+                    print(f"MERGED    {task_id} -> {head}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
                 return 0
 
             if args.command == "downgrade":

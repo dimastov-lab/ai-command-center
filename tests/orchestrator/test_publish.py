@@ -5,7 +5,6 @@ No network, no GitHub — the contract is the argv and the branch state."""
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -24,14 +23,19 @@ def repo(tmp_path):
     subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True)
     work = tmp_path / "work"
     subprocess.run(["git", "clone", str(bare), str(work)], check=True, capture_output=True)
-    _git(work, "config", "user.email", "t@t"); _git(work, "config", "user.name", "t")
-    (work / "base.txt").write_text("base\n"); _git(work, "add", "."); _git(work, "commit", "-m", "base")
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "base.txt").write_text("base\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
     _git(work, "push", "origin", "main")
 
-    bin_ = tmp_path / "bin"; bin_.mkdir()
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
     calls = tmp_path / "calls.log"
     lease = bin_ / "voyn-lease"
-    lease.write_text(f"#!/bin/sh\necho \"lease $*\" >> {calls}\nexit 0\n"); lease.chmod(0o755)
+    lease.write_text(f"#!/bin/sh\necho \"lease $*\" >> {calls}\nexit 0\n")
+    lease.chmod(0o755)
     gh = bin_ / "gh"
     gh.write_text(
         f"#!/bin/sh\necho \"gh $*\" >> {calls}\n"
@@ -39,7 +43,8 @@ def repo(tmp_path):
         "  view) exit 1 ;;\n"  # no existing PR
         "  create) echo 'https://github.com/x/y/pull/1'; exit 0 ;;\n"
         "esac\n"
-    ); gh.chmod(0o755)
+    )
+    gh.chmod(0o755)
     return work, bin_, calls
 
 
@@ -66,7 +71,9 @@ def test_a_run_with_no_commit_is_nothing_to_publish(repo, monkeypatch):
 def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     work, bin_, calls = repo
     _with_path(bin_, monkeypatch)
-    (work / "change.txt").write_text("x\n"); _git(work, "add", "."); _git(work, "commit", "-m", "work")
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
 
     r = publish_run(work, _cfg(bin_))
     assert r.ok, r.reason
@@ -85,7 +92,9 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
 def test_lease_refusal_does_not_push(repo, monkeypatch):
     work, bin_, calls = repo
     _with_path(bin_, monkeypatch)
-    (work / "c.txt").write_text("x\n"); _git(work, "add", "."); _git(work, "commit", "-m", "w")
+    (work / "c.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "w")
     (bin_ / "voyn-lease").write_text(f"#!/bin/sh\necho \"lease $*\" >> {calls}\nexit 3\n")
     (bin_ / "voyn-lease").chmod(0o755)
 
