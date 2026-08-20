@@ -59,6 +59,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional attempts to grant beyond those already burned (default 1).",
     )
 
+    # Queue/lease/worker telemetry (SRV-08-WORKER-METRICS). Lives here rather
+    # than in the worker for the same reason queue-reap does: it reads
+    # `work_item_public` / `work_attempt_public`, which are `aicc_app` grants
+    # and deliberately not worker ones — a worker host must not be able to
+    # enumerate the fleet's leases.
+    metrics = sub.add_parser(
+        "queue-metrics",
+        help="Write queue/lease/worker gauges for node_exporter's textfile "
+        "collector (run by aicc-queue-metrics.timer).",
+    )
+    metrics.add_argument(
+        "--textfile-dir",
+        default=None,
+        help="node_exporter textfile directory "
+        "(default /var/lib/prometheus/node-exporter).",
+    )
+    metrics.add_argument(
+        "--stdout",
+        action="store_true",
+        help="Print the exposition instead of writing it; for operators "
+        "checking the series before wiring the timer up.",
+    )
+    metrics.add_argument(
+        "--expect-queue",
+        action="append",
+        default=[],
+        metavar="NAME",
+        dest="expect_queues",
+        help="Emit zero-valued series for this queue even when it holds no "
+        "rows. Repeatable. Without it an empty queue is indistinguishable "
+        "from a stopped exporter.",
+    )
+
     # The structured backlog store (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S1).
     imp = sub.add_parser(
         "backlog-import",
@@ -155,6 +188,39 @@ def main(argv: list[str] | None = None) -> int:
 
                 reaped = WorkQueueAdmin(lambda: nullcontext(conn)).reap()
                 print(f"reaped {reaped} lapsed attempt(s)")
+                return 0
+
+            if args.command == "queue-metrics":
+                from pathlib import Path
+
+                from command_center.telemetry import textfile
+                from command_center.telemetry.queue_metrics import (
+                    QueueMetricsCollector,
+                    render_exposition,
+                )
+
+                collector = QueueMetricsCollector(
+                    lambda: nullcontext(conn),
+                    expected_queues=tuple(args.expect_queues),
+                )
+                # render_exposition never raises: an unreachable database
+                # becomes `up 0` in the written file. That is the point of the
+                # timer — a failed collection must still refresh the
+                # generated-timestamp, or a database outage would present as a
+                # dead exporter and route to the wrong on-call.
+                exposition = render_exposition(collector)
+                if args.stdout:
+                    print(exposition, end="")
+                    return 0
+                directory = (
+                    Path(args.textfile_dir)
+                    if args.textfile_dir
+                    else textfile.DEFAULT_TEXTFILE_DIR
+                )
+                written = textfile.write_atomic(
+                    exposition, directory / textfile.DEFAULT_FILENAME
+                )
+                print(f"wrote {written}")
                 return 0
 
             if args.command == "queue-dlq":
