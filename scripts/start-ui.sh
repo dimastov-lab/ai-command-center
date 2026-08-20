@@ -16,9 +16,13 @@ if ! command -v streamlit >/dev/null 2>&1; then
   exit 1
 fi
 
-# Bind to localhost by default: the application has no authentication layer,
-# so it must not be reachable from the local network unless the operator
-# explicitly opts in. Pass an explicit --server.address to override.
+# Bind to localhost: the application has no authentication layer and runs
+# privileged git/gh and agent subprocesses, so it must not be reachable from the
+# local network. Passing an explicit --server.address still overrides this
+# default — this script cannot stop that — but a non-loopback address is then
+# refused by the application itself at first session
+# (command_center/console_boundary.py, ADR 0010). The override exists to choose
+# *which* loopback address, not whether to be on one.
 if [[ $# -eq 0 ]] || ! grep -q -- "--server.address" <<<"$*"; then
   set -- --server.address localhost "$@"
 fi

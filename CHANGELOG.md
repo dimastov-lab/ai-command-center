@@ -43,6 +43,43 @@ functional application milestones of `app.py`.
   exact host the worker ships to. Both are now guarded, with the reason
   recorded at the guard.
 
+### Security — the Streamlit console is local-only by decision, and by its own refusal (`VOYN-W0-AICC-CONSOLE-NO-AUTH`)
+
+The console runs `git`, `gh` and agent subprocesses on the host and has no authentication layer.
+Localhost binding kept it off the network, but that is a compensating control, not architecture, and
+every artifact that applied it also documented its own bypass — `.streamlit/config.toml` and
+`scripts/start-ui.sh` invited "an intentional, reviewed exposure" via `--server.address`,
+`docker-compose.aml.yml` invited `AML_BIND_HOST`, and `README.md` printed the command. Nothing
+performed the review those sentences assumed, and no gate could see the bypass, because it lives in
+a command line rather than in a file.
+
+- [ADR 0010](docs/adr/0010-streamlit-console-stays-local.md) records the decision the audit asked
+  for, with the three candidate answers evaluated: an identity-aware reverse proxy (rejected — buys
+  authentication only, while this surface also lacks authorization and attribution, and the bypass
+  survives), the AIOS identity boundary held inside the console (rejected for now — Streamlit has no
+  router, so "every privileged action is behind a check" could only be a claim maintained by
+  reading, and it funds the client being replaced), and retiring remote Streamlit in favour of the
+  authenticated HTTP API plus the web/desktop clients (**chosen** — it removes the surface instead
+  of wrapping it, needs no infrastructure this repository does not own, and costs nothing today).
+- `command_center/console_boundary.py` is the in-process half: `app.py` calls it before building a
+  page and refuses the session on any non-loopback bind, reading the address Streamlit actually
+  resolved so a config file, an environment variable and a CLI flag are all seen. An *unset* address
+  refuses too — Streamlit's own default is every interface.
+- `docker-compose.aml.yml` publishes on a literal `127.0.0.1`; `AML_BIND_HOST` is gone. Widening the
+  publish is now an edit to a gated file rather than a shell variable. The container's
+  `STREAMLIT_SERVER_ADDRESS: 0.0.0.0` — correct, because the namespace is private — is paired with
+  `AICC_CONSOLE_PRIVATE_NAMESPACE: "1"`, the one assertion the process cannot verify for itself.
+- `tests/test_console_boundary.py` covers the refusal logic, the `app.py` wiring end-to-end through
+  `AppTest`, and pins `is_serving()`'s marker to the Streamlit CLI's own import of it — the one
+  failure mode of this design that would be fail-*open*. `tests/test_deployment_exposure.py` gains
+  three gates: the publish host must be a literal, the namespace assertion must accompany a
+  non-loopback container bind, and no other deployment artifact may assert it.
+
+This does not close the port. `app.py` is a linear script run per session, so a misconfigured
+deployment still listens and still serves Streamlit's own shell and health endpoint; what no session
+gets is the application. Nor does it authenticate anyone — the decision is that this surface never
+will, because the surface that needs authentication already has one.
+
 ### Security — container deployment no longer exposes the console (`VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH`)
 
 An earlier audit (`9761459`, BLOCKER-1) pinned the Streamlit console to localhost for the bare

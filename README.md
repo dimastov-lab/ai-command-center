@@ -16,7 +16,10 @@ deprecated. Native parity is being reached deliberately, increment by increment;
 Streamlit is where you launch agents and drive the completion pipeline.
 
 This repository is not a production, distributed, or remote-worker execution platform. Its durable
-state is local to the machine running it, and there is no authentication layer in any interface.
+state is local to the machine running it. The Streamlit console and the read-only web dashboard have
+no authentication layer and are local-only surfaces by decision
+([ADR 0010](docs/adr/0010-streamlit-console-stays-local.md)); the mutating HTTP API routes are the
+one authenticated surface (`command_center/http_auth`).
 
 ## Which interface does what
 
@@ -178,12 +181,16 @@ python -m streamlit run app.py     # or: scripts/start-ui.sh
 ```
 
 `scripts/start-ui.sh` activates `.venv` when present, forwards additional Streamlit arguments, and
-binds to localhost by default. It does not install dependencies. The application has no
-authentication, so it must not be reachable from the local network unless you explicitly opt in:
+binds to localhost. It does not install dependencies.
 
-```bash
-scripts/start-ui.sh --server.address 0.0.0.0   # explicitly expose (not recommended)
-```
+**The console is local-only, by decision and by enforcement.** It has no authentication layer while
+it runs `git`, `gh` and agent subprocesses on your machine, so
+[ADR 0010](docs/adr/0010-streamlit-console-stays-local.md) records that it is never exposed off-host
+and that remote access is served by the authenticated HTTP API and the web/desktop clients instead.
+Passing `--server.address 0.0.0.0` no longer exposes it: the application refuses to serve the
+session and tells you so. The one sanctioned non-loopback bind is a container whose network
+namespace is private and whose published port is loopback-qualified, which `docker-compose.aml.yml`
+declares with `AICC_CONSOLE_PRIVATE_NAMESPACE=1`.
 
 The local Claude execution paths require an installed and authenticated `claude` CLI. Optional
 environment variables are documented in [`.env.example`](.env.example); the application does not
@@ -478,9 +485,11 @@ merges are to be blocked on it.
   returns a plan but does not perform it.
 - Fail-closed workspace verification is scoped to normal task-v2 paths that supply a `WorkspaceSpec`;
   low-level/ad-hoc launches preserve their separate behavior.
-- Streamlit and the web dashboard bind to localhost by default; passing an explicit
-  `--server.address` overrides that. No interface has authentication, so do not bind to a reachable
-  interface.
+- The Streamlit console is local-only and refuses to serve a session on a non-loopback bind
+  ([ADR 0010](docs/adr/0010-streamlit-console-stays-local.md)); it has no authentication and is not
+  getting one. The read-only web dashboard binds to localhost and has no authentication either. The
+  authenticated surface is the HTTP API (`command_center/http_auth`), and it authenticates mutating
+  routes only.
 - The system does not provide distributed execution, remote-worker durability, or seamless process
   resumption.
 

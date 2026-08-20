@@ -14,9 +14,14 @@
 # The application has NO authentication layer yet performs privileged git/gh and
 # subprocess operations, so the console must never be reachable off-host. Pinning
 # localhost here makes it the default for EVERY launch path — including a bare
-# `streamlit run app.py`, which does not go through scripts/start-ui.sh. An
-# explicit `--server.address` CLI flag still overrides this for an intentional,
-# reviewed exposure (see README "Getting started").
+# `streamlit run app.py`, which does not go through scripts/start-ui.sh.
+#
+# An explicit `--server.address` CLI flag still overrides this value, and this
+# file cannot see that it did. It is no longer a supported way to expose the
+# console: ADR 0010 (docs/adr/0010-streamlit-console-stays-local.md) records
+# that the console stays local and that remote access is the authenticated HTTP
+# API's job, and command_center/console_boundary.py refuses to serve any session
+# on a non-loopback bind however that bind was chosen.
 address = "localhost"
 
 [client]

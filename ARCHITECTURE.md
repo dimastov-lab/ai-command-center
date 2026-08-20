@@ -42,19 +42,31 @@ flowchart LR
 ```
 
 Streamlit itself serves HTTP and WebSocket traffic. **The application has no authentication layer**
-yet performs privileged git/gh and subprocess operations, so every launch path is constrained to
-keep it off-host unless the operator deliberately opts out:
+yet performs privileged git/gh and subprocess operations.
+[ADR 0010](docs/adr/0010-streamlit-console-stays-local.md) settles what follows from that: the
+console is a **local-only, single-operator surface** and will not receive an authentication layer;
+remote and multi-operator access is served by the authenticated HTTP API
+(`command_center/http_auth`) and the `web/` and desktop clients in front of it. "Reviewed exposure"
+is not a supported configuration.
+
+Five controls hold that line — four over the launch artifacts, one inside the process:
 
 | Launch path | Control |
 |---|---|
 | `streamlit run app.py` | `.streamlit/config.toml` pins `[server] address = "localhost"` |
 | `scripts/start-ui.sh` | injects `--server.address localhost` unless one is passed |
 | container entrypoint | `scripts/aml-entrypoint.sh` has **no default** and exits `78` unless `STREAMLIT_SERVER_ADDRESS` is set |
-| `docker compose` | the port is published on `${AML_BIND_HOST:-127.0.0.1}` |
+| `docker compose` | the port is published on a literal `127.0.0.1`, with no variable in front of it |
+| the console itself | `command_center/console_boundary.py` refuses to serve a session on a non-loopback bind |
 
-`tests/test_deployment_exposure.py` is the gate for all four. Not being exposed is not the same as
-being authenticated: HTTP authentication is a separate, still-open piece of work, so widening any of
-these controls means putting an unauthenticated privileged console on the network.
+The first four are file-based and `tests/test_deployment_exposure.py` gates them; none of them can
+see a `--server.address` typed on a command line, which is why the fifth exists and reads the
+address Streamlit actually resolved (`tests/test_console_boundary.py`). The single sanctioned
+non-loopback bind is a private container network namespace, declared with
+`AICC_CONSOLE_PRIVATE_NAMESPACE=1` in the same artifact that publishes the port on loopback.
+
+Not being exposed is still not the same as being authenticated. The difference is that the
+authenticated surface now exists somewhere else, and adding one here is no longer the plan.
 
 ## 2. UI and service boundaries
 

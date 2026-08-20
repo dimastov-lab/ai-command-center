@@ -18,8 +18,20 @@ This module owns the invariant for all four so that a regression in any one of
 them fails the gate.
 
 Scope note: these tests assert only that the surface is not *exposed*. They do
-not — and cannot — assert that it is *authenticated*, because it is not. HTTP
-authentication is designed separately (AUTH-HTTP-01).
+not — and cannot — assert that it is *authenticated*, because it is not, and
+under [ADR 0010](../docs/adr/0010-streamlit-console-stays-local.md) it never
+will be: the console is a local-only surface and remote access is the
+authenticated HTTP API's job (AUTH-HTTP-01).
+
+That ADR also closes the gap this module structurally cannot cover. Every
+assertion here reads a *file*, so none of them can see a `--server.address`
+typed on a command line — which is exactly what all four artifacts used to
+advertise as "an intentional, reviewed exposure". The in-process counterpart is
+`command_center/console_boundary.py`, gated by `tests/test_console_boundary.py`.
+The last three tests below are the seam between the two: they pin the compose
+publish to a *literal* loopback address (so widening it is an edit to a gated
+file rather than a shell variable), and they pin the one operator assertion the
+in-process guard has to take on trust to the single artifact allowed to make it.
 """
 
 from __future__ import annotations
@@ -225,4 +237,140 @@ def test_compose_sets_the_container_bind_address_explicitly() -> None:
     assert environment.get("STREAMLIT_SERVER_ADDRESS"), (
         "compose must set STREAMLIT_SERVER_ADDRESS explicitly; the entrypoint has no "
         "default and the service would otherwise refuse to start"
+    )
+
+
+# --- Path 4b: the decision ADR 0010 makes non-negotiable ---------------------
+
+#: Set by the container deployment to assert the one fact the console process
+#: cannot observe about itself: that its non-loopback bind is inside a private
+#: network namespace. Kept as a literal here rather than imported from
+#: `command_center.console_boundary` on purpose — this is the deployment side of
+#: the contract, and a rename in the module should surface as a failing test
+#: naming both halves, not as both halves quietly agreeing on a new name while
+#: the shipped compose file still sets the old one.
+PRIVATE_NAMESPACE_ENV = "AICC_CONSOLE_PRIVATE_NAMESPACE"
+
+#: Where an operator-facing bind address could plausibly be introduced. Test
+#: sources are excluded deliberately: they must be free to construct the
+#: assertion as data in order to test it.
+DEPLOYMENT_ARTIFACT_GLOBS = (
+    "scripts/**/*",
+    "deploy/**/*",
+    "packaging/**/*",
+    ".github/**/*",
+    "Dockerfile",
+    "Makefile",
+    ".env.example",
+    "docker-compose*.yml",
+)
+
+_ASSERTION_ASSIGNMENT = re.compile(
+    rf"{PRIVATE_NAMESPACE_ENV}\s*[:=]\s*[\"\']?([^\"\'\s#]*)",
+)
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _raw_published_host(port_spec: str) -> str | None:
+    """The host segment of a compose port spec, *before* any interpolation.
+
+    Separate from `_published_host_address` above, which resolves defaults
+    first. Here the point is precisely to see the `${...}` if there is one.
+    """
+    spec = port_spec.rsplit("/", 1)[0]
+    if spec.startswith("["):
+        host, _, _rest = spec[1:].partition("]")
+        return host or None
+    head, separator, rest = spec.partition(":")
+    if not separator or ":" not in rest:  # "8501" or "8501:8501"
+        return None
+    return head or None
+
+
+def test_compose_publish_host_is_a_literal_an_operator_cannot_widen() -> None:
+    """The host address must not be an interpolated variable.
+
+    `test_compose_publishes_ports_only_on_a_loopback_default` above accepts a
+    safe *default*, which is what `${AML_BIND_HOST:-127.0.0.1}` was. ADR 0010
+    withdrew that: a default is a knob, and the comment beside this one used to
+    invite operators to turn it ("set AML_BIND_HOST to widen it, in front of a
+    reviewed authenticating proxy"). Nothing performed that review, and turning
+    the knob left no trace in the repository at all.
+
+    With a literal, widening the publish means editing a file this module reads,
+    so the change arrives in a diff and fails here — which is the only place the
+    decision can be re-argued.
+    """
+    for entry in _compose_service().get("ports", []):
+        host = _raw_published_host(entry)
+        assert host is not None, f"port {entry!r} publishes without a host address"
+        assert "${" not in host, (
+            f"port {entry!r} takes its host interface from a variable; an operator "
+            "can then expose an unauthenticated privileged console without changing "
+            "a tracked file (ADR 0010)"
+        )
+        assert _is_loopback(host), f"port {entry!r} publishes on {host!r}, not loopback"
+
+
+def test_compose_declares_the_private_namespace_for_its_container_bind() -> None:
+    """The container's `0.0.0.0` is the one sanctioned non-loopback bind — and it
+    must say so, because the console now refuses that bind by default.
+
+    The two settings are a pair: `STREAMLIT_SERVER_ADDRESS: 0.0.0.0` is only
+    safe *because* the publish above is loopback-qualified, and the assertion
+    variable is the deployment stating that. Shipping the first without the
+    second means the container starts and then refuses every session; shipping
+    the second without the first means an assertion is standing where it is not
+    needed and would silently cover a later widening.
+    """
+    environment = _compose_service().get("environment", {})
+    address = environment.get("STREAMLIT_SERVER_ADDRESS")
+    assert address, "compose must set STREAMLIT_SERVER_ADDRESS explicitly"
+
+    declared = str(environment.get(PRIVATE_NAMESPACE_ENV, "")).strip().lower() in _TRUTHY
+    if _is_loopback(str(address)):
+        assert not declared, (
+            f"compose binds the loopback address {address!r} and does not need "
+            f"{PRIVATE_NAMESPACE_ENV}; an assertion that is not needed is one that "
+            "will still be here covering a later change that does need reviewing"
+        )
+    else:
+        assert declared, (
+            f"compose binds {address!r} inside the container but does not set "
+            f"{PRIVATE_NAMESPACE_ENV}; command_center/console_boundary.py refuses "
+            "every session on a non-loopback bind without it (ADR 0010)"
+        )
+
+
+def test_no_other_deployment_artifact_asserts_a_private_namespace() -> None:
+    """The assertion is unverifiable at runtime, so its blast radius is bounded here.
+
+    A process cannot see its host's port-publishing rules, so
+    `AICC_CONSOLE_PRIVATE_NAMESPACE` is something the deployment claims rather
+    than something the console checks. What makes the claim reviewable is that
+    it appears in exactly one file — the same file whose publish line the test
+    above pins to a literal loopback address, which is what makes the claim
+    true. Set anywhere else it is an unpaired assertion: a way to switch the
+    guard off with no accompanying evidence, which is the "reviewed exposure"
+    ADR 0010 removed, restored under a new name.
+    """
+    permitted = COMPOSE.resolve()
+    offenders: list[str] = []
+
+    for pattern in DEPLOYMENT_ARTIFACT_GLOBS:
+        for path in ROOT.glob(pattern):
+            if not path.is_file() or path.resolve() == permitted:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue  # a binary or unreadable artifact cannot set an env var
+            for match in _ASSERTION_ASSIGNMENT.finditer(text):
+                if match.group(1).strip().lower() in _TRUTHY:
+                    offenders.append(f"{path.relative_to(ROOT)}: {match.group(0)!r}")
+
+    assert not offenders, (
+        f"{PRIVATE_NAMESPACE_ENV} is asserted outside {COMPOSE.name}, where nothing "
+        "pins the loopback publish that makes it true: " + "; ".join(offenders)
     )

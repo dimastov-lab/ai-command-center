@@ -7,15 +7,21 @@ services:
     container_name: aml-service
     restart: unless-stopped
     ports:
-      # The host interface is named explicitly and defaults to loopback. An
-      # unqualified "8501:8501" publishes on EVERY host interface, and Docker
-      # writes that rule below a host firewall, so the exposure would not show
-      # up in the firewall's own configuration. This service has no
-      # authentication and performs privileged git/gh and subprocess
-      # operations, so reaching it off-host must be a deliberate act:
-      # set AML_BIND_HOST to widen it, in front of a reviewed authenticating
-      # proxy.
-      - "${AML_BIND_HOST:-127.0.0.1}:${AML_PORT:-8501}:8501"
+      # The host interface is a literal loopback address with no variable in
+      # front of it. An unqualified "8501:8501" publishes on EVERY host
+      # interface, and Docker writes that rule below a host firewall, so the
+      # exposure would not show up in the firewall's own configuration.
+      #
+      # This used to read "${AML_BIND_HOST:-127.0.0.1}", with a comment
+      # inviting an operator to widen it "in front of a reviewed
+      # authenticating proxy". ADR 0010 withdrew that invitation: this console
+      # has no authentication layer, is not getting one, and remote access is
+      # served by the authenticated HTTP API and the web/desktop clients
+      # instead. Removing the variable is the point — widening the publish now
+      # means editing this line, which fails
+      # `tests/test_deployment_exposure.py` in review rather than succeeding
+      # silently in an operator's shell.
+      - "127.0.0.1:${AML_PORT:-8501}:8501"
     volumes:
       - aml-data:/data
     environment:
@@ -30,6 +36,15 @@ services:
       # контейнера. Реальная граница экспозиции — адрес публикации в `ports`.
       # Entrypoint не имеет значения по умолчанию и без этой строки не стартует.
       STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
+      # Утверждение, которое сам процесс проверить не может: адрес 0.0.0.0 выше
+      # находится внутри приватного сетевого namespace, а порт опубликован
+      # только на loopback (строка `ports` выше). Без этой переменной
+      # `command_center/console_boundary.py` отказывается обслуживать сессии на
+      # не-loopback адресе (ADR 0010). Утверждение истинно ровно потому, что
+      # публикация выше — литеральный 127.0.0.1; если её расширить, эта строка
+      # станет ложной. Это единственное место в репозитории, где переменная
+      # выставляется в истинное значение, и тест это фиксирует.
+      AICC_CONSOLE_PRIVATE_NAMESPACE: "1"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s

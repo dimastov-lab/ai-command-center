@@ -3,17 +3,20 @@ from __future__ import annotations
 import html
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from streamlit import config as streamlit_config
 
 from command_center import (
     activity_log,
     agent_runner,
     artifacts,
     chat_service,
+    console_boundary,
     dashboard_truth,
     execution_queue,
     executors,
@@ -65,6 +68,23 @@ from command_center.ui import (
     task_dependencies,
     tokens,
 )
+
+# The console refuses to run itself on a reachable interface (ADR 0010). This is
+# the first statement after the import block for a reason: `app.py` is a linear
+# script, so stopping here means no page, no widget and no callback belonging to
+# a privileged action is ever built for this session. The launch-path guards in
+# `.streamlit/config.toml`, `scripts/start-ui.sh`, `scripts/aml-entrypoint.sh`
+# and `docker-compose.aml.yml` cannot see a `--server.address` passed on the
+# command line; this can, because it reads the option Streamlit actually
+# resolved. See `command_center/console_boundary.py`.
+try:
+    console_boundary.enforce(address=streamlit_config.get_option("server.address"))
+except console_boundary.ConsoleExposureRefused as refusal:
+    # stderr as well as the page: the operator who chose the bind address is
+    # watching the terminal, and may never open the browser at all.
+    print(f"[AICC] {refusal}", file=sys.stderr, flush=True)
+    st.error(str(refusal))
+    st.stop()
 
 ROOT = Path(__file__).resolve().parent
 PROJECTS_DIR = ROOT / "projects"
