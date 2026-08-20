@@ -156,6 +156,75 @@ class BacklogStore:
                 cur.execute("SELECT status, count(*) FROM backlog_task GROUP BY status")
                 return {status: int(count) for status, count in cur.fetchall()}
 
+    def list_tasks(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """A page of tasks, newest-updated first, plus the total count for
+        that filter (paging metadata, not a second query the caller has to
+        issue to know whether there is a next page)."""
+        keys = (
+            "task_id",
+            "wave",
+            "priority",
+            "status",
+            "kind",
+            "title",
+            "repo",
+            "revision",
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                if status is not None:
+                    cur.execute(
+                        "SELECT count(*) FROM backlog_task WHERE status = %s",
+                        (status,),
+                    )
+                    total = int(cur.fetchone()[0])
+                    cur.execute(
+                        "SELECT task_id, wave, priority, status, kind, title, repo, "
+                        "revision FROM backlog_task WHERE status = %s "
+                        "ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                        (status, limit, offset),
+                    )
+                else:
+                    cur.execute("SELECT count(*) FROM backlog_task")
+                    total = int(cur.fetchone()[0])
+                    cur.execute(
+                        "SELECT task_id, wave, priority, status, kind, title, repo, "
+                        "revision FROM backlog_task "
+                        "ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                        (limit, offset),
+                    )
+                tasks = [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+        return tasks, total
+
+    def list_events(self, task_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        keys = ("event", "outcome", "reason", "actor", "detail", "created_at")
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT event, outcome, reason, actor, detail, created_at "
+                    "FROM backlog_event WHERE task_id = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (task_id, limit),
+                )
+                return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
+    def list_evidence(self, task_id: str) -> list[dict[str, Any]]:
+        keys = ("kind", "value", "recorded_at")
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT kind, value, recorded_at FROM backlog_evidence "
+                    "WHERE task_id = %s ORDER BY recorded_at",
+                    (task_id,),
+                )
+                return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
     # -- the importer ---------------------------------------------------------
 
     def import_markdown(self, text: str) -> ImportReport:

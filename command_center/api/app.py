@@ -29,12 +29,14 @@ clean, additive move rather than a breaking rename of live paths.
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from command_center.api import (
     audit_routes,
+    backlog_routes,
     conflict_routes,
     council_routes,
     marketplace_routes,
@@ -99,11 +101,39 @@ def _build_read_router() -> APIRouter:
     return router
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Open the PostgreSQL pool for the life of the process, when configured.
+
+    Same contract as `command_center.webapi.app._lifespan`: absence of
+    `AICC_PG_HOST` means "this deployment has no server backlog" (a
+    developer's own SQLite-backed instance), not a misconfiguration —
+    startup proceeds and `backlog_routes` surfaces 503 per request. A host
+    that *is* set but unusable is fatal here on purpose, same reasoning as
+    the webapi twin: a bad DSN should stop the deploy, not surface as a 503
+    storm on every dashboard poll.
+    """
+    opened = False
+    if os.environ.get("AICC_PG_HOST"):
+        from command_center.db import pool
+
+        pool.open_pool()
+        opened = True
+    try:
+        yield
+    finally:
+        if opened:
+            from command_center.db import pool
+
+            pool.close_pool()
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="AI Command Center API",
         version=service.get_health().version,
         summary="Backend for the desktop and mobile shells (v1).",
+        lifespan=_lifespan,
     )
 
     # Dev-only CORS for a locally served frontend (opt-in via env). Write verbs
@@ -131,6 +161,7 @@ def create_app() -> FastAPI:
     app.include_router(marketplace_routes.router, dependencies=guard)
     app.include_router(model_registry_routes.router, dependencies=guard)
     app.include_router(networking_routes.router, dependencies=guard)
+    app.include_router(backlog_routes.router, dependencies=guard)
 
     # Fail closed at boot, not only in CI: a mutating route this build does not
     # route to an operation stops the process here.
