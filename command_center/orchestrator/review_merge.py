@@ -134,7 +134,6 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE with the merged sha as evidence."""
     cfg = cfg or ReviewConfig()
-    cfg = cfg or ReviewConfig()
     report = LoopReport()
     tasks = _rows(
         factory,
