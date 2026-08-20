@@ -71,6 +71,54 @@ def _covers(leased: str | None, repository: Path) -> bool:
     return repository == path or repository.is_relative_to(path)
 
 
+def _process_start(pid: int) -> str | None:
+    """Field 22 of ``/proc/<pid>/stat`` -- the same identity token the lease
+    authority stores. Parsed past the last ``)`` because ``comm`` is
+    parenthesised and may itself contain spaces, which a naive split would
+    mis-column."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields = stat[stat.rindex(")") + 2 :].split()
+        return fields[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _ancestry() -> dict[int, str | None]:
+    """This process and every ancestor, mapped to its start token.
+
+    A lease held by one of our own ancestors is not a foreign writer: the
+    supervisor that owns the tree is precisely who launched us, and refusing
+    its own dispatch would deadlock the loop it runs. ``process_start`` is
+    checked alongside the pid because pids are reused, and a recycled pid that
+    happens to match an ancestor would otherwise open the gate.
+    """
+    seen: dict[int, str | None] = {}
+    pid = os.getpid()
+    while pid > 0 and pid not in seen:
+        seen[pid] = _process_start(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat[stat.rindex(")") + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return seen
+
+
+def _held_by_our_own_line(row: dict, ancestry: dict[int, str | None]) -> bool:
+    """True when this lease belongs to us or to a process that launched us."""
+    pid = row.get("process_pid")
+    if not isinstance(pid, int) or pid not in ancestry:
+        return False
+    claimed = row.get("process_start")
+    ours = ancestry[pid]
+    if claimed is None or ours is None:
+        # The row names one of our pids but identity cannot be confirmed on
+        # both sides. Fail closed: an unverifiable match is not a match.
+        return False
+    return str(claimed) == str(ours)
+
+
 def blocking_lease(repository: Path) -> str | None:
     """Reason this dispatch must not run, or None when the path is clear."""
     if not os.environ.get("VOYN_LEASE_DSN"):
@@ -102,6 +150,7 @@ def blocking_lease(repository: Path) -> str | None:
         target = repository
     hosts = _this_host()
     now = datetime.now(timezone.utc)
+    ancestry = _ancestry()
     for row in rows:
         if not isinstance(row, dict) or row.get("host") not in hosts:
             # A worktree path on another host is a different directory that
@@ -113,6 +162,8 @@ def blocking_lease(repository: Path) -> str | None:
         if expires_at is not None and expires_at <= now:
             # An expired lease holds nothing; takeover is the lease tool's
             # own decision, not ours to pre-empt.
+            continue
+        if _held_by_our_own_line(row, ancestry):
             continue
         return (
             f"worktree {target} is held by writer {row.get('owner')!r} "

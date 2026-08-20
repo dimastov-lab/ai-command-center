@@ -5,9 +5,11 @@ claude binary, no repository on disk unless a test builds one."""
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -483,3 +485,61 @@ def test_no_configured_authority_leaves_the_gate_inert(handler, tmp_path) -> Non
     run_agent, runs = handler
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert outcome.ok and len(runs) == 1
+
+
+def _own_start(pid: int) -> str:
+    """The identity token the lease authority stores for a pid, read the same
+    way the gate reads it -- past the last ``)``, because ``comm`` is
+    parenthesised and may contain spaces."""
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    return stat[stat.rindex(")") + 2 :].split()[19]
+
+
+def test_a_lease_held_by_our_own_supervisor_does_not_block(
+    handler, lease_tool, tmp_path
+) -> None:
+    """The process that launched us owning the tree is the normal shape.
+
+    A supervisor holds the lease and dispatches this worker into the tree it
+    owns; refusing there would deadlock the loop the supervisor runs. Our own
+    pid stands in for the ancestor -- self is the first entry of the ancestry
+    walk, so it exercises the same match.
+    """
+    run_agent, runs = handler
+    pid = os.getpid()
+    lease_tool(_lease_row(tmp_path, process_pid=pid, process_start=_own_start(pid)))
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1, "the dispatch was refused by its own supervisor's lease"
+
+
+def test_a_recycled_pid_matching_an_ancestor_still_blocks(
+    handler, lease_tool, tmp_path
+) -> None:
+    """Identity is (pid, process_start), not pid alone.
+
+    Same pid as ours, different start token: a foreign writer whose pid the
+    kernel happened to reuse. Matching on the number alone would open the gate
+    for it.
+    """
+    run_agent, runs = handler
+    lease_tool(
+        _lease_row(tmp_path, process_pid=os.getpid(), process_start="not-our-start")
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert runs == []
+
+
+def test_a_lease_with_no_identity_token_still_blocks(
+    handler, lease_tool, tmp_path
+) -> None:
+    """An unverifiable match is not a match: the row names our pid, but with
+    no ``process_start`` on either side to confirm it, the gate fails closed."""
+    run_agent, runs = handler
+    row = json.loads(_lease_row(tmp_path, process_pid=os.getpid()))
+    row[0].pop("process_start", None)
+    lease_tool(json.dumps(row))
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert runs == []
