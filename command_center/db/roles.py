@@ -122,6 +122,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
+    "backlog_task_remediation",
     "backlog_writer_lease",
     "completion",
     "completion_event",
@@ -259,6 +260,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_evidence": _READ,
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
+    "backlog_task_remediation": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -267,6 +269,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_evidence": _NONE,
     "backlog_event": _NONE,
     "backlog_writer_lease": _NONE,
+    "backlog_task_remediation": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -470,6 +473,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_upsert_task(text, text, text, text, text, text, text, text)",
     "backlog_transition(text, text, bigint)",
     "backlog_record_evidence(text, text, text)",
+    "backlog_record_remediation(text, text, text, text)",
     "backlog_add_dependency(text, text)",
     "backlog_lease_acquire(text, text, integer)",
     "backlog_lease_heartbeat(text, text, integer)",

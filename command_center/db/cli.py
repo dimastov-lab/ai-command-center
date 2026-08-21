@@ -289,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
                 marker_report = publish_review_verdicts(lambda: _nc(conn), args.repo_path)
                 for task_id, pr in marker_report.reviewed:
                     print(f"MARKER    {task_id} -> {pr}")
+                for task_id, new_task_id in marker_report.remediated:
+                    print(f"REMEDIATE {task_id} -> {new_task_id}")
                 for task_id, reason in marker_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0

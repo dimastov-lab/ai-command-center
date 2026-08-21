@@ -218,6 +218,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_upsert_task",
         "backlog_transition",
         "backlog_record_evidence",
+        "backlog_record_remediation",
         "backlog_add_dependency",
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",
