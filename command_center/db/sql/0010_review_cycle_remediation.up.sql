@@ -27,14 +27,17 @@
 -- productive part of the graph.
 --
 -- The review-cycle key is fixed in the same migration because the two are
--- one connected design, not two: a remediation task pushes a new commit to
--- the SAME PR, so review identity must be per (task, pr, head sha, review
--- policy version), not per task_id alone -- otherwise the exact same
--- permanent-first-review problem this migration is fixing for remediation
--- would just as easily hit an ordinary task that gets a second push while
--- still IN_PROGRESS. review_merge.py's review_once()/publish_review_
--- verdicts() are updated in the same PR to build and look up that key; see
--- their module docstring for the Python-side half of this design.
+-- one connected design, not two: the remediation task opens its OWN new PR
+-- (the rejected PR is left as-is, superseded), so it needs its own fresh
+-- review identity rather than inheriting the permanently-consumed
+-- `review:<task_id>` key its REJECTED parent used -- otherwise the exact
+-- same permanent-first-review problem this migration is fixing for
+-- remediation would just as easily hit an ordinary task that gets a second
+-- push while still IN_PROGRESS. Both cases need the same fix: identity per
+-- (task, pr, head sha, review policy version), not per task_id alone.
+-- review_merge.py's review_once()/publish_review_verdicts() are updated in
+-- the same PR to build and look up that key; see their module docstring
+-- for the Python-side half of this design.
 
 -- REJECTED joins DONE as the only two states READY_TO_REVIEW can reach.
 ALTER TABLE backlog_task DROP CONSTRAINT backlog_task_status_vocabulary;
