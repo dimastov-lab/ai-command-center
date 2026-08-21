@@ -202,6 +202,83 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
         assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
 
 
+def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: a CheckRun with `conclusion:
+    null` because it hasn't finished (`status` QUEUED/IN_PROGRESS) used to
+    read identically to one that simply carries no conclusion key at all --
+    both passed. A required check still running must block merge, not be
+    treated as passing."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/20")
+    head = "c" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"}],
+            "statusCheckRollup": [
+                {"name": "CI", "status": "IN_PROGRESS", "conclusion": None},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M3", "checks_not_green: ['CI']") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M3",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # noqa: F811
+    """The rollup mixes CheckRun and legacy StatusContext shapes; a pending
+    StatusContext (`state: PENDING`, no `conclusion`/`status` keys at all)
+    must block merge the same as a running CheckRun does."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M4", "https://github.com/x/y/pull/21")
+    head = "f" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"}],
+            "statusCheckRollup": [{"name": "legacy-ci", "state": "PENDING"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M4", "checks_not_green: ['legacy-ci']") in report.skipped
+
+
+def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: an ACCEPT marker sitting in an
+    OLDER review must not authorize merge once a NEWER review exists on the
+    same head -- e.g. a stale ACCEPT from before a dismissed/superseded
+    review. Only the latest review by submittedAt counts."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M5", "https://github.com/x/y/pull/22")
+    head = "9" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [
+                {"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"},
+                {"body": "Actually, hold on -- this needs another look.", "submittedAt": "2026-01-02T00:00:00Z"},
+            ],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
+
+
 def test_publish_verdict_posts_the_marker_gh_pr_review_reads(rig, monkeypatch):  # noqa: F811
     """VOYN-W0-AICC-MISSING-MARKER-PUBLISHER: the agent's own ACCEPT verdict
     must reach GitHub as the exact `ACCEPTANCE: ACCEPT <sha>` comment-review
