@@ -325,19 +325,31 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
     return json.loads(payload) if isinstance(payload, str) else payload
 
 
+def _accept_marker_on_latest_review(reviews: list[dict[str, Any]], head: str) -> bool:
+    """Whether the marker stands on the MOST RECENT review, not merely
+    somewhere in the array. A superseded/earlier review carrying the marker
+    text must not count once a later review exists -- otherwise a stale
+    ACCEPT from before a rejected re-review (or before a dismissed review)
+    would still authorize merge. `submittedAt` is ISO 8601, so lexical max
+    is chronological max; a missing timestamp sorts first (never wins)."""
+    if not reviews:
+        return False
+    latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
+    return f"ACCEPTANCE: ACCEPT {head}" in (latest.get("body") or "")
+
+
 def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
-    view = _gh(["pr", "view", pr_url, "--json", "reviews,headRefOid"], repo_path)
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "reviews,headRefOid"], repo_path
+    )
     if view.returncode != 0:
         return False, ""
     data = json.loads(view.stdout or "{}")
     head = data.get("headRefOid", "")
-    accept = any(
-        f"ACCEPTANCE: ACCEPT {head}" in (r.get("body") or "")
-        for r in data.get("reviews", [])
-    )
+    accept = _accept_marker_on_latest_review(data.get("reviews", []), head)
     return accept, head
 
 
@@ -500,6 +512,27 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
 # -- Part 3: merge ------------------------------------------------------------
 
 
+def _check_is_green(check: dict[str, Any]) -> bool:
+    """A single `statusCheckRollup` entry is green iff it is DEFINITIVELY
+    successful -- never on absence of information. GitHub's rollup mixes two
+    shapes: a CheckRun (`status`: QUEUED/IN_PROGRESS/COMPLETED, `conclusion`
+    set only once `status == COMPLETED`) and a legacy StatusContext (`state`:
+    PENDING/SUCCESS/FAILURE/ERROR, no `status`/`conclusion` keys at all).
+    The prior check only ever looked at `conclusion` and treated `None` as
+    passing -- which is exactly the value a CheckRun has while still queued
+    or running, and also what `.get()` returns for a StatusContext that
+    never had the key, silently waving through a still-pending required
+    check on either shape. Fail closed: anything not explicitly SUCCESS
+    (via conclusion) or SUCCESS (via legacy state) is not green."""
+    conclusion = check.get("conclusion")
+    if conclusion is not None:
+        return conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED")
+    state = check.get("state")
+    if state is not None:
+        return state == "SUCCESS"
+    return False
+
+
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker stands on the head. `gh pr view` gives both in one call."""
@@ -514,17 +547,13 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     if data.get("state") != "OPEN":
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
-    accept = any(
-        f"ACCEPTANCE: ACCEPT {head}" in (r.get("body") or "")
-        for r in data.get("reviews", [])
-    )
+    accept = _accept_marker_on_latest_review(data.get("reviews", []), head)
     if not accept:
         return False, "no_accept_marker_on_head"
     rollup = data.get("statusCheckRollup") or []
     bad = [
         c.get("name", "?") for c in rollup
-        if c.get("conclusion") not in (None, "SUCCESS", "NEUTRAL", "SKIPPED")
-        and "cceptance" not in c.get("name", "")
+        if not _check_is_green(c) and "cceptance" not in c.get("name", "")
     ]
     if bad:
         return False, f"checks_not_green: {bad[:3]}"
