@@ -191,6 +191,35 @@ def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
+def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypatch):  # noqa: F811
+    """Independent review, round 2 (2026-08-21): taking the last VERDICT and
+    the last HEAD_SHA *independently* can still combine two unrelated lines
+    -- e.g. the reviewer's real, final REJECT followed by incidental prose
+    that happens to contain both an ACCEPT (about a different PR) and this
+    PR's actual head sha. That must not synthesize an ACCEPT-with-real-sha
+    marker. Only a VERDICT line immediately followed by its own HEAD_SHA
+    line counts as a verdict at all."""
+    app_factory, store, worker = rig
+    real_head = "c" * 40
+    _ready(store, app_factory, "VOYN-W0-P7", "https://github.com/x/y/pull/17")
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P7",
+        "VERDICT: REJECT\n"
+        "The stale-head check is buggy.\n\n"
+        f"Note: PR #99 shares HEAD_SHA: {real_head} with this one, where "
+        "VERDICT: ACCEPT was correctly given for the analogous change.\n",
+    )
+
+    posted = []
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: posted.append(argv) or __import__("subprocess").CompletedProcess(argv, 0, "{}", ""),
+    )
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P7", "verdict_or_head_sha_missing_in_review_result") in report.skipped
+    assert not any(a[:2] == ["pr", "review"] for a in posted)
+
+
 def test_publish_verdict_skips_without_a_completed_review_yet(rig):  # noqa: F811
     app_factory, store, _worker = rig
     _ready(store, app_factory, "VOYN-W0-P3", "https://github.com/x/y/pull/13")

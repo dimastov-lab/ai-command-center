@@ -127,12 +127,23 @@ def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig | None = None) -> 
 
 # -- Part 2b: publish the verdict as the marker merge_once reads -------------
 
-# Same shape as handlers.py's _HEAD_SHA_TRAILER (the labelled-trailer-only
-# rule: a bare 40-hex string in a transcript is any object id at all, so only
-# the explicit trailer counts). Verdict is equally strict -- the exact
-# uppercase token the review prompt asks for, nothing inferred from prose.
-_VERDICT = re.compile(r"^VERDICT:\s*(ACCEPT|REJECT)\s*$", re.MULTILINE)
-_HEAD_SHA_TRAILER = re.compile(r"^HEAD_SHA:\s*([0-9a-f]{7,40})\s*$", re.MULTILINE)
+# The verdict and its sha must be matched as ONE co-located block, not as two
+# independently-searched tokens: a transcript can legitimately mention other
+# VERDICT: or HEAD_SHA: lines (a corrected earlier draft, an aside comparing
+# another PR) elsewhere in the free text. Matching each independently and
+# pairing "the last of each" can silently combine an unrelated trailing
+# ACCEPT with an unrelated trailing sha that happens to equal the real head --
+# caught live by independent review (2026-08-21) on a transcript reading
+# "VERDICT: REJECT ... Note: PR #99 shares HEAD_SHA: <this pr's head>, where
+# VERDICT: ACCEPT was correct" -- the earlier per-token .search()/finditer()
+# fix would post ACCEPTANCE for a PR the reviewer explicitly rejected. This
+# pattern requires HEAD_SHA to be the line immediately following VERDICT
+# (matching the prompt's own instruction), so only a genuine verdict
+# statement -- not incidental prose -- can produce a match.
+_VERDICT_BLOCK = re.compile(
+    r"^VERDICT:\s*(ACCEPT|REJECT)\s*\n+HEAD_SHA:\s*([0-9a-f]{7,40})\s*$",
+    re.MULTILINE,
+)
 
 
 def _latest_review_result(factory: Any, task_id: str) -> dict[str, Any] | None:
@@ -192,22 +203,20 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
             report.skipped.append((task_id, "no_review_result_yet"))
             continue
         text = result.get("result_text") or ""
-        # The LAST match, not the first: the prompt asks for the verdict "as
-        # the last line", but nothing enforces that, and an agent reasoning
-        # aloud in free text can draft a tentative verdict, reconsider, and
-        # correct it -- .search() would silently keep the earlier one.
-        # Independent review caught this live (2026-08-21): a transcript
-        # that says ACCEPT, keeps reading, finds a real defect, then says
-        # REJECT would have posted ACCEPTANCE anyway under .search().
-        verdict_matches = list(_VERDICT.finditer(text))
-        sha_matches = list(_HEAD_SHA_TRAILER.finditer(text))
-        if not verdict_matches or not sha_matches:
+        # The LAST co-located block, not the first: the prompt asks for the
+        # verdict "as the last line", but nothing enforces that, and an agent
+        # reasoning aloud in free text can draft a tentative verdict,
+        # reconsider, and correct it. Requiring VERDICT and HEAD_SHA to be
+        # adjacent (see _VERDICT_BLOCK) also rules out pairing an unrelated
+        # trailing ACCEPT with an unrelated trailing sha from separate prose.
+        blocks = list(_VERDICT_BLOCK.finditer(text))
+        if not blocks:
             report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
             continue
-        if verdict_matches[-1].group(1) != "ACCEPT":
+        verdict, sha = blocks[-1].group(1), blocks[-1].group(2)
+        if verdict != "ACCEPT":
             report.skipped.append((task_id, "review_verdict_reject"))
             continue
-        sha = sha_matches[-1].group(1)
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
