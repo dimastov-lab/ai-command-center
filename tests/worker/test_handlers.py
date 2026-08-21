@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from command_center import agent_runner
+from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import parse_agent_run, PayloadError
 
@@ -375,6 +376,55 @@ def test_result_carries_pr_url_and_labelled_head_sha(handler, monkeypatch) -> No
     assert outcome.ok
     assert outcome.result["pr_url"] == "https://github.com/o/r/pull/42"
     assert outcome.result["head_sha"] == "deadbeefcafe"
+
+
+def test_publish_branches_on_the_backlog_task_id_not_the_project_id(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-PUBLISH-BRANCH-COLLISION: publish_run branches on
+    ``cfg.task`` (``backlog/<task>``, publish.py), so passing the shared
+    project_id there put every task for one project on the SAME branch —
+    a later force-push silently erased an earlier, still-open task's work.
+    The payload's own backlog_task_id must be what reaches PublishConfig."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-REAL-TASK"),
+        _event(),
+        1,
+    )
+    assert captured[0].task == "VOYN-W0-REAL-TASK"
+
+
+def test_publish_falls_back_to_project_id_without_a_backlog_task_id(
+    handler, monkeypatch
+) -> None:
+    """A payload enqueued before this field existed still parses and still
+    publishes -- to the old shared-branch name, not a crash."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert captured[0].task == "proj"  # _payload()'s project_id
 
 
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:

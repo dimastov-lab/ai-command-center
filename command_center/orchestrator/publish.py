@@ -66,6 +66,30 @@ def _lease_argv(cfg: PublishConfig, verb: str, repo_path: Path) -> list[str]:
     ]
 
 
+def _https_push_target(repo_path: Path) -> str | None:
+    """The repo's own `origin`, rewritten to HTTPS when it is an
+    `git@github.com:` SSH remote — pushed through the host's global `gh`
+    credential helper (`gh auth setup-git`, already configured on every
+    worker for `gh pr create`/`gh pr view` below) instead of a per-repo
+    deploy key. Deploy keys proved unreliable in practice on 2026-08-21:
+    GitHub silently blocks them for private repos on this org's Free plan,
+    and one denied write even on a *public* repo despite a verified,
+    correctly-registered, non-read-only key — with no actionable diagnostic
+    on either side. `gh`'s own OAuth credential is what every manual
+    recovery this session ultimately fell back to, so it becomes the
+    primary path here rather than the last resort."""
+    remote = _run(["git", "remote", "get-url", "origin"], repo_path)
+    if remote.returncode != 0:
+        return None
+    url = remote.stdout.strip()
+    prefix = "git@github.com:"
+    if url.startswith(prefix):
+        return "https://github.com/" + url[len(prefix):]
+    if url.startswith("https://github.com/"):
+        return url
+    return None
+
+
 def _process_start() -> str:
     # The lease binds ownership to (pid, process-start) so a recycled pid
     # cannot inherit a dead process's lease. Read this process's start from
@@ -98,11 +122,21 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         # returns to the pool and a later tick retries — never a forced push.
         return PublishResult(ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}")
     try:
-        git_ssh = f"ssh -i {cfg.deploy_key} -o IdentitiesOnly=yes"
-        push = _run(
-            ["git", "push", "--force-with-lease", "origin", f"HEAD:refs/heads/{branch}"],
-            repo_path, {"GIT_SSH_COMMAND": git_ssh},
-        )
+        https_target = _https_push_target(repo_path)
+        if https_target is not None:
+            push = _run(
+                ["git", "push", "--force-with-lease", https_target,
+                 f"HEAD:refs/heads/{branch}"],
+                repo_path,
+            )
+        else:
+            # origin isn't a github.com remote this host knows how to
+            # rewrite to HTTPS -- fall back to the configured deploy key.
+            git_ssh = f"ssh -i {cfg.deploy_key} -o IdentitiesOnly=yes"
+            push = _run(
+                ["git", "push", "--force-with-lease", "origin", f"HEAD:refs/heads/{branch}"],
+                repo_path, {"GIT_SSH_COMMAND": git_ssh},
+            )
         if push.returncode != 0:
             return PublishResult(ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}")
     finally:

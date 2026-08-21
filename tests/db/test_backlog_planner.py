@@ -20,7 +20,7 @@ from command_center.db import roles
 from command_center.db.backlog_parser import ParsedTask
 from command_center.db.backlog_store import BacklogStore
 from command_center.db.work_queue_store import ClaimedWork, WorkQueueStore
-from command_center.orchestrator.planner import PlanLimits, plan_once
+from command_center.orchestrator.planner import PlanLimits, _payload_for, plan_once
 
 pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
 
@@ -121,6 +121,26 @@ def _task(task_id: str, **overrides) -> ParsedTask:
     )
     values.update(overrides)
     return ParsedTask(**values)
+
+
+def test_dispatch_payload_carries_the_specific_task_id() -> None:
+    """VOYN-W0-AICC-PUBLISH-BRANCH-COLLISION: the publish branch is
+    `backlog/<backlog_task_id>` (publish.py, via handlers.py). Before this
+    field existed the payload only carried `project_id` -- shared by every
+    task in one repo -- so every dispatch for the same repo published to the
+    SAME branch and a later force-push erased an earlier task's still-open
+    work. Pinned here so a future refactor cannot silently drop the field
+    the payload's shape review would not otherwise catch (dict access, not a
+    typed schema at this layer)."""
+    task = {
+        "task_id": "VOYN-W0-SPECIFIC-TASK",
+        "wave": "0",
+        "priority": "P0",
+        "title": "t",
+        "body": "b",
+    }
+    payload, _budget = _payload_for(task, PlanLimits(), ("AICC", "/srv/repo"))
+    assert payload["backlog_task_id"] == "VOYN-W0-SPECIFIC-TASK"
 
 
 def _dispatch(app_factory, task_id, planner="planner-t", wip=4, payload=None):
