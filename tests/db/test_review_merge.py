@@ -165,6 +165,32 @@ def test_publish_verdict_skips_a_reject(rig, monkeypatch):  # noqa: F811
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
+def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811
+    """Independent review, 2026-08-21: a reviewing agent reasoning aloud can
+    draft a tentative ACCEPT, keep reading, find a real defect, and correct
+    itself to REJECT further down the same transcript. .search() would have
+    silently kept the first (wrong) verdict and posted ACCEPTANCE anyway --
+    the dangerous direction, since the other way (REJECT then ACCEPT) only
+    fails closed. Pinned by taking the LAST VERDICT: line."""
+    app_factory, store, worker = rig
+    _ready(store, app_factory, "VOYN-W0-P6", "https://github.com/x/y/pull/16")
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P6",
+        "Initial pass looked clean.\nVERDICT: ACCEPT\n\n"
+        "Wait -- rereading the diff, the stale-head check is buggy after all.\n"
+        "Correcting my assessment:\nVERDICT: REJECT\nHEAD_SHA: " + "9" * 40 + "\n",
+    )
+
+    posted = []
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: posted.append(argv) or __import__("subprocess").CompletedProcess(argv, 0, "{}", ""),
+    )
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P6", "review_verdict_reject") in report.skipped
+    assert not any(a[:2] == ["pr", "review"] for a in posted)
+
+
 def test_publish_verdict_skips_without_a_completed_review_yet(rig):  # noqa: F811
     app_factory, store, _worker = rig
     _ready(store, app_factory, "VOYN-W0-P3", "https://github.com/x/y/pull/13")

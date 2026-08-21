@@ -192,15 +192,22 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
             report.skipped.append((task_id, "no_review_result_yet"))
             continue
         text = result.get("result_text") or ""
-        verdict_match = _VERDICT.search(text)
-        sha_match = _HEAD_SHA_TRAILER.search(text)
-        if verdict_match is None or sha_match is None:
+        # The LAST match, not the first: the prompt asks for the verdict "as
+        # the last line", but nothing enforces that, and an agent reasoning
+        # aloud in free text can draft a tentative verdict, reconsider, and
+        # correct it -- .search() would silently keep the earlier one.
+        # Independent review caught this live (2026-08-21): a transcript
+        # that says ACCEPT, keeps reading, finds a real defect, then says
+        # REJECT would have posted ACCEPTANCE anyway under .search().
+        verdict_matches = list(_VERDICT.finditer(text))
+        sha_matches = list(_HEAD_SHA_TRAILER.finditer(text))
+        if not verdict_matches or not sha_matches:
             report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
             continue
-        if verdict_match.group(1) != "ACCEPT":
+        if verdict_matches[-1].group(1) != "ACCEPT":
             report.skipped.append((task_id, "review_verdict_reject"))
             continue
-        sha = sha_match.group(1)
+        sha = sha_matches[-1].group(1)
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
