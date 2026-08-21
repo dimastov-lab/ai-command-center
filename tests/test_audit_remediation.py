@@ -55,10 +55,17 @@ def test_gh_is_denied_for_implementation_and_remediation_agents():
 
 
 def test_read_only_agents_have_no_shell_tool_at_all():
+    """Unrestricted Bash/git are unreachable via tool-set replacement; the
+    two narrowly-scoped, read-only `gh pr view`/`gh pr diff` entries a review
+    run needs to open the PR it was asked to assess are the sole exception
+    (2026-08-21) -- everything else Bash-shaped, including plain `Bash` and
+    any git subcommand, remains absent."""
     cmd = agent_runner.build_command("review it", task_type="review")
     assert "--tools" in cmd
-    tools = cmd[cmd.index("--tools") + 1]
-    assert "Bash" not in tools  # tool-set replacement: gh/git unreachable
+    tools = cmd[cmd.index("--tools") + 1].split(",")
+    assert "Bash" not in tools
+    bash_entries = [t for t in tools if t.startswith("Bash")]
+    assert set(bash_entries) <= {"Bash(gh pr view:*)", "Bash(gh pr diff:*)"}
 
 
 @pytest.mark.parametrize(

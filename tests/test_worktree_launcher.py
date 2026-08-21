@@ -302,7 +302,12 @@ def test_permission_profile_read_only_task_type():
     assert profile.key == worktree_launcher.PROFILE_READ_ONLY
     assert profile.allowed_tools == tuple(agent_runner.READ_ONLY_ALLOWED_TOOLS)
     assert profile.disallowed_tools == ()
-    assert "Bash" not in " ".join(profile.allowed_tools or ())
+    # The unrestricted Bash tool is absent; only the two narrowly-scoped,
+    # read-only `gh pr view`/`gh pr diff` patterns a review run needs to open
+    # the PR it was asked to assess are present.
+    assert "Bash" not in (profile.allowed_tools or ())
+    bash_entries = [t for t in (profile.allowed_tools or ()) if t.startswith("Bash")]
+    assert set(bash_entries) <= {"Bash(gh pr view:*)", "Bash(gh pr diff:*)"}
 
 
 def test_permission_profile_implementation_task_type():

@@ -27,9 +27,12 @@ Security model:
   `READ_ONLY_TASK_TYPES`) receive genuine technical enforcement, not a prompt
   instruction: `build_command` passes `--tools` (which — per `claude --help` —
   replaces the entire *available* tool set, not merely a permission hint layered on
-  top of it) set to exactly `READ_ONLY_ALLOWED_TOOLS` (`Read`, `Grep`, `Glob`). The
-  `Bash` tool is not in that list, so it is not merely denied by pattern — it does
-  not exist for that run. Nothing invocable through it (arbitrary shell redirection,
+  top of it) set to exactly `READ_ONLY_ALLOWED_TOOLS` (`Read`, `Grep`, `Glob`, plus
+  two narrowly-scoped `Bash(gh pr view:*)`/`Bash(gh pr diff:*)` patterns a `review`
+  run needs to actually open the PR it was asked to assess — see that constant's own
+  comment). Bash otherwise is not in that list, so it is not merely denied by pattern
+  for anything else — it does not exist for that run beyond those two exact
+  subcommands. Nothing else invocable through it (arbitrary shell redirection,
   `rm`/`mv`/`cp`/`sed -i`, `git add`/`apply`/`checkout`/`restore`/`switch`/`stash`/
   `commit`/`push`/`merge`/`reset`/`rebase`/`clean`, or anything else) is reachable,
   because there is no tool call that can reach a shell at all. `Edit`/`Write`/
@@ -186,7 +189,24 @@ def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevat
 # are likewise simply not in this list. This app already captures the pre/post-run
 # git snapshot itself (`git_snapshot`, below), so a read-only run does not need shell
 # access to git to do its job.
-READ_ONLY_ALLOWED_TOOLS: list[str] = ["Read", "Grep", "Glob"]
+#
+# The two `Bash(gh pr ...)` entries are the one deliberate exception, added
+# 2026-08-21 after a `review`-type run reported live (worker-01, task
+# VOYN-W0-SEC-AUDIT-EXPIRES-METADATA) that it could not open the PR it was
+# asked to review at all: `READ_ONLY_ALLOWED_TOOLS` had no Bash, but
+# `_REVIEW_PROMPT` (review_merge.py) asks the agent to read a diff on
+# GitHub, not a local file `Read`/`Grep`/`Glob` can reach -- no review this
+# pipeline ever enqueued had ever actually inspected a diff. `--tools` is
+# still a full replacement, so this grants Bash *only* for these two exact
+# gh subcommand patterns (view/diff — both read-only, no state mutation
+# possible through either) and nothing else; `gh pr create/merge/close/
+# review/comment` and every other Bash invocation remain absent from the
+# tool set entirely, the same fail-closed guarantee the comment above
+# describes for every other command.
+READ_ONLY_ALLOWED_TOOLS: list[str] = [
+    "Read", "Grep", "Glob",
+    "Bash(gh pr view:*)", "Bash(gh pr diff:*)",
+]
 
 # Bash patterns blocked via `--disallowedTools` for implementation/remediation runs,
 # which keep the `Bash` tool (they need it to run tests/linters/etc. per the

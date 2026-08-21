@@ -98,15 +98,25 @@ def _disallowed_tools_argument(command: list[str]) -> list[str]:
 # `Bash` is ever reintroduced into a read-only task type's tool set, by any means.
 
 
+# The two exact, narrowly-scoped exceptions read-only task types are granted
+# (2026-08-21): a `review` run has to be able to open the PR it was asked to
+# assess, which `Read`/`Grep`/`Glob` alone cannot reach (they see the local
+# filesystem, not GitHub). Both are read-only GitHub operations; no other
+# `gh` subcommand and no unscoped `Bash` is ever in this set.
+_APPROVED_READ_ONLY_BASH_PATTERNS = {"Bash(gh pr view:*)", "Bash(gh pr diff:*)"}
+
+
 @pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
 def test_read_only_task_types_never_receive_unrestricted_bash(task_type):
     command = agent_runner.build_command("review this", task_type=task_type)
     tools = _tools_argument(command)
-    assert "Bash" not in tools, f"{task_type} must not have the Bash tool available at all"
-    # Also assert no unrestricted `Bash(...)`-shaped entry (i.e. it isn't merely
-    # renamed/wrapped) and that this task type isn't instead relying on the weaker
-    # `--disallowedTools` denylist mechanism.
-    assert not any(tool.startswith("Bash") for tool in tools)
+    assert "Bash" not in tools, f"{task_type} must not have the unrestricted Bash tool"
+    # Every `Bash(...)`-shaped entry must be one of the two approved,
+    # narrowly-scoped read-only `gh pr` patterns — nothing broader, and this
+    # task type isn't instead relying on the weaker `--disallowedTools`
+    # denylist mechanism.
+    bash_entries = [tool for tool in tools if tool.startswith("Bash")]
+    assert set(bash_entries) <= _APPROVED_READ_ONLY_BASH_PATTERNS
     assert "--disallowedTools" not in command
 
 
@@ -115,7 +125,7 @@ def test_read_only_task_types_get_exactly_the_approved_tool_set(task_type):
     command = agent_runner.build_command("review this", task_type=task_type)
     tools = _tools_argument(command)
     assert tools == agent_runner.READ_ONLY_ALLOWED_TOOLS
-    assert set(tools) == {"Read", "Grep", "Glob"}
+    assert set(tools) == {"Read", "Grep", "Glob", *_APPROVED_READ_ONLY_BASH_PATTERNS}
 
 
 @pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
@@ -128,12 +138,17 @@ def test_read_only_task_types_have_no_file_edit_tools(task_type):
 
 @pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
 def test_read_only_task_types_have_no_git_mutating_path_at_all(task_type):
-    """With Bash absent from --tools, no git-mutating command is reachable — this
-    asserts that property directly rather than trusting a pattern list."""
+    """No git-mutating command is reachable: unscoped Bash is absent from
+    --tools, and the only Bash(...) entries present are the two narrowly-
+    scoped, read-only `gh pr view`/`gh pr diff` patterns — this asserts that
+    property directly rather than trusting a pattern list."""
     command = agent_runner.build_command("review this", task_type=task_type)
     tools = _tools_argument(command)
     assert tools, "read-only task types must still have a non-empty allowed tool set"
-    assert not any(tool == "Bash" or tool.startswith("Bash(") for tool in tools)
+    assert "Bash" not in tools
+    bash_entries = [tool for tool in tools if tool.startswith("Bash(")]
+    assert set(bash_entries) <= _APPROVED_READ_ONLY_BASH_PATTERNS
+    assert not any("git" in entry for entry in bash_entries)
 
 
 def test_review_final_gate_and_architecture_review_share_the_identical_policy():
@@ -208,13 +223,15 @@ def test_trusted_development_profile_permits_read_search_edit_write_bash():
 
 def test_read_only_profile_has_no_write_or_shell_permissions():
     """Required regression test 4: read-only profile must not contain write
-    or shell permissions."""
+    permissions or unrestricted shell — only the two narrowly-scoped,
+    read-only `gh pr view`/`gh pr diff` Bash patterns a review run needs to
+    open the PR it was asked to assess."""
     command = agent_runner.build_command("review this", task_type="review")
     tools = _tools_argument(command)
     assert "Bash" not in tools
     assert "Write" not in tools
     assert "Edit" not in tools
-    assert set(tools) == {"Read", "Grep", "Glob"}
+    assert set(tools) == {"Read", "Grep", "Glob", *_APPROVED_READ_ONLY_BASH_PATTERNS}
 
 
 @pytest.mark.parametrize("task_type", ["review", "final_gate", "architecture_review", "implementation", "remediation"])
