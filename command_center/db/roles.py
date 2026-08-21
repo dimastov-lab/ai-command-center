@@ -75,6 +75,7 @@ __all__ = [
     "ALL_VIEWS",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
+    "merge_function_privileges",
     "merge_privileges",
     "VIEW_PRIVILEGES",
     "apply_bootstrap",
@@ -227,6 +228,36 @@ def merge_privileges(
                 privileges
             )
     return merged
+
+
+def merge_function_privileges(
+    *contributions: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Union the EXECUTE surfaces of several contributions, in declared order.
+
+    `merge_privileges()` for signatures. EXECUTE is where the replacement
+    mistake costs the most, because for two of the three roles it is the whole
+    reach: `aicc_worker` holds no table privilege at all on the claim protocol
+    and `aicc_operator` holds none on any domain table, so a contribution that
+    replaces instead of unioning does not narrow those roles — it empties them.
+    That is the literal failure `merge_privileges()` names, "a role that may
+    execute nothing", and a tuple is even easier to get wrong than a dict: the
+    correct spelling is `a + b`, the wrong one is `b`, and both type-check.
+
+    First-seen order is kept so the rendered SQL stays stable, and a signature
+    two contributions both name is granted once — a duplicate GRANT is
+    harmless against PostgreSQL but makes the rendered patch misreport how wide
+    a role's surface is.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for contribution in contributions:
+        for signature in contribution:
+            if signature in seen:
+                continue
+            seen.add(signature)
+            merged.append(signature)
+    return tuple(merged)
 
 
 # The queue-claim tables (0002), which the control plane may read and may not
@@ -421,25 +452,56 @@ _WORKER_TABLES: dict[str, frozenset[str]] = {
 # Views are granted separately from tables: `information_schema` reports them
 # through the same catalog, so folding them into `PRIVILEGES` would let a view
 # silently satisfy an assertion about a table.
+#
+# Declared per slice and merged, for the reason `merge_privileges()` exists.
+# These are the redacted read paths onto the three tables granted to nobody —
+# `work_attempt` (0002), `enrollment_ticket` and `principal_credential` (0003)
+# — so a slice that replaced the app's view map instead of unioning with it
+# would take away the only route the control plane has to its own queue.
+
+# The redacted read path onto the claim protocol (0002). `work_attempt_public`
+# is the one that matters: `work_attempt` itself is granted to nobody because
+# it holds `claim_token_hash`, and this view is what omits it.
+_APP_QUEUE_VIEWS: dict[str, frozenset[str]] = {
+    "work_attempt_public": _READ,
+    "work_dlq": _READ,
+    "work_item_public": _READ,
+}
+
+# The redacted read paths onto the enrolment tables (0003), which hold
+# `ticket_hash` and `secret_hash` and are therefore granted to nobody.
+_APP_ENROLMENT_VIEWS: dict[str, frozenset[str]] = {
+    "enrollment_ticket_public": _READ,
+    "principal_credential_public": _READ,
+}
+
+# The planner's eligibility view (0005/0006, BO-S1/S2).
+_APP_BACKLOG_VIEWS: dict[str, frozenset[str]] = {
+    "backlog_eligible": _READ,
+}
+
+# The operator sees the same two redacted enrolment views and nothing else: it
+# admits and evicts hosts, which needs the ticket and credential state, and it
+# has no business in the queue.
+_OPERATOR_ENROLMENT_VIEWS: dict[str, frozenset[str]] = {
+    "enrollment_ticket_public": _READ,
+    "principal_credential_public": _READ,
+}
+
 VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
     MappingProxyType(
         {
             APP_ROLE: MappingProxyType(
-                {
-                    "backlog_eligible": _READ,
-                    "enrollment_ticket_public": _READ,
-                    "principal_credential_public": _READ,
-                    "work_attempt_public": _READ,
-                    "work_dlq": _READ,
-                    "work_item_public": _READ,
-                }
+                merge_privileges(
+                    _APP_QUEUE_VIEWS, _APP_ENROLMENT_VIEWS, _APP_BACKLOG_VIEWS
+                )
             ),
+            # A worker reads no view, for the same reason it reads no queue
+            # table: its own work arrives in the verdict `queue_claim()`
+            # returns, and enumerating anything else is reconnaissance.
             WORKER_ROLE: MappingProxyType({}),
             OPERATOR_ROLE: MappingProxyType(
-                {
-                    "enrollment_ticket_public": _READ,
-                    "principal_credential_public": _READ,
-                }
+                merge_privileges(_OPERATOR_ENROLMENT_VIEWS)
             ),
         }
     )
@@ -523,13 +585,20 @@ _OPERATOR_FUNCTIONS = (
 
 FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
     {
-        # Concatenated rather than replaced, for the reason `merge_privileges`
-        # exists: a second task's grants must add to the first's, and the
-        # failure mode of getting it wrong — a role that may execute nothing —
-        # is silent in each task's own suite.
-        APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS + _APP_BACKLOG_FUNCTIONS,
-        WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
-        OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
+        # Merged rather than replaced, for the reason `merge_privileges` exists:
+        # a second task's grants must add to the first's, and the failure mode
+        # of getting it wrong — a role that may execute nothing — is silent in
+        # each task's own suite. `+` would compose these correctly too; the
+        # named helper is what makes the next slice's author reach for a union
+        # instead of assigning their own tuple, and what the layer-merge test
+        # pins.
+        APP_ROLE: merge_function_privileges(
+            _APP_FUNCTIONS, _APP_ENROLMENT_FUNCTIONS, _APP_BACKLOG_FUNCTIONS
+        ),
+        WORKER_ROLE: merge_function_privileges(
+            _WORKER_FUNCTIONS, _WORKER_ENROLMENT_FUNCTIONS
+        ),
+        OPERATOR_ROLE: merge_function_privileges(_OPERATOR_FUNCTIONS),
     }
 )
 
