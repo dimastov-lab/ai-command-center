@@ -75,3 +75,4 @@ runtime.db-wal
 .aider.tags.cache.v4/
 data/integration_registry.json
 data/integration_registry.lock
+.artifacts/
