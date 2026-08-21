@@ -617,7 +617,27 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     would force every routine migration to run as a superuser.
     """
     _require_identifier(schema)
-    statements: list[str] = [render_role_creation(role) for role in ALL_ROLES]
+    # Roles are cluster-level, not database-level, but nothing else about this
+    # bootstrap call is: the test suite runs one throwaway database per
+    # xdist worker, all in the same cluster, each calling apply_bootstrap()
+    # concurrently. render_role_creation()'s "IF NOT EXISTS THEN CREATE ROLE"
+    # is check-then-act, not atomic *across* the transactions two different
+    # worker connections hold -- two workers can both see "not yet created",
+    # then race the actual CREATE ROLE, and the loser's whole bootstrap
+    # transaction (this is executed as one transaction by `_execute`) rolls
+    # back on the duplicate-object error, undoing statements later in the
+    # same worker's own database that had nothing to do with the cluster
+    # role, and leaving a role a third worker's GRANT then targets as
+    # "does not exist" (VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE, observed
+    # repeatedly 2026-08-20/21). An advisory xact lock (cluster-scoped, like
+    # the roles it guards, and released automatically at this transaction's
+    # commit/rollback) makes the create-if-missing section atomic across
+    # concurrent bootstrap calls without serializing the rest of the test
+    # suite the way a `serial` marker on every DB-integration test would.
+    statements: list[str] = [
+        "SELECT pg_advisory_xact_lock(7823649102);",
+        *(render_role_creation(role) for role in ALL_ROLES),
+    ]
 
     # PUBLIC is granted CREATE and USAGE on `public` by default in PostgreSQL
     # below 15, which would let any authenticated role create objects in the
