@@ -593,11 +593,30 @@ def render_role_creation(role: str) -> str:
     provisioned by the operator (or by `docker-compose.server.yml` from the
     environment), so no credential can be committed to this repository or
     leak into a migration log.
+
+    Roles are cluster-level, not database-level: the test suite runs one
+    throwaway database per xdist worker, all sharing one cluster, and every
+    place that provisions roles (this repo has two: `render_bootstrap()`
+    below, and the test suite's own `role_passwords` fixture, which calls
+    this function directly to give the roles LOGIN -- found live,
+    2026-08-21, when a first fix that only guarded `render_bootstrap()`'s
+    call site did not close the flake, because that fixture's identical
+    "IF NOT EXISTS THEN CREATE ROLE" races it independently) can run this
+    concurrently from a different worker's connection. The check ("does the
+    role exist") and the act ("create it") are two statements, not one, so
+    they are not atomic across two *different* transactions racing each
+    other -- only within a single one. `pg_advisory_xact_lock` here, inside
+    the same DO block as the check and the create, is cluster-scoped like
+    the role it guards and is released automatically when this statement's
+    (or its enclosing transaction's) implicit transaction ends, so it
+    protects every caller by construction instead of depending on each call
+    site remembering to wrap itself (VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE).
     """
     _require_identifier(role)
     return (
         "DO $$\n"
         "BEGIN\n"
+        "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} NOLOGIN;\n"
         "    END IF;\n"
@@ -617,27 +636,10 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     would force every routine migration to run as a superuser.
     """
     _require_identifier(schema)
-    # Roles are cluster-level, not database-level, but nothing else about this
-    # bootstrap call is: the test suite runs one throwaway database per
-    # xdist worker, all in the same cluster, each calling apply_bootstrap()
-    # concurrently. render_role_creation()'s "IF NOT EXISTS THEN CREATE ROLE"
-    # is check-then-act, not atomic *across* the transactions two different
-    # worker connections hold -- two workers can both see "not yet created",
-    # then race the actual CREATE ROLE, and the loser's whole bootstrap
-    # transaction (this is executed as one transaction by `_execute`) rolls
-    # back on the duplicate-object error, undoing statements later in the
-    # same worker's own database that had nothing to do with the cluster
-    # role, and leaving a role a third worker's GRANT then targets as
-    # "does not exist" (VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE, observed
-    # repeatedly 2026-08-20/21). An advisory xact lock (cluster-scoped, like
-    # the roles it guards, and released automatically at this transaction's
-    # commit/rollback) makes the create-if-missing section atomic across
-    # concurrent bootstrap calls without serializing the rest of the test
-    # suite the way a `serial` marker on every DB-integration test would.
-    statements: list[str] = [
-        "SELECT pg_advisory_xact_lock(7823649102);",
-        *(render_role_creation(role) for role in ALL_ROLES),
-    ]
+    # Concurrency-safety for the CREATE ROLE statements lives inside
+    # render_role_creation() itself (see its docstring) rather than here, so
+    # every caller gets it, not just this one.
+    statements: list[str] = [render_role_creation(role) for role in ALL_ROLES]
 
     # PUBLIC is granted CREATE and USAGE on `public` by default in PostgreSQL
     # below 15, which would let any authenticated role create objects in the
