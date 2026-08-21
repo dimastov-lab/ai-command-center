@@ -18,6 +18,7 @@ tests would let a migration test's `DROP TABLE` race a privilege test's
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 
@@ -27,14 +28,32 @@ from command_center.db import roles as _roles
 
 ADMIN_DSN_ENV = "AICC_TEST_PG_ADMIN_DSN"
 
-# Passwords for the login-enabled variants of the product roles. Random per
-# session: nothing in the suite should work against a fixed credential that
-# could accidentally be reused by a real deployment.
+# Passwords for the login-enabled variants of the product roles. Derived from
+# a per-RUN seed rather than plain `secrets.token_urlsafe()`: the roles are
+# cluster objects (one `aicc_migrator` for the whole cluster), but this dict
+# is a module-level constant computed once per xdist WORKER PROCESS, and each
+# worker independently calling `secrets.token_urlsafe()` produced a different
+# value -- the `role_passwords` fixture (session-scoped, so once per worker)
+# then had every worker overwrite the SAME cluster-wide role's password with
+# its own random value, leaving every worker except whichever ran last
+# holding a stale password its own connections then failed to authenticate
+# with (`password authentication failed for user aicc_migrator`, live in CI
+# 2026-08-21, only visible once the same flake's other two bugs were fixed
+# and stopped masking it). `PYTEST_XDIST_TESTRUNUID` is broadcast by the
+# xdist controller to every worker of one test session, so deriving from it
+# gives every worker the same passwords within a run while still varying
+# run to run -- nothing in the suite works against a fixed credential that
+# could accidentally be reused by a real deployment, which is the property
+# the original random-per-session design was for.
 #
 # Derived from `ALL_ROLES` rather than listed: a role added to the inventory
 # without a password here fails at fixture setup with a `KeyError`, which reads
 # as a broken test rather than as the missing provisioning step it is.
-_ROLE_PASSWORDS = {role: secrets.token_urlsafe(24) for role in _roles.ALL_ROLES}
+_RUN_SEED = os.environ.get("PYTEST_XDIST_TESTRUNUID") or secrets.token_urlsafe(24)
+_ROLE_PASSWORDS = {
+    role: hashlib.sha256(f"{_RUN_SEED}:{role}".encode()).hexdigest()
+    for role in _roles.ALL_ROLES
+}
 
 
 @pytest.fixture(scope="session")
