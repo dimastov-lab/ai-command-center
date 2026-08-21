@@ -371,6 +371,68 @@ def test_lease_lost_before_execution_refuses_to_start(handler) -> None:
     assert not outcome.ok and outcome.retryable and runs == []
 
 
+def test_run_claude_code_receives_lease_lost_as_cancel_event(handler) -> None:
+    """VOYN-W0-AICC-FORCED-AGENT-CANCELLATION: the same `lease_lost` event
+    checked once before the subprocess starts must also reach the runner as
+    `cancel_event`, so a lease lost mid-run can actually stop it — not just
+    be noticed once it exits on its own."""
+    run_agent, runs = handler
+    event = _event()
+    run_agent(_payload(), event, 1)
+    assert len(runs) == 1
+    assert runs[0]["cancel_event"] is event
+
+
+def test_lease_lost_mid_run_discards_outcome_and_never_publishes(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-FORCED-AGENT-CANCELLATION requirement 3b: a lease that
+    dies WHILE the agent is running (not just before it starts) must not let
+    the same attempt's outcome reach `publish_run` (a real `git push` + PR
+    create) or be reported as ok. `run_claude_code` itself does not return
+    until the process group is confirmed terminated (see
+    `agent_runner._terminate_process_group`); this test fakes that return
+    with `status="cancelled"` and the event already set — the shape a real
+    mid-run cancellation leaves behind — and asserts the handler treats it as
+    unaccountable rather than a completed run worth publishing."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    publish_calls: list = []
+
+    def fake_publish(repository, cfg):
+        publish_calls.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    event = _event()
+
+    def cancelled_run(**kwargs):
+        # Simulate the daemon's heartbeat thread setting `lease_lost` while
+        # the subprocess was still in flight -- by the time `run_claude_code`
+        # returns, cancellation has already been confirmed.
+        event.set()
+        return agent_runner.RunResult(
+            status="cancelled",
+            exit_code=None,
+            stdout="",
+            stderr="",
+            duration_seconds=3.0,
+            started_at="2026-08-21T12:00:00+00:00",
+            completed_at="2026-08-21T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", cancelled_run)
+
+    outcome = run_agent(_payload(task_type="implementation"), event, 1)
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert publish_calls == []
+
+
 def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
     run_agent, _ = handler
 
