@@ -221,15 +221,59 @@ class PostgresTableMirror:
 
     # --- reads -------------------------------------------------------------
 
-    def list_records(self) -> list[dict]:
-        """Every mirrored record, shaped like the authority's own row."""
+    def list_records(self, *, key_from: Any = None, key_to: Any = None) -> list[dict]:
+        """Mirrored records, shaped like the authority's own row.
+
+        Every row by default. `key_from` and `key_to` narrow the read to the
+        half-open key interval `[key_from, key_to)`, `None` meaning unbounded on
+        that side — which is what lets `mirror_support.windowed_divergence`
+        reconcile a large table a window at a time instead of materialising both
+        sides of it. Measured at 200 000 rows: 294.9 MB whole against 28.6 MB
+        windowed, for the same answer.
+
+        Optional parameters rather than a second reader, and that is the whole
+        design decision. A windowed reader would share this method's entire body
+        — the column list, the codec round trip, the key order — and a second
+        copy of that body is the defect this migration keeps having: the copy
+        drifts, and the one that drifted is the one reconciliation reads
+        through.
+
+        A bound is the key's own value: a bare value for a single-column key, a
+        tuple for a composite one (`provider_attempt` is keyed by
+        `(run_id, attempt_number)`), compared row-wise so a composite window is
+        one interval along the key rather than a box around it. A single-column
+        key accepts either form, because the caller that builds windows has the
+        key as a tuple in every case.
+
+        Text key columns are compared under `COLLATE "C"`; see `_KEY_COLLATION`
+        for why the collation is spelled out. Which columns those are is decided
+        by the *bound's* own type rather than by asking the catalogue: the value
+        came out of the column, so a `str` bound is a text column, and `COLLATE`
+        on a `bigint` is an error rather than a no-op.
+
+        `ORDER BY` is unchanged, and is deliberately not what makes the
+        windowing correct: which rows a window holds is decided by the
+        predicate, and rows inside it are matched by key rather than by
+        position. So the cluster's own order stays, and an unbounded call emits
+        exactly the statement it always has.
+        """
         spec = self.spec
+        where, params = _key_window(spec.key_columns, key_from, key_to)
+        statement = (
+            f"SELECT {', '.join(spec.columns)} FROM {spec.table}{where} "
+            f"ORDER BY {', '.join(spec.key_columns)}"
+        )
         with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT {', '.join(spec.columns)} FROM {spec.table} "
-                    f"ORDER BY {', '.join(spec.key_columns)}"
-                )
+                if params:
+                    cur.execute(statement, params)
+                else:
+                    # No parameter sequence at all on the unbounded read, so it
+                    # stays the call every store's suite already exercises:
+                    # psycopg switches to the extended protocol the moment one
+                    # is passed, which is a change this method was not asked to
+                    # make.
+                    cur.execute(statement)
                 rows = cur.fetchall()
         return [
             {
@@ -238,6 +282,86 @@ class PostgresTableMirror:
             }
             for row in rows
         ]
+
+
+#: The collation a key window is compared under, spelled out rather than left to
+#: the cluster's default.
+#:
+#: The authority is SQLite, which compares `TEXT` with `BINARY` — byte order —
+#: and `COLLATE "C"` is what that means on this side. A window compared under a
+#: typical install's default would cut text keys somewhere the authority does not
+#: agree with: `Task-1` and `task_1` order one way in `en_US.UTF-8` and the other
+#: in byte order, so a boundary taken from the authority would land between
+#: different rows on the two sides. What follows is overlapping windows and rows
+#: compared twice rather than rows silently skipped — the intervals still cover
+#: the whole key space whatever order their boundaries arrive in — but a gate
+#: reporting differences that are not there is one nobody can pass.
+#:
+#: `parity_gate` names the same collation for the same reason, and the two are
+#: the same claim about what "in order" means between these two databases.
+_KEY_COLLATION = 'COLLATE "C"'
+
+
+def _key_window(key_columns: tuple[str, ...], key_from: Any, key_to: Any) -> tuple[str, tuple]:
+    """The `WHERE` clause for `[key_from, key_to)` and its parameters.
+
+    `("", ())` when neither bound is given, which is what keeps the unbounded
+    read byte-identical to the statement this mirror has always emitted.
+
+    Half-open, and not by preference: consecutive windows share a boundary
+    value, so `>=` on one side and `<` on the other is what makes their union
+    the entire key space with no row landing in two of them.
+    """
+    terms: list[str] = []
+    params: list[Any] = []
+    for bound, operator in ((key_from, ">="), (key_to, "<")):
+        if bound is None:
+            continue
+        values = _key_values(key_columns, bound)
+        comparable = _comparable_key(key_columns, values)
+        terms.append(f"{comparable} {operator} {_key_placeholders(key_columns)}")
+        params.extend(values)
+    if not terms:
+        return "", ()
+    return " WHERE " + " AND ".join(terms), tuple(params)
+
+
+def _key_values(key_columns: tuple[str, ...], bound: Any) -> tuple:
+    """One bound as a value per key column.
+
+    A bare value is accepted for a single-column key, because that is what an
+    operator at a REPL has; a tuple is accepted for every key, because that is
+    what a caller walking windows has. A wrong arity is refused here rather than
+    reaching the database, where it would arrive as a driver error about a
+    statement instead of about the bound.
+    """
+    values = tuple(bound) if isinstance(bound, (tuple, list)) else (bound,)
+    if len(values) != len(key_columns):
+        raise ValueError(
+            f"a bound on {key_columns} needs {len(key_columns)} value(s), not {values!r}"
+        )
+    return values
+
+
+def _comparable_key(key_columns: tuple[str, ...], values: tuple) -> str:
+    """The key as one comparable expression, collated where a collation applies.
+
+    Several columns become a row constructor, so the comparison is the standard
+    row-wise one — `(a, b) >= (x, y)` means "at or after that key", which is the
+    interval the walk cuts, and not the `a >= x AND b >= y` box a per-column
+    reading would produce.
+    """
+    terms = [
+        f"{column} {_KEY_COLLATION}" if isinstance(value, str) else column
+        for column, value in zip(key_columns, values, strict=True)
+    ]
+    return terms[0] if len(terms) == 1 else "(" + ", ".join(terms) + ")"
+
+
+def _key_placeholders(key_columns: tuple[str, ...]) -> str:
+    if len(key_columns) == 1:
+        return "%s"
+    return "(" + ", ".join(["%s"] * len(key_columns)) + ")"
 
 
 def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
@@ -255,11 +379,29 @@ def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
     that reconciliation takes the *stored* reader. The warning has to be
     readable where the mistake is made, which is a REPL at cutover time, not a
     source file.
+
+    The returned function takes an optional `window=<rows>`, which routes to
+    `mirror_support.windowed_divergence` and compares a key-window at a time
+    instead of materialising both sides. Off by default: the answer is identical
+    either way, but windowing needs a mirror whose `list_records` accepts bounds
+    and an authority already in key order, and those are the caller's to
+    guarantee rather than this function's to assume.
     """
 
-    def divergence(authority_rows: Iterable[dict], mirror: Any) -> list[dict]:
-        return mirror_support.divergence(
-            authority_rows, mirror, spec.columns, spec.codec, key=spec.key_columns
+    def divergence(
+        authority_rows: Iterable[dict], mirror: Any, *, window: int | None = None
+    ) -> list[dict]:
+        if window is None:
+            return mirror_support.divergence(
+                authority_rows, mirror, spec.columns, spec.codec, key=spec.key_columns
+            )
+        return mirror_support.windowed_divergence(
+            authority_rows,
+            mirror,
+            spec.columns,
+            spec.codec,
+            key=spec.key_columns,
+            window=window,
         )
 
     divergence.__name__ = f"{spec.table}_divergence"

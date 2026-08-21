@@ -71,10 +71,14 @@ __all__ = [
     "OPERATOR_ROLE",
     "WORKER_ROLE",
     "ALL_ROLES",
+    "GRANTED_ROLES",
     "ALL_TABLES",
     "ALL_VIEWS",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
+    "declared_column_privileges",
+    "declared_sequence_privileges",
+    "declared_table_privileges",
     "merge_privileges",
     "VIEW_PRIVILEGES",
     "apply_bootstrap",
@@ -105,7 +109,7 @@ ALL_ROLES = (MIGRATOR_ROLE, APP_ROLE, WORKER_ROLE, OPERATOR_ROLE)
 #: come from ownership; naming it here rather than repeating a literal tuple at
 #: each of the four loops in `render_table_grants()` is what stops a fifth role
 #: from being added to three of them.
-_GRANTED_ROLES = (APP_ROLE, WORKER_ROLE, OPERATOR_ROLE)
+GRANTED_ROLES = (APP_ROLE, WORKER_ROLE, OPERATOR_ROLE)
 
 # Every domain table created by the migration set, plus the runner's own
 # bookkeeping table. `test_upgrade_creates_the_declared_schema` fails if the
@@ -629,7 +633,7 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     statements.append(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;")
 
     statements.append(f"GRANT USAGE, CREATE ON SCHEMA {schema} TO {MIGRATOR_ROLE};")
-    for role in _GRANTED_ROLES:
+    for role in GRANTED_ROLES:
         statements.append(f"GRANT USAGE ON SCHEMA {schema} TO {role};")
 
     # Role DDL for the enrolment protocol (0003). Issuing a per-host credential
@@ -663,6 +667,56 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     statements.append(f"GRANT pg_signal_backend TO {MIGRATOR_ROLE};")
 
     return statements
+
+
+def declared_table_privileges(role: str) -> dict[str, frozenset[str]]:
+    """`{table: privileges}` for `role`, with the column-scoped ones removed.
+
+    The split between "granted on the table" and "granted on named columns" is
+    policy rather than a rendering detail: the worker's `UPDATE` on `completion`
+    is column-scoped precisely so a compromised execution host cannot stamp
+    `review_verdict`. The renderer below and the deployment gate
+    (`command_center.db.grant_gate`) must agree on it exactly — a second
+    implementation of the split is how the gate would come to read a
+    table-wide `UPDATE` as compliant with a column-scoped declaration.
+    """
+    scoped = COLUMN_PRIVILEGES.get(role, {})
+    return {
+        table: frozenset(p for p in privileges if p not in scoped.get(table, {}))
+        for table, privileges in PRIVILEGES[role].items()
+    }
+
+
+def declared_column_privileges(role: str) -> dict[str, dict[str, tuple[str, ...]]]:
+    """`{table: {privilege: columns}}` for `role`'s column-scoped grants.
+
+    A privilege the matrix does not give the role on that table is dropped: a
+    column list alone is a narrowing of a privilege, never a grant of one.
+    """
+    declared: dict[str, dict[str, tuple[str, ...]]] = {}
+    for table, per_privilege in COLUMN_PRIVILEGES.get(role, {}).items():
+        held = PRIVILEGES[role].get(table, frozenset())
+        scoped = {
+            privilege: tuple(columns)
+            for privilege, columns in per_privilege.items()
+            if privilege in held
+        }
+        if scoped:
+            declared[table] = scoped
+    return declared
+
+
+def declared_sequence_privileges(role: str) -> dict[str, frozenset[str]]:
+    """`{sequence: {"USAGE"}}` for the identity sequences `role` may advance.
+
+    Keyed by sequence but decided by the table: a role that may not INSERT into
+    the table has no business advancing its counter.
+    """
+    return {
+        sequence: frozenset({"USAGE"})
+        for table, sequence in IDENTITY_SEQUENCES.items()
+        if "INSERT" in PRIVILEGES[role].get(table, frozenset())
+    }
 
 
 def render_table_grants(
@@ -719,7 +773,7 @@ def render_table_grants(
     statements.append(f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM PUBLIC;")
     statements.append(f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;")
 
-    for role in _GRANTED_ROLES:
+    for role in GRANTED_ROLES:
         statements.append(f"REVOKE ALL ON ALL TABLES IN SCHEMA {schema} FROM {role};")
         statements.append(
             f"REVOKE ALL ON ALL SEQUENCES IN SCHEMA {schema} FROM {role};"
@@ -731,18 +785,20 @@ def render_table_grants(
             f"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA {schema} FROM {role};"
         )
 
-    for role in _GRANTED_ROLES:
-        for table, privileges in sorted(PRIVILEGES[role].items()):
+    for role in GRANTED_ROLES:
+        table_wide_privileges = declared_table_privileges(role)
+        column_privileges = declared_column_privileges(role)
+        for table in sorted(PRIVILEGES[role]):
             _require_identifier(table)
             if not _relation_exists(table):
                 continue
-            columns = COLUMN_PRIVILEGES.get(role, {}).get(table, {})
-            table_wide = sorted(p for p in privileges if p not in columns)
+            table_wide = sorted(table_wide_privileges[table])
             if table_wide:
                 statements.append(
                     f"GRANT {', '.join(table_wide)} ON {schema}.{table} TO {role};"
                 )
-            for privilege in sorted(p for p in privileges if p in columns):
+            columns = column_privileges.get(table, {})
+            for privilege in sorted(columns):
                 for column in columns[privilege]:
                     _require_identifier(column)
                 column_list = ", ".join(columns[privilege])
@@ -769,14 +825,18 @@ def render_table_grants(
     # Identity columns draw from a sequence; INSERT alone is not enough. Granted
     # per sequence rather than schema-wide, so a role still cannot advance the
     # counters of tables it may not write.
-    for role in _GRANTED_ROLES:
+    for role in GRANTED_ROLES:
+        declared = declared_sequence_privileges(role)
         for table, sequence in sorted(IDENTITY_SEQUENCES.items()):
-            if "INSERT" not in PRIVILEGES[role].get(table, frozenset()):
+            if sequence not in declared:
                 continue
             if not _relation_exists(table):
                 continue
             _require_identifier(sequence)
-            statements.append(f"GRANT USAGE ON SEQUENCE {schema}.{sequence} TO {role};")
+            privileges = ", ".join(sorted(declared[sequence]))
+            statements.append(
+                f"GRANT {privileges} ON SEQUENCE {schema}.{sequence} TO {role};"
+            )
 
     return statements
 

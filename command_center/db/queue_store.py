@@ -30,8 +30,14 @@ from datetime import datetime
 from typing import Any
 
 from command_center.db.mirror_support import ColumnCodec, render_authority_timestamp
+from command_center.db.table_mirror import MirroredTable
 
-__all__ = ["PostgresQueueMirror", "QUEUE_ENTRY_COLUMNS"]
+__all__ = [
+    "PostgresQueueMirror",
+    "QUEUE_ENTRY",
+    "QUEUE_ENTRY_COLUMNS",
+    "QUEUE_ORDER_COLUMN",
+]
 
 #: The queue entry's own columns, in schema order. `position` is deliberately
 #: not here: it is how the mirror preserves order, not part of an entry, and a
@@ -48,6 +54,15 @@ QUEUE_ENTRY_COLUMNS: tuple[str, ...] = (
     "evaluated_at",
     "launched_at",
 )
+
+#: The column that carries the JSON file's list order, and the reason it is named
+#: rather than left implicit: the target has a column the authority does not, so
+#: anything checking "every column on the target is declared somewhere" needs the
+#: declaration to exist. `VOYN-W0-AICC-SRV-07b`'s parity gate is that check, and a
+#: gate holding its own private allowance for `position` would be a gate with a
+#: tolerance — the one thing it is not allowed to have. So the allowance lives
+#: here, beside the contract it belongs to.
+QUEUE_ORDER_COLUMN = "position"
 
 
 class PostgresQueueMirror:
@@ -78,7 +93,7 @@ class PostgresQueueMirror:
         return pool.connection()
 
     def replace_entries(self, entries: list[dict]) -> None:
-        columns = (*QUEUE_ENTRY_COLUMNS, "position")
+        columns = (*QUEUE_ENTRY_COLUMNS, QUEUE_ORDER_COLUMN)
         placeholders = ", ".join(["%s"] * len(columns))
         rows = [
             tuple(_CODEC.to_column(column, entry.get(column)) for column in QUEUE_ENTRY_COLUMNS)
@@ -102,7 +117,7 @@ class PostgresQueueMirror:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT {', '.join(QUEUE_ENTRY_COLUMNS)} FROM queue_entry "
-                    "ORDER BY position ASC"
+                    f"ORDER BY {QUEUE_ORDER_COLUMN} ASC"
                 )
                 rows = cur.fetchall()
         return [
@@ -125,6 +140,26 @@ class PostgresQueueMirror:
 #: emitted UTC with a `Z` suffix, which no writer in this application produces
 #: — so `queue_divergence` would have called every timestamped entry different.
 _CODEC = ColumnCodec(timestamps=frozenset({"added_at", "evaluated_at", "launched_at"}))
+
+#: What this table is, in the vocabulary every other mirrored table is declared
+#: in — columns, codec, key — so a caller that has to reason about all 33 tables
+#: has one shape to reason about rather than 32 plus a special case.
+#:
+#: Deliberately a bare `MirroredTable` and *not* a `PostgresTableMirror`
+#: subclass. The class above has `replace_entries`/`list_entries` and no
+#: `upsert`, which is a contract of its own for good reasons (`table_mirror.py`
+#: gives them), and subclassing to be discoverable would enrol it in a shared
+#: contract it cannot satisfy. A declaration is not an implementation: this says
+#: what the queue's rows *are*, which is what `mirror_support.divergence` needs
+#: to compare them, and it is why the cutover gate can decide the queue's parity
+#: with the same definition of equality it uses for everything else instead of a
+#: second one written for the queue.
+QUEUE_ENTRY = MirroredTable(
+    table="queue_entry",
+    columns=QUEUE_ENTRY_COLUMNS,
+    codec=_CODEC,
+    key="id",
+)
 
 
 def _as_json_value(value: Any) -> Any:

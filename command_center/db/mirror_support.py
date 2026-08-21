@@ -21,21 +21,35 @@ promise `command_center.db.__init__` makes to the desktop and CLI entry points.
 
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import islice
 from typing import Any, Iterable
 
 __all__ = [
     "MIRROR_UNAVAILABLE",
+    "WINDOW_ROWS",
     "ColumnCodec",
     "divergence",
     "render_authority_timestamp",
     "to_instant",
+    "windowed_divergence",
 ]
 
 #: Sentinel id used when the mirror itself could not be read.
 MIRROR_UNAVAILABLE = "__mirror_unavailable__"
+
+#: Authority rows a windowed comparison holds at once, and therefore roughly the
+#: number of mirrored rows fetched beside them.
+#:
+#: Measured rather than picked. Over a 200 000-row table the whole-table
+#: comparison peaked at 294.9 MB and this window at 28.6 MB — 10.3x — for the
+#: identical divergence records. The saving is a ratio rather than a constant:
+#: it is what the two sides stop holding, so it grows with the table, which is
+#: exactly why an append-only table is what needed this.
+WINDOW_ROWS = 5000
 
 
 def to_instant(value: str) -> datetime:
@@ -280,6 +294,200 @@ def divergence(
         )
     return differences
 
+
+def windowed_divergence(
+    authority_rows: Iterable[dict],
+    mirror: Any,
+    columns: Iterable[str],
+    codec: ColumnCodec | None = None,
+    *,
+    key: str | tuple[str, ...] = "id",
+    window: int = WINDOW_ROWS,
+) -> list[dict]:
+    """`divergence`, asked a key-window at a time instead of all at once.
+
+    Same four shapes, same records, and deliberately the same comparison: each
+    window is handed to `divergence` above as an object carrying exactly
+    `list_records()`. Nothing here decides whether two rows agree. A second,
+    window-aware definition of equality is the trade this migration keeps being
+    offered and keeps refusing.
+
+    What changes is what is resident. `divergence` materialises both sides,
+    which for an append-only table — `run_event`, `provider_attempt`,
+    `audit_finding` — is a ceiling nobody chose and one that grows with the
+    table. Measured over 200 000 rows: 294.9 MB whole against 28.6 MB at
+    `window=5000`, reporting the identical records. Peak here is two windows of
+    the authority (one being compared, one already read for its boundary) plus
+    the mirrored rows of one interval, plus the report — which is as large as
+    the disagreement is, and is the answer rather than an overhead.
+
+    `authority_rows` is consumed lazily and **must arrive in key order**: byte
+    order, which is what SQLite's `BINARY` means and what the target is asked
+    for under `COLLATE "C"` (see `PostgresTableMirror.list_records`). A caller
+    handing over a list gets the mirror side's saving only; one handing over a
+    cursor gets both.
+
+    **Both ends of the walk are open, and that is the property to keep.** The
+    windows are `(-inf, k1), [k1, k2), ... , [kn, +inf)`, cut at the authority's
+    own keys, and consecutive ones share a boundary — so their union is the
+    entire key space and every mirrored row falls in exactly one. A prototype
+    that bounded the walk by the authority's own first and last key instead lost
+    a row the mirror held with a key above all of them: the `unexpected` shape,
+    a mirror *ahead* of the system of record, which is the one thing a loop over
+    the authority cannot see and the reason `divergence` reports four shapes and
+    not three. An empty authority is the same rule at its limit — one window
+    over everything, so a mirror holding rows nobody wrote is still reported
+    rather than compared against nothing.
+
+    Raises rather than reports on two caller errors: an authority out of key
+    order, and a mirror whose `list_records` takes no bounds. `divergence`
+    promises never to raise because it runs on the dual-write read path; this
+    runs in a backfill and a cutover gate, where a wrong call must not be dressed
+    up as a finding about the data. Out-of-order input fails in the *safe*
+    direction anyway — overlapping windows report rows twice rather than skipping
+    them, because that union covers the key space whatever order the boundaries
+    arrive in — so the refusal buys a legible failure, not a safe one.
+    """
+    if window < 1:
+        raise ValueError(f"a window holds at least one row, not {window}")
+    _refuse_a_mirror_that_cannot_be_windowed(mirror)
+
+    names = tuple(columns)
+    keys = (key,) if isinstance(key, str) else tuple(key)
+
+    def identity(row: dict) -> tuple:
+        return tuple(row.get(name) for name in keys)
+
+    def compare(rows: list[dict], key_from: tuple | None, key_to: tuple | None) -> list[dict]:
+        return divergence(rows, _KeyWindow(mirror, key_from, key_to), names, codec, key=keys)
+
+    reported: list[dict] = []
+    rows = iter(authority_rows)
+    pending: list[dict] | None = None  # the window still awaiting its upper bound
+    lower: tuple | None = None  # its lower bound; `None` on the first, which is the point
+    highest: tuple | None = None  # the order witness, carried across batches
+
+    while True:
+        batch = list(islice(rows, window))
+        if not batch:
+            break
+        highest = _in_key_order(batch, identity, highest)
+        boundary = identity(batch[0])
+        if pending is not None:
+            found = compare(pending, lower, boundary)
+            unreadable = _unreadable(found, lower, boundary)
+            if unreadable is not None:
+                return unreadable
+            reported.extend(found)
+            lower = boundary
+        pending = batch
+
+    found = compare(pending or [], lower, None)
+    unreadable = _unreadable(found, lower, None)
+    if unreadable is not None:
+        return unreadable
+    reported.extend(found)
+    return reported
+
+
+class _KeyWindow:
+    """The mirror narrowed to one half-open key interval, under the one name
+    `divergence` knows.
+
+    An adapter rather than a `divergence` that understands windows: the
+    comparison keeps taking "something with `list_records()`", so a window and a
+    whole table travel the same code path and there is nothing to keep in step
+    between them. It is also what lets a caller window a store this module has
+    never heard of — an adapter, a test's fake — without it being a
+    `PostgresTableMirror`.
+
+    Bounds are always the key as a tuple, including the single-column case, so
+    this class has no shape decision to make; `list_records` accepts either.
+    """
+
+    __slots__ = ("_key_from", "_key_to", "_mirror")
+
+    def __init__(self, mirror: Any, key_from: tuple | None, key_to: tuple | None) -> None:
+        self._mirror = mirror
+        self._key_from = key_from
+        self._key_to = key_to
+
+    def list_records(self) -> list[dict]:
+        return self._mirror.list_records(key_from=self._key_from, key_to=self._key_to)
+
+
+def _refuse_a_mirror_that_cannot_be_windowed(mirror: Any) -> None:
+    """Refuse a mirror whose `list_records` takes no bounds, before any read.
+
+    Without this the first window's call raises `TypeError` *inside*
+    `divergence`, which catches everything and reports `MIRROR_UNAVAILABLE` —
+    "the mirror could not be read". That is a FAIL claiming the store is
+    unreachable when what is actually wrong is the call, and a gate would then
+    declare its divergence total not established on the strength of a typo.
+    """
+    try:
+        signature = inspect.signature(mirror.list_records)
+    except (TypeError, ValueError):
+        return  # Not introspectable; let the call itself answer.
+    try:
+        signature.bind(key_from=None, key_to=None)
+    except TypeError:
+        raise TypeError(
+            f"{type(mirror).__name__}.list_records takes no `key_from`/`key_to`, so it "
+            "cannot answer a window. See `PostgresTableMirror.list_records`, which takes "
+            "them as optional parameters rather than as a second reader."
+        ) from None
+
+
+def _in_key_order(batch: list[dict], identity: Any, highest: tuple | None) -> tuple:
+    """Check one batch continues the ascending key walk; return its last key.
+
+    Equal keys are refused along with descending ones. A repeated key means the
+    column being walked is not the unique thing it was declared to be, and
+    `divergence` pairs rows through a dict — so the second row would silently
+    replace the first and the comparison would report agreement about a row it
+    never looked at.
+    """
+    for row in batch:
+        current = identity(row)
+        try:
+            ordered = highest is None or highest < current
+        except TypeError as exc:
+            raise ValueError(
+                f"the authority's keys are not mutually comparable: {highest!r} then "
+                f"{current!r} ({exc}). A window is an interval, so a key column holding "
+                "more than one type has no order to cut it at."
+            ) from exc
+        if not ordered:
+            raise ValueError(
+                f"the authority's rows are not in ascending key order: {current!r} follows "
+                f"{highest!r}. Windows are cut at the authority's own keys, so unordered "
+                "input compares rows against an interval they are not in and reports "
+                "differences that are not there."
+            )
+        highest = current
+    return highest
+
+
+def _unreadable(records: list[dict], key_from: tuple | None, key_to: tuple | None):
+    """The sentinel, told which window died — or `None` when the window was read.
+
+    Returned *alone*, discarding whatever earlier windows found. The walk stops
+    at the first unreadable window, so the windows after it were never compared,
+    and a list mixing real records with an incomplete walk has a length that
+    means neither "this many differences" nor "not established". A consumer
+    already reads the sentinel as the second (`parity_gate` reports the table's
+    divergence count as `None`), and that reading is only true if nothing is
+    stapled to it.
+    """
+    if not records:
+        return None
+    first = records[0]
+    if first.get("id") != MIRROR_UNAVAILABLE or "detail" not in first:
+        return None
+    low = "-inf" if key_from is None else repr(key_from)
+    high = "+inf" if key_to is None else repr(key_to)
+    return [{**first, "detail": f"{first['detail']} (window [{low}, {high}))"}]
 
 def _reported(row_key: tuple) -> Any:
     """What a divergence record shows as the row's identity.

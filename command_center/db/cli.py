@@ -9,6 +9,11 @@ every deploy as the migrator. The application credential does neither.
     AICC_PG_USER=postgres       ... python -m command_center.db bootstrap
     AICC_PG_USER=aicc_migrator  ... python -m command_center.db upgrade
     AICC_PG_USER=aicc_app       ... python -m command_center.db status
+    AICC_PG_USER=aicc_app       ... python -m command_center.db verify-grants
+
+`verify-grants` is the deployment gate: it exits non-zero while the live grant
+graph differs from `roles.py`, which is the state a database is left in when
+migrations run without `apply_table_grants()` after them.
 """
 
 from __future__ import annotations
@@ -34,6 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "upgrade",
         help="Apply pending migrations and re-assert table grants (as the migrator).",
+    )
+    # The deployment gate (VOYN-W0-AICC-GRANTS-ARE-CORRECTNESS-NOT-HYGIENE).
+    # Readable by any role, so a deploy script can run it under the same
+    # credential the service uses; exit 1 means the database must not be put
+    # into rotation.
+    sub.add_parser(
+        "verify-grants",
+        help="Check the live grant graph against roles.py. Exit 1 on any "
+        "violation — a migrated database whose grants were not applied is "
+        "not a ready database.",
     )
 
     # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
@@ -113,6 +128,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _report_grant_audit(conn) -> int:
+    """Print the grant gate's verdict. 0 when compliant, 1 when not.
+
+    The full detail is printed here, unlike on `/readyz`: this is an operator
+    command run with a database credential in hand, and "which role reaches
+    which object" is the only form of the answer that can be acted on.
+    """
+    from command_center.db import grant_gate
+
+    violations = grant_gate.audit_grants(conn)
+    if not violations:
+        print("grants: compliant with the declared matrix")
+        return 0
+    print(f"grants: {len(violations)} violation(s)", file=sys.stderr)
+    for violation in violations:
+        print(f"    {violation}", file=sys.stderr)
+    print(
+        "The database is NOT ready. Re-run this as the migrator:\n"
+        "    AICC_PG_USER=aicc_migrator python -m command_center.db upgrade",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
@@ -148,7 +187,16 @@ def main(argv: list[str] | None = None) -> int:
                 # app" the same state.
                 count = roles.apply_table_grants(conn)
                 print(f"re-asserted {count} table grants")
-                return 0
+                # Then prove it, in the same run and against the same database.
+                # The grants are part of the claim protocol's correctness, so a
+                # deploy that migrated but did not end up on the declared matrix
+                # must go red here rather than at the next readiness probe.
+                return _report_grant_audit(conn)
+
+            if args.command == "verify-grants":
+                print(f"target:  {config.redacted()}")
+                print(f"version: {migrations.current_version(conn)}")
+                return _report_grant_audit(conn)
 
             if args.command == "queue-reap":
                 from command_center.db.work_queue_admin import WorkQueueAdmin
