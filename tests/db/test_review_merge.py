@@ -19,7 +19,6 @@ def _complete_review(app_factory, worker, task_id, result_text):
     review_once/the real daemon would, so publish_review_verdicts reads a
     result shaped like production, not a hand-built row."""
     from command_center.db.work_queue_store import WorkQueueStore
-    from contextlib import nullcontext as _nc
 
     store = WorkQueueStore(app_factory)
     payload = {
