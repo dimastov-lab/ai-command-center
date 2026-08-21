@@ -7,25 +7,44 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   verdict yet, enqueue one adversarial review run (read-only profile) whose
   prompt names the PR. The verdict lands in the work result like any outcome.
 - ``publish_review_verdicts``: for each READY_TO_REVIEW task whose review
-  work item has a result but whose PR head has no marker yet, parse the
-  agent's own ``VERDICT: ACCEPT|REJECT`` / ``HEAD_SHA: <sha>`` lines from the
-  result text and, on ACCEPT, post the ``ACCEPTANCE: ACCEPT <sha>`` marker as
-  a comment-type PR review (``gh pr review --comment``) -- the exact string
-  ``merge_once`` scans for. The original design named a separate
-  control-plane app (voyn-acceptance) for this, deliberately kept out of this
-  process so its credential never entered the worker; that app's GitHub
-  installation did not survive the 2026-08-20 org migration (installations
-  are not carried over by a repository transfer) and was never reconnected.
-  The field it would have used (``ReviewConfig.marker_tool``) was declared
-  but never actually invoked anywhere -- this function had no implementation
-  at all until VOYN-W0-AICC-MISSING-MARKER-PUBLISHER (2026-08-21), so no
-  review verdict, however produced, ever reached GitHub and ``merge_once``
-  could not merge a single PR autonomously start to finish. Posting as a
-  *comment*-type review, not an approval, is deliberate: GitHub refuses
-  self-approval for the PR's own author (this pipeline's author and merger
-  are the same account), but a comment-type review from the author is
-  permitted and still lands in the ``reviews[]`` array ``merge_once`` reads
-  — verified live against voyn88/aios#273 before writing this.
+  work item has a result *for the PR's current head sha* but whose PR head
+  has no marker yet, parse the agent's own ``VERDICT: ACCEPT|REJECT`` /
+  ``HEAD_SHA: <sha>`` lines from the result text. On ACCEPT, post the
+  ``ACCEPTANCE: ACCEPT <sha>`` marker as a comment-type PR review
+  (``gh pr review --comment``) -- the exact string ``merge_once`` scans for.
+  The original design named a separate control-plane app (voyn-acceptance)
+  for this, deliberately kept out of this process so its credential never
+  entered the worker; that app's GitHub installation did not survive the
+  2026-08-20 org migration (installations are not carried over by a
+  repository transfer) and was never reconnected. The field it would have
+  used (``ReviewConfig.marker_tool``) was declared but never actually
+  invoked anywhere -- this function had no implementation at all until
+  VOYN-W0-AICC-MISSING-MARKER-PUBLISHER (2026-08-21), so no review verdict,
+  however produced, ever reached GitHub and ``merge_once`` could not merge a
+  single PR autonomously start to finish. Posting as a *comment*-type
+  review, not an approval, is deliberate: GitHub refuses self-approval for
+  the PR's own author (this pipeline's author and merger are the same
+  account), but a comment-type review from the author is permitted and
+  still lands in the ``reviews[]`` array ``merge_once`` reads — verified
+  live against voyn88/aios#273 before writing this.
+
+  On REJECT, dispatches a new, linked remediation task (see
+  ``_remediate_rejection``) instead of leaving the task stuck forever: the
+  first time this pipeline ever actually reviewed a real diff (2026-08-21,
+  the same day the marker publisher above went live), both real reviews it
+  produced correctly REJECTED with concrete feedback -- and there was no
+  code path anywhere that did anything with that beyond skipping it every
+  tick, permanently. The review-cycle identity (``_review_key``, keyed on
+  task + PR number + exact head sha + review policy version, not just
+  task_id) is the other half of this same fix: it is what lets the new
+  remediation task's own push get its own independent review, and equally
+  what lets an ordinary task get re-reviewed after a second push while
+  still IN_PROGRESS -- both were structurally impossible under a
+  permanent, task_id-only key. See migration ``0010_review_cycle_
+  remediation`` for the schema half (the ``REJECTED`` terminal leaf and the
+  ``backlog_task_remediation`` lineage table) and its header comment for
+  why a cycle back into the rejected task's own state machine was rejected
+  in favour of a new linked task.
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
@@ -40,6 +59,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,6 +85,11 @@ class LoopReport:
     reviewed: list[tuple[str, str]] = field(default_factory=list)
     merged: list[tuple[str, str]] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: (rejected_task_id, new_remediation_task_id) — a REJECT verdict spawned
+    #: a linked follow-up task instead of just being skipped. See
+    #: publish_review_verdicts' docstring for why this is a new task, not a
+    #: cycle back into the rejected task's own state machine.
+    remediated: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
@@ -104,12 +129,46 @@ _REVIEW_PROMPT = (
 _MAX_DIFF_CHARS = 60_000
 
 
-_PR_URL = re.compile(r"^https://github\.com/[^/]+/([^/]+)/pull/\d+$")
+_PR_URL = re.compile(r"^https://github\.com/[^/]+/([^/]+)/pull/(\d+)$")
+
+# Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
+# old verdict untrustworthy under the new policy (e.g. what the agent is
+# asked to check, or the required VERDICT/HEAD_SHA format itself) -- baked
+# into the review-cycle key below so a policy change can be rolled out by
+# incrementing this constant, forcing every task to be re-reviewed under the
+# new contract rather than silently reusing a verdict given for an older,
+# looser policy.
+_REVIEW_POLICY_VERSION = "v1"
 
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
     match = _PR_URL.match(pr_url)
     return match.group(1) if match else None
+
+
+def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
+    """The review-cycle identity: (task, PR, exact head sha, policy
+    version) -- not just task_id. A permanent `review:<task_id>` key meant
+    that once a task's FIRST review concluded (either verdict), no later
+    review could ever be enqueued for it again, because the queue's
+    idempotency treats a repeated key as "already running/ran, return the
+    existing item" rather than "run again." That silently broke both
+    remediation (a follow-up push to the same PR could never get a fresh
+    review) and the ordinary case of a second push to a PR still
+    IN_PROGRESS -- found live 2026-08-21 while building the reject ->
+    remediation loop, the same day review_once() actually reviewed a real
+    diff for the first time in the system's history. Keying on the exact
+    head sha instead makes re-review automatic: a new commit is a new sha
+    is a new key is a new review, with the old verdict's history left
+    exactly as it was (immutable, addressable by its own sha) rather than
+    overwritten. Returns None if `pr_url` doesn't parse (caller already
+    validates this via `_repo_from_pr_url` before reaching here in
+    practice, but a malformed URL must never produce a malformed key)."""
+    match = _PR_URL.match(pr_url)
+    if match is None:
+        return None
+    pr_number = match.group(2)
+    return f"review:{task_id}:{pr_number}:{head_sha}:{_REVIEW_POLICY_VERSION}"
 
 
 def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
@@ -192,6 +251,10 @@ def review_once(
                 (task_id, f"diff_too_large: {len(diff)} chars > {_MAX_DIFF_CHARS}")
             )
             continue
+        key = _review_key(task_id, pr_url, head_sha)
+        if key is None:
+            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            continue
         project_id, repository_path = route
         payload = {
             "kind": "agent_run", "v": 1, "project_id": project_id,
@@ -201,7 +264,7 @@ def review_once(
             ),
             "timeout_seconds": cfg.review_timeout, "untrusted": False,
         }
-        enqueue(cfg.queue, f"review:{task_id}", payload, task_id)
+        enqueue(cfg.queue, key, payload, task_id)
         report.reviewed.append((task_id, pr_url))
     return report
 
@@ -238,19 +301,23 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
-def _latest_review_result(factory: Any, task_id: str) -> dict[str, Any] | None:
-    """The most recent succeeded review-class work result for this task, or
-    None if the review hasn't finished (or hasn't been dispatched) yet.
-    Keyed on the same idempotency_key review_once enqueues with, so this
-    reads exactly the run review_once started -- never a stale or unrelated
-    result for the same task_id."""
+def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
+    """The succeeded review-class work result for this exact review-cycle
+    key (task, PR, head sha, policy version), or None if no review has
+    completed for exactly this state yet -- covers both "still running" and
+    "the review that ran was for an older head" in one lookup, since a
+    different head sha is simply a different key. Callers pass in the
+    CURRENT head sha's key (computed via `_review_key`); nothing here
+    guesses or falls back to "the most recent review for this task_id",
+    which is what let a stale, superseded verdict be read as current before
+    the review-cycle key existed."""
     rows = _rows(
         factory,
         "SELECT wr.payload FROM work_item i "
         "JOIN work_result wr ON wr.result_id = i.result_id "
         "WHERE i.task_id = %s AND i.idempotency_key = %s AND i.state = 'succeeded' "
         "ORDER BY wr.created_at DESC LIMIT 1",
-        (task_id, f"review:{task_id}"),
+        (task_id, key),
     )
     if not rows:
         return None
@@ -274,12 +341,103 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return accept, head
 
 
+def _remediate_rejection(
+    factory: Any, task_id: str, pr_url: str, head_sha: str, review_text: str
+) -> str | None:
+    """On a REJECT verdict: create a new, linked follow-up task instead of
+    cycling the rejected task back into its own state machine (0010's
+    rationale -- see the migration's header comment for why a
+    READY_TO_REVIEW -> IN_PROGRESS cycle was rejected in favour of this).
+    The new task carries the review's own feedback verbatim in its prompt,
+    goes through the exact same OPEN -> ... -> READY_TO_REVIEW pipeline as
+    any other task (no new dispatch code), and opens its own fresh PR --
+    the review-cycle key change in this same migration means its review
+    gets its own independent identity automatically, with no special-casing
+    for "this is a remediation." The original task transitions to the
+    terminal REJECTED leaf; its history is untouched, immutable, and still
+    addressable by its own task_id.
+
+    Idempotent: if a remediation task already exists for this parent (an
+    earlier tick already handled this exact rejection), returns None and
+    does nothing -- publish_review_verdicts' caller treats that the same as
+    "already handled," not as a fresh event to report."""
+    from command_center.db.backlog_parser import ParsedTask
+    from command_center.db.backlog_store import BacklogStore
+
+    with factory() as conn:
+        conn.autocommit = False
+        try:
+            # Plain SELECT, no FOR UPDATE: the app role only ever holds read
+            # privilege on backlog_task (every backlog table is _READ-only
+            # for aicc_app -- see roles.py's _APP_BACKLOG_TABLES comment,
+            # "every write travels through a SECURITY DEFINER function").
+            # Concurrency safety comes from backlog_transition()'s own
+            # optimistic-revision check below, the same way merge_once
+            # already reads the revision with a plain SELECT rather than
+            # locking the row itself.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM backlog_task_remediation WHERE parent_task_id = %s",
+                    (task_id,),
+                )
+                if cur.fetchone() is not None:
+                    conn.rollback()
+                    return None
+
+                cur.execute(
+                    "SELECT wave, priority, title, body, repo, revision "
+                    "FROM backlog_task WHERE task_id = %s",
+                    (task_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                wave, priority, title, body, repo, revision = row
+
+            new_task_id = f"{task_id}-REM"
+            new_title = f"Remediation: {title}"
+            new_body = (
+                f"{body}\n\n---\n"
+                f"Follow-up on {task_id}, rejected by adversarial review of "
+                f"{pr_url} at {head_sha}:\n\n{review_text}\n\n"
+                "Push a fix addressing the feedback above and open a new pull "
+                "request -- the rejected PR is left as-is, superseded by this task."
+            )
+            store = BacklogStore(lambda: nullcontext(conn))
+            ok, _reason, _changed = store.upsert_task(
+                ParsedTask(
+                    task_id=new_task_id, wave=wave, priority=priority,
+                    status="OPEN", kind="task", title=new_title, body=new_body,
+                    repo=repo, line_no=0,
+                )
+            )
+            if not ok:
+                conn.rollback()
+                return None
+            ok, _reason = store.record_remediation(new_task_id, task_id, pr_url, head_sha)
+            if not ok:
+                conn.rollback()
+                return None
+            ok, _reason, _revision = store.transition(task_id, "REJECTED", revision)
+            if not ok:
+                conn.rollback()
+                return None
+            conn.commit()
+            return new_task_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.autocommit = True
+
+
 def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
-    """For each READY_TO_REVIEW task whose review run has a result, publish
-    the ACCEPT marker merge_once looks for. A REJECT verdict, a missing
-    verdict/sha in the result text, or a marker already posted for the
-    current head are all skips, not errors -- the task simply waits for its
-    next state (a fresh review after a new push, or a human)."""
+    """For each READY_TO_REVIEW task whose review run has a result *for the
+    PR's current head sha*, publish the ACCEPT marker merge_once looks for,
+    or -- on REJECT -- dispatch a linked remediation task (see
+    `_remediate_rejection`). A missing verdict/sha in the result text or a
+    marker already posted for the current head are skips, not errors."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     tasks = _rows(
@@ -290,7 +448,18 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
         (cfg.max_per_tick,),
     )
     for task_id, pr_url in tasks:
-        result = _latest_review_result(factory, task_id)
+        already, current_head = _has_accept_marker(repo_path, pr_url)
+        if already:
+            report.skipped.append((task_id, "marker_already_posted"))
+            continue
+        if not current_head:
+            report.skipped.append((task_id, "pr_view_failed"))
+            continue
+        key = _review_key(task_id, pr_url, current_head)
+        if key is None:
+            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            continue
+        result = _latest_review_result(factory, task_id, key)
         if result is None:
             report.skipped.append((task_id, "no_review_result_yet"))
             continue
@@ -300,20 +469,22 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
             report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
             continue
         verdict, sha = parsed
+        if sha != current_head:
+            # The review-cycle key already scopes the lookup to a review run
+            # AT current_head, so this is the agent misreporting its own
+            # HEAD_SHA line rather than a stale-evidence race -- fail closed
+            # either way, never post a marker whose sha doesn't match what
+            # the agent said it reviewed.
+            report.skipped.append(
+                (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
+            )
+            continue
         if verdict != "ACCEPT":
-            report.skipped.append((task_id, "review_verdict_reject"))
-            continue
-        already, current_head = _has_accept_marker(repo_path, pr_url)
-        if already:
-            report.skipped.append((task_id, "marker_already_posted"))
-            continue
-        if current_head and current_head != sha:
-            # The PR moved since this review ran (a new push). Posting a
-            # marker for a sha that is no longer the head would satisfy
-            # merge_once's string match against stale evidence -- exactly
-            # the "evidence measured on a state that no longer exists" class
-            # already on file. A fresh review_once tick will re-dispatch.
-            report.skipped.append((task_id, f"stale_review: reviewed {sha} but head is {current_head}"))
+            new_task_id = _remediate_rejection(factory, task_id, pr_url, current_head, text)
+            if new_task_id:
+                report.remediated.append((task_id, new_task_id))
+            else:
+                report.skipped.append((task_id, "review_verdict_reject_remediation_already_dispatched"))
             continue
         posted = _gh(
             ["pr", "review", pr_url, "--comment", "--body", f"ACCEPTANCE: ACCEPT {sha}"],

@@ -14,10 +14,15 @@ from command_center.orchestrator.review_merge import (
 )
 
 
-def _complete_review(app_factory, worker, task_id, result_text):
+def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text):
     """Enqueue + claim + complete a review-class work item exactly the way
     review_once/the real daemon would, so publish_review_verdicts reads a
-    result shaped like production, not a hand-built row."""
+    result shaped like production, not a hand-built row. Keyed via the real
+    `_review_key` (task + PR number + head sha + policy version) -- the
+    caller's `head_sha` must match whatever the test's faked `gh pr view`
+    reports as `headRefOid`, the same way review_once/publish_review_
+    verdicts always compute the key from the PR's live head, never a value
+    handed in separately."""
     from command_center.db.work_queue_store import WorkQueueStore
 
     store = WorkQueueStore(app_factory)
@@ -26,9 +31,8 @@ def _complete_review(app_factory, worker, task_id, result_text):
         "repository_path": "", "task_type": "review",
         "prompt": "review it", "timeout_seconds": 900, "untrusted": False,
     }
-    store.enqueue(
-        "execution", idempotency_key=f"review:{task_id}", payload=payload, task_id=task_id
-    )
+    key = review_merge._review_key(task_id, pr_url, head_sha)
+    store.enqueue("execution", idempotency_key=key, payload=payload, task_id=task_id)
     claimed = worker.claim("execution", visibility_seconds=60)
     assert worker.complete(claimed, {"status": "completed", "result_text": result_text})
 
@@ -70,7 +74,11 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     assert ("VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7") in report.reviewed
     assert len(calls) == 1
     q, key, payload, task_id = calls[0]
-    assert key == "review:VOYN-W0-R1"  # idempotency key
+    # task + PR number + exact head sha + review policy version -- not just
+    # the task_id -- so a later push to the same PR (remediation, or an
+    # ordinary second push while still IN_PROGRESS) gets its own fresh
+    # review instead of being permanently deduped against this one.
+    assert key == f"review:VOYN-W0-R1:7:{head}:v1"
     assert task_id == "VOYN-W0-R1"
     assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
     # The diff is embedded in the prompt directly -- the orchestrator fetches
@@ -201,9 +209,10 @@ def test_publish_verdict_posts_the_marker_gh_pr_review_reads(rig, monkeypatch): 
     not just that some gh call happened."""
     app_factory, store, worker = rig
     head = "d" * 40
-    _ready(store, app_factory, "VOYN-W0-P1", "https://github.com/x/y/pull/11")
+    pr_url = "https://github.com/x/y/pull/11"
+    _ready(store, app_factory, "VOYN-W0-P1", pr_url)
     _complete_review(
-        app_factory, worker, "VOYN-W0-P1",
+        app_factory, worker, "VOYN-W0-P1", pr_url, head,
         f"Reviewed the diff, found nothing wrong.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
     )
 
@@ -229,22 +238,113 @@ def test_publish_verdict_posts_the_marker_gh_pr_review_reads(rig, monkeypatch): 
     assert posted[0][body_index] == f"ACCEPTANCE: ACCEPT {head}"
 
 
-def test_publish_verdict_skips_a_reject(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkeypatch):  # noqa: F811
+    """VOYN-W0-AICC-REVIEW-REJECT-REMEDIATION-LOOP: a REJECT must not just be
+    skipped forever -- it dispatches a new, linked follow-up task (0010's
+    design: a new task, not a cycle back into the rejected task's own state
+    machine) so the loop actually closes end to end instead of dead-ending
+    the moment a real review agent finds a real defect (which is exactly
+    what happened live 2026-08-21, the first time this pipeline ever
+    reviewed a real diff: both real reviews it produced correctly
+    REJECTED)."""
+    import subprocess as sp
+
     app_factory, store, worker = rig
-    _ready(store, app_factory, "VOYN-W0-P2", "https://github.com/x/y/pull/12")
+    head = "e" * 40
+    pr_url = "https://github.com/x/y/pull/12"
+    _ready(store, app_factory, "VOYN-W0-P2", pr_url)
+    feedback = "Found a real defect: the retry loop never terminates."
     _complete_review(
-        app_factory, worker, "VOYN-W0-P2",
-        "Found a real defect.\nVERDICT: REJECT\nHEAD_SHA: " + "e" * 40 + "\n",
+        app_factory, worker, "VOYN-W0-P2", pr_url, head,
+        f"{feedback}\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
     )
 
     posted = []
-    monkeypatch.setattr(
-        review_merge, "_gh",
-        lambda argv, repo: posted.append(argv) or __import__("subprocess").CompletedProcess(argv, 0, "{}", ""),
-    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        posted.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-P2", "review_verdict_reject") in report.skipped
+    assert ("VOYN-W0-P2", "VOYN-W0-P2-REM") in report.remediated
     assert not any(a[:2] == ["pr", "review"] for a in posted)
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-P2",))
+        assert cur.fetchone()[0] == "REJECTED"
+
+        cur.execute(
+            "SELECT status, title, body FROM backlog_task WHERE task_id=%s",
+            ("VOYN-W0-P2-REM",),
+        )
+        new_status, new_title, new_body = cur.fetchone()
+        assert new_status == "OPEN"
+        assert "Remediation" in new_title
+        assert feedback in new_body
+        assert pr_url in new_body
+        assert head in new_body
+
+        cur.execute(
+            "SELECT parent_task_id, pr_url, rejected_head_sha "
+            "FROM backlog_task_remediation WHERE task_id=%s",
+            ("VOYN-W0-P2-REM",),
+        )
+        parent, linked_pr, linked_sha = cur.fetchone()
+        assert parent == "VOYN-W0-P2"
+        assert linked_pr == pr_url
+        assert linked_sha == head
+
+
+def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):  # noqa: F811
+    """The parent task leaves READY_TO_REVIEW the instant it is REJECTED, so
+    a second publish_review_verdicts tick never even selects it again -- the
+    state machine itself is the idempotency boundary, not a special skip
+    reason. What must still hold is the DB-level guard inside
+    `_remediate_rejection`: called twice directly for the same parent (the
+    only way to reach it a second time -- a race between two ticks that both
+    read READY_TO_REVIEW before either commits), it must create exactly one
+    remediation task, not two."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head = "e" * 40
+    pr_url = "https://github.com/x/y/pull/12"
+    _ready(store, app_factory, "VOYN-W0-P2B", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P2B", pr_url, head,
+        f"A defect.\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
+    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    first = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P2B", "VOYN-W0-P2B-REM") in first.remediated
+
+    # The task is now REJECTED -- a second full tick finds nothing to do.
+    second = publish_review_verdicts(app_factory, "/tmp")
+    assert not second.remediated
+    assert not second.skipped
+
+    # Direct second call to the guarded function itself, simulating a race:
+    # the DB-level "does a remediation already exist" check must refuse.
+    again = review_merge._remediate_rejection(
+        app_factory, "VOYN-W0-P2B", pr_url, head, "A defect.\nVERDICT: REJECT\n"
+    )
+    assert again is None
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_task WHERE task_id LIKE %s",
+            ("VOYN-W0-P2B-REM%",),
+        )
+        assert cur.fetchone()[0] == 1
 
 
 def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811
@@ -254,22 +354,30 @@ def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     silently kept the first (wrong) verdict and posted ACCEPTANCE anyway --
     the dangerous direction, since the other way (REJECT then ACCEPT) only
     fails closed. Pinned by taking the LAST VERDICT: line."""
+    import subprocess as sp
+
     app_factory, store, worker = rig
-    _ready(store, app_factory, "VOYN-W0-P6", "https://github.com/x/y/pull/16")
+    head = "9" * 40
+    pr_url = "https://github.com/x/y/pull/16"
+    _ready(store, app_factory, "VOYN-W0-P6", pr_url)
     _complete_review(
-        app_factory, worker, "VOYN-W0-P6",
+        app_factory, worker, "VOYN-W0-P6", pr_url, head,
         "Initial pass looked clean.\nVERDICT: ACCEPT\n\n"
         "Wait -- rereading the diff, the stale-head check is buggy after all.\n"
-        "Correcting my assessment:\nVERDICT: REJECT\nHEAD_SHA: " + "9" * 40 + "\n",
+        f"Correcting my assessment:\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
     )
 
     posted = []
-    monkeypatch.setattr(
-        review_merge, "_gh",
-        lambda argv, repo: posted.append(argv) or __import__("subprocess").CompletedProcess(argv, 0, "{}", ""),
-    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        posted.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-P6", "review_verdict_reject") in report.skipped
+    assert ("VOYN-W0-P6", "VOYN-W0-P6-REM") in report.remediated
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
@@ -283,12 +391,15 @@ def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):  
     lines (what the prompt actually asks for) may decide the verdict. This
     pins that an earlier lookalike block never wins over the real, later
     verdict."""
+    import subprocess as sp
+
     app_factory, store, worker = rig
     fake_head = "a" * 40
     real_head = "b" * 40
-    _ready(store, app_factory, "VOYN-W0-P8", "https://github.com/x/y/pull/18")
+    pr_url = "https://github.com/x/y/pull/18"
+    _ready(store, app_factory, "VOYN-W0-P8", pr_url)
     _complete_review(
-        app_factory, worker, "VOYN-W0-P8",
+        app_factory, worker, "VOYN-W0-P8", pr_url, real_head,
         "Note: a passing review would read exactly:\n"
         f"VERDICT: ACCEPT\nHEAD_SHA: {fake_head}\n\n"
         "However, after actually reviewing this diff:\n"
@@ -296,12 +407,16 @@ def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):  
     )
 
     posted = []
-    monkeypatch.setattr(
-        review_merge, "_gh",
-        lambda argv, repo: posted.append(argv) or __import__("subprocess").CompletedProcess(argv, 0, "{}", ""),
-    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": real_head, "reviews": []}), "")
+        posted.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-P8", "review_verdict_reject") in report.skipped
+    assert ("VOYN-W0-P8", "VOYN-W0-P8-REM") in report.remediated
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
@@ -313,11 +428,14 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
     PR's actual head sha. That must not synthesize an ACCEPT-with-real-sha
     marker. Only a VERDICT line immediately followed by its own HEAD_SHA
     line counts as a verdict at all."""
+    import subprocess as sp
+
     app_factory, store, worker = rig
     real_head = "c" * 40
-    _ready(store, app_factory, "VOYN-W0-P7", "https://github.com/x/y/pull/17")
+    pr_url = "https://github.com/x/y/pull/17"
+    _ready(store, app_factory, "VOYN-W0-P7", pr_url)
     _complete_review(
-        app_factory, worker, "VOYN-W0-P7",
+        app_factory, worker, "VOYN-W0-P7", pr_url, real_head,
         "VERDICT: REJECT\n"
         "The stale-head check is buggy.\n\n"
         f"Note: PR #99 shares HEAD_SHA: {real_head} with this one, where "
@@ -325,18 +443,32 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
     )
 
     posted = []
-    monkeypatch.setattr(
-        review_merge, "_gh",
-        lambda argv, repo: posted.append(argv) or __import__("subprocess").CompletedProcess(argv, 0, "{}", ""),
-    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": real_head, "reviews": []}), "")
+        posted.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P7", "verdict_or_head_sha_missing_in_review_result") in report.skipped
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
-def test_publish_verdict_skips_without_a_completed_review_yet(rig):  # noqa: F811
+def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
     app_factory, store, _worker = rig
-    _ready(store, app_factory, "VOYN-W0-P3", "https://github.com/x/y/pull/13")
+    pr_url = "https://github.com/x/y/pull/13"
+    _ready(store, app_factory, "VOYN-W0-P3", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": "z" * 40, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P3", "no_review_result_yet") in report.skipped
 
@@ -344,9 +476,10 @@ def test_publish_verdict_skips_without_a_completed_review_yet(rig):  # noqa: F81
 def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F811
     app_factory, store, worker = rig
     head = "f" * 40
-    _ready(store, app_factory, "VOYN-W0-P4", "https://github.com/x/y/pull/14")
+    pr_url = "https://github.com/x/y/pull/14"
+    _ready(store, app_factory, "VOYN-W0-P4", pr_url)
     _complete_review(
-        app_factory, worker, "VOYN-W0-P4",
+        app_factory, worker, "VOYN-W0-P4", pr_url, head,
         f"Looks fine.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
     )
 
@@ -369,18 +502,25 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F
     assert not posted
 
 
-def test_publish_verdict_skips_a_stale_review_after_a_new_push(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig, monkeypatch):  # noqa: F811
     """VOYN-OPS-EVIDENCE-MEASURED-ON-A-STATE-THAT-NO-LONGER-EXISTS, same
     class at a new site: the review ran against a sha that is no longer the
     PR's head (a push landed after the review was dispatched). Posting the
     old sha's marker would satisfy merge_once's string match against a
-    branch state nobody re-reviewed."""
+    branch state nobody re-reviewed. Was a dedicated post-hoc "stale_review"
+    check before the review-cycle key existed; now it is structurally
+    impossible instead of separately guarded -- the lookup itself is keyed
+    to the CURRENT head, so a review recorded for a different (old) sha is
+    simply not found at all, indistinguishable from "never reviewed" (which
+    is the correct, safe reading: from the current head's perspective, it
+    hasn't been)."""
     app_factory, store, worker = rig
     reviewed_sha = "1" * 40
     new_head = "2" * 40
-    _ready(store, app_factory, "VOYN-W0-P5", "https://github.com/x/y/pull/15")
+    pr_url = "https://github.com/x/y/pull/15"
+    _ready(store, app_factory, "VOYN-W0-P5", pr_url)
     _complete_review(
-        app_factory, worker, "VOYN-W0-P5",
+        app_factory, worker, "VOYN-W0-P5", pr_url, reviewed_sha,
         f"Looks fine.\nVERDICT: ACCEPT\nHEAD_SHA: {reviewed_sha}\n",
     )
 
@@ -396,7 +536,7 @@ def test_publish_verdict_skips_a_stale_review_after_a_new_push(rig, monkeypatch)
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert any(t == "VOYN-W0-P5" and r.startswith("stale_review") for t, r in report.skipped)
+    assert ("VOYN-W0-P5", "no_review_result_yet") in report.skipped
     assert not posted
 
 
@@ -429,3 +569,47 @@ def test_repo_from_pr_url():
     ) == "ai-command-center"
     assert review_merge._repo_from_pr_url("not a url") is None
     assert review_merge._repo_from_pr_url("https://github.com/voyn88/aios") is None
+
+
+def test_review_key_scopes_by_pr_number_head_sha_and_policy_version():
+    base = "https://github.com/voyn88/aios/pull/273"
+    sha_a = "a" * 40
+    sha_b = "b" * 40
+    key_a = review_merge._review_key("VOYN-W0-X", base, sha_a)
+    key_b = review_merge._review_key("VOYN-W0-X", base, sha_b)
+    assert key_a != key_b  # a new commit is a new review, automatically
+    assert key_a == f"review:VOYN-W0-X:273:{sha_a}:{review_merge._REVIEW_POLICY_VERSION}"
+    assert review_merge._review_key("VOYN-W0-X", "not a url", sha_a) is None
+
+
+def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """The general case the review-cycle key fixes, not just remediation: an
+    ordinary task still IN_PROGRESS/READY_TO_REVIEW that gets a second push
+    to its PR must be reviewable again, not permanently deduped against
+    whatever the first push's review concluded."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/repo-d2/pull/20"
+    _ready(store, app_factory, "VOYN-W0-R5", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": next(current_head)}), "")
+        if argv[:2] == ["pr", "diff"]:
+            return sp.CompletedProcess(argv, 0, "diff --git a/x b/x\n+hi\n", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    calls = []
+    enqueue = lambda q, k, p, tid: calls.append((q, k, p, tid))  # noqa: E731
+
+    current_head = iter(["a" * 40])
+    review_once(app_factory, enqueue, "/tmp")
+    current_head = iter(["b" * 40])
+    review_once(app_factory, enqueue, "/tmp")
+
+    assert len(calls) == 2
+    keys = {key for _q, key, _p, _tid in calls}
+    assert len(keys) == 2  # two distinct review-cycle identities, not deduped
+    assert all(k.startswith("review:VOYN-W0-R5:20:") for k in keys)
