@@ -208,7 +208,13 @@ def _run_agent(
                 ),
                 owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
                 session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
-                task=request.project_id,
+                # The publish branch is `backlog/<task>` (publish.py) --
+                # per-task, or every dispatch for this project collides on
+                # one shared branch and a later force-push silently erases
+                # an earlier task's still-unmerged work (VOYN-W0-AICC-
+                # PUBLISH-BRANCH-COLLISION). Falls back to project_id only
+                # for a payload enqueued before this field existed.
+                task=request.backlog_task_id or request.project_id,
                 deploy_key=deploy_key,
             ),
         )

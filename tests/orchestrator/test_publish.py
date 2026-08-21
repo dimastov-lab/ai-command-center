@@ -89,6 +89,49 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     assert log.index("acquire") < log.index("create")  # acquired before publishing
 
 
+def test_a_github_ssh_origin_is_pushed_over_https(repo, monkeypatch):
+    """VOYN-W0-AICC-DEPLOY-KEY-WRITE-DENIED (2026-08-21): a verified,
+    correctly-registered, non-read-only deploy key still had its write
+    silently denied by GitHub with no actionable diagnostic (reproduced live
+    against a public repo). `gh`'s own credential helper (`gh auth
+    setup-git`, already configured host-wide) is what recovered every
+    manual push this session, so it is now the primary path: an
+    `origin` shaped like `git@github.com:org/repo.git` is rewritten to
+    `https://github.com/org/repo.git` and pushed there instead of over the
+    SSH deploy key. Proven here by pointing `origin` at a github.com URL
+    that would fail DNS/auth if actually dialled, and asserting the push
+    argv names that rewritten HTTPS target -- not `origin` -- via a `git`
+    shim on PATH that logs argv instead of a real network push."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _git(work, "remote", "set-url", "origin", "git@github.com:voyn88/ai-command-center.git")
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+
+    import shutil
+
+    real_git = shutil.which("git")
+    git_shim = bin_ / "git"
+    git_shim.write_text(
+        f"#!/bin/sh\n"
+        f"echo \"git $*\" >> {calls}\n"
+        "case \"$1\" in\n"
+        "  push) exit 0 ;;\n"
+        f"  *) exec {real_git} \"$@\" ;;\n"
+        "esac\n"
+    )
+    git_shim.chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+    assert r.ok, r.reason
+    log = calls.read_text()
+    push_lines = [line for line in log.splitlines() if line.startswith("git push")]
+    assert len(push_lines) == 1, log
+    assert "https://github.com/voyn88/ai-command-center.git" in push_lines[0]
+    assert "git@github.com" not in push_lines[0]
+
+
 def test_lease_refusal_does_not_push(repo, monkeypatch):
     work, bin_, calls = repo
     _with_path(bin_, monkeypatch)

@@ -50,6 +50,17 @@ class AgentRunRequest:
     #: BO-S2a: the ordered executor cascade. Empty means "no cascade" — the
     #: pre-cascade single-executor behaviour, byte-for-byte.
     cascade: tuple[dict[str, Any], ...] = ()
+    #: The canonical backlog task_id, when the planner sent one (optional so
+    #: an older enqueued payload -- pre-dating this field -- still parses).
+    #: Threaded through to the publish branch name (`publish.py`:
+    #: `backlog/<task>`) so two DIFFERENT tasks for the same project stop
+    #: colliding on one shared branch: before this field existed, every
+    #: agent_run for a project published to `backlog/<project_id>`, and a
+    #: `--force-with-lease` push from task B silently overwrote task A's
+    #: still-unmerged work on that same branch (VOYN-W0-AICC-PUBLISH-BRANCH-
+    #: COLLISION, found 2026-08-21: 29 backlog tasks pointed at one PR with a
+    #: single 7-line diff).
+    backlog_task_id: str | None = None
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -130,6 +141,8 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
             )
         cascade.append(dict(link))
 
+    backlog_task_id = _string(payload, "backlog_task_id")
+
     return AgentRunRequest(
         project_id=project_id,
         repository_path=repository_path,
@@ -139,4 +152,5 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         model=model,
         untrusted=untrusted,
         cascade=tuple(cascade),
+        backlog_task_id=backlog_task_id,
     )

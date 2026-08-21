@@ -127,6 +127,7 @@ def _payload_for(
         "timeout_seconds": limits.timeout_seconds,
         "untrusted": False,
         "cascade": cascade,
+        "backlog_task_id": task["task_id"],
     }
     return payload, len(cascade)
 
