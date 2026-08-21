@@ -17,9 +17,16 @@ Outcome discipline:
   "the agent failed the task" is a result for the control plane to read,
   not a queue-level failure to redeliver, and retrying a completed mutating
   run would re-apply its side effects;
-- only the case where execution could not start (runner missing, OS error
-  surfaced as status ``failed`` with no exit code and empty stdout) stays
-  retryable: another host or a later moment can genuinely cure it.
+- only the case where execution could not start stays retryable: another
+  host or a later moment can genuinely cure it. That covers both the runner
+  never launching the process (OS error surfaced as status ``failed`` with
+  no exit code and empty stdout) *and* the CLI process launching but the
+  Claude-CLI account itself failing before any task work happened (rate
+  limit / auth / overload -- the CLI's own structured ``is_error`` +
+  ``api_error_status``/``terminal_reason`` fields, see
+  ``agent_runner.RunResult.is_executor_api_error``). Both are executor
+  infrastructure failures, not task outcomes, however different their raw
+  ``exit_code``/``stdout`` shape looks.
 
 Result rows are bounded: stdout/stderr travel as tails, because a jsonb
 column is a coordination record, not a log store -- the full transcript
@@ -318,6 +325,23 @@ def _run_agent(
         return HandlerOutcome(
             ok=False,
             reason=_tail(run.stderr) or "runner failed to start",
+            retryable=True,
+        )
+    if run.is_executor_api_error:
+        # Incident 2026-08-21 16:09 UTC: the CLI process itself started (exit
+        # code 1, non-empty stdout) but the *account*, not the task, failed --
+        # a rate limit / auth / overload response the CLI reports through its
+        # own structured `is_error`+`api_error_status`/`terminal_reason`
+        # fields (see `RunResult.is_executor_api_error`), never by executing
+        # any task work. That is indistinguishable from the "process never
+        # started" case above in every way that matters here: nothing ran,
+        # so redelivery is safe and may land on a healthier host/account, and
+        # the worktree (if any) holds no run output worth preserving.
+        if isolated_workspace is not None:
+            workspace_provisioning.remove_workspace(isolated_workspace, repository)
+        return HandlerOutcome(
+            ok=False,
+            reason=f"executor infrastructure failure (api_error_status present in CLI output): {_tail(result_text)}",
             retryable=True,
         )
     # BO-S3b: a successful mutating run publishes its commits as a PR so the

@@ -411,6 +411,27 @@ def extract_result_text(stdout: str) -> str:
     return stdout
 
 
+def _parse_cli_result_payload(stdout: str) -> dict | None:
+    """Parse `stdout` as the single JSON object `claude -p --output-format json`
+    emits on a completed invocation, returning it only when it decodes to a
+    dict.
+
+    Returns `None` for anything else — empty output, a JSON array (the
+    `stream-json`/NDJSON shape `extract_result_text` also has to tolerate),
+    plain non-JSON text, or a parse error. Callers (`RunResult.is_executor_api_error`)
+    must treat `None` as "no signal", never as a default classification either
+    way: this function only ever *positively confirms* a shape, it never
+    guesses one.
+    """
+    if not stdout:
+        return None
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 class RunResult:
     def __init__(
         self,
@@ -431,9 +452,51 @@ class RunResult:
         self.started_at = started_at
         self.completed_at = completed_at
 
+        # Parsed once here (not re-parsed by every caller) so
+        # `is_executor_api_error` below and any other consumer read plain
+        # attributes rather than each re-implementing JSON parsing/fallback
+        # over raw stdout. See `_parse_cli_result_payload` for the fail-safe
+        # contract.
+        payload = _parse_cli_result_payload(stdout)
+        self.is_error: bool = bool(payload.get("is_error")) if payload else False
+        self.api_error_status = payload.get("api_error_status") if payload else None
+        self.terminal_reason = payload.get("terminal_reason") if payload else None
+
     @property
     def result_status(self) -> str:
         return self.status
+
+    @property
+    def is_executor_api_error(self) -> bool:
+        """True only when the CLI's own structured output positively confirms
+        an API-level failure (rate limit, auth, overload, ...) rather than a
+        genuine task-level outcome.
+
+        Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
+        Claude-CLI account hit its session/rate limit mid-fleet. The CLI
+        still exited non-zero with output on stdout (`exit_code=1`,
+        non-empty `stdout`), so the pre-existing "process never started"
+        check in `worker.handlers._run_agent`
+        (`status == "failed" and exit_code is None and not stdout`) never
+        fired, and the run fell through to `ok=True` -- an infrastructure
+        failure recorded as a genuine task success, permanently un-retried.
+        The real payload carried `is_error: true`, `api_error_status: 429`
+        and `terminal_reason: "api_error"` -- a signal the CLI emits
+        specifically when it never got to attempt the task, distinct from a
+        task that executed and failed on its own merits. Checked here as
+        `(is_error and api_error_status is not None) or terminal_reason ==
+        "api_error"` -- either half alone has been observed in real captures,
+        so both are treated as sufficient. Deliberately does NOT look at
+        `result` text content: a genuinely completed task's own report could
+        contain unrelated words like "error" or "rate limit", and heuristics
+        on free text would misclassify real task failures as infrastructure
+        failures, causing exactly the "retrying a completed mutating run
+        re-applies its side effects" hazard `worker.handlers` warns against.
+        `False` (never `True`) when `_parse_cli_result_payload` could not
+        positively confirm a parseable dict payload -- fail safe to today's
+        behavior rather than guess.
+        """
+        return (self.is_error and self.api_error_status is not None) or self.terminal_reason == "api_error"
 
 
 def run_claude_code(
