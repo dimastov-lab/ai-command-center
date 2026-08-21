@@ -8,12 +8,13 @@ import json
 import os
 import socket
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from command_center import agent_runner
+from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import parse_agent_run, PayloadError
@@ -37,9 +38,35 @@ def _event() -> threading.Event:
     return threading.Event()
 
 
+def isolated_path(repository: Path, backlog_task: str = "proj") -> Path:
+    """The isolated worktree path `_run_agent` derives for a mutating
+    dispatch of `repository`/`backlog_task` -- mirrors
+    `handlers._isolated_workspace_path` (`<repo>-worktrees/backlog-<task>`)
+    so a test can predict where the lease gate and provisioning will look
+    without importing the private helper itself."""
+    return repository.parent / f"{repository.name}-worktrees" / f"backlog-{backlog_task}"
+
+
+@dataclass(frozen=True)
+class _FakeEvidence:
+    workspace_path: str
+
+
 @pytest.fixture
 def handler(monkeypatch, tmp_path):
-    """The agent_run handler with every external seam faked to succeed."""
+    """The agent_run handler with every external seam faked to succeed.
+
+    Workspace provisioning is faked too, at the same seam level as
+    `run_claude_code`: these are generic outcome-discipline tests, not
+    isolation tests, and a real `git worktree add` would need an actual
+    repository under `tmp_path` for every one of them. The fake hands back
+    exactly the path `_run_agent` asked for (`spec.workspace_path`), so the
+    dispatch flow -- including which path reaches `run_claude_code` and the
+    lease gate -- is unchanged from a real provision; only the git mutation
+    itself is skipped. Real provisioning end-to-end (a real repo, a real
+    worktree, real cleanup) is exercised separately in
+    `test_isolated_workspace.py`.
+    """
     monkeypatch.setattr(
         agent_runner, "validate_repository", lambda project_id, path: tmp_path
     )
@@ -59,6 +86,14 @@ def handler(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", fake_run)
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "provision_and_verify",
+        lambda spec: _FakeEvidence(workspace_path=spec.workspace_path),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "remove_workspace", lambda *a, **kw: "removed"
+    )
     # The writer-lease gate is a real external seam: it shells out to the
     # lease tool whenever VOYN_LEASE_DSN names an authority, and this host
     # has one. Unset it here so the default fixture stays hermetic -- the
@@ -457,10 +492,11 @@ def test_mutating_dispatch_into_a_leased_worktree_is_refused(
     another writer holds, and the collision only surfaced at commit time --
     by which point the foreign edits were already in the tree."""
     run_agent, runs = handler
-    lease_tool(_lease_row(tmp_path))
+    worktree = isolated_path(tmp_path)
+    lease_tool(_lease_row(worktree))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
-    assert "claude-worker" in outcome.reason and str(tmp_path) in outcome.reason
+    assert "claude-worker" in outcome.reason and str(worktree) in outcome.reason
     assert runs == [], "nothing may execute in another writer's checkout"
 
 
@@ -491,9 +527,10 @@ def test_expired_other_host_and_other_path_leases_do_not_block(
     """Three ways a row can name this path without holding it."""
     run_agent, runs = handler
     stale = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    worktree = isolated_path(tmp_path)
     for row in (
-        _lease_row(tmp_path, expires_at=stale),
-        _lease_row(tmp_path, host="some-other-worker"),
+        _lease_row(worktree, expires_at=stale),
+        _lease_row(worktree, host="some-other-worker"),
         _lease_row(tmp_path.parent / "a-different-checkout"),
     ):
         runs.clear()
@@ -557,7 +594,7 @@ def test_a_lease_held_by_our_own_supervisor_does_not_block(
     """
     run_agent, runs = handler
     pid = os.getpid()
-    lease_tool(_lease_row(tmp_path, process_pid=pid, process_start=_own_start(pid)))
+    lease_tool(_lease_row(isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert outcome.ok, outcome.reason
     assert len(runs) == 1, "the dispatch was refused by its own supervisor's lease"
@@ -574,7 +611,7 @@ def test_a_recycled_pid_matching_an_ancestor_still_blocks(
     """
     run_agent, runs = handler
     lease_tool(
-        _lease_row(tmp_path, process_pid=os.getpid(), process_start="not-our-start")
+        _lease_row(isolated_path(tmp_path), process_pid=os.getpid(), process_start="not-our-start")
     )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
@@ -587,7 +624,7 @@ def test_a_lease_with_no_identity_token_still_blocks(
     """An unverifiable match is not a match: the row names our pid, but with
     no ``process_start`` on either side to confirm it, the gate fails closed."""
     run_agent, runs = handler
-    row = json.loads(_lease_row(tmp_path, process_pid=os.getpid()))
+    row = json.loads(_lease_row(isolated_path(tmp_path), process_pid=os.getpid()))
     row[0].pop("process_start", None)
     lease_tool(json.dumps(row))
     outcome = run_agent(_payload(task_type="implementation"), _event())

@@ -31,9 +31,10 @@ from __future__ import annotations
 import os
 import re
 import threading
+from pathlib import Path
 from typing import Any
 
-from command_center import agent_runner
+from command_center import agent_runner, project_config, workspace_provisioning
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
@@ -42,6 +43,70 @@ from command_center.orchestrator.publish import PublishConfig, publish_run
 __all__ = ["build_handlers"]
 
 _TAIL_CHARS = 4000
+
+# Sibling worktree directory, one per branch — the SAME convention
+# `task_pipeline.derive_worktree_path` uses for the desktop launch path
+# (`<repo>-worktrees/<branch-slug>`, outside the repository so a worktree
+# never appears as untracked noise inside it). Kept as a private four-line
+# duplicate here rather than an import: task_pipeline.py is the ~2400-line
+# desktop pipeline module, and pulling it into the worker's dispatch path for
+# one pure path-formatting function would wire an unrelated UI-facing module
+# into a security-sensitive hot path. Matching the string convention (not
+# importing the code) is what matters — it means a task's worker-provisioned
+# worktree and its desktop-pipeline worktree for the same branch resolve to
+# the identical path, so `blocking_lease` still detects a collision between
+# the two launch paths. If a third caller needs this convention, extract it
+# into `workspace_provisioning` then — not before.
+_WORKTREE_PARENT_SUFFIX = "-worktrees"
+
+# VOYN-W0-AICC-ISOLATED-WORKTREE-PER-ATTEMPT naming decision: keyed by
+# BRANCH (`backlog/<task>`), not by attempt. The payload contract
+# (`worker.payloads.AgentRunRequest`) carries no `attempt_id`/`head_sha` --
+# the only per-delivery identifier available at this call site is the
+# queue's own `attempt_no` (a Handler parameter, not payload data). Keying by
+# attempt_no instead of branch was rejected: git allows exactly one worktree
+# per branch (`provision_workspace`'s `no_conflicting_worktree` gate), and
+# `publish_run` always pushes to `backlog/<task>` regardless of which attempt
+# produced the commit -- a worktree per attempt_no would either collide with
+# that gate the moment two attempts of the same task existed, or require a
+# second, attempt-scoped branch that `publish_run` does not know about. A
+# worktree per TASK is the isolation the audit actually needs: the defect was
+# different tasks/branches sharing ONE checkout, not one task's own retries
+# sharing it with each other -- those retries sharing a worktree is
+# correct, since they are building toward the same branch and the same PR.
+_provision_locks: dict[str, threading.Lock] = {}
+_provision_locks_guard = threading.Lock()
+
+
+def _isolated_workspace_path(repository: Path, branch: str) -> Path:
+    slug = branch.strip().strip("/").replace("/", "-") or "work"
+    return repository.parent / f"{repository.name}{_WORKTREE_PARENT_SUFFIX}" / slug
+
+
+def _provision_lock(key: str) -> threading.Lock:
+    """One lock per resolved workspace path, so two in-process deliveries
+    that both compute the same new path cannot both pass
+    `provision_workspace`'s `workspace.exists()` check before either has
+    created it (`provision_workspace` is check-then-act, not itself atomic
+    against a concurrent identical call).
+
+    This closes the race for THIS process only. The daemon's own claim loop
+    (`worker.daemon.WorkerDaemon.run_forever`) dispatches one item at a time,
+    so within a single worker process two deliveries never overlap in the
+    first place; this lock is defense-in-depth for a future multi-threaded
+    dispatcher, and for tests that call the handler directly from several
+    threads. A concurrent SECOND PROCESS (this host or another) redelivering
+    the SAME task while a first attempt is still running is a different,
+    known gap: nothing here acquires a held lease for the duration of the
+    run (only `blocking_lease` preflights, and `publish_run` holds one only
+    around its own push) -- closing that is VOYN-W0-AICC-LEASE-FULL-
+    LIFECYCLE, explicitly out of scope for this change."""
+    with _provision_locks_guard:
+        lock = _provision_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _provision_locks[key] = lock
+        return lock
 
 #: BO-S3 result enrichment: the delivery contract for machine-readable
 #: outcomes. A PR reference is extracted by its exact URL shape — nothing
@@ -149,22 +214,79 @@ def _run_agent(
             retryable=False,
         )
 
-    # Single-writer gate at the dispatch boundary (part B of
-    # VOYN-OPS-WORKER-DISPATCH-INTO-LEASED-WORKTREE). The git hooks enforce
-    # the writer lease for commits made through them, but this handler wrote
-    # into the routed checkout without ever asking who holds it -- so an agent
-    # could edit files in a tree another writer owns, and the hook would only
-    # notice at commit time, with the collision already on disk. Retryable:
-    # a lease is a temporary claim, so redelivery lands once it is released,
-    # bounded by the item's own max_attempts. Mutating types only -- a
-    # read-only run gets the read-only sandbox profile and writes nothing.
+    # The publish branch is `backlog/<task>` (publish.py) -- per-task, or
+    # every dispatch for this project collides on one shared branch and a
+    # later force-push silently erases an earlier task's still-unmerged work
+    # (VOYN-W0-AICC-PUBLISH-BRANCH-COLLISION). Falls back to project_id only
+    # for a payload enqueued before this field existed. Computed once and
+    # reused for both the isolation branch below and PublishConfig.task, so
+    # the worktree a run executes in and the branch it publishes to can never
+    # drift apart.
+    backlog_task = request.backlog_task_id or request.project_id
+
+    # Isolated workspace per mutating task (VOYN-W0-AICC-ISOLATED-WORKTREE-
+    # PER-ATTEMPT, a P0 audit finding: every mutating run for a project
+    # shared ONE checkout -- `repository` -- with no isolation at all, so two
+    # concurrently-dispatched tasks for the same project could corrupt each
+    # other's working tree. `run_repository` is what actually gets handed to
+    # the CLI and to `publish_run` below; for a read-only task it stays
+    # `repository` unchanged (no isolation requirement, and no worktree churn
+    # for the common read-only case). See `_isolated_workspace_path`'s
+    # comment for the branch-not-attempt naming decision.
+    run_repository = repository
+    isolated_workspace: Path | None = None
+
     if task_type in agent_runner.MUTATING_TASK_TYPES:
-        held = blocking_lease(repository)
+        expected_branch = f"backlog/{backlog_task}"
+        isolated_workspace = _isolated_workspace_path(repository, expected_branch)
+
+        # Single-writer gate at the dispatch boundary (part B of
+        # VOYN-OPS-WORKER-DISPATCH-INTO-LEASED-WORKTREE), now checked against
+        # the ISOLATED workspace -- the directory this dispatch is actually
+        # about to write into -- rather than the shared `repository`. Checked
+        # before provisioning: the path is computed deterministically above
+        # with no filesystem access, so this can run whether or not the
+        # worktree exists yet. Retryable: a lease is a temporary claim, so
+        # redelivery lands once it is released, bounded by the item's own
+        # max_attempts.
+        held = blocking_lease(isolated_workspace)
         if held is not None:
             return HandlerOutcome(ok=False, reason=held, retryable=True)
 
+        base_branch = (
+            project_config.get_project_config(request.project_id).get("default_branch")
+            or "main"
+        )
+        spec = workspace_provisioning.WorkspaceSpec(
+            workspace_path=str(isolated_workspace),
+            expected_branch=expected_branch,
+            base_branch=base_branch,
+            repository_path=str(repository),
+            task_type=task_type,
+        )
+        try:
+            # Locked per-path: `provision_workspace` is check-then-act
+            # (`workspace.exists()` then `git worktree add`), not itself safe
+            # against two in-process callers racing to create the same new
+            # path. See `_provision_lock`'s docstring for what this does and
+            # does not cover.
+            with _provision_lock(str(isolated_workspace)):
+                evidence = workspace_provisioning.provision_and_verify(spec)
+        except workspace_provisioning.WorkspaceVerificationError as exc:
+            # A verification failure here (branch already checked out
+            # elsewhere, base branch missing, dirty leftover worktree under a
+            # stricter policy, ...) is a fact about repository state that a
+            # later moment can genuinely cure -- redelivery retries once
+            # whatever blocked it clears, bounded by max_attempts.
+            return HandlerOutcome(
+                ok=False,
+                reason=f"workspace isolation failed at {exc.failed_step}: {exc.detail}",
+                retryable=True,
+            )
+        run_repository = Path(evidence.workspace_path)
+
     run = agent_runner.run_claude_code(
-        repository_path=repository,
+        repository_path=run_repository,
         prompt=request.prompt,
         task_type=task_type,
         timeout_seconds=request.timeout_seconds,
@@ -188,6 +310,11 @@ def _run_agent(
     if run.status == "failed" and run.exit_code is None and not run.stdout:
         # The process never started (OSError path in the runner): nothing
         # executed, so redelivery is safe and may land on a healthier host.
+        # The worktree (if any) holds no run output either -- safe to remove
+        # immediately rather than leave an empty one behind for every failed
+        # launch attempt.
+        if isolated_workspace is not None:
+            workspace_provisioning.remove_workspace(isolated_workspace, repository)
         return HandlerOutcome(
             ok=False,
             reason=_tail(run.stderr) or "runner failed to start",
@@ -200,7 +327,7 @@ def _run_agent(
     deploy_key = os.environ.get("AICC_PUBLISH_DEPLOY_KEY", "")
     if task_type in agent_runner.MUTATING_TASK_TYPES and deploy_key:
         pub = publish_run(
-            repository,
+            run_repository,
             PublishConfig(
                 lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
                 repository=os.environ.get(
@@ -208,13 +335,7 @@ def _run_agent(
                 ),
                 owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
                 session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
-                # The publish branch is `backlog/<task>` (publish.py) --
-                # per-task, or every dispatch for this project collides on
-                # one shared branch and a later force-push silently erases
-                # an earlier task's still-unmerged work (VOYN-W0-AICC-
-                # PUBLISH-BRANCH-COLLISION). Falls back to project_id only
-                # for a payload enqueued before this field existed.
-                task=request.backlog_task_id or request.project_id,
+                task=backlog_task,
                 deploy_key=deploy_key,
             ),
         )
@@ -226,6 +347,33 @@ def _run_agent(
         }
         if pub.pr_url:
             result["pr_url"] = pub.pr_url
+        # Cleanup is conditioned on the branch actually being durable
+        # somewhere else first. `pub.ok` (a real push -- the commit now lives
+        # on `origin/backlog/<task>`) and `reason == "nothing_to_publish"`
+        # (publish.py's own `ok=False` -- HEAD already equals the base
+        # branch, so the run made no commit at all) both mean there is
+        # nothing local left to lose; in either case the worktree is
+        # disposable. Any OTHER failure (lease_unavailable / push_failed /
+        # pr_create_failed / cannot read HEAD) deliberately leaves the
+        # worktree in place: it may be the only remaining copy of whatever
+        # the agent committed, and deleting it on a transient publish
+        # failure would be real, unrecoverable data loss for the sake of
+        # tidiness. "Recovery-safe" here means recoverable, not merely
+        # crash-safe -- the next attempt's `provision_workspace` simply
+        # reuses ("reused") the still-present worktree.
+        publish_left_nothing_local = pub.ok or pub.reason == "nothing_to_publish"
+        if isolated_workspace is not None and publish_left_nothing_local:
+            workspace_provisioning.remove_workspace(isolated_workspace, repository)
+    elif isolated_workspace is not None:
+        # Publishing is disabled for this deployment (no
+        # AICC_PUBLISH_DEPLOY_KEY): the worktree's local commits are the ONLY
+        # record of this run's work, exactly as the shared checkout's commits
+        # were before this change. Removing it would silently discard a
+        # completed mutating run's entire output, so local-only mode never
+        # cleans up -- the worktree accumulates the same way the shared
+        # checkout used to, and an operator enabling publishing later can
+        # still recover it.
+        pass
     return HandlerOutcome(ok=True, result=result)
 
 
