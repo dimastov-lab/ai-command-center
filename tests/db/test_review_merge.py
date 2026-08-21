@@ -50,18 +50,39 @@ def _ready(store, factory, task_id, pr):
         c.commit()
 
 
-def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes):  # noqa: F811
+def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypatch):  # noqa: F811
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7")
+    head = "d" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"headRefOid": head}), "")
+        if argv[:2] == ["pr", "diff"]:
+            return subprocess.CompletedProcess(argv, 0, "diff --git a/x b/x\n+hi\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
-    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)))
+    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
     assert ("VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7") in report.reviewed
     assert len(calls) == 1
     q, key, payload, task_id = calls[0]
     assert key == "review:VOYN-W0-R1"  # idempotency key
     assert task_id == "VOYN-W0-R1"
     assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
+    # The diff is embedded in the prompt directly -- the orchestrator fetches
+    # it, not the review agent -- so the agent needs no Bash/gh access of its
+    # own at all. Independent review (2026-08-21) found that granting a
+    # review agent even a narrowly-scoped `gh pr view/diff` Bash pattern let
+    # a prompt-injected instruction inside the diff pass an unconstrained
+    # `--repo` argument and read unrelated private repos, no shell escape
+    # needed; embedding is the fix that removes the capability instead of
+    # trying to scope it.
+    assert "diff --git a/x b/x" in payload["prompt"]
+    assert head in payload["prompt"]
     # Resolved through the same repo_route() table implementation dispatch
     # uses, not the raw backlog task_id and an empty path -- the worker's
     # validate_repository rejects both (VOYN-W0-AICC-MISSING-MARKER-
@@ -75,10 +96,52 @@ def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R2", "https://github.com/x/unrouted-repo/pull/9")
     calls = []
-    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)))
+    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
     assert not calls
     assert any(
         task_id == "VOYN-W0-R2" and reason.startswith("no_repo_route")
+        for task_id, reason in report.skipped
+    )
+
+
+def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-R3", "https://github.com/x/repo-d2/pull/12")
+
+    def fake_gh(argv, repo):
+        import subprocess
+        return subprocess.CompletedProcess(argv, 1, "", "not found")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    calls = []
+    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
+    assert not calls
+    assert any(
+        task_id == "VOYN-W0-R3" and reason.startswith("pr_diff_fetch_failed")
+        for task_id, reason in report.skipped
+    )
+
+
+def test_review_skips_a_diff_over_the_size_cap(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
+    head = "e" * 40
+    huge_diff = "x" * (review_merge._MAX_DIFF_CHARS + 1)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"headRefOid": head}), "")
+        if argv[:2] == ["pr", "diff"]:
+            return subprocess.CompletedProcess(argv, 0, huge_diff, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    calls = []
+    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
+    assert not calls
+    assert any(
+        task_id == "VOYN-W0-R4" and reason.startswith("diff_too_large")
         for task_id, reason in report.skipped
     )
 
