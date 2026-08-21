@@ -50,18 +50,37 @@ def _ready(store, factory, task_id, pr):
         c.commit()
 
 
-def test_review_enqueues_one_run_per_ready_task(rig):  # noqa: F811
+def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes):  # noqa: F811
 
     app_factory, store, _ = rig
-    _ready(store, app_factory, "VOYN-W0-R1", "https://github.com/x/y/pull/7")
+    _ready(store, app_factory, "VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7")
     calls = []
     report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)))
-    assert ("VOYN-W0-R1", "https://github.com/x/y/pull/7") in report.reviewed
+    assert ("VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7") in report.reviewed
     assert len(calls) == 1
     q, key, payload, task_id = calls[0]
     assert key == "review:VOYN-W0-R1"  # idempotency key
     assert task_id == "VOYN-W0-R1"
     assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
+    # Resolved through the same repo_route() table implementation dispatch
+    # uses, not the raw backlog task_id and an empty path -- the worker's
+    # validate_repository rejects both (VOYN-W0-AICC-MISSING-MARKER-
+    # PUBLISHER's review-dispatch half, found live 2026-08-21: every review
+    # this function ever enqueued had dead-lettered on first attempt).
+    assert payload["project_id"] == "AICC"
+    assert payload["repository_path"] == "/srv/repo-d2"
+
+
+def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-R2", "https://github.com/x/unrouted-repo/pull/9")
+    calls = []
+    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)))
+    assert not calls
+    assert any(
+        task_id == "VOYN-W0-R2" and reason.startswith("no_repo_route")
+        for task_id, reason in report.skipped
+    )
 
 
 def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noqa: F811
@@ -336,3 +355,14 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert any(t == "VOYN-W0-M3" and "checks_not_green" in r for t, r in report.skipped)
+
+
+def test_repo_from_pr_url():
+    assert review_merge._repo_from_pr_url(
+        "https://github.com/voyn88/aios/pull/273"
+    ) == "aios"
+    assert review_merge._repo_from_pr_url(
+        "https://github.com/voyn88/ai-command-center/pull/1"
+    ) == "ai-command-center"
+    assert review_merge._repo_from_pr_url("not a url") is None
+    assert review_merge._repo_from_pr_url("https://github.com/voyn88/aios") is None

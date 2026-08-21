@@ -91,6 +91,14 @@ _REVIEW_PROMPT = (
 )
 
 
+_PR_URL = re.compile(r"^https://github\.com/[^/]+/([^/]+)/pull/\d+$")
+
+
+def _repo_from_pr_url(pr_url: str) -> str | None:
+    match = _PR_URL.match(pr_url)
+    return match.group(1) if match else None
+
+
 def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig | None = None) -> LoopReport:
     """Enqueue a review run for each READY_TO_REVIEW task with a pr and no
     review queued yet. ``enqueue(queue, key, payload, task_id)`` is the queue
@@ -100,7 +108,23 @@ def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig | None = None) -> 
     publish_review_verdicts can look the result back up by
     ``work_item.task_id`` -- omitting it left that column NULL for every
     review item, which is what VOYN-W0-AICC-MISSING-MARKER-PUBLISHER's
-    lookup exposed."""
+    lookup exposed.
+
+    ``project_id``/``repository_path`` are resolved through the same
+    ``planner.repo_route()`` table implementation dispatch uses -- not the
+    raw backlog task_id and an empty path, which is what this function sent
+    until 2026-08-21. The worker's ``validate_repository`` requires
+    ``project_id`` to be a canonical ``PROJECT_IDS`` member with a
+    configured local checkout and rejects a blank ``repository_path``
+    outright, so every review this function ever enqueued dead-lettered on
+    first attempt with ``agent_run payload missing required fields:
+    ['repository_path']`` -- found live via the DB queue (2026-08-21) when
+    the merge train the marker-publisher was built to unblock still showed
+    zero real reviews ever completing. The repo name is parsed from the PR
+    URL because that -- not the backlog task_id -- is what selects the
+    worker-host checkout the review must run in."""
+    from command_center.orchestrator.planner import repo_route
+
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Idempotency is the queue's: enqueue keys on review:<task>, so a task
@@ -114,9 +138,15 @@ def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig | None = None) -> 
         (cfg.max_per_tick,),
     )
     for task_id, pr_url in tasks:
+        repo = _repo_from_pr_url(pr_url)
+        route = repo_route(repo) if repo else None
+        if route is None:
+            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            continue
+        project_id, repository_path = route
         payload = {
-            "kind": "agent_run", "v": 1, "project_id": task_id,
-            "repository_path": "", "task_type": "review",
+            "kind": "agent_run", "v": 1, "project_id": project_id,
+            "repository_path": repository_path, "task_type": "review",
             "prompt": _REVIEW_PROMPT.format(pr=pr_url, task=task_id),
             "timeout_seconds": cfg.review_timeout, "untrusted": False,
         }
