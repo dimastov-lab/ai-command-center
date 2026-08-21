@@ -86,8 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "backlog-review",
         help="One review tick (BO-S3b): enqueue an adversarial review run for "
-        "each READY_TO_REVIEW task carrying a PR (aicc-backlog-review.timer).",
-    )
+        "each READY_TO_REVIEW task carrying a PR, then publish the ACCEPT "
+        "marker for any task whose review already returned a verdict "
+        "(aicc-backlog-review.timer). Needs --repo-path.",
+    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
     sub.add_parser(
         "backlog-merge",
         help="One merge tick (BO-S3b): merge every reviewed PR whose ACCEPT "
@@ -267,15 +269,25 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
-                from command_center.orchestrator.review_merge import review_once
+                from command_center.orchestrator.review_merge import (
+                    publish_review_verdicts,
+                    review_once,
+                )
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 report = review_once(
                     lambda: _nc(conn),
-                    lambda q, k, pl: store.enqueue(q, idempotency_key=k, payload=pl),
+                    lambda q, k, pl, tid: store.enqueue(
+                        q, idempotency_key=k, payload=pl, task_id=tid
+                    ),
                 )
                 for task_id, pr in report.reviewed:
                     print(f"REVIEW    {task_id} -> {pr}")
+                marker_report = publish_review_verdicts(lambda: _nc(conn), args.repo_path)
+                for task_id, pr in marker_report.reviewed:
+                    print(f"MARKER    {task_id} -> {pr}")
+                for task_id, reason in marker_report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
                 return 0
 
             if args.command == "backlog-merge":
