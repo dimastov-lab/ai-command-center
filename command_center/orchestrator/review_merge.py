@@ -127,23 +127,34 @@ def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig | None = None) -> 
 
 # -- Part 2b: publish the verdict as the marker merge_once reads -------------
 
-# The verdict and its sha must be matched as ONE co-located block, not as two
-# independently-searched tokens: a transcript can legitimately mention other
-# VERDICT: or HEAD_SHA: lines (a corrected earlier draft, an aside comparing
-# another PR) elsewhere in the free text. Matching each independently and
-# pairing "the last of each" can silently combine an unrelated trailing
-# ACCEPT with an unrelated trailing sha that happens to equal the real head --
-# caught live by independent review (2026-08-21) on a transcript reading
-# "VERDICT: REJECT ... Note: PR #99 shares HEAD_SHA: <this pr's head>, where
-# VERDICT: ACCEPT was correct" -- the earlier per-token .search()/finditer()
-# fix would post ACCEPTANCE for a PR the reviewer explicitly rejected. This
-# pattern requires HEAD_SHA to be the line immediately following VERDICT
-# (matching the prompt's own instruction), so only a genuine verdict
-# statement -- not incidental prose -- can produce a match.
-_VERDICT_BLOCK = re.compile(
-    r"^VERDICT:\s*(ACCEPT|REJECT)\s*\n+HEAD_SHA:\s*([0-9a-f]{7,40})\s*$",
-    re.MULTILINE,
-)
+# Three rounds of independent review (2026-08-21) each broke a version of
+# this that scanned the whole transcript for VERDICT:/HEAD_SHA: tokens and
+# picked "the last one(s)", however matched: .search() kept the first
+# occurrence (a corrected tentative ACCEPT overrode a real later REJECT);
+# independently-searched-then-paired last-of-each combined an unrelated
+# trailing ACCEPT with an unrelated trailing sha; and even a single
+# co-located regex still matches an ILLUSTRATIVE block anywhere in the text
+# (an agent explaining "a passing review would read: VERDICT: ACCEPT /
+# HEAD_SHA: <the real head>" while discussing formatting, after already
+# giving a real REJECT) -- that block is syntactically a perfect match and,
+# if it happens to be the last one in the document, "last match anywhere"
+# still picks it over the real verdict.
+#
+# The prompt (_REVIEW_PROMPT) already tells the agent to close with the
+# verdict "as the last line" of its response. Trusting that literally --
+# the true final two non-blank lines of the transcript, nothing scanned or
+# searched -- removes the whole class: an illustrative aside earlier in the
+# text can never be "the last two lines" unless it IS the agent's actual,
+# final, intended conclusion.
+def _parse_verdict(text: str) -> tuple[str, str] | None:
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    verdict_match = re.fullmatch(r"VERDICT:\s*(ACCEPT|REJECT)", lines[-2])
+    sha_match = re.fullmatch(r"HEAD_SHA:\s*([0-9a-f]{7,40})", lines[-1])
+    if not verdict_match or not sha_match:
+        return None
+    return verdict_match.group(1), sha_match.group(1)
 
 
 def _latest_review_result(factory: Any, task_id: str) -> dict[str, Any] | None:
@@ -203,17 +214,11 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
             report.skipped.append((task_id, "no_review_result_yet"))
             continue
         text = result.get("result_text") or ""
-        # The LAST co-located block, not the first: the prompt asks for the
-        # verdict "as the last line", but nothing enforces that, and an agent
-        # reasoning aloud in free text can draft a tentative verdict,
-        # reconsider, and correct it. Requiring VERDICT and HEAD_SHA to be
-        # adjacent (see _VERDICT_BLOCK) also rules out pairing an unrelated
-        # trailing ACCEPT with an unrelated trailing sha from separate prose.
-        blocks = list(_VERDICT_BLOCK.finditer(text))
-        if not blocks:
+        parsed = _parse_verdict(text)
+        if parsed is None:
             report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
             continue
-        verdict, sha = blocks[-1].group(1), blocks[-1].group(2)
+        verdict, sha = parsed
         if verdict != "ACCEPT":
             report.skipped.append((task_id, "review_verdict_reject"))
             continue

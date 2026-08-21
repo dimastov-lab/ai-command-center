@@ -191,6 +191,38 @@ def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
+def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):  # noqa: F811
+    """Independent review, round 3 (2026-08-21): even a single co-located
+    VERDICT+HEAD_SHA regex still matches wherever it occurs in the text --
+    including a purely illustrative block ("a passing review would read
+    exactly: ...") that isn't the agent's real conclusion. Scanning for
+    "the last regex match anywhere" over the free text is the wrong
+    primitive entirely; only the transcript's true final two non-blank
+    lines (what the prompt actually asks for) may decide the verdict. This
+    pins that an earlier lookalike block never wins over the real, later
+    verdict."""
+    app_factory, store, worker = rig
+    fake_head = "a" * 40
+    real_head = "b" * 40
+    _ready(store, app_factory, "VOYN-W0-P8", "https://github.com/x/y/pull/18")
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P8",
+        "Note: a passing review would read exactly:\n"
+        f"VERDICT: ACCEPT\nHEAD_SHA: {fake_head}\n\n"
+        "However, after actually reviewing this diff:\n"
+        f"VERDICT: REJECT\nHEAD_SHA: {real_head}\n",
+    )
+
+    posted = []
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: posted.append(argv) or __import__("subprocess").CompletedProcess(argv, 0, "{}", ""),
+    )
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P8", "review_verdict_reject") in report.skipped
+    assert not any(a[:2] == ["pr", "review"] for a in posted)
+
+
 def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypatch):  # noqa: F811
     """Independent review, round 2 (2026-08-21): taking the last VERDICT and
     the last HEAD_SHA *independently* can still combine two unrelated lines
