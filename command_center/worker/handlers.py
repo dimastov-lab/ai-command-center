@@ -292,13 +292,59 @@ def _run_agent(
             )
         run_repository = Path(evidence.workspace_path)
 
+    # VOYN-W0-AICC-FORCED-AGENT-CANCELLATION: the same `lease_lost` event this
+    # function already checked once, above, *before* starting the subprocess,
+    # is now also handed to the runner as `cancel_event` so a lease lost
+    # *mid-run* forcibly terminates the process group instead of only being
+    # noticed after the fact, once the CLI exits on its own (which could be
+    # up to `request.timeout_seconds` later, mutating the isolated worktree
+    # the whole time). `run_claude_code` does not return until the process
+    # group is either its own natural exit or confirmed terminated
+    # (SIGTERM -> bounded grace -> SIGKILL, see `agent_runner._terminate_
+    # process_group`) — so by the time this call returns, `daemon._execute`'s
+    # `lease_lost.is_set()` check (which discards the outcome without writing
+    # it back) is looking at an attempt whose subprocess is provably no
+    # longer running, not one still mutating state the daemon can no longer
+    # account for. This does not by itself change *when* the queue considers
+    # the attempt free for redelivery — that remains the lease's own
+    # visibility-window expiry / supersession in `work_queue_store`,
+    # unaffected by this change — it closes the narrower, previously-open gap
+    # that the OS process kept running regardless of that decision.
     run = agent_runner.run_claude_code(
         repository_path=run_repository,
         prompt=request.prompt,
         task_type=task_type,
         timeout_seconds=request.timeout_seconds,
         model=model,
+        cancel_event=lease_lost,
     )
+
+    if lease_lost.is_set():
+        # Cancellation confirmed: `run_claude_code` did not return until the
+        # process group was either its own natural exit or SIGTERM/SIGKILL
+        # confirmed terminated, so nothing from this run is still executing.
+        # But the lease is gone, so this run's output is unaccountable in
+        # exactly the sense the pre-flight `lease_lost.is_set()` check above
+        # already guards against -- do not extract/publish anything from it.
+        # In particular this must return *before* the `publish_run` call
+        # below: publishing is a real `git push` + PR creation, and doing
+        # that from a worktree a forcibly-killed, possibly half-written
+        # agent run left behind would be the same unaccountable-mutation
+        # class this whole change exists to close, just moved one step
+        # later. The worktree itself is deliberately left in place (matching
+        # every other "do not delete on an ambiguous outcome" branch below)
+        # so a later attempt can inspect or reuse it.
+        # `daemon._execute` discards whatever `HandlerOutcome` is returned
+        # here (its own `lease_lost.is_set()` check, checked again after this
+        # handler returns) -- this early return is for this function's own
+        # legibility and to keep `publish_run` from ever running against a
+        # killed-mid-flight worktree, not to change what the daemon does
+        # with the result.
+        return HandlerOutcome(
+            ok=False,
+            reason="lease lost mid-execution; agent process group was forcibly terminated",
+            retryable=True,
+        )
 
     result_text = agent_runner.extract_result_text(run.stdout)
     result = {

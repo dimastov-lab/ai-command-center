@@ -53,14 +53,36 @@ Security model:
   listed above. That guarantee is unconditional and does not depend on what a spawned
   `claude` process chooses to do.
 
-- Cancellation: Streamlit re-executes the whole script top-to-bottom on every
-  interaction, so there is no supervisor process that could safely interrupt a
-  `subprocess.run` call already in flight from a *previous* run. This module
-  therefore implements a robust **synchronous** runner: the calling Streamlit page
-  blocks (with a spinner) until the process exits or the timeout fires. "Cancelled" is
-  a valid `RUN_STATUSES` value but is only ever reached if the process could not be
-  started at all — there is no fake mid-flight cancel button. This is a known,
-  documented limitation (see ARCHITECTURE.md / README "Known limitations").
+- Cancellation (Streamlit v1 path): Streamlit re-executes the whole script
+  top-to-bottom on every interaction, so there is no supervisor process that
+  could safely interrupt a run already in flight from a *previous* Streamlit
+  rerun. Callers that never pass `cancel_event` (`chat_service`,
+  `launch_service`) still get this behavior: the call blocks (with a spinner)
+  until the process exits or the timeout fires, and there is no fake
+  mid-flight cancel button for them. This is a known, documented limitation
+  (see ARCHITECTURE.md / README "Known limitations").
+
+- Cancellation (worker daemon path, VOYN-W0-AICC-FORCED-AGENT-CANCELLATION):
+  the worker daemon (`worker.daemon.WorkerDaemon`) *does* have a live
+  out-of-band signal — the `lease_lost` event its heartbeat thread sets the
+  moment the database says this attempt's lease is gone
+  (`worker.daemon._heartbeat_loop`). `worker.handlers._run_agent` passes that
+  same event through as `run_claude_code`'s `cancel_event`, so a lease lost
+  *mid-run* (not just before the subprocess was started) now forcibly
+  terminates the in-flight `claude` process instead of leaving it to mutate
+  an isolated worktree the daemon can no longer account for. The subprocess
+  is always launched as its own process-group leader (`os.setsid` on POSIX,
+  `CREATE_NEW_PROCESS_GROUP` on Windows) specifically so termination can
+  target the whole group — the CLI process plus any child it spawned (tool
+  subprocesses, MCP servers) — not just its own PID; killing only the PID
+  would leave orphaned children as the same class of unaccountable mutation
+  this change exists to close. Termination escalates SIGTERM (POSIX) /
+  CTRL_BREAK_EVENT (Windows) -> bounded grace period -> SIGKILL (POSIX) /
+  `Popen.kill()` (Windows), mirroring the existing `timeout_seconds`
+  enforcement (which now also targets the process group, for the same
+  orphan-child reason, rather than only the CLI's own PID as the previous
+  `subprocess.run(timeout=...)` form did). "Cancelled" is a valid
+  `RUN_STATUSES` value, returned only via this path.
 """
 
 from __future__ import annotations
@@ -68,7 +90,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -499,6 +524,91 @@ class RunResult:
         return (self.is_error and self.api_error_status is not None) or self.terminal_reason == "api_error"
 
 
+# How often the mid-run poll loop wakes to re-check `cancel_event` and the
+# deadline. Short enough that a lease-loss signal turns into a SIGTERM within
+# a fraction of a second of the heartbeat thread setting the event; long
+# enough not to spin the CPU over the lifetime of a run that can last up to
+# MAX_TIMEOUT_SECONDS.
+CANCEL_POLL_INTERVAL_SECONDS = 0.5
+
+# Grace period between SIGTERM and SIGKILL when forcibly terminating a
+# process group (mid-run cancellation, and now also the timeout path — see
+# the module docstring's "Cancellation (worker daemon path)" note for why
+# both share this mechanism). Configurable per call via
+# `termination_grace_seconds`; this is only the default. 15s matches the
+# existing convention of generous-but-bounded waits elsewhere in this module
+# (MIN_TIMEOUT_SECONDS=30 is the shortest a whole run is ever given; 15s is a
+# fraction of that, enough for the CLI's own signal handling / MCP server
+# shutdown to run without leaving a lost lease's mutation in flight for long).
+DEFAULT_TERMINATION_GRACE_SECONDS = 15.0
+
+
+def _popen_new_process_group_kwargs() -> dict:
+    """Extra `Popen` kwargs so the spawned `claude` process becomes the leader
+    of its own process group (POSIX) / process group (Windows), never sharing
+    ours. This is what makes group-wide termination possible at all — without
+    it, `os.killpg`/`CTRL_BREAK_EVENT` would reach this worker process too."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}  # POSIX: equivalent to a preexec_fn calling os.setsid()
+
+
+def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> None:
+    """Escalating termination of `proc`'s entire process group: SIGTERM (POSIX)
+    / CTRL_BREAK_EVENT (Windows), wait up to `grace_seconds`, then SIGKILL
+    (POSIX) / `Popen.kill()` (Windows) if it is still alive.
+
+    Targets the *group*, not just `proc.pid` — see `_popen_new_process_group_
+    kwargs` and the module docstring: a plain `proc.kill()` would leave any
+    child the CLI spawned (tool subprocesses, MCP servers) running and
+    unaccounted for, which is the exact defect class this change closes.
+    Never raises: a process that already exited (race between our poll and
+    its own completion) is treated as success, not an error.
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+        except (OSError, ValueError):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return  # already gone
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return  # already gone
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        # Even SIGKILL cannot be un-delivered short of a kernel bug or an
+        # uninterruptible (D-state) child; there is nothing further this
+        # function can do. The caller's own bookkeeping (worker.daemon
+        # discarding the outcome, the isolated worktree staying leased-out
+        # until the group is confirmed dead) is what protects against
+        # redelivery, not a guarantee that this call blocks forever.
+        pass
+
+
 def run_claude_code(
     *,
     repository_path: Path,
@@ -506,48 +616,46 @@ def run_claude_code(
     task_type: str,
     timeout_seconds: int,
     model: str | None = None,
+    cancel_event: threading.Event | None = None,
+    termination_grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
 ) -> RunResult:
-    """Execute Claude Code synchronously. Never raises for expected failure modes."""
+    """Execute Claude Code. Never raises for expected failure modes.
+
+    Runs the CLI as its own process-group leader (`_popen_new_process_group_
+    kwargs`) via `subprocess.Popen` rather than the blocking `subprocess.run`
+    form, specifically so a caller that hands in `cancel_event` gets a hook to
+    intervene mid-run: while the process is alive, this function polls both
+    `cancel_event` and the `timeout_seconds` deadline every
+    `CANCEL_POLL_INTERVAL_SECONDS`, and on either trip forcibly terminates the
+    whole process group (`_terminate_process_group`) rather than leaving it
+    running. `cancel_event` is optional and defaults to `None` (never set) so
+    every existing caller that does not pass one — `chat_service`,
+    `launch_service`, and any future v1 Streamlit launch — is unaffected: the
+    call still blocks until the process exits or the timeout fires, exactly
+    as the previous `subprocess.run(timeout=...)` implementation did, just
+    without a hook nobody asked for.
+
+    `worker.handlers._run_agent` is the one caller that passes `cancel_event`
+    today, wiring in the daemon's own `lease_lost` event so a lease lost
+    mid-run now actually stops the subprocess instead of merely being noticed
+    after the fact once it exits on its own.
+    """
     command = build_command(prompt, task_type=task_type, model=model)
     started_at = models.iso_now()
     started_monotonic = time.monotonic()
 
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
             cwd=repository_path,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
             # Strip ambient Git/GitHub credentials: this agent has no reason to
             # authenticate to a remote, and the completion pipeline (not the
             # agent) owns push/merge. See scrub_vcs_credentials.
             env=scrub_vcs_credentials(dict(os.environ)),
-        )
-        duration = time.monotonic() - started_monotonic
-        status = "completed" if completed.returncode == 0 else "failed"
-        return RunResult(
-            status=status,
-            exit_code=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            duration_seconds=duration,
-            started_at=started_at,
-            completed_at=models.iso_now(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration = time.monotonic() - started_monotonic
-        stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return RunResult(
-            status="timed_out",
-            exit_code=None,
-            stdout=stdout,
-            stderr=stderr,
-            duration_seconds=duration,
-            started_at=started_at,
-            completed_at=models.iso_now(),
+            **_popen_new_process_group_kwargs(),
         )
     except OSError as exc:
         duration = time.monotonic() - started_monotonic
@@ -560,6 +668,85 @@ def run_claude_code(
             started_at=started_at,
             completed_at=models.iso_now(),
         )
+
+    # `Popen.communicate()` is the only safe way to drain stdout/stderr
+    # without risking the classic pipe-full deadlock (the CLI's own
+    # `--output-format json` transcript can comfortably exceed the OS pipe
+    # buffer). It is called exactly once, from a background thread, so the
+    # main loop below is free to poll `cancel_event`/the deadline without
+    # itself blocking on I/O — `communicate()` is documented to work
+    # correctly when the process is killed out from under it (it simply
+    # returns whatever was written before the pipes closed).
+    collected: dict[str, str] = {}
+
+    def _collect() -> None:
+        try:
+            out, err = proc.communicate()
+        except (OSError, ValueError):
+            out, err = "", ""
+        collected["stdout"] = out or ""
+        collected["stderr"] = err or ""
+
+    collector = threading.Thread(target=_collect, name="agent-runner-io", daemon=True)
+    collector.start()
+
+    deadline = started_monotonic + timeout_seconds
+    outcome = "exited"
+    while True:
+        collector.join(timeout=CANCEL_POLL_INTERVAL_SECONDS)
+        if not collector.is_alive():
+            outcome = "exited"
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            outcome = "cancelled"
+            break
+        if time.monotonic() >= deadline:
+            outcome = "timed_out"
+            break
+
+    if outcome in ("cancelled", "timed_out"):
+        _terminate_process_group(proc, grace_seconds=termination_grace_seconds)
+        # The collector thread's `communicate()` call unblocks once the
+        # killed process closes its pipes; bound the wait generously (grace
+        # period again, plus headroom) rather than joining forever, so a
+        # pathological D-state child cannot hang this call indefinitely.
+        collector.join(timeout=termination_grace_seconds + 5.0)
+
+    duration = time.monotonic() - started_monotonic
+    stdout = collected.get("stdout", "")
+    stderr = collected.get("stderr", "")
+    exit_code = proc.poll()
+
+    if outcome == "cancelled":
+        return RunResult(
+            status="cancelled",
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            duration_seconds=duration,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+    if outcome == "timed_out":
+        return RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            duration_seconds=duration,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+    status = "completed" if exit_code == 0 else "failed"
+    return RunResult(
+        status=status,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=duration,
+        started_at=started_at,
+        completed_at=models.iso_now(),
+    )
 
 
 def resolve_timeout(requested: int | None) -> int:

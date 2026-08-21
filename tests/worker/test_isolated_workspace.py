@@ -67,7 +67,7 @@ def _fake_run(*, commit: bool = True, status: str = "completed", exit_code: int 
     actually writes and commits into the `repository_path` it is given, so a
     test can observe which physical directory received the work."""
 
-    def run(*, repository_path, prompt, task_type, timeout_seconds, model=None):
+    def run(*, repository_path, prompt, task_type, timeout_seconds, model=None, cancel_event=None):
         if commit:
             target = Path(repository_path)
             (target / "change.txt").write_text(f"work: {prompt}\n")
