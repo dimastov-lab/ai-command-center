@@ -10,6 +10,7 @@ fell back to `repository_path`.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -437,3 +438,55 @@ def test_remove_workspace_leaves_a_dirty_worktree_for_the_next_reuse(tmp_path):
     reused = wp.provision_and_verify(spec)
     assert reused.provision_outcome == "reused"
     assert (workspace / "leftover.txt").exists()
+
+
+# --------------------------------------------------------------------------
+# prune_repository (periodic sweep primitive)
+# --------------------------------------------------------------------------
+
+
+def test_prune_repository_reconciles_metadata_left_by_a_directory_that_vanished(tmp_path):
+    """Simulates the gap `remove_workspace`'s own inline prune cannot reach:
+    a worker killed after `provision_workspace` but before any cleanup call,
+    which leaves the worktree directory deleted (e.g. by the host reclaiming
+    disk) but its `.git/worktrees/<name>` entry still registered."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-d"
+    _git(repo, "worktree", "add", "-b", "task/d", str(workspace), "main")
+    assert any(entry.get("branch") == "task/d" for entry in git_info.get_worktrees(repo))
+
+    shutil.rmtree(workspace)  # directory gone; metadata not yet reconciled
+
+    outcome = wp.prune_repository(repo)
+
+    assert outcome == "pruned"
+    assert all(entry.get("branch") != "task/d" for entry in git_info.get_worktrees(repo))
+
+
+def test_prune_repository_is_a_noop_when_nothing_is_dangling(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+
+    assert wp.prune_repository(repo) == "pruned"
+
+
+def test_prune_repository_never_touches_a_live_worktree(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-e"
+    _git(repo, "worktree", "add", "-b", "task/e", str(workspace), "main")
+
+    outcome = wp.prune_repository(repo)
+
+    assert outcome == "pruned"
+    assert workspace.is_dir()
+    assert any(entry.get("branch") == "task/e" for entry in git_info.get_worktrees(repo))
+
+
+def test_prune_repository_refuses_a_non_repository_path(tmp_path):
+    not_a_repo = tmp_path / "plain-dir"
+    not_a_repo.mkdir()
+
+    assert wp.prune_repository(not_a_repo) == "not_a_repository"
+
+
+def test_prune_repository_refuses_a_missing_path(tmp_path):
+    assert wp.prune_repository(tmp_path / "does-not-exist") == "not_a_repository"
