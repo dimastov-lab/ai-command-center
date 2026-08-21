@@ -221,6 +221,127 @@ def test_runner_never_started_is_retryable(handler, monkeypatch) -> None:
     assert not outcome.ok and outcome.retryable
 
 
+def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch) -> None:
+    """Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
+    Claude-CLI account hit its session/rate limit mid-fleet. The process
+    still started and exited non-zero *with* stdout, so the pre-existing
+    "process never started" check (`exit_code is None and not stdout`) never
+    fired and the run fell through to `ok=True` -- an infrastructure failure
+    recorded as a genuine task success, so it was never retried. 142 backlog
+    tasks cascade-exhausted their retry budget from this exact payload,
+    captured verbatim from the live incident DB."""
+    run_agent, _ = handler
+
+    rate_limited_stdout = json.dumps(
+        {
+            "is_error": True,
+            "duration_api_ms": 0,
+            "num_turns": 1,
+            "stop_reason": "stop_sequence",
+            "total_cost_usd": 0,
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 12,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+            "terminal_reason": "api_error",
+            "fast_mode_disabled_reason": "sdk_opt_in_required",
+            "subtype": "success",
+            "api_error_status": 429,
+            "result": "You've hit your session limit · resets 4:10pm (UTC)",
+            "type": "result",
+            "duration_ms": 410,
+            "uuid": "6f1c9c2e-6b1a-4b0a-9b7e-1f2c3d4e5f60",
+        }
+    )
+
+    def rate_limited(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=rate_limited_stdout,
+            stderr="",
+            duration_seconds=0.41,
+            started_at="2026-08-21T16:09:00+00:00",
+            completed_at="2026-08-21T16:09:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", rate_limited)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "executor infrastructure failure" in outcome.reason
+    assert "session limit" in outcome.reason
+
+
+def test_genuine_task_failure_with_error_flavoured_text_still_ok(handler, monkeypatch) -> None:
+    """Regression guard for the fix above: a run that genuinely executed and
+    the agent's own report happens to mention "error"/"rate limit" in free
+    text -- but the CLI's structured payload carries neither `is_error` nor
+    `terminal_reason: "api_error"` -- must still be `ok=True`, never
+    reclassified as an infrastructure failure. Detection must key off the
+    CLI's own structured signal, not a broad heuristic on `result_text`."""
+    run_agent, _ = handler
+
+    genuinely_failed_stdout = json.dumps(
+        {
+            "is_error": False,
+            "subtype": "success",
+            "type": "result",
+            "result": (
+                "Ran the test suite: 3 failures remain in "
+                "test_rate_limit_handling.py. Could not resolve the "
+                "underlying error in the time available."
+            ),
+            "num_turns": 14,
+            "duration_ms": 240000,
+            "total_cost_usd": 0.42,
+        }
+    )
+
+    def genuinely_failed(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=genuinely_failed_stdout,
+            stderr="pytest exited 1",
+            duration_seconds=240.0,
+            started_at="2026-08-19T12:00:00+00:00",
+            completed_at="2026-08-19T12:04:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", genuinely_failed)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert outcome.result["status"] == "failed"
+
+
+def test_non_json_stdout_fails_safe_not_misclassified(handler, monkeypatch) -> None:
+    """`run.stdout` isn't always pure JSON (e.g. a stream-json/NDJSON shape,
+    or plain text). When it can't be positively parsed as the CLI's
+    structured result object, the new detection must never trigger as a
+    fallback default -- only a confirmed signal is retryable, per
+    `agent_runner._parse_cli_result_payload`'s fail-safe contract."""
+    run_agent, _ = handler
+
+    def not_json(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="Error: rate limit api_error 429\nsomething went wrong",
+            stderr="",
+            duration_seconds=1.0,
+            started_at="2026-08-19T12:00:00+00:00",
+            completed_at="2026-08-19T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", not_json)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert outcome.result["status"] == "failed"
+
+
 def test_untrusted_mutating_task_is_refused_not_downgraded(handler) -> None:
     """Audit D7 at the queue boundary: refusal with the reason named, not a
     silent read-only downgrade that half-executes and looks completed."""
