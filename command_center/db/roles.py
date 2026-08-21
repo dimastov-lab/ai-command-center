@@ -671,18 +671,54 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     # once any function in the schema has a different owner (measured, not
     # assumed). Splitting the owner therefore needs this renderer to learn about
     # second owners first. Filed as VOYN-W0-AICC-SRV-03d.
-    statements.append(f"ALTER ROLE {MIGRATOR_ROLE} CREATEROLE;")
     # `ADMIN TRUE` is what lets `CREATE ROLE ... IN ROLE aicc_worker` grant the
     # membership; `INHERIT FALSE, SET FALSE` is what stops the migrator picking
-    # up the worker's privileges or becoming it as a side effect.
+    # up the worker's privileges or becoming it as a side effect. Terminating a
+    # revoked host's live backends needs `pg_signal_backend` — without it, a
+    # leaked password that is already connected keeps its connection until the
+    # credential's TTL runs out, so revocation would stop future authentication
+    # only.
+    #
+    # All three writes are guarded IF-NOT-ALREADY-SET, not just lock-guarded:
+    # apply_bootstrap() runs on every test in this suite (hundreds of calls per
+    # run), and an unconditional ALTER ROLE / GRANT re-issues a real catalog
+    # write on the shared cluster-level aicc_migrator row every single time,
+    # even though nothing changes after the first. The advisory lock (acquired
+    # above, in render_role_creation()) does serialize those writes correctly,
+    # but under sustained load across many xdist workers each producing
+    # hundreds of needless real writes to the SAME row, the write volume alone
+    # was enough to occasionally surface `tuple concurrently updated` even with
+    # every write serialized -- live-reproduced 2026-08-21, cleared by cutting
+    # the writes themselves down to once per fresh cluster instead of once per
+    # test. This mirrors render_role_creation()'s own IF-NOT-EXISTS discipline.
     statements.append(
-        f"GRANT {WORKER_ROLE} TO {MIGRATOR_ROLE} "
-        "WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;"
+        f"DO $$\n"
+        f"BEGIN\n"
+        f"    PERFORM pg_advisory_xact_lock(7823649102);\n"
+        f"    IF NOT (SELECT rolcreaterole FROM pg_roles WHERE rolname = '{MIGRATOR_ROLE}') THEN\n"
+        f"        ALTER ROLE {MIGRATOR_ROLE} CREATEROLE;\n"
+        f"    END IF;\n"
+        f"    IF NOT EXISTS (\n"
+        f"        SELECT 1 FROM pg_auth_members m\n"
+        f"        JOIN pg_roles r ON r.oid = m.roleid\n"
+        f"        JOIN pg_roles g ON g.oid = m.member\n"
+        f"        WHERE r.rolname = '{WORKER_ROLE}' AND g.rolname = '{MIGRATOR_ROLE}'\n"
+        f"          AND m.admin_option\n"
+        f"    ) THEN\n"
+        f"        GRANT {WORKER_ROLE} TO {MIGRATOR_ROLE} "
+        f"WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;\n"
+        f"    END IF;\n"
+        f"    IF NOT EXISTS (\n"
+        f"        SELECT 1 FROM pg_auth_members m\n"
+        f"        JOIN pg_roles r ON r.oid = m.roleid\n"
+        f"        JOIN pg_roles g ON g.oid = m.member\n"
+        f"        WHERE r.rolname = 'pg_signal_backend' AND g.rolname = '{MIGRATOR_ROLE}'\n"
+        f"    ) THEN\n"
+        f"        GRANT pg_signal_backend TO {MIGRATOR_ROLE};\n"
+        f"    END IF;\n"
+        f"END\n"
+        f"$$;"
     )
-    # Terminating a revoked host's live backends. Without it, a leaked password
-    # that is already connected keeps its connection until the credential's TTL
-    # runs out, so revocation would stop future authentication only.
-    statements.append(f"GRANT pg_signal_backend TO {MIGRATOR_ROLE};")
 
     return statements
 

@@ -57,13 +57,27 @@ def role_passwords(admin_dsn, psycopg) -> dict[str, str]:
     Roles are cluster objects rather than per-database ones, so this runs once
     and the per-test databases reuse them. Production does the same: the roles
     are created by `render_grants()`, and the operator attaches credentials.
+
+    "Session-scoped" is per xdist WORKER PROCESS, not cluster-wide, so N
+    workers each run this concurrently against the same cluster roles.
+    `render_role_creation()` guards its own CREATE with an advisory lock, but
+    that lock releases as soon as that one statement's implicit transaction
+    ends -- it does not cover the `ALTER ROLE ... PASSWORD` right after,
+    which two workers can then run concurrently on the very same catalog
+    row and get `tuple concurrently updated` from (found live, 2026-08-21,
+    after fixing the CREATE-side race and a missing-dependency bug in the
+    same flake: VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE turned out to be three
+    independent bugs under one error signature). Holding the lock for this
+    fixture's whole body, in one explicit transaction, serializes CREATE and
+    ALTER together across workers instead of only the CREATE half.
     """
     from psycopg import sql
 
     from command_center.db import roles as roles_module
 
-    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+    with psycopg.connect(admin_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(7823649102);")
             for role in roles_module.ALL_ROLES:
                 cur.execute(roles_module.render_role_creation(role))
                 cur.execute(
@@ -136,13 +150,24 @@ def _override(dsn: str, **overrides: str) -> str:
 
 
 @pytest.fixture
-def pg_connection_factory(admin_conn, psycopg, test_dsn):  # noqa: ARG001
+def pg_connection_factory(admin_conn, psycopg, test_dsn, role_passwords):  # noqa: ARG001
     """A `connection()`-shaped factory over a migrated throwaway database.
 
     Shaped like `command_center.db.pool.connection` so the store under test
     talks to the real seam rather than to a fixture-specific interface — a
     store proved against a bespoke connection object is not proved against the
     one it runs on.
+
+    Depends on `role_passwords` for its side effect, not its value: the
+    migrations this fixture applies GRANT to `aicc_app`/`aicc_worker` (e.g.
+    `backlog_triage()`), so those cluster-level roles must exist before
+    `migrations.upgrade()` runs. Nothing enforced that ordering before this
+    fix -- if the xdist worker running this test hadn't already resolved
+    `role_passwords` via some other fixture first, the GRANT hit a role
+    that plain didn't exist yet, independent of any concurrency race
+    (VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE: this, not the CREATE ROLE race
+    the advisory lock guards, is why it kept reproducing even after that
+    lock was correctly in place).
     """
     from contextlib import contextmanager
 
