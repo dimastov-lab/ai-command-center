@@ -280,9 +280,12 @@ def main(argv: list[str] | None = None) -> int:
                     lambda q, k, pl, tid: store.enqueue(
                         q, idempotency_key=k, payload=pl, task_id=tid
                     ),
+                    args.repo_path,
                 )
                 for task_id, pr in report.reviewed:
                     print(f"REVIEW    {task_id} -> {pr}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
                 marker_report = publish_review_verdicts(lambda: _nc(conn), args.repo_path)
                 for task_id, pr in marker_report.reviewed:
                     print(f"MARKER    {task_id} -> {pr}")
