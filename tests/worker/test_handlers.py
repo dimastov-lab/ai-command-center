@@ -812,4 +812,109 @@ def test_a_lease_with_no_identity_token_still_blocks(
     lease_tool(json.dumps(row))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
-    assert runs == []
+
+
+# -- full-lifecycle writer lease (VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE) ----
+
+
+def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The writer lease must be acquired (and the pre-push hook's identity
+    provisioned) BEFORE the workspace is provisioned and the agent runs --
+    not only around `publish_run`'s own push -- and released only once the
+    whole dispatch is done. `blocking_lease`'s own `list` preflight must run
+    first (it is the read-only check for a lease held by someone ELSE);
+    `acquire`/`install-hooks` (this task's lease, held by us) follow it."""
+    run_agent, runs = handler
+    calls = tmp_path / "lease-calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    # `blocking_lease` calls plain `[tool, "list"]` (no `--repo`/identity
+    # flags -- it is a read-only preflight over every lease, not one this
+    # process's own identity); the writer lease's `acquire`/`install-hooks`/
+    # `release` go through `lease_client.lease_argv`'s
+    # `--repo <path> <verb> --repository ... --owner ...` shape instead. One
+    # script answers both: it always emits `[]` (the only thing `list`
+    # reads) and exits 0.
+    binary.write_text(
+        "#!/bin/sh\n"
+        f'echo "$*" >> {calls}\n'
+        "echo '[]'\n"
+        "exit 0\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+
+    lines = calls.read_text().splitlines()
+    assert lines and lines[0] == "list", "blocking_lease's preflight runs first"
+
+    def _first(verb: str) -> int:
+        # `--repo <path> <verb> ...` -- the verb is the third token.
+        return next(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
+
+    def _last(verb: str) -> int:
+        return max(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
+
+    assert _first("acquire") >= 1
+    assert _first("install-hooks") >= 1
+    assert _first("release") >= 1
+    assert 0 < _first("acquire") < _first("install-hooks"), (
+        "the writer lease is acquired, and the hook identity provisioned "
+        "under it, before provisioning/running the agent"
+    )
+    assert _last("install-hooks") < _first("release"), (
+        "the lease must still be held while the hook identity is current, "
+        "released only once the dispatch is fully done"
+    )
+
+
+def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Another writer already holding the repository-level lease (or the
+    authority refusing/unreachable for the acquire specifically, as opposed
+    to `list`) must refuse the dispatch retryably before any workspace is
+    touched or the agent is launched -- the same fail-closed shape
+    `blocking_lease` already has for its own preflight."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        # `blocking_lease` calls plain `[tool, "list"]` ($1=list, no
+        # `--repo`); the writer lease's calls go through `--repo <path>
+        # <verb> ...` ($3=verb). Distinguish on whichever positional
+        # argument actually carries the verb for that call shape.
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'lease already held by another writer' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "writer lease unavailable" in outcome.reason
+    assert runs == [], "the agent must not run without the writer lease held"
+
+
+def test_no_configured_authority_leaves_the_writer_lease_inert_too(
+    handler, tmp_path
+) -> None:
+    """Symmetric with `test_no_configured_authority_leaves_the_gate_inert`
+    for `blocking_lease`: a host with no `VOYN_LEASE_DSN` has no lease
+    authority to acquire a lease from either, so the full-lifecycle lease
+    must not block it (it already inherits the ambient absence of
+    `VOYN_LEASE_TOOL`/`VOYN_LEASE_DSN` from the `handler` fixture)."""
+    run_agent, runs = handler
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
