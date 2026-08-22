@@ -300,6 +300,7 @@ def _run_agent(
             # a host with no configured lease authority has no lease to
             # hold, and must not be blocked by requiring a tool that was
             # never wired up for it.
+            full_lifecycle_lease_held = False
             if os.environ.get("VOYN_LEASE_DSN"):
                 lease_cfg = writer_lease.WriterLeaseConfig(
                     lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
@@ -314,6 +315,11 @@ def _run_agent(
                     stack.enter_context(
                         writer_lease.hold(repository, lease_cfg, lease_lost)
                     )
+                    # `publish_run` below must not drop this lease itself --
+                    # see `PublishConfig.release_lease` -- release happens
+                    # only once, when `stack.close()` runs in this function's
+                    # own `finally`.
+                    full_lifecycle_lease_held = True
                 except writer_lease.WriterLeaseUnavailable as exc:
                     # Another writer already holds the repository's lease,
                     # or the authority refused/could not be reached: a data
@@ -465,8 +471,12 @@ def _run_agent(
         # the autonomous loop closes without a human. Opt-in by env
         # (AICC_PUBLISH_DEPLOY_KEY); unset = local commit only, review fleets
         # unaffected. The lease inside publish_run enforces single-writer
-        # for the push itself; the writer lease entered into `stack` above
-        # (when configured) already covers this call too.
+        # for the push itself when no outer lease is held; when the writer
+        # lease was entered into `stack` above, `release_lease=False` keeps
+        # `publish_run` from dropping it early -- only `stack.close()` in
+        # this function's own `finally` releases it, once, after this
+        # call's own post-publish work (below) and `remove_workspace`'s
+        # worktree cleanup have both finished.
         deploy_key = os.environ.get("AICC_PUBLISH_DEPLOY_KEY", "")
         if task_type in agent_runner.MUTATING_TASK_TYPES and deploy_key:
             pub = publish_run(
@@ -480,6 +490,7 @@ def _run_agent(
                     session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
                     task=backlog_task,
                     deploy_key=deploy_key,
+                    release_lease=not full_lifecycle_lease_held,
                 ),
             )
             result["publish"] = {

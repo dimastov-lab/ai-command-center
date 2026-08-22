@@ -53,6 +53,19 @@ class PublishConfig:
     deploy_key: str  # path to the per-repo deploy private key
     base: str = "main"
     ttl: int = 600
+    # False when the caller already holds the writer lease for the whole
+    # provision->agent->tests->publish lifecycle (`writer_lease.hold`,
+    # VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE) and will release it itself.
+    # `acquire`/`install-hooks` stay unconditional either way -- both are
+    # idempotent re-affirmations under an already-held lease -- but
+    # `release` here is a real termination of the row, not a re-affirmation:
+    # dropping it mid-function, before this call's own `gh pr view`/
+    # `gh pr create` and the caller's post-publish worktree cleanup, would
+    # reopen exactly the unfenced window that lease exists to close. Default
+    # True preserves this module's own standalone behavior (its docstring's
+    # "acquired through... never bypassed" contract) for any caller that
+    # does not hold an outer lease.
+    release_lease: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +161,8 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     # reject with this stale a file.
     hooks = _run(_lease_argv(cfg, "install-hooks", repo_path), repo_path)
     if hooks.returncode != 0:
-        _run(_lease_argv(cfg, "release", repo_path), repo_path)
+        if cfg.release_lease:
+            _run(_lease_argv(cfg, "release", repo_path), repo_path)
         return PublishResult(
             ok=False, reason=f"install_hooks_failed: {hooks.stderr.strip()[:120]}"
         )
@@ -171,7 +185,8 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         if push.returncode != 0:
             return PublishResult(ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}")
     finally:
-        _run(_lease_argv(cfg, "release", repo_path), repo_path)
+        if cfg.release_lease:
+            _run(_lease_argv(cfg, "release", repo_path), repo_path)
 
     body = (
         f"Autonomous delivery of {cfg.task}.\n\n"

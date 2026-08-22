@@ -31,6 +31,18 @@ competing claim. `install-hooks` is re-run on every successful renewal too
 fresh for the whole run, not only in the seconds around the push
 `publish_run` still separately re-provisions.
 
+`release`, unlike `acquire`/`install-hooks`, is NOT idempotent under an
+already-held lease -- it is a real termination of the row. When this
+module's caller already holds the lease, it passes
+`PublishConfig(release_lease=False)` so `publish_run` only re-affirms
+(acquire, install-hooks) and leaves the one real release to this module's
+own `hold()` exiting -- after `publish_run` returns and the caller's own
+post-publish work (PR bookkeeping, worktree cleanup) has finished. An
+earlier revision of this module let `publish_run` release unconditionally,
+which silently dropped the lease mid-function, before that cleanup; see
+`VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE`'s backlog entry for the
+independent-review finding that caught it.
+
 Renewal mirrors `worker.daemon.WorkerDaemon._heartbeat_loop`'s shape: a
 background thread renews at a third of the lease TTL, and any failure to
 renew -- another writer took the lease over, the authority is unreachable,

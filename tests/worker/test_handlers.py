@@ -873,6 +873,65 @@ def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
     )
 
 
+def test_publish_does_not_release_a_lease_the_caller_still_holds(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Independent-review finding on VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE:
+    the first revision let `publish_run` release the writer lease
+    unconditionally in its own `finally`, dropping it mid-dispatch -- before
+    this function's own post-publish work and `remove_workspace`'s worktree
+    cleanup, both still inside the caller's `stack`. When the full-lifecycle
+    lease was actually acquired (`VOYN_LEASE_DSN` configured), `publish_run`
+    must be called with `release_lease=False` so the one real release stays
+    with the caller's own `stack.close()`."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text("#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; fi\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert captured and captured[0].release_lease is False
+
+
+def test_publish_releases_its_own_lease_when_no_full_lifecycle_lease_is_held(
+    handler, monkeypatch
+) -> None:
+    """Symmetric case: no `VOYN_LEASE_DSN` means no full-lifecycle lease was
+    ever acquired (the `handler` fixture already unsets it), so
+    `publish_run` must keep its own default `release_lease=True` -- nothing
+    else will ever release that lease if it doesn't."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert captured and captured[0].release_lease is True
+
+
 def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
     handler, monkeypatch, tmp_path
 ) -> None:
