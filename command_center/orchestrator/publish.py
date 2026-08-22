@@ -121,6 +121,28 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         # The lease is held by another writer: a data refusal, the attempt
         # returns to the pool and a later tick retries — never a forced push.
         return PublishResult(ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}")
+    # Live-reproduced 2026-08-21: `install-hooks` is what writes the
+    # pre-push hook's `voyn-lease.env` (repository/owner/session/task/pid/
+    # process-start) -- and it had only ever been run once, at whatever
+    # moment the hooks were first provisioned on this host. The pre-push
+    # hook reads that FROZEN file on every push and compares it against the
+    # lease row THIS `acquire` just wrote fresh, so `verify` refused every
+    # push with `VOYN_LEASE_REFUSED verify mismatch` once the identity that
+    # provisioned the hooks (an old, long-dead process) no longer matched
+    # anything this or any later worker process would ever present. Calling
+    # `install-hooks` with the exact same identity args as the `acquire`
+    # that just succeeded keeps the hook's on-disk copy of "who currently
+    # holds this lease" in lockstep with the database row `verify` actually
+    # checks against -- every acquire re-provisions it, not just the first
+    # one ever run on a host. Failing this fails closed (release, refuse to
+    # push) rather than attempting a push `verify` is already known to
+    # reject with this stale a file.
+    hooks = _run(_lease_argv(cfg, "install-hooks", repo_path), repo_path)
+    if hooks.returncode != 0:
+        _run(_lease_argv(cfg, "release", repo_path), repo_path)
+        return PublishResult(
+            ok=False, reason=f"install_hooks_failed: {hooks.stderr.strip()[:120]}"
+        )
     try:
         https_target = _https_push_target(repo_path)
         if https_target is not None:

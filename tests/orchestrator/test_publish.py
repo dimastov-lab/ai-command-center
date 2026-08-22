@@ -86,7 +86,8 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     assert "backlog/VOYN-W0-TEST" in out
     log = calls.read_text()
     assert " acquire " in log and " release " in log  # lease taken and freed
-    assert log.index("acquire") < log.index("create")  # acquired before publishing
+    assert " install-hooks " in log  # hook's on-disk identity kept fresh
+    assert log.index("acquire") < log.index("install-hooks") < log.index("create")
 
 
 def test_a_github_ssh_origin_is_pushed_over_https(repo, monkeypatch):
@@ -143,6 +144,39 @@ def test_lease_refusal_does_not_push(repo, monkeypatch):
 
     r = publish_run(work, _cfg(bin_))
     assert not r.ok and r.reason.startswith("lease_unavailable")
+    out = subprocess.run(["git", "ls-remote", "--heads", str(work.parent / "origin.git")],
+                         capture_output=True, text=True).stdout
+    assert "backlog" not in out  # never pushed
+
+
+def test_stale_hook_identity_fails_closed_without_pushing(repo, monkeypatch):
+    """VOYN-W0-AICC-LEASE-VERIFY-MISMATCH-BLOCKS-ALL-PUBLISH, live-reproduced
+    2026-08-21: `install-hooks` is what re-provisions the pre-push hook's
+    on-disk identity file so it matches the lease `acquire` just took --
+    without it, the hook's `verify` step (not exercised by these fakes,
+    which never actually run the hook) would refuse the push against a
+    frozen, wrong identity. If `install-hooks` itself fails here, that must
+    fail closed: release the lease and never attempt the push, rather than
+    pushing anyway into a `verify` we already know will reject it."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "c.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "w")
+    (bin_ / "voyn-lease").write_text(
+        f"#!/bin/sh\necho \"lease $*\" >> {calls}\n"
+        # argv shape: voyn-lease --repo <path> <verb> ... -- verb is $3.
+        "case \"$3\" in\n"
+        "  install-hooks) exit 5 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    (bin_ / "voyn-lease").chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+    assert not r.ok and r.reason.startswith("install_hooks_failed")
+    log = calls.read_text()
+    assert " acquire " in log and " install-hooks " in log and " release " in log
     out = subprocess.run(["git", "ls-remote", "--heads", str(work.parent / "origin.git")],
                          capture_output=True, text=True).stdout
     assert "backlog" not in out  # never pushed
