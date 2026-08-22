@@ -38,6 +38,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from command_center.worker import lease_client
+
 __all__ = ["PublishConfig", "PublishResult", "publish_run"]
 
 
@@ -51,6 +53,19 @@ class PublishConfig:
     deploy_key: str  # path to the per-repo deploy private key
     base: str = "main"
     ttl: int = 600
+    # False when the caller already holds the writer lease for the whole
+    # provision->agent->tests->publish lifecycle (`writer_lease.hold`,
+    # VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE) and will release it itself.
+    # `acquire`/`install-hooks` stay unconditional either way -- both are
+    # idempotent re-affirmations under an already-held lease -- but
+    # `release` here is a real termination of the row, not a re-affirmation:
+    # dropping it mid-function, before this call's own `gh pr view`/
+    # `gh pr create` and the caller's post-publish worktree cleanup, would
+    # reopen exactly the unfenced window that lease exists to close. Default
+    # True preserves this module's own standalone behavior (its docstring's
+    # "acquired through... never bypassed" contract) for any caller that
+    # does not hold an outer lease.
+    release_lease: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,14 +89,15 @@ def _run(argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None) ->
 
 
 def _lease_argv(cfg: PublishConfig, verb: str, repo_path: Path) -> list[str]:
-    import os
-
-    return [
-        cfg.lease_tool, "--repo", str(repo_path), verb,
-        "--repository", cfg.repository, "--owner", cfg.owner,
-        "--session", cfg.session, "--task", cfg.task,
-        "--pid", str(os.getpid()), "--process-start", _process_start(),
-    ]
+    # Delegates to the shared `lease_client` module so this argv shape and
+    # `writer_lease.py`'s (VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE, the
+    # lease held across the whole provision->agent->tests->publish
+    # lifecycle, not just this push) can never drift apart.
+    identity = lease_client.LeaseIdentity(
+        lease_tool=cfg.lease_tool, repository=cfg.repository,
+        owner=cfg.owner, session=cfg.session, task=cfg.task,
+    )
+    return lease_client.lease_argv(identity, verb, repo_path)
 
 
 def _https_push_target(repo_path: Path) -> str | None:
@@ -106,18 +122,6 @@ def _https_push_target(repo_path: Path) -> str | None:
     if url.startswith("https://github.com/"):
         return url
     return None
-
-
-def _process_start() -> str:
-    # The lease binds ownership to (pid, process-start) so a recycled pid
-    # cannot inherit a dead process's lease. Read this process's start from
-    # /proc; falls back to "0" where unavailable (the lease tool still keys
-    # on pid+owner+session, which is enough for the single-writer guarantee).
-    try:
-        with open(f"/proc/{__import__('os').getpid()}/stat", encoding="ascii") as fh:
-            return fh.read().split(") ", 1)[1].split()[19]
-    except (OSError, IndexError):
-        return "0"
 
 
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
@@ -157,7 +161,8 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     # reject with this stale a file.
     hooks = _run(_lease_argv(cfg, "install-hooks", repo_path), repo_path)
     if hooks.returncode != 0:
-        _run(_lease_argv(cfg, "release", repo_path), repo_path)
+        if cfg.release_lease:
+            _run(_lease_argv(cfg, "release", repo_path), repo_path)
         return PublishResult(
             ok=False, reason=f"install_hooks_failed: {hooks.stderr.strip()[:120]}"
         )
@@ -180,7 +185,8 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         if push.returncode != 0:
             return PublishResult(ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}")
     finally:
-        _run(_lease_argv(cfg, "release", repo_path), repo_path)
+        if cfg.release_lease:
+            _run(_lease_argv(cfg, "release", repo_path), repo_path)
 
     body = (
         f"Autonomous delivery of {cfg.task}.\n\n"

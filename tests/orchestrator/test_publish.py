@@ -90,6 +90,56 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     assert log.index("acquire") < log.index("install-hooks") < log.index("create")
 
 
+def test_release_lease_false_never_calls_release(repo, monkeypatch):
+    """VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE, independent-review finding:
+    a caller holding the full-lifecycle lease across provision->agent->
+    tests->publish must not have it dropped mid-`publish_run` -- `acquire`/
+    `install-hooks` stay (idempotent re-affirmation), but `release` is a
+    real termination of the row and must be left to the caller's own
+    `writer_lease.hold()` exiting, after this function returns."""
+    from dataclasses import replace
+
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+
+    r = publish_run(work, replace(_cfg(bin_), release_lease=False))
+    assert r.ok, r.reason
+    log = calls.read_text()
+    assert " acquire " in log
+    assert " install-hooks " in log
+    assert " release " not in log
+
+
+def test_release_lease_false_still_skips_release_on_install_hooks_failure(repo, monkeypatch):
+    """The early-exit path (install-hooks fails) has its own release call --
+    it must respect `release_lease` too, not just the happy-path `finally`."""
+    from dataclasses import replace
+
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+    lease = bin_ / "voyn-lease"
+    lease.write_text(
+        f"#!/bin/sh\necho \"lease $*\" >> {calls}\n"
+        "case \"$3\" in\n"  # --repo <path> <verb> ... -- verb is $3
+        "  install-hooks) exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    lease.chmod(0o755)
+
+    r = publish_run(work, replace(_cfg(bin_), release_lease=False))
+    assert not r.ok and r.reason.startswith("install_hooks_failed")
+    log = calls.read_text()
+    assert " acquire " in log
+    assert " release " not in log
+
+
 def test_a_github_ssh_origin_is_pushed_over_https(repo, monkeypatch):
     """VOYN-W0-AICC-DEPLOY-KEY-WRITE-DENIED (2026-08-21): a verified,
     correctly-registered, non-read-only deploy key still had its write
