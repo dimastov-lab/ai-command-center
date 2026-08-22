@@ -5,9 +5,27 @@ and go nowhere until this module publishes them. Publishing is gated by the
 same single-writer invariant the pre-push hook enforces: a branch is pushed
 only while this process holds the repository's writer lease, acquired through
 the very tool the hook verifies (``voyn-lease``) — never bypassed with
-``--no-verify``. The deploy key (added to GitHub with write access) is the
-push credential; ``gh`` opens the PR carrying the ``HEAD_SHA:`` trailer that
-result-ingest already parses.
+``--no-verify``. ``gh``'s own OAuth credential over the HTTPS-rewritten
+``origin`` is the push credential (see ``_https_push_target``); the deploy
+key is the opt-in switch for publishing at all and the credential only on
+the SSH fallback. ``gh`` also opens the PR carrying the ``HEAD_SHA:`` trailer
+that result-ingest already parses.
+
+That lease has an on-disk shadow, which is why every ``acquire`` here is
+followed by ``install-hooks`` under the identity it just acquired (#351).
+The hook presents repository/owner/session/task/pid/process-start read from
+``voyn-lease.env`` — one file in the clone's common git dir, shared by every
+worktree of that clone — and it used to be written once per host, so it froze
+on a long-dead process and ``verify`` refused every push no matter who really
+held the lease. The refresh buys exactly one thing, and it is not a standing
+invariant: while this publish holds the lease, the file names this publisher.
+``release`` leaves it behind, so between publishes the file names a writer
+that already released — harmless, because ``verify`` then finds no matching
+row and refuses. Nor can it come to name the wrong *live* holder: the lease
+authority keys one row per repository id, which every worktree of this clone
+publishes under, so no two of them hold it at once, and ``verify`` recomputes
+worktree, branch and head from the pushing checkout rather than trusting the
+file. Deleting the call brings the frozen identity back; it is not redundant.
 
 Every outcome is data (a ``PublishResult``); this never raises into the
 worker loop. A run that produced no commit is reported as ``nothing_to_publish``,
