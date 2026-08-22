@@ -8,6 +8,31 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed (`VOYN-W0-AICC-SRV-07`)
+- `docs/srv01b-schema-map.md` now records that the migration volume figures
+  («≈1.22 млн строк» and the «бэкфилл ≈6.5 минут» window derived from it) are an
+  **extrapolation from one table of a synthetic ≈35 MB fixture** (200 000
+  messages, 50 contacts), not a measurement of production. The one snapshot ever
+  taken of the live database found the opposite: its domain tables empty, 137
+  rows in the whole file. Neither file is in the repo or in CI, so the number
+  cannot be re-measured here — and unlike every other section of that map, this
+  one says that about itself instead of inheriting the credibility of the
+  machine-taken measurements around it.
+- The correction carries two obligations for SRV-07/SRV-09. The importer
+  measures its own source (`count(*)` in wave order, before the first insert)
+  and carries that count into the transfer report, because a planning estimate
+  is not an input to the backfill window. And because "row counts match" passes
+  identically on an empty table, an importer that read nothing is
+  indistinguishable from one that moved everything unless the measured source
+  count travels beside the reconciliation verdict.
+- `tests/architecture/test_migration_volume_claims_fitness.py` keeps this from
+  rotting back: a volume figure in the migration docs without the word
+  «экстраполяция» fails the gate, as does that specific hearsay pair anywhere in
+  the repo's Markdown, since an unlabelled number reads as a measurement — which
+  is exactly how the original error was made. The checker is a pure function
+  over text and its negative controls assert that it can fail, rather than
+  trusting a green run over today's docs.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
