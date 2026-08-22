@@ -5,9 +5,20 @@ and go nowhere until this module publishes them. Publishing is gated by the
 same single-writer invariant the pre-push hook enforces: a branch is pushed
 only while this process holds the repository's writer lease, acquired through
 the very tool the hook verifies (``voyn-lease``) — never bypassed with
-``--no-verify``. The deploy key (added to GitHub with write access) is the
-push credential; ``gh`` opens the PR carrying the ``HEAD_SHA:`` trailer that
-result-ingest already parses.
+``--no-verify``. What the hook checks that lease against is an identity frozen
+on disk: ``voyn-lease.env``, written by ``install-hooks`` into the clone's git
+common dir, one copy shared by every worktree of that clone. Every ``acquire``
+here re-runs ``install-hooks`` with the identity it just acquired under,
+because left to whichever process first provisioned the hooks the file names a
+long-dead pid and ``verify`` then refuses every push no matter who actually
+holds the lease (#351). It is a refresh, not a restore: ``release`` leaves the
+file naming this publisher, so outside an acquire/release window the on-disk
+identity is a released writer's, and only the next ``acquire`` makes it true
+again. When ``origin`` is a github.com remote it is rewritten to HTTPS and
+pushed under ``gh``'s OAuth credential; the deploy key is the SSH fallback for
+any other remote, and its env var is what switches publishing on at all.
+``gh`` opens the PR carrying the ``HEAD_SHA:`` trailer that result-ingest
+already parses.
 
 Every outcome is data (a ``PublishResult``); this never raises into the
 worker loop. A run that produced no commit is reported as ``nothing_to_publish``,
