@@ -5,9 +5,11 @@ and go nowhere until this module publishes them. Publishing is gated by the
 same single-writer invariant the pre-push hook enforces: a branch is pushed
 only while this process holds the repository's writer lease, acquired through
 the very tool the hook verifies (``voyn-lease``) — never bypassed with
-``--no-verify``. The deploy key (added to GitHub with write access) is the
-push credential; ``gh`` opens the PR carrying the ``HEAD_SHA:`` trailer that
-result-ingest already parses.
+``--no-verify``. Every ``acquire`` re-runs ``install-hooks`` with that same
+identity, so the hook's on-disk copy of it (``voyn-lease.env``) can never go
+stale relative to the live lease-holder. The deploy key (added to GitHub with
+write access) is the push credential; ``gh`` opens the PR carrying the
+``HEAD_SHA:`` trailer that result-ingest already parses.
 
 Every outcome is data (a ``PublishResult``); this never raises into the
 worker loop. A run that produced no commit is reported as ``nothing_to_publish``,
